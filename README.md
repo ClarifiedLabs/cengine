@@ -1,95 +1,73 @@
 # cengine
 
-`cengine` is an experimental, lightweight Docker Engine-compatible daemon for Apple silicon. It accepts Docker Engine API v1.44 requests on a user-owned Unix socket and runs Linux containers as lightweight virtual machines through Apple's [Containerization](https://github.com/apple/containerization) package.
+`cengine` is an experimental, lightweight Docker Engine-compatible daemon for
+Apple silicon. It runs Linux containers as lightweight virtual machines using
+Apple's [Containerization](https://github.com/apple/containerization) package.
 
-This repository is an experimental engine rather than a complete implementation of every Docker API. Its focused runtime surface now covers interactive Docker CLI use, Compose application lifecycle, Buildx container builds, networking, observability, and daemon recovery.
-
-Note: this project was created as part of testing out gpt-5.6-sol for the first time. All planning was done with `xhigh` effort and implementation was done with `low` effort as of commit f78d30dcb6eae948fbdd271f08e5c82d1656457a.
+Note: this project was created as part of testing out gpt-5.6-sol for the first time. As of commit 224624b705e9a94428316c9c33a96b70d77f08b1 all planning used `xhigh` effort and implementation used `low`.
 
 ## Requirements
 
 - Apple silicon
 - macOS 26 or newer
-- Xcode 26
-- Docker CLI (optional, but required to use the Docker context and Buildx)
+- Docker CLI
 
-## Build and test
+## Install
+
+Install `cengine` with Homebrew:
 
 ```sh
-make test
-make test-compat
-make dist-cli
-make package
+brew install --cask clarifiedlabs/tap/cengine
 ```
 
-`cengine` is built by `cengine.xcodeproj`; SwiftPM is not a supported build
-entrypoint. `make test` runs both Xcode test bundles, `make dist-cli` stages the
-release CLI at `dist/cengine`, and `make package` builds a local unsigned
-installer for payload inspection.
-
-`make test-compat` runs the cengine-owned Docker API and Docker Compose
-compatibility suites against an isolated real daemon and temporary engine root.
-It requires the installed Kata kernel and never uses the normal cengine socket
-or persisted state. See
-[`docs/docker-compatibility.md`](docs/docker-compatibility.md) for the current
-compatibility ledger and test provenance.
-
-Local CLI builds are ad-hoc signed with
-`com.apple.security.virtualization`. The project deliberately does not request
-the separate vmnet entitlements: Apple's macOS 26 Containerization networking
-path operates under the Virtualization entitlement. The build verifies the
-final entitlement set.
-
-Public releases are Developer ID signed, notarized, stapled `.pkg` installers
-published through GitHub Releases and `ClarifiedLabs/homebrew-tap`. See
-[`docs/release.md`](docs/release.md).
-
-## Install for the current user
-
-Place the release binary at a stable path, then run:
+Then install the per-user service, Linux kernel, Docker context, and Buildx
+builder:
 
 ```sh
-/usr/local/bin/cengine system install
+cengine system install
+```
+
+Check that the engine is ready:
+
+```sh
+cengine system status
+cengine system doctor
 docker --context cengine info
 ```
 
-Installation downloads a pinned Kata kernel and verifies its SHA-256 digest, installs a `dev.cengine.engine` LaunchAgent, and creates the `cengine` Docker context. It never changes the active Docker context. If the daemon exposes all endpoints Buildx needs, installation also attempts to create the `cengine-builder` builder; failure is non-fatal during this MVP phase.
+## Usage
 
-To remove the service and context while preserving images and container data:
+Run Docker commands against `cengine` by selecting its context:
+
+```sh
+docker --context cengine run --rm hello-world
+docker --context cengine ps
+docker --context cengine images
+docker --context cengine compose up
+docker buildx build --builder cengine-builder .
+```
+
+To make `cengine` the default engine for subsequent Docker commands, activate
+its Docker context:
+
+```sh
+docker context use cengine
+docker info
+```
+
+Switch back to Docker's standard context with:
+
+```sh
+docker context use default
+```
+
+To remove the service and Docker context while preserving images and container
+data:
 
 ```sh
 cengine system uninstall
 ```
 
-For development without downloading a kernel or starting VMs:
-
-```sh
-cengine daemon --metadata-only
-DOCKER_HOST=unix://$HOME/.cengine/run/docker.sock docker info
-```
-
-## Architecture
-
-```text
-docker / compose / buildx
-          |
-          | HTTP v1.44 over ~/.cengine/run/docker.sock
-          v
-  SwiftNIO API router
-          |
-          v
- persisted EngineRuntime actor
-          |
-          v
- AppleContainerBackend actor
-          |
-          v
- Apple Containerization + Virtualization.framework
-   (one lightweight VM per running container)
-```
-
-State is JSON with an explicit schema envelope and atomic rename/fsync persistence under `~/Library/Application Support/cengine`. Runtime sockets remain under `~/.cengine/run`, and daemon logs are under `~/Library/Logs/cengine`.
-
-## Current compatibility
-
-Implemented API groups include server ping/version/info and live events; authenticated, platform-aware image pull with live progress, import/list/inspect/history/delete and pruning with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect, restart, pause, resource update, health checks, stats, top, and pruning; automatic exit reconciliation and auto-remove; reusable multi-client attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable and following container logs; safe bidirectional archive copy before and after container start; bind, named/anonymous volume, and tmpfs mounts; shared vmnet networking with live alias updates, TCP and UDP port publishing, and Docker-shaped network and volume lifecycle APIs; and a working managed Buildx container driver with local, pushed, and Docker `--load` outputs. Direct `docker build` intentionally returns a message directing clients to Buildx.
+For architecture, development, testing, and implementation details, see
+[`docs/development.md`](docs/development.md). Docker API and Compose support is
+tracked in [`docs/docker-compatibility.md`](docs/docker-compatibility.md).

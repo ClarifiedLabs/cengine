@@ -31,3 +31,70 @@ The CLI target is ad-hoc signed for local development with
 The Xcode workspace owns Swift package resolution. Update and commit
 `cengine.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
 when dependency versions change.
+
+## Architecture
+
+```text
+docker / compose / buildx
+          |
+          | HTTP v1.44 over ~/.cengine/run/docker.sock
+          v
+  SwiftNIO API router
+          |
+          v
+ persisted EngineRuntime actor
+          |
+          v
+ AppleContainerBackend actor
+          |
+          v
+ Apple Containerization + Virtualization.framework
+   (one lightweight VM per running container)
+```
+
+State is JSON with an explicit schema envelope and atomic rename/fsync
+persistence under `~/Library/Application Support/cengine`. Runtime sockets
+remain under `~/.cengine/run`, and daemon logs are under
+`~/Library/Logs/cengine`.
+
+## Implementation scope
+
+This repository is an experimental engine rather than a complete
+implementation of every Docker API. Its focused runtime surface covers
+interactive Docker CLI use, Compose application lifecycle, Buildx container
+builds, networking, observability, and daemon recovery.
+
+Implemented API groups include server ping/version/info and live events;
+authenticated, platform-aware image pull with live progress,
+import/list/inspect/history/delete and pruning; container lifecycle, health,
+stats, top, logs, attach, exec, archive copy, mounts, networking, ports, and
+pruning; and Docker-shaped network and volume lifecycle APIs. A managed Buildx
+container driver supports local, pushed, and Docker `--load` outputs. Direct
+`docker build` intentionally directs clients to Buildx.
+
+See [`docker-compatibility.md`](docker-compatibility.md) for the detailed
+compatibility ledger and test provenance.
+
+## Local installation and metadata-only development
+
+`cengine system install` downloads the pinned Kata kernel and verifies its
+SHA-256 digest, installs the `dev.cengine.engine` LaunchAgent, creates the
+`cengine` Docker context, and attempts to create the `cengine-builder` Buildx
+builder. It does not change the active Docker context.
+
+To develop without downloading a kernel or starting VMs:
+
+```sh
+cengine daemon --metadata-only
+DOCKER_HOST=unix://$HOME/.cengine/run/docker.sock docker info
+```
+
+## Releases
+
+Public releases are Developer ID signed, notarized, stapled `.pkg` installers
+published through GitHub Releases and `ClarifiedLabs/homebrew-tap`. See
+[`release.md`](release.md) for the release process.
+
+Note: this project was created as part of testing gpt-5.6-sol. Planning used
+`xhigh` effort and implementation used `low` effort through commit
+`f78d30dcb6eae948fbdd271f08e5c82d1656457a`.
