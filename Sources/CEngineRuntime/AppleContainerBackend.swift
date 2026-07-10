@@ -120,13 +120,7 @@ public actor AppleContainerBackend: ContainerBackend {
         let volumeRoot = self.volumeRoot
         let staged = stagedCopies[record.id] ?? []
         guard let interface = interfaces[record.id] else { throw EngineError(.internalError, "container network is unavailable") }
-        let networkIDs = Set(record.networks.map(\.networkID))
-        let peerHosts = preparedRecords.values.compactMap { peer -> Hosts.Entry? in
-            guard peer.id != record.id, !networkIDs.isDisjoint(with: peer.networks.map(\.networkID)),
-                  let peerInterface = interfaces[peer.id] else { return nil }
-            let aliases = Set([peer.name, peer.hostname] + peer.networks.flatMap(\.aliases))
-            return Hosts.Entry(ipAddress: peerInterface.ipv4Address.address.description, hostnames: aliases.sorted())
-        }
+        let peerHosts = hostEntries(for: record, records: Array(preparedRecords.values))
         guard let image = preparedImages[record.id] else { throw EngineError(.notFound, "prepared image is unavailable") }
         let selectedPlatform = try Self.platform(record.platform)
         let selectedConfig = try await image.config(for: selectedPlatform)
@@ -227,6 +221,7 @@ public actor AppleContainerBackend: ContainerBackend {
                 return 127
             }
         }
+        await synchronizeHosts()
     }
 
     public func wait(_ record: ContainerRecord) async throws -> Int32 {
@@ -348,6 +343,39 @@ public actor AppleContainerBackend: ContainerBackend {
         for entry in try FileManager.default.contentsOfDirectory(at: runtimeContainerRoot, includingPropertiesForKeys: nil) {
             guard !containerIDs.contains(entry.lastPathComponent) else { continue }
             try FileManager.default.removeItem(at: entry)
+        }
+    }
+
+    public func updateNetworkRecords(_ records: [ContainerRecord]) async throws {
+        let byID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
+        for id in Array(preparedRecords.keys) where byID[id] != nil { preparedRecords[id] = byID[id] }
+        await synchronizeHosts()
+    }
+
+    private func hostEntries(for record: ContainerRecord, records: [ContainerRecord]) -> [Hosts.Entry] {
+        let networkIDs = Set(record.networks.map(\.networkID))
+        return records.compactMap { peer in
+            guard let peerInterface = interfaces[peer.id] else { return nil }
+            guard peer.id == record.id || !networkIDs.isDisjoint(with: peer.networks.map(\.networkID)) else { return nil }
+            let names = Set([peer.name, peer.hostname] + peer.networks.flatMap(\.aliases)).filter {
+                !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" }
+            }
+            guard !names.isEmpty else { return nil }
+            return Hosts.Entry(ipAddress: peerInterface.ipv4Address.address.description, hostnames: names.sorted())
+        }
+    }
+
+    private func synchronizeHosts() async {
+        let records = Array(preparedRecords.values)
+        for record in records {
+            guard let container = containers[record.id] else { continue }
+            let hosts = Hosts(entries: Hosts.default.entries + hostEntries(for: record, records: records)).hostsFile
+            let escaped = hosts.replacingOccurrences(of: "'", with: "'\"'\"'")
+            guard let process = try? await container.exec("hosts-\(UUID().uuidString)", configuration: {
+                var config = LinuxProcessConfiguration(); config.arguments = ["/bin/sh", "-c", "printf '%s' '\(escaped)' > /etc/hosts"]
+                return config
+            }()) else { continue }
+            try? await process.start(); _ = try? await process.wait(timeoutInSeconds: 5); try? await process.delete()
         }
     }
 

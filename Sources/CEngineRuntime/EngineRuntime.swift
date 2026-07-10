@@ -97,6 +97,7 @@ public actor EngineRuntime {
         }
         try await backend.prepare(record)
         snapshot.containers.append(record)
+        try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
         emit(containerEvent("create", record))
         return record
@@ -414,27 +415,23 @@ public actor EngineRuntime {
                                ipv6Address: String? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
-        guard snapshot.containers[index].phase == .created else {
-            throw EngineError(.unsupported, "live network attachment is not supported by the VM backend")
-        }
         guard !snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else { return }
         snapshot.containers[index].networks.append(.init(
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address
         ))
+        try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
     }
 
     public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
-        guard snapshot.containers[index].phase == .created || force else {
-            throw EngineError(.unsupported, "live network detachment is not supported by the VM backend")
-        }
         guard snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else {
             if force { return }
             throw EngineError(.notFound, "container is not connected to network (network.name)")
         }
         snapshot.containers[index].networks.removeAll { $0.networkID == network.id }
+        try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
     }
 
