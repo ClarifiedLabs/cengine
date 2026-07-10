@@ -83,7 +83,20 @@ public struct DockerRouter: Sendable {
             record.stopSignal = input.StopSignal ?? "SIGTERM"
             record.stopTimeoutSeconds = input.StopTimeout ?? 10
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)
+            if let health = input.Healthcheck, let test = health.Test, test.first != "NONE" {
+                record.healthcheck = .init(
+                    test: test, intervalNanoseconds: health.Interval ?? 30_000_000_000,
+                    timeoutNanoseconds: health.Timeout ?? 30_000_000_000, retries: health.Retries ?? 3,
+                    startPeriodNanoseconds: health.StartPeriod ?? 0
+                )
+                record.healthStatus = "starting"; record.healthFailingStreak = 0
+            }
             record.mounts = try mounts(from: input)
+            for index in record.mounts.indices where record.mounts[index].kind == .volume && record.mounts[index].source.isEmpty {
+                let name = Identifier.random()
+                _ = try await runtime.createVolume(name: name, anonymous: true)
+                record.mounts[index].source = name
+            }
             record.ports = ports(from: input)
             for (networkName, endpoint) in input.NetworkingConfig?.EndpointsConfig ?? [:] {
                 let network = try await runtime.network(networkName)
@@ -109,6 +122,14 @@ public struct DockerRouter: Sendable {
                 headers: ["Content-Type": "application/vnd.docker.raw-stream"],
                 body: try await runtime.containerLogs(id)
             )
+        case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/stats"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/stats".count))
+            let record = try await runtime.container(id)
+            return json(status: .ok, ContainerStatsResponse(try await runtime.containerStatistics(id), container: record))
+        case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/top"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/top".count))
+            let result = try await runtime.containerTop(id, arguments: (query["ps_args"] ?? "-ef").split(whereSeparator: \.isWhitespace).map(String.init))
+            return json(status: .ok, ContainerTopResponse(Titles: result.titles, Processes: result.processes))
         case (.PUT, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/archive"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/archive".count))
             guard let path = query["path"], !path.isEmpty else { throw EngineError(.badRequest, "path is required") }
@@ -169,6 +190,14 @@ public struct DockerRouter: Sendable {
             let id = String(value.dropFirst("/containers/".count).dropLast("/restart".count))
             try await runtime.restartContainer(id, timeoutSeconds: query["t"].flatMap(Int.init))
             return APIResponse(status: .noContent)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/update"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/update".count))
+            let input = try decoder.decode(ContainerUpdateRequest.self, from: request.body)
+            let policy = input.RestartPolicy.map {
+                RestartPolicyRecord(name: $0.Name, maximumRetryCount: $0.MaximumRetryCount ?? 0)
+            }
+            _ = try await runtime.updateContainer(id, memoryBytes: input.Memory, nanoCPUs: input.NanoCpus, restartPolicy: policy)
+            return json(status: .ok, ContainerUpdateResponse(Warnings: []))
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
             let input = try decoder.decode(ExecCreateRequest.self, from: request.body)
@@ -197,7 +226,8 @@ public struct DockerRouter: Sendable {
             return APIResponse(status: .ok)
         case (.DELETE, let value) where value.hasPrefix("/containers/"):
             let id = String(value.dropFirst("/containers/".count))
-            try await runtime.removeContainer(id, force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
+            try await runtime.removeContainer(id, force: parseBool(query["force"]) ?? false, removeVolumes: parseBool(query["v"]) ?? false)
+            return APIResponse(status: .noContent)
         case (.GET, "/networks"):
             return json(status: .ok, await runtime.listNetworks().map(DockerNetworkResponse.init))
         case (.GET, let value) where value.hasPrefix("/networks/"):
@@ -222,6 +252,12 @@ public struct DockerRouter: Sendable {
             return APIResponse(status: .ok)
         case (.POST, "/networks/prune"):
             return json(status: .ok, PruneResponse(networks: try await runtime.pruneNetworks()))
+        case (.POST, "/containers/prune"):
+            return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers()))
+        case (.POST, "/images/prune"):
+            return json(status: .ok, PruneResponse(images: try await runtime.pruneImages()))
+        case (.POST, "/volumes/prune"):
+            return json(status: .ok, PruneResponse(volumes: try await runtime.pruneVolumes()))
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):
@@ -320,6 +356,10 @@ public struct DockerRouter: Sendable {
 
     public func containerLogs(_ identifier: String) async throws -> Data { try await runtime.containerLogs(identifier) }
     public func events() async -> AsyncStream<RuntimeEvent> { await runtime.events() }
+    public func statistics(_ identifier: String) async throws -> ContainerStatsResponse {
+        let record = try await runtime.container(identifier)
+        return ContainerStatsResponse(try await runtime.containerStatistics(identifier), container: record)
+    }
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
@@ -370,9 +410,27 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public let Config: ConfigResponse
     public let RestartCount: Int
     public let NetworkSettings: NetworkSettingsResponse
+    public let HostConfig: HostConfigResponse
 
-    public struct StateResponse: Codable, Sendable { let Status: String; let Running: Bool; let Paused: Bool; let Restarting: Bool; let OOMKilled: Bool; let Dead: Bool; let Pid: Int; let ExitCode: Int32; let Error: String; let StartedAt: String; let FinishedAt: String }
-    public struct ConfigResponse: Codable, Sendable { let Hostname: String; let User: String; let Tty: Bool; let OpenStdin: Bool; let Env: [String]; let Cmd: [String]; let Image: String; let WorkingDir: String; let Labels: [String: String] }
+    public struct StateResponse: Codable, Sendable {
+        let Status: String; let Running: Bool; let Paused: Bool; let Restarting: Bool; let OOMKilled: Bool
+        let Dead: Bool; let Pid: Int; let ExitCode: Int32; let Error: String; let StartedAt: String; let FinishedAt: String
+        let Health: HealthStateResponse?
+    }
+    public struct HealthStateResponse: Codable, Sendable { let Status: String; let FailingStreak: Int; let Log: [String] }
+    public struct ConfigResponse: Codable, Sendable {
+        let Hostname: String; let User: String; let Tty: Bool; let OpenStdin: Bool; let Env: [String]
+        let Cmd: [String]; let Image: String; let WorkingDir: String; let Labels: [String: String]
+        let Healthcheck: HealthcheckResponse?
+    }
+    public struct HealthcheckResponse: Codable, Sendable {
+        let Test: [String]; let Interval: Int64; let Timeout: Int64; let Retries: Int; let StartPeriod: Int64
+    }
+    public struct HostConfigResponse: Codable, Sendable {
+        let Memory: UInt64; let NanoCpus: Int64; let AutoRemove: Bool; let Privileged: Bool
+        let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
+        struct RestartPolicy: Codable, Sendable { let Name: String; let MaximumRetryCount: Int }
+    }
     public struct NetworkSettingsResponse: Codable, Sendable {
         let Bridge: String; let SandboxID: String; let HairpinMode: Bool
         let Ports: [String: [PortBindingResponse]?]
@@ -391,9 +449,15 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let formatter = ISO8601DateFormatter()
         Id = record.id; Name = "/\(record.name)"; Created = formatter.string(from: record.createdAt)
         Path = record.processArguments.first ?? ""; Args = Array(record.processArguments.dropFirst()); Image = record.image
-        State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z")
-        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels)
+        State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
+        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds) })
         RestartCount = record.restartCount
+        HostConfig = .init(
+            Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
+            AutoRemove: record.autoRemove, Privileged: record.privileged,
+            ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,
+            RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount)
+        )
         let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
         let endpoints = record.networks.reduce(into: [String: EndpointResponse]()) { result, endpoint in
             let network = networkByID[endpoint.networkID]

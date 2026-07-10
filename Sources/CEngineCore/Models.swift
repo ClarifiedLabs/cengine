@@ -62,6 +62,12 @@ public struct HealthcheckRecord: Codable, Hashable, Sendable {
     public var timeoutNanoseconds: Int64
     public var retries: Int
     public var startPeriodNanoseconds: Int64
+    public init(test: [String], intervalNanoseconds: Int64, timeoutNanoseconds: Int64,
+                retries: Int, startPeriodNanoseconds: Int64) {
+        self.test = test; self.intervalNanoseconds = intervalNanoseconds
+        self.timeoutNanoseconds = timeoutNanoseconds; self.retries = retries
+        self.startPeriodNanoseconds = startPeriodNanoseconds
+    }
 }
 
 public struct ContainerRecord: Codable, Sendable {
@@ -94,6 +100,8 @@ public struct ContainerRecord: Codable, Sendable {
     public var stopTimeoutSeconds: Int
     public var restartPolicy: RestartPolicyRecord
     public var healthcheck: HealthcheckRecord?
+    public var healthStatus: String?
+    public var healthFailingStreak: Int?
     public var mounts: [MountRecord]
     public var ports: [PortBinding]
     public var networks: [NetworkEndpointRecord]
@@ -128,6 +136,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.stopSignal = "SIGTERM"
         self.stopTimeoutSeconds = 10
         self.restartPolicy = .init()
+        self.healthStatus = nil
+        self.healthFailingStreak = nil
         self.mounts = []
         self.ports = []
         self.networks = []
@@ -156,9 +166,11 @@ public struct VolumeRecord: Codable, Sendable {
     public var sizeBytes: UInt64
     public var labels: [String: String]
     public var options: [String: String]
+    public var anonymous: Bool?
 
-    public init(name: String, createdAt: Date = Date(), sizeBytes: UInt64, labels: [String: String] = [:], options: [String: String] = [:]) {
+    public init(name: String, createdAt: Date = Date(), sizeBytes: UInt64, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) {
         self.name = name; self.createdAt = createdAt; self.sizeBytes = sizeBytes; self.labels = labels; self.options = options
+        self.anonymous = anonymous
     }
 }
 

@@ -21,6 +21,7 @@ public actor EngineRuntime {
     let backend: any ContainerBackend
     private var execs: [String: ExecRecord] = [:]
     private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
+    private var healthTasks: [String: Task<Void, Never>] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -111,6 +112,7 @@ public actor EngineRuntime {
         }
         try await persist()
         emit(containerEvent("start", snapshot.containers[current]))
+        startHealthMonitor(record.id)
         Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
@@ -124,6 +126,43 @@ public actor EngineRuntime {
 
     public func containerLogs(_ identifier: String) async throws -> Data {
         try await backend.logs(for: container(identifier))
+    }
+
+    public func containerStatistics(_ identifier: String) async throws -> BackendStatistics {
+        let record = try container(identifier)
+        guard record.phase == .running else { throw EngineError(.conflict, "Container is not running") }
+        return try await backend.statistics(record)
+    }
+
+    public func containerTop(_ identifier: String, arguments: [String]) async throws -> (titles: [String], processes: [[String]]) {
+        let record = try container(identifier)
+        guard record.phase == .running else { throw EngineError(.conflict, "Container is not running") }
+        return try await backend.top(record, arguments: arguments)
+    }
+
+    public func updateContainer(_ identifier: String, memoryBytes: Int64?, nanoCPUs: Int64?,
+                                restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
+        let index = try containerIndex(identifier)
+        let old = snapshot.containers[index]
+        var updated = old
+        if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
+        if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
+        if let restartPolicy { updated.restartPolicy = restartPolicy }
+        if old.phase == .running || old.phase == .paused {
+            _ = try await backend.stop(old, timeoutSeconds: old.stopTimeoutSeconds)
+            try await backend.delete(old)
+            try await backend.prepare(updated)
+            try await backend.start(updated)
+            updated.phase = .running; updated.startedAt = Date(); updated.finishedAt = nil; updated.exitCode = nil
+        }
+        snapshot.containers[index] = updated
+        try await persist()
+        emit(containerEvent("update", updated))
+        if updated.phase == .running, let startedAt = updated.startedAt {
+            let updatedID = updated.id
+            Task { [weak self] in await self?.monitorContainer(updatedID, startedAt: startedAt) }
+        }
+        return updated
     }
 
     public func killContainer(_ identifier: String, signal: String) async throws {
@@ -168,6 +207,7 @@ public actor EngineRuntime {
         snapshot.containers[current].restartCount += 1
         try await persist()
         emit(containerEvent("restart", snapshot.containers[current]))
+        startHealthMonitor(record.id)
         Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
@@ -226,6 +266,7 @@ public actor EngineRuntime {
         snapshot.containers[current].finishedAt = Date()
         try await persist()
         emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
+        healthTasks.removeValue(forKey: record.id)?.cancel()
     }
 
     public func waitContainer(_ identifier: String) async throws -> Int32 {
@@ -242,15 +283,17 @@ public actor EngineRuntime {
         return code
     }
 
-    public func removeContainer(_ identifier: String, force: Bool) async throws {
+    public func removeContainer(_ identifier: String, force: Bool, removeVolumes: Bool = false) async throws {
         let index = try containerIndex(identifier)
         if snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused {
             guard force else { throw EngineError(.conflict, "You cannot remove a running container. Stop the container before attempting removal or force remove.") }
             _ = try await backend.stop(snapshot.containers[index], timeoutSeconds: 0)
         }
         let removed = snapshot.containers[index]
+        healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
         snapshot.containers.remove(at: index)
+        if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
         try await persist()
         emit(containerEvent("destroy", removed))
     }
@@ -371,10 +414,35 @@ public actor EngineRuntime {
         return removed.map(\.name)
     }
 
-    public func createVolume(name: String, sizeBytes: UInt64 = 512 * 1024 * 1024 * 1024, labels: [String: String] = [:], options: [String: String] = [:]) async throws -> VolumeRecord {
+    public func pruneContainers() async throws -> [String] {
+        let removed = snapshot.containers.filter { $0.phase != .running && $0.phase != .paused }
+        for record in removed { try await backend.delete(record) }
+        let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
+        try await persist()
+        removed.forEach { emit(containerEvent("destroy", $0)) }
+        return removed.map(\.id)
+    }
+
+    public func pruneImages() async throws -> [ImageRecord] {
+        let used = Set(snapshot.containers.map(\.image))
+        let removed = snapshot.images.filter { image in image.references.allSatisfy { !used.contains($0) } }
+        for image in removed { for reference in image.references { try await backend.deleteImage(reference: reference) } }
+        let ids = Set(removed.map(\.id)); snapshot.images.removeAll { ids.contains($0.id) }
+        try await persist(); return removed
+    }
+
+    public func pruneVolumes() async throws -> [String] {
+        let used = Set(snapshot.containers.flatMap(\.mounts).filter { $0.kind == .volume }.map(\.source))
+        let removed = snapshot.volumes.filter { !used.contains($0.name) }
+        for volume in removed { try await backend.deleteVolume(volume.name) }
+        snapshot.volumes.removeAll { !used.contains($0.name) }
+        try await persist(); return removed.map(\.name)
+    }
+
+    public func createVolume(name: String, sizeBytes: UInt64 = 512 * 1024 * 1024 * 1024, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
         if let existing = snapshot.volumes.first(where: { $0.name == name }) { return existing }
-        let record = VolumeRecord(name: name, createdAt: Date(), sizeBytes: sizeBytes, labels: labels, options: options)
+        let record = VolumeRecord(name: name, createdAt: Date(), sizeBytes: sizeBytes, labels: labels, options: options, anonymous: anonymous)
         snapshot.volumes.append(record)
         try await persist()
         return record
@@ -386,6 +454,7 @@ public actor EngineRuntime {
         }
         let inUse = snapshot.containers.contains { container in container.mounts.contains { $0.kind == .volume && $0.source == name } }
         guard force || !inUse else { throw EngineError(.conflict, "remove \(name): volume is in use") }
+        try await backend.deleteVolume(name)
         snapshot.volumes.remove(at: index)
         try await persist()
     }
@@ -419,6 +488,56 @@ public actor EngineRuntime {
                         .merging(extra) { _, new in new })
     }
 
+    private func startHealthMonitor(_ identifier: String) {
+        healthTasks.removeValue(forKey: identifier)?.cancel()
+        guard let record = try? container(identifier), record.healthcheck != nil else { return }
+        healthTasks[identifier] = Task { [weak self] in await self?.runHealthMonitor(identifier) }
+    }
+
+    private func removeAnonymousVolumes(usedBy record: ContainerRecord) async throws {
+        let names = Set(record.mounts.filter { $0.kind == .volume }.map(\.source))
+        let removable = snapshot.volumes.filter { names.contains($0.name) && $0.anonymous == true }
+        for volume in removable { try await backend.deleteVolume(volume.name) }
+        let removedNames = Set(removable.map(\.name))
+        snapshot.volumes.removeAll { removedNames.contains($0.name) }
+    }
+
+    private func runHealthMonitor(_ identifier: String) async {
+        guard let initial = try? container(identifier), let health = initial.healthcheck else { return }
+        if health.startPeriodNanoseconds > 0 {
+            try? await Task.sleep(for: .nanoseconds(health.startPeriodNanoseconds))
+        }
+        while !Task.isCancelled {
+            guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .running else { return }
+            let record = snapshot.containers[index]
+            let arguments: [String]
+            switch health.test.first {
+            case "CMD": arguments = Array(health.test.dropFirst())
+            case "CMD-SHELL": arguments = ["/bin/sh", "-c", health.test.dropFirst().joined(separator: " ")]
+            default: arguments = health.test
+            }
+            guard !arguments.isEmpty else { return }
+            let result = try? await backend.runHealthcheck(
+                record, arguments: arguments,
+                timeoutSeconds: max(1, health.timeoutNanoseconds / 1_000_000_000)
+            )
+            guard let current = try? containerIndex(identifier), snapshot.containers[current].phase == .running else { return }
+            if result?.exitCode == 0 {
+                snapshot.containers[current].healthStatus = "healthy"
+                snapshot.containers[current].healthFailingStreak = 0
+            } else {
+                let failures = (snapshot.containers[current].healthFailingStreak ?? 0) + 1
+                snapshot.containers[current].healthFailingStreak = failures
+                snapshot.containers[current].healthStatus = failures >= max(health.retries, 1) ? "unhealthy" : "starting"
+            }
+            let status = snapshot.containers[current].healthStatus ?? "starting"
+            emit(containerEvent("health_status: \(status)", snapshot.containers[current]))
+            try? await persist()
+            let delay = max(health.intervalNanoseconds, 100_000_000)
+            try? await Task.sleep(for: .nanoseconds(delay))
+        }
+    }
+
     private static func imageRecords(from images: [BackendImage]) -> [ImageRecord] {
         Dictionary(grouping: images, by: \ .id).map { id, values in
             ImageRecord(id: id, references: values.map(\ .reference).sorted(), createdAt: Date(),
@@ -440,9 +559,11 @@ public actor EngineRuntime {
         snapshot.containers[index].finishedAt = Date()
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
+        healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
         if autoRemove {
             try? await backend.delete(record)
+            try? await removeAnonymousVolumes(usedBy: record)
             if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
             emit(containerEvent("destroy", record))
         }

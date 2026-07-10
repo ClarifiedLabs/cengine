@@ -242,6 +242,64 @@ public actor AppleContainerBackend: ContainerBackend {
         interfaces[record.id]?.ipv4Address.address.description
     }
 
+    public func statistics(_ record: ContainerRecord) async throws -> BackendStatistics {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        let value = try await container.statistics(categories: .all)
+        return BackendStatistics(
+            cpuTotalNanoseconds: (value.cpu?.usageUsec ?? 0) * 1_000,
+            cpuUserNanoseconds: (value.cpu?.userUsec ?? 0) * 1_000,
+            cpuSystemNanoseconds: (value.cpu?.systemUsec ?? 0) * 1_000,
+            memoryUsage: value.memory?.usageBytes ?? 0, memoryLimit: value.memory?.limitBytes ?? record.memoryBytes,
+            memoryCache: value.memory?.cacheBytes ?? 0, pids: value.process?.current ?? 0,
+            blockReadBytes: value.blockIO?.devices.reduce(0) { $0 + $1.readBytes } ?? 0,
+            blockWriteBytes: value.blockIO?.devices.reduce(0) { $0 + $1.writeBytes } ?? 0,
+            networks: (value.networks ?? []).map {
+                .init(name: $0.interface, rxBytes: $0.receivedBytes, rxPackets: $0.receivedPackets,
+                      rxErrors: $0.receivedErrors, txBytes: $0.transmittedBytes,
+                      txPackets: $0.transmittedPackets, txErrors: $0.transmittedErrors)
+            }
+        )
+    }
+
+    public func top(_ record: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]]) {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        let capture = CaptureWriter()
+        let process = try await container.exec("top-\(UUID().uuidString)") { config in
+            config.arguments = ["/bin/sh", "-c", "for d in /proc/[0-9]*; do p=${d##*/}; n=$(cat $d/comm 2>/dev/null); printf '%s|%s\\n' \"$p\" \"$n\"; done"]
+            config.stdout = capture; config.stderr = capture
+        }
+        try await process.start()
+        let status = try await process.wait()
+        try? await process.delete()
+        guard status.exitCode == 0 else { throw EngineError(.internalError, "ps exited with status \(status.exitCode)") }
+        let rows = capture.string.split(whereSeparator: \.isNewline).map { line in
+            line.split(separator: "|", maxSplits: 1).map(String.init)
+        }
+        return (["PID", "CMD"], rows)
+    }
+
+    public func runHealthcheck(_ record: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String) {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        let capture = CaptureWriter()
+        let process = try await container.exec("health-\(UUID().uuidString)") { config in
+            config.arguments = arguments; config.stdout = capture; config.stderr = capture
+        }
+        try await process.start()
+        do {
+            let status = try await process.wait(timeoutInSeconds: max(timeoutSeconds, 1))
+            try? await process.delete()
+            return (status.exitCode, capture.string)
+        } catch {
+            try? await process.kill(.kill); try? await process.delete()
+            return (1, "health check timed out")
+        }
+    }
+
+    public func deleteVolume(_ name: String) async throws {
+        let url = volumeRoot.appending(path: name, directoryHint: .isDirectory)
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+    }
+
     public func completion(_ record: ContainerRecord) async -> Int32? {
         guard let task = waitTasks[record.id] else { return nil }
         return await task.value
@@ -399,5 +457,13 @@ private extension Sequence {
         for element in self { result.append(try await transform(element)) }
         return result
     }
+}
+
+private final class CaptureWriter: Writer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    var string: String { lock.withLock { String(decoding: data, as: UTF8.self) } }
+    func write(_ value: Data) throws { lock.withLock { data.append(value) } }
+    func close() throws {}
 }
 #endif

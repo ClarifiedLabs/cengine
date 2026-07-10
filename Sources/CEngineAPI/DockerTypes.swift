@@ -75,6 +75,12 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     public var HostConfig: HostConfig?
     public var Mounts: [Mount]?
     public var NetworkingConfig: NetworkingConfigRequest?
+    public var Healthcheck: HealthcheckRequest?
+
+    public struct HealthcheckRequest: Decodable, Sendable {
+        public var Test: [String]?; public var Interval: Int64?; public var Timeout: Int64?
+        public var Retries: Int?; public var StartPeriod: Int64?
+    }
 
     public struct NetworkingConfigRequest: Decodable, Sendable {
         public var EndpointsConfig: [String: EndpointSettingsRequest]
@@ -117,6 +123,55 @@ public struct ContainerCreateResponse: Codable, Sendable { public let Id: String
 public struct ContainerWaitResponse: Encodable, Sendable {
     public let StatusCode: Int32
     public let Error: DockerErrorBody?
+}
+public struct ContainerUpdateRequest: Decodable, Sendable {
+    public var Memory: Int64?; public var NanoCpus: Int64?; public var RestartPolicy: RestartPolicy?
+    public struct RestartPolicy: Decodable, Sendable { public var Name: String; public var MaximumRetryCount: Int? }
+}
+public struct ContainerUpdateResponse: Encodable, Sendable { public let Warnings: [String] }
+public struct ContainerTopResponse: Encodable, Sendable { public let Titles: [String]; public let Processes: [[String]] }
+public struct ContainerStatsResponse: Encodable, Sendable {
+    public let id: String; public let name: String
+    public let read: String; public let preread: String; public let pids_stats: Pids
+    public let blkio_stats: BlockIO; public let num_procs: UInt64
+    public let cpu_stats: CPU; public let precpu_stats: CPU; public let memory_stats: Memory
+    public let networks: [String: Network]
+    public struct Pids: Encodable, Sendable { let current: UInt64; let limit: UInt64 }
+    public struct BlockIO: Encodable, Sendable { let io_service_bytes_recursive: [Entry] }
+    public struct Entry: Encodable, Sendable { let major: Int; let minor: Int; let op: String; let value: UInt64 }
+    public struct CPU: Encodable, Sendable {
+        let cpu_usage: Usage; let system_cpu_usage: UInt64; let online_cpus: Int; let throttling_data: Throttling
+    }
+    public struct Usage: Encodable, Sendable {
+        let total_usage: UInt64; let usage_in_kernelmode: UInt64; let usage_in_usermode: UInt64; let percpu_usage: [UInt64]
+    }
+    public struct Throttling: Encodable, Sendable { let periods: UInt64 = 0; let throttled_periods: UInt64 = 0; let throttled_time: UInt64 = 0 }
+    public struct Memory: Encodable, Sendable { let usage: UInt64; let max_usage: UInt64; let stats: [String: UInt64]; let limit: UInt64 }
+    public struct Network: Encodable, Sendable {
+        let rx_bytes: UInt64; let rx_packets: UInt64; let rx_errors: UInt64; let rx_dropped: UInt64 = 0
+        let tx_bytes: UInt64; let tx_packets: UInt64; let tx_errors: UInt64; let tx_dropped: UInt64 = 0
+    }
+    public init(_ value: BackendStatistics, container: ContainerRecord) {
+        id = container.id; name = container.name
+        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        read = formatter.string(from: value.read); preread = formatter.string(from: value.read.addingTimeInterval(-1))
+        pids_stats = .init(current: value.pids, limit: UInt64.max); num_procs = value.pids
+        blkio_stats = .init(io_service_bytes_recursive: [
+            .init(major: 0, minor: 0, op: "Read", value: value.blockReadBytes),
+            .init(major: 0, minor: 0, op: "Write", value: value.blockWriteBytes),
+        ])
+        let usage = Usage(total_usage: value.cpuTotalNanoseconds, usage_in_kernelmode: value.cpuSystemNanoseconds,
+                          usage_in_usermode: value.cpuUserNanoseconds, percpu_usage: [value.cpuTotalNanoseconds])
+        let system = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000) * UInt64(max(container.cpus, 1))
+        cpu_stats = .init(cpu_usage: usage, system_cpu_usage: system, online_cpus: container.cpus, throttling_data: .init())
+        precpu_stats = .init(cpu_usage: usage, system_cpu_usage: system, online_cpus: container.cpus, throttling_data: .init())
+        memory_stats = .init(usage: value.memoryUsage, max_usage: value.memoryUsage,
+                             stats: ["cache": value.memoryCache], limit: value.memoryLimit)
+        networks = Dictionary(uniqueKeysWithValues: value.networks.map {
+            ($0.name, .init(rx_bytes: $0.rxBytes, rx_packets: $0.rxPackets, rx_errors: $0.rxErrors,
+                            tx_bytes: $0.txBytes, tx_packets: $0.txPackets, tx_errors: $0.txErrors))
+        })
+    }
 }
 
 public struct ExecCreateRequest: Decodable, Sendable {
@@ -189,6 +244,16 @@ public struct PruneResponse: Encodable, Sendable {
     public let SpaceReclaimed: UInt64
     public init(networks: [String]) {
         ContainersDeleted = nil; ImagesDeleted = nil; NetworksDeleted = networks; VolumesDeleted = nil; SpaceReclaimed = 0
+    }
+    public init(containers: [String]) {
+        ContainersDeleted = containers; ImagesDeleted = nil; NetworksDeleted = nil; VolumesDeleted = nil; SpaceReclaimed = 0
+    }
+    public init(images: [ImageRecord]) {
+        ContainersDeleted = nil; ImagesDeleted = images.map { .init(Deleted: $0.id) }
+        NetworksDeleted = nil; VolumesDeleted = nil; SpaceReclaimed = UInt64(images.reduce(0) { $0 + $1.size })
+    }
+    public init(volumes: [String]) {
+        ContainersDeleted = nil; ImagesDeleted = nil; NetworksDeleted = nil; VolumesDeleted = volumes; SpaceReclaimed = 0
     }
 }
 public struct VolumeCreateRequest: Decodable, Sendable { public var Name: String?; public var Driver: String?; public var DriverOpts: [String: String]?; public var Labels: [String: String]? }

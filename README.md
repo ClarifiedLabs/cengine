@@ -74,14 +74,12 @@ State is JSON with an explicit schema envelope and atomic rename/fsync persisten
 
 ## Current compatibility
 
-Implemented API groups include server ping/version/info and live events; image pull/import/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; reusable multi-client attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable and following container logs; safe bidirectional archive copy before and after container start; bind, volume, and tmpfs mounts; shared vmnet networking with Compose aliases, TCP port publishing, and Docker-shaped network and volume lifecycle APIs; and a working managed Buildx container driver with local, pushed, and Docker `--load` outputs. Direct `docker build` intentionally returns a message directing clients to Buildx.
+Implemented API groups include server ping/version/info and live events; image pull/import/list/inspect/delete and pruning with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect, restart, pause, resource update, health checks, stats, top, and pruning; automatic exit reconciliation and auto-remove; reusable multi-client attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable and following container logs; safe bidirectional archive copy before and after container start; bind, named/anonymous volume, and tmpfs mounts; shared vmnet networking with Compose aliases, TCP port publishing, and Docker-shaped network and volume lifecycle APIs; and a working managed Buildx container driver with local, pushed, and Docker `--load` outputs. Direct `docker build` intentionally returns a message directing clients to Buildx.
 
 Known gaps:
 
 - Restart policies and recovery after daemon or process failure
 - UDP host port publishing and dynamic DNS updates when peers join after a container starts
-- Anonymous-volume lifecycle
-- Health checks, stats, top, update, and resource pruning
 - Registry authentication, image history, and real pull progress
 - Full `linux/amd64` image selection; the VM enables Rosetta, but the current Apple `ContainerManager` convenience pull path selects the host platform
 - Recovery or cleanup of live VM handles after daemon restart (persisted running containers are conservatively marked exited)

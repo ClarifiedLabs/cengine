@@ -42,6 +42,17 @@ private actor CompletionBackend: ContainerBackend {
     func execStatus(_: ExecRecord) async -> Int32? { 0 }
     func pause(_: ContainerRecord) async throws {}
     func resume(_: ContainerRecord) async throws {}
+    func statistics(_: ContainerRecord) async throws -> BackendStatistics {
+        .init(cpuTotalNanoseconds: 1_000, cpuUserNanoseconds: 700, cpuSystemNanoseconds: 300,
+              memoryUsage: 1_024, memoryLimit: 4_096, memoryCache: 128, pids: 2,
+              blockReadBytes: 10, blockWriteBytes: 20, networks: [])
+    }
+    func top(_: ContainerRecord, arguments _: [String]) async throws -> (titles: [String], processes: [[String]]) {
+        (["PID", "CMD"], [["1", "sleep 10"]])
+    }
+    func runHealthcheck(_: ContainerRecord, arguments _: [String], timeoutSeconds _: Int64) async throws -> (exitCode: Int32, output: String) {
+        (0, "ok")
+    }
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
         [BackendImage(
             id: "sha256:0123456789abcdef",
@@ -432,5 +443,77 @@ private actor ImageStoreBackend: ContainerBackend {
         #expect(event?.action == "create")
         #expect(event?.id == record.id)
         #expect(event?.attributes["name"] == "eventful")
+    }
+
+    @Test func statsTopUpdateAndPruneUseDockerSchemas() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let record = try await runtime.createContainer(ContainerRecord(name: "observed", image: "debian"))
+        try await runtime.startContainer(record.id)
+        let stats = await router.route(.init(method: .GET, uri: "/v1.44/containers/observed/stats?stream=false"))
+        #expect(stats.status == .ok)
+        let statsJSON = try #require(JSONSerialization.jsonObject(with: stats.body) as? [String: Any])
+        #expect((statsJSON["memory_stats"] as? [String: Any])?["usage"] as? Int == 1_024)
+        let top = await router.route(.init(method: .GET, uri: "/v1.44/containers/observed/top?ps_args=-ef"))
+        let topJSON = try #require(JSONSerialization.jsonObject(with: top.body) as? [String: Any])
+        #expect(topJSON["Titles"] as? [String] == ["PID", "CMD"])
+        let update = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/observed/update",
+            body: Data(#"{"Memory":8192,"NanoCpus":2000000000,"RestartPolicy":{"Name":"always"}}"#.utf8)
+        ))
+        #expect(update.status == .ok)
+        let updated = try await runtime.container(record.id)
+        #expect(updated.memoryBytes == 8_192)
+        #expect(updated.cpus == 2)
+        #expect(updated.restartPolicy.name == "always")
+
+        try await runtime.stopContainer(record.id, timeoutSeconds: 0)
+        let prune = await router.route(.init(method: .POST, uri: "/v1.44/containers/prune", body: Data(#"{"filters":{}}"#.utf8)))
+        #expect(prune.status == .ok)
+        let pruneJSON = try #require(JSONSerialization.jsonObject(with: prune.body) as? [String: Any])
+        #expect((pruneJSON["ContainersDeleted"] as? [String])?.contains(record.id) == true)
+    }
+
+    @Test func healthcheckTransitionsContainerToHealthy() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=healthy",
+            body: Data(#"{"Image":"debian","Healthcheck":{"Test":["CMD","true"],"Interval":100000000,"Timeout":1000000000,"Retries":2}}"#.utf8)
+        ))
+        let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        try await runtime.startContainer(id)
+        for _ in 0..<50 {
+            if try await runtime.container(id).healthStatus == "healthy" { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(try await runtime.container(id).healthStatus == "healthy")
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/healthy/json"))
+        let json = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let state = try #require(json["State"] as? [String: Any])
+        #expect((state["Health"] as? [String: Any])?["Status"] as? String == "healthy")
+    }
+
+    @Test func anonymousVolumeIsCreatedAndRemovedWithContainer() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=anonymous-volume",
+            body: Data(#"{"Image":"debian","Mounts":[{"Type":"volume","Target":"/data"}]}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let volumes = await router.route(.init(method: .GET, uri: "/v1.44/volumes"))
+        let envelope = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
+        #expect((envelope["Volumes"] as? [[String: Any]])?.count == 1)
+        let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/containers/anonymous-volume?v=1"))
+        #expect(remove.status == .noContent)
+        let after = await router.route(.init(method: .GET, uri: "/v1.44/volumes"))
+        let afterEnvelope = try #require(JSONSerialization.jsonObject(with: after.body) as? [String: Any])
+        #expect((afterEnvelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
     }
 }

@@ -15,6 +15,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var followIO: ContainerIOBridge?
     private var followSubscription: UUID?
     private var eventTask: Task<Void, Never>?
+    private var statsTask: Task<Void, Never>?
     private let maximumBodyBytes: Int
 
     public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
@@ -32,6 +33,10 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             body.writeBuffer(&chunk)
         case .end:
             guard let head else { return }
+            if Self.isStreamingStats(head.uri), let id = Self.statsContainerID(head.uri) {
+                startStats(identifier: id, channel: context.channel)
+                return
+            }
             if Self.isEvents(head.uri) {
                 startEvents(channel: context.channel)
                 return
@@ -53,6 +58,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     public func channelInactive(context: ChannelHandlerContext) {
         if let followSubscription { followIO?.detach(followSubscription) }
         eventTask?.cancel()
+        statsTask?.cancel()
         context.fireChannelInactive()
     }
 
@@ -129,6 +135,41 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private static func isEvents(_ uri: String) -> Bool {
         guard let components = URLComponents(string: uri) else { return false }
         return components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression) == "/events"
+    }
+
+    private func startStats(identifier: String, channel: Channel) {
+        statsTask = Task { [router] in
+            channel.eventLoop.execute {
+                var headers = HTTPHeaders(); headers.add(name: "Content-Type", value: "application/json")
+                headers.add(name: "Transfer-Encoding", value: "chunked")
+                channel.writeAndFlush(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
+            }
+            let encoder = JSONEncoder()
+            while !Task.isCancelled {
+                do {
+                    var encoded = try encoder.encode(await router.statistics(identifier)); encoded.append(0x0a)
+                    let payload = encoded
+                    channel.eventLoop.execute {
+                        var buffer = channel.allocator.buffer(capacity: payload.count); buffer.writeBytes(payload)
+                        channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                    }
+                    try await Task.sleep(for: .seconds(1))
+                } catch { break }
+            }
+            channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
+        }
+    }
+
+    private static func isStreamingStats(_ uri: String) -> Bool {
+        guard let components = URLComponents(string: uri), components.path.hasSuffix("/stats") else { return false }
+        return !((components.queryItems ?? []).contains { $0.name == "stream" && ($0.value == "0" || $0.value == "false") })
+    }
+
+    private static func statsContainerID(_ uri: String) -> String? {
+        guard let components = URLComponents(string: uri) else { return nil }
+        let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
+        guard path.hasPrefix("/containers/"), path.hasSuffix("/stats") else { return nil }
+        return String(path.dropFirst("/containers/".count).dropLast("/stats".count))
     }
 
     private static func write(channel: Channel, response: APIResponse, keepAlive: Bool) {

@@ -29,6 +29,10 @@ public protocol ContainerBackend: Sendable {
     func resume(_ container: ContainerRecord) async throws
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
     func ipv4Address(for container: ContainerRecord) async -> String?
+    func statistics(_ container: ContainerRecord) async throws -> BackendStatistics
+    func top(_ container: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]])
+    func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String)
+    func deleteVolume(_ name: String) async throws
 }
 
 public extension ContainerBackend {
@@ -68,6 +72,16 @@ public extension ContainerBackend {
         try await start(container)
     }
     func ipv4Address(for _: ContainerRecord) async -> String? { nil }
+    func statistics(_: ContainerRecord) async throws -> BackendStatistics {
+        throw EngineError(.unsupported, "container statistics are unavailable for this backend")
+    }
+    func top(_: ContainerRecord, arguments _: [String]) async throws -> (titles: [String], processes: [[String]]) {
+        throw EngineError(.unsupported, "container process listing is unavailable for this backend")
+    }
+    func runHealthcheck(_: ContainerRecord, arguments _: [String], timeoutSeconds _: Int64) async throws -> (exitCode: Int32, output: String) {
+        throw EngineError(.unsupported, "health checks are unavailable for this backend")
+    }
+    func deleteVolume(_: String) async throws {}
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {
