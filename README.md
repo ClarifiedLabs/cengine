@@ -2,7 +2,7 @@
 
 `cengine` is an experimental, lightweight Docker Engine-compatible daemon for Apple silicon. It accepts Docker Engine API v1.44 requests on a user-owned Unix socket and runs Linux containers as lightweight virtual machines through Apple's [Containerization](https://github.com/apple/containerization) package.
 
-This repository is an early functional MVP, not yet a replacement for Docker Desktop. It supports interactive containers, exec, logs, archive copy, image import, and a managed Buildx container, but substantial networking, observability, recovery, and Compose work remains.
+This repository is an experimental engine rather than a complete implementation of every Docker API. Its focused runtime surface now covers interactive Docker CLI use, Compose application lifecycle, Buildx container builds, networking, observability, and daemon recovery.
 
 ## Requirements
 
