@@ -1,5 +1,9 @@
 /.build
 /.swiftpm
+/dist
 /.DS_Store
-*.xcodeproj
+DerivedData/
 xcuserdata/
+*.xcuserstate
+__pycache__/
+*.profraw

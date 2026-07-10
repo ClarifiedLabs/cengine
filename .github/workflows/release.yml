@@ -1,0 +1,284 @@
+name: release
+
+on:
+  push:
+    branches:
+      - release-ci
+    tags:
+      - v*.*.*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  require-tests:
+    name: Require macOS tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 125
+    permissions:
+      actions: write
+      contents: read
+    env:
+      TEST_WORKFLOW_FILE: test.yml
+      TEST_TIMEOUT_SECONDS: 7200
+      TEST_DISPATCH_GRACE_SECONDS: 120
+      TEST_POLL_SECONDS: 30
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Resolve test target
+        id: test-target
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            git fetch origin main
+            git merge-base --is-ancestor "$sha" origin/main
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ref=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+      - name: Wait for or start test workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TEST_REF: ${{ steps.test-target.outputs.ref }}
+          TEST_SHA: ${{ steps.test-target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repo, workflow = os.environ["REPO"], os.environ["TEST_WORKFLOW_FILE"]
+          ref, sha, token = os.environ["TEST_REF"], os.environ["TEST_SHA"], os.environ["GH_TOKEN"]
+          deadline = time.monotonic() + int(os.environ["TEST_TIMEOUT_SECONDS"])
+          dispatch_at = time.monotonic() + int(os.environ["TEST_DISPATCH_GRACE_SECONDS"])
+          poll = int(os.environ["TEST_POLL_SECONDS"])
+          headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+
+          def request(method, url, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      return response.read()
+              except urllib.error.HTTPError as error:
+                  print(error.read().decode(errors="replace"), file=sys.stderr)
+                  raise
+
+          def runs():
+              query = urllib.parse.urlencode({"head_sha": sha, "per_page": "50"})
+              data = json.loads(request("GET", f"{api}/repos/{repo}/actions/workflows/{workflow}/runs?{query}"))
+              return [run for run in data.get("workflow_runs", []) if run.get("head_sha") == sha]
+
+          dispatched = False
+          while time.monotonic() < deadline:
+              matches = runs()
+              if any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in matches):
+                  print("Required test workflow passed")
+                  raise SystemExit(0)
+              if any(run.get("status") != "completed" for run in matches):
+                  print("Waiting for active test workflow")
+                  time.sleep(poll)
+                  continue
+              if any(run.get("conclusion") != "success" for run in matches):
+                  print("Required test workflow failed", file=sys.stderr)
+                  raise SystemExit(1)
+              if not matches and not dispatched and time.monotonic() >= dispatch_at:
+                  encoded = urllib.parse.quote(workflow, safe="")
+                  request("POST", f"{api}/repos/{repo}/actions/workflows/{encoded}/dispatches", {"ref": ref})
+                  dispatched = True
+              time.sleep(poll)
+          print("Timed out waiting for required tests", file=sys.stderr)
+          raise SystemExit(1)
+          PY
+
+  build:
+    name: Build notarized package
+    needs: require-tests
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      PROJECT: cengine.xcodeproj
+      SCHEME: cengine
+      XCODE_SOURCE_PACKAGES_PATH: .build/ci/xcode-source-packages
+      XCODE_DERIVED_DATA_PATH: .build/ci/xcode-derived-data
+      BUILD_DIR: .build/release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Verify release commit is on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$(git rev-parse "$GITHUB_SHA^{commit}")" origin/main
+      - name: Resolve release version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            tag="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 2>/dev/null || true)"
+            if [[ -n "$tag" ]]; then version="${tag#v}"; else version="$(sed -nE 's/.*MARKETING_VERSION = ([0-9]+[.][0-9]+[.][0-9]+);.*/\1/p' "$PROJECT/project.pbxproj" | head -n 1)"; fi
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Require Xcode 26
+        run: |
+          version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
+          case "$version" in 26|26.*) ;; *) exit 1;; esac
+      - name: Cache Xcode Swift packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.XCODE_SOURCE_PACKAGES_PATH }}
+          key: xcode-spm-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'cengine.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: xcode-spm-${{ runner.os }}-
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.XCODE_DERIVED_DATA_PATH }}
+          key: xcode-deriveddata-release-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'Sources/**/*.swift', 'Configuration/*.entitlements', 'Scripts/package-release.sh') }}
+          restore-keys: xcode-deriveddata-release-${{ runner.os }}-
+      - name: Install App Store Connect API key
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          path="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          mkdir -p "$(dirname "$path")"
+          printf '%s\n' "$APP_STORE_CONNECT_PRIVATE_KEY" > "$path"
+          chmod 600 "$path"
+          echo "APP_STORE_CONNECT_KEY_PATH=$path" >> "$GITHUB_ENV"
+      - name: Import Developer ID certificates
+        env:
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
+          DEVELOPER_ID_INSTALLER_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_INSTALLER_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_INSTALLER_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          decode() { if base64 --decode </dev/null >/dev/null 2>&1; then base64 --decode; else base64 -D; fi; }
+          keychain="$RUNNER_TEMP/cengine-release.keychain-db"
+          password="$(openssl rand -base64 32)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64" | decode > "$RUNNER_TEMP/application.p12"
+          printf '%s' "$DEVELOPER_ID_INSTALLER_CERTIFICATE_BASE64" | decode > "$RUNNER_TEMP/installer.p12"
+          security import "$RUNNER_TEMP/application.p12" -P "$DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security import "$RUNNER_TEMP/installer.p12" -P "$DEVELOPER_ID_INSTALLER_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          identity() { security find-identity -v -p basic "$keychain" | awk -v kind="$1" 'index($0, kind) { sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit }'; }
+          application="$(identity 'Developer ID Application')"
+          installer="$(identity 'Developer ID Installer')"
+          [[ -n "$application" && -n "$installer" ]]
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          echo "CENGINE_DEVELOPER_ID_APPLICATION=$application" >> "$GITHUB_ENV"
+          echo "CENGINE_DEVELOPER_ID_INSTALLER=$installer" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/application.p12" "$RUNNER_TEMP/installer.p12"
+      - name: Resolve packages
+        run: |
+          mkdir -p "$XCODE_SOURCE_PACKAGES_PATH" "$XCODE_DERIVED_DATA_PATH"
+          xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$PWD/$XCODE_SOURCE_PACKAGES_PATH" \
+            -derivedDataPath "$PWD/$XCODE_DERIVED_DATA_PATH" -skipPackagePluginValidation
+      - name: Build signed notarized package
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          CENGINE_RELEASE_VERSION="${{ steps.version.outputs.version }}" \
+          CENGINE_BUILD_NUMBER="$GITHUB_RUN_NUMBER" \
+          CENGINE_SIGN_RELEASE=1 CENGINE_NOTARIZE=1 \
+          XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
+          XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
+          ./Scripts/package-release.sh
+      - name: Upload package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cengine-${{ steps.version.outputs.version }}.pkg
+          path: dist/cengine-${{ steps.version.outputs.version }}.pkg
+          if-no-files-found: error
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          package="dist/cengine-${VERSION}.pkg"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$package" --clobber
+          else
+            gh release create "$tag" "$package" --title "cengine ${VERSION}" \
+              --notes "Download and open the signed, notarized installer package below." --verify-tag
+          fi
+      - name: Cleanup
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" && -f "$KEYCHAIN_PATH" ]]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
+          rm -rf "$HOME/.appstoreconnect"
+
+  homebrew-publish:
+    name: Publish Homebrew cask
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: source
+      - name: Create tap token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: ClarifiedLabs
+          repositories: homebrew-tap
+          permission-contents: write
+      - name: Checkout tap
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ClarifiedLabs/homebrew-tap
+          token: ${{ steps.tap-token.outputs.token }}
+          path: homebrew-tap
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cengine-${{ needs.build.outputs.version }}.pkg
+          path: package
+      - name: Update cask
+        env:
+          TAG: ${{ github.ref_name }}
+          TAP_DIR: ${{ github.workspace }}/homebrew-tap
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          PKG_SHA256="$(sha256sum "package/cengine-${VERSION}.pkg" | awk '{print $1}')" source/Scripts/homebrew-cask.sh
+      - name: Commit tap update
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd homebrew-tap
+          git config user.name "${{ steps.tap-token.outputs.app-slug }}[bot]"
+          git config user.email "${{ steps.tap-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git add Casks/cengine.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update cengine ${TAG}"
+            git push
+          fi

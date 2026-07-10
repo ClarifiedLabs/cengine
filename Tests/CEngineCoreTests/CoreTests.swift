@@ -11,6 +11,25 @@ private final class DataBox: @unchecked Sendable {
 }
 
 @Suite struct CoreTests {
+    @Test func versionReadsBundleMetadataAndFallsBack() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bundleURL = root.appending(path: "VersionFixture.bundle", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
+        let info: [String: Any] = [
+            "CFBundleIdentifier": "dev.cengine.version-fixture",
+            "CFBundleName": "VersionFixture",
+            "CFBundlePackageType": "BNDL",
+            "CFBundleShortVersionString": "2.3.4",
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try data.write(to: bundleURL.appending(path: "Info.plist"))
+        let bundle = try #require(Bundle(url: bundleURL))
+
+        #expect(CEngineVersion.shortVersion(bundle: bundle) == "2.3.4")
+        #expect(CEngineVersion.shortVersion(bundle: Bundle()) == "0.0.1")
+    }
+
     @Test func kataKernelUsesPublishedZstdAsset() {
         #expect(KernelInstaller.archiveURL.lastPathComponent == "kata-static-3.28.0-arm64.tar.zst")
         #expect(KernelInstaller.archiveSHA256.count == 64)

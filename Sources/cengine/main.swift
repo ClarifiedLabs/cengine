@@ -14,7 +14,7 @@ import OSLog
             if !arguments.isEmpty { arguments.removeFirst() }
             switch command {
             case "daemon": try await daemon(arguments)
-            case "version", "--version": print("cengine 0.1.0")
+            case "version", "--version": print("cengine \(CEngineVersion.shortVersion())")
             case "system": try await system(arguments)
             case "help", "--help", "-h": usage()
             default: throw EngineError(.badRequest, "unknown command: \(command)")

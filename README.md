@@ -8,30 +8,38 @@ This repository is an experimental engine rather than a complete implementation 
 
 - Apple silicon
 - macOS 26 or newer
-- Swift 6.2 or newer
+- Xcode 26
 - Docker CLI (optional, but required to use the Docker context and Buildx)
 
 ## Build and test
 
 ```sh
 make test
-make release
+make dist-cli
+make package
 ```
 
-The release target ad-hoc signs the executable with Apple's required
-`com.apple.security.virtualization` entitlement. Running `swift build -c release`
-directly produces a binary that cannot create the VM network.
+`cengine` is built by `cengine.xcodeproj`; SwiftPM is not a supported build
+entrypoint. `make test` runs both Xcode test bundles, `make dist-cli` stages the
+release CLI at `dist/cengine`, and `make package` builds a local unsigned
+installer for payload inspection.
 
-The project deliberately limits direct SwiftPM dependencies to Apple Containerization, SwiftNIO, and Swift System. `make test` enforces that allowlist. Transitive packages required by Containerization are not duplicated as direct dependencies.
+Local CLI builds are ad-hoc signed with
+`com.apple.security.virtualization`. The project deliberately does not request
+the separate vmnet entitlements: Apple's macOS 26 Containerization networking
+path operates under the Virtualization entitlement. The build verifies the
+final entitlement set.
 
-Some developer machines have an old Homebrew or source-installed `/usr/local/include/zlib.h` that shadows the macOS SDK header. `Scripts/swift.sh` applies a narrow VFS overlay in that case; it does not alter system files.
+Public releases are Developer ID signed, notarized, stapled `.pkg` installers
+published through GitHub Releases and `ClarifiedLabs/homebrew-tap`. See
+[`docs/release.md`](docs/release.md).
 
 ## Install for the current user
 
 Place the release binary at a stable path, then run:
 
 ```sh
-.build/release/cengine system install
+/usr/local/bin/cengine system install
 docker --context cengine info
 ```
 

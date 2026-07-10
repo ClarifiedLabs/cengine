@@ -1,0 +1,65 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+      - release-ci
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: macOS tests
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      PROJECT: cengine.xcodeproj
+      SCHEME: cengine
+      XCODE_SOURCE_PACKAGES_PATH: .build/ci/xcode-source-packages
+      XCODE_DERIVED_DATA_PATH: .build/ci/xcode-derived-data
+      XCODE_RESULT_BUNDLE_PATH: .build/ci/xcresults/CEngineTests.xcresult
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Require Xcode 26
+        run: |
+          set -euo pipefail
+          version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
+          case "$version" in 26|26.*) ;; *) echo "Xcode 26 is required; found $version" >&2; exit 1;; esac
+      - name: Cache Xcode Swift packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.XCODE_SOURCE_PACKAGES_PATH }}
+          key: xcode-spm-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'cengine.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: xcode-spm-${{ runner.os }}-
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.XCODE_DERIVED_DATA_PATH }}
+          key: xcode-deriveddata-test-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'cengine.xcodeproj/xcshareddata/xcschemes/*.xcscheme', 'Sources/**/*.swift', 'Tests/**/*.swift', 'Configuration/*.entitlements') }}
+          restore-keys: xcode-deriveddata-test-${{ runner.os }}-
+      - name: Resolve packages
+        run: |
+          mkdir -p "$XCODE_SOURCE_PACKAGES_PATH" "$XCODE_DERIVED_DATA_PATH"
+          xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$PWD/$XCODE_SOURCE_PACKAGES_PATH" \
+            -derivedDataPath "$PWD/$XCODE_DERIVED_DATA_PATH" -skipPackagePluginValidation
+      - name: Run tests
+        run: |
+          mkdir -p "$(dirname "$XCODE_RESULT_BUNDLE_PATH")"
+          make test XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
+            XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
+            XCODE_RESULT_BUNDLE="$XCODE_RESULT_BUNDLE_PATH"
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CEngineTests.xcresult
+          path: ${{ env.XCODE_RESULT_BUNDLE_PATH }}
+          if-no-files-found: warn

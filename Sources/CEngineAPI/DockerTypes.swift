@@ -17,7 +17,7 @@ public struct DockerEventResponse: Encodable, Sendable {
 public struct DockerVersionResponse: Encodable, Sendable {
     public let Platform: PlatformInfo
     public let Components: [Component]
-    public let Version = "0.1.0"
+    public let Version = CEngineVersion.shortVersion()
     public let ApiVersion = "1.44"
     public let MinAPIVersion = "1.44"
     public let GitCommit = "unknown"
@@ -33,7 +33,7 @@ public struct DockerVersionResponse: Encodable, Sendable {
 
     public init() {
         Platform = .init(Name: "cengine")
-        Components = [.init(Name: "Engine", Version: "0.1.0", Details: ["ApiVersion": "1.44", "Arch": "arm64", "Os": "linux"])]
+        Components = [.init(Name: "Engine", Version: CEngineVersion.shortVersion(), Details: ["ApiVersion": "1.44", "Arch": "arm64", "Os": "linux"])]
     }
 }
 
@@ -48,7 +48,7 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let DriverStatus = [[String]]()
     public let DockerRootDir: String
     public let Name = Host.current().localizedName ?? "mac"
-    public let ServerVersion = "0.1.0"
+    public let ServerVersion = CEngineVersion.shortVersion()
     public let OperatingSystem = "macOS / cengine"
     public let OSType = "linux"
     public let Architecture = "arm64"
