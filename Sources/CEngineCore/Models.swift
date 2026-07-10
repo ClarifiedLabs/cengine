@@ -1,0 +1,168 @@
+import Foundation
+
+public enum ContainerPhase: String, Codable, Sendable {
+    case created
+    case running
+    case paused
+    case exited
+    case dead
+}
+
+public struct PortBinding: Codable, Hashable, Sendable {
+    public var hostIP: String
+    public var hostPort: UInt16
+    public var containerPort: UInt16
+    public var proto: String
+
+    public init(hostIP: String = "0.0.0.0", hostPort: UInt16, containerPort: UInt16, proto: String = "tcp") {
+        self.hostIP = hostIP
+        self.hostPort = hostPort
+        self.containerPort = containerPort
+        self.proto = proto
+    }
+}
+
+public struct MountRecord: Codable, Hashable, Sendable {
+    public enum Kind: String, Codable, Sendable { case bind, volume, tmpfs }
+    public var kind: Kind
+    public var source: String
+    public var destination: String
+    public var readOnly: Bool
+
+    public init(kind: Kind, source: String, destination: String, readOnly: Bool = false) {
+        self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly
+    }
+}
+
+public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
+    public var networkID: String
+    public var aliases: [String]
+    public var ipv4Address: String?
+    public var ipv6Address: String?
+}
+
+public struct RestartPolicyRecord: Codable, Hashable, Sendable {
+    public var name: String
+    public var maximumRetryCount: Int
+
+    public init(name: String = "no", maximumRetryCount: Int = 0) {
+        self.name = name
+        self.maximumRetryCount = maximumRetryCount
+    }
+}
+
+public struct HealthcheckRecord: Codable, Hashable, Sendable {
+    public var test: [String]
+    public var intervalNanoseconds: Int64
+    public var timeoutNanoseconds: Int64
+    public var retries: Int
+    public var startPeriodNanoseconds: Int64
+}
+
+public struct ContainerRecord: Codable, Sendable {
+    public var id: String
+    public var name: String
+    public var image: String
+    public var platform: String
+    public var createdAt: Date
+    public var phase: ContainerPhase
+    public var startedAt: Date?
+    public var finishedAt: Date?
+    public var exitCode: Int32?
+    public var processArguments: [String]
+    public var environment: [String]
+    public var workingDirectory: String
+    public var user: String
+    public var hostname: String
+    public var labels: [String: String]
+    public var tty: Bool
+    public var openStdin: Bool
+    public var privileged: Bool
+    public var readOnlyRootfs: Bool
+    public var autoRemove: Bool
+    public var useInit: Bool
+    public var memoryBytes: UInt64
+    public var cpus: Int
+    public var stopSignal: String
+    public var stopTimeoutSeconds: Int
+    public var restartPolicy: RestartPolicyRecord
+    public var healthcheck: HealthcheckRecord?
+    public var mounts: [MountRecord]
+    public var ports: [PortBinding]
+    public var networks: [NetworkEndpointRecord]
+    public var restartCount: Int
+
+    public init(
+        id: String = Identifier.random(), name: String, image: String,
+        platform: String = "linux/arm64", processArguments: [String] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.image = image
+        self.platform = platform
+        self.createdAt = Date()
+        self.phase = .created
+        self.processArguments = processArguments
+        self.environment = []
+        self.workingDirectory = ""
+        self.user = ""
+        self.hostname = String(id.prefix(12))
+        self.labels = [:]
+        self.tty = false
+        self.openStdin = false
+        self.privileged = false
+        self.readOnlyRootfs = false
+        self.autoRemove = false
+        self.useInit = false
+        self.memoryBytes = 1_073_741_824
+        self.cpus = 4
+        self.stopSignal = "SIGTERM"
+        self.stopTimeoutSeconds = 10
+        self.restartPolicy = .init()
+        self.mounts = []
+        self.ports = []
+        self.networks = []
+        self.restartCount = 0
+    }
+}
+
+public struct NetworkRecord: Codable, Sendable {
+    public var id: String
+    public var name: String
+    public var createdAt: Date
+    public var subnet: String
+    public var gateway: String
+    public var internalNetwork: Bool
+    public var labels: [String: String]
+
+    public init(id: String, name: String, createdAt: Date = Date(), subnet: String, gateway: String, internalNetwork: Bool = false, labels: [String: String] = [:]) {
+        self.id = id; self.name = name; self.createdAt = createdAt; self.subnet = subnet; self.gateway = gateway
+        self.internalNetwork = internalNetwork; self.labels = labels
+    }
+}
+
+public struct VolumeRecord: Codable, Sendable {
+    public var name: String
+    public var createdAt: Date
+    public var sizeBytes: UInt64
+    public var labels: [String: String]
+    public var options: [String: String]
+
+    public init(name: String, createdAt: Date = Date(), sizeBytes: UInt64, labels: [String: String] = [:], options: [String: String] = [:]) {
+        self.name = name; self.createdAt = createdAt; self.sizeBytes = sizeBytes; self.labels = labels; self.options = options
+    }
+}
+
+public struct ImageRecord: Codable, Sendable {
+    public var id: String
+    public var references: [String]
+    public var createdAt: Date
+    public var size: Int64
+    public var architecture: String
+    public var os: String
+
+    public init(id: String, references: [String], createdAt: Date, size: Int64, architecture: String, os: String) {
+        self.id = id; self.references = references; self.createdAt = createdAt; self.size = size
+        self.architecture = architecture; self.os = os
+    }
+}
