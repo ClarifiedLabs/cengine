@@ -229,6 +229,9 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(mounts.first?["RW"] as? Bool == false)
         let host = try #require(object["HostConfig"] as? [String: Any])
         #expect((host["Binds"] as? [String]) == ["data:/data:ro"])
+        #expect(host["NetworkMode"] as? String == "default")
+        let logConfig = try #require(host["LogConfig"] as? [String: Any])
+        #expect(logConfig["Type"] as? String == "json-file")
         let bindings = try #require(host["PortBindings"] as? [String: [[String: String]]])
         #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
     }

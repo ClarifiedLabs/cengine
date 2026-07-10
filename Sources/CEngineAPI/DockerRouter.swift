@@ -471,7 +471,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
         let Binds: [String]; let Mounts: [MountResponse]
         let PortBindings: [String: [PortBindingResponse]]
+        let NetworkMode: String; let LogConfig: LogConfigResponse
         struct RestartPolicy: Codable, Sendable { let Name: String; let MaximumRetryCount: Int }
+        struct LogConfigResponse: Codable, Sendable { let `Type`: String; let Config: [String: String] }
     }
     public struct MountResponse: Codable, Sendable {
         let `Type`: String; let Name: String?; let Source: String; let Destination: String
@@ -516,7 +518,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
             Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
                 "\($0.source):\($0.destination)\($0.readOnly ? ":ro" : "")"
             },
-            Mounts: mounts, PortBindings: portBindings
+            Mounts: mounts, PortBindings: portBindings, NetworkMode: "default",
+            LogConfig: .init(Type: "json-file", Config: [:])
         )
         Mounts = mounts
         let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })

@@ -180,7 +180,6 @@ def test_wait_next_exit(client: docker.DockerClient, top):
     assert not waiter.is_alive() and result[0]["StatusCode"] == 0
 
 
-@KNOWN_GAP(reason="CTR-021: container inspect is not yet fully Docker v1.44 schema-complete")
 @pytest.mark.compat("CTR-021")
 def test_container_inspect_compatibility(client: docker.DockerClient, top):
     inspect = client.api.inspect_container(top.id)
