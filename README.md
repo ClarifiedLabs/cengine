@@ -80,6 +80,5 @@ Known gaps:
 
 - UDP host port publishing and dynamic DNS updates when peers join after a container starts
 - Registry authentication, image history, and real pull progress
-- Full `linux/amd64` image selection; the VM enables Rosetta, but the current Apple `ContainerManager` convenience pull path selects the host platform
 
 These gaps are reported as unsupported or absent rather than silently emulated.

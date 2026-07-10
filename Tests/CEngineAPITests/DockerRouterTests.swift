@@ -263,6 +263,19 @@ private actor RestartBackend: ContainerBackend {
         #expect(explicitConfig["Hostname"] as? String == "web.internal")
     }
 
+    @Test func containerCreatePreservesRequestedPlatform() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=amd64&platform=linux%2Famd64",
+            body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        #expect(try await runtime.container("amd64").platform == "linux/amd64")
+    }
+
     @Test func directBuildExplainsBuildxRequirement() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

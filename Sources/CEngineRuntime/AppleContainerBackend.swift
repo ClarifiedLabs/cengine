@@ -1,6 +1,7 @@
 #if os(macOS)
 import CEngineCore
 import Containerization
+import ContainerizationEXT4
 import ContainerizationOCI
 import ContainerizationOS
 import Foundation
@@ -11,6 +12,7 @@ public actor AppleContainerBackend: ContainerBackend {
     public static let defaultVminitReference = "ghcr.io/apple/containerization/vminit:0.37.0"
 
     private var manager: ContainerManager
+    private let vmm: VZVirtualMachineManager
     private var network: VmnetNetwork
     private var interfaces: [String: any Containerization.Interface] = [:]
     private let portForwarder = PortForwarder()
@@ -22,6 +24,7 @@ public actor AppleContainerBackend: ContainerBackend {
     private var execWaitTasks: [String: Task<Int32, Never>] = [:]
     private var execExitCodes: [String: Int32] = [:]
     private var preparedRecords: [String: ContainerRecord] = [:]
+    private var preparedImages: [String: Containerization.Image] = [:]
     private struct StagedCopy: Sendable { let source: URL; let destination: String }
     private var stagedCopies: [String: [StagedCopy]] = [:]
     private let volumeRoot: URL
@@ -46,12 +49,21 @@ public actor AppleContainerBackend: ContainerBackend {
         try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
         let network = try VmnetNetwork()
         self.network = network
-        self.manager = try await ContainerManager(
-            kernel: Kernel(path: kernel, platform: .linuxArm),
-            initfsReference: vminitReference,
-            root: runtimeRoot,
-            network: nil,
-            rosetta: rosetta
+        let imageStore = try ImageStore(path: runtimeRoot)
+        let initPath = runtimeRoot.appending(path: "initfs.ext4")
+        let initfs: Containerization.Mount
+        if FileManager.default.fileExists(atPath: initPath.path) {
+            initfs = .block(format: "ext4", source: initPath.path, destination: "/", options: ["ro"])
+        } else {
+            initfs = try await imageStore.getInitImage(reference: vminitReference).initBlock(at: initPath, for: .linuxArm)
+        }
+        let machineManager = VZVirtualMachineManager(
+            kernel: Kernel(path: kernel, platform: .linuxArm), initialFilesystem: initfs, rosetta: rosetta
+        )
+        self.vmm = machineManager
+        self.manager = try ContainerManager(
+            kernel: Kernel(path: kernel, platform: .linuxArm), initfs: initfs,
+            imageStore: imageStore, network: nil, rosetta: rosetta
         )
     }
 
@@ -59,7 +71,7 @@ public actor AppleContainerBackend: ContainerBackend {
         guard platform == "linux/arm64" || platform == "linux/amd64" else {
             throw EngineError(.unsupported, "unsupported platform \(platform)")
         }
-        _ = try await manager.imageStore.get(reference: reference, pull: true)
+        _ = try await image(reference: reference, platform: platform, pull: true)
     }
 
     public func prepare(_ record: ContainerRecord) async throws {
@@ -68,11 +80,12 @@ public actor AppleContainerBackend: ContainerBackend {
         }
 
         let io = ContainerIOBridge(tty: record.tty, logURL: logRoot.appending(path: "\(record.id).log"))
-        _ = try await manager.imageStore.get(reference: record.image, pull: true)
+        let image = try await image(reference: record.image, platform: record.platform, pull: true)
         if interfaces[record.id] == nil {
             interfaces[record.id] = try network.createInterface(record.id)
         }
         preparedRecords[record.id] = record
+        preparedImages[record.id] = image
         ioBridges[record.id] = io
     }
 
@@ -88,17 +101,18 @@ public actor AppleContainerBackend: ContainerBackend {
             let aliases = Set([peer.name, peer.hostname] + peer.networks.flatMap(\.aliases))
             return Hosts.Entry(ipAddress: peerInterface.ipv4Address.address.description, hostnames: aliases.sorted())
         }
-        var manager = self.manager
-        let image = try await manager.imageStore.get(reference: record.image, pull: true)
-        let imageConfig = try await image.config(for: .current).config
+        guard let image = preparedImages[record.id] else { throw EngineError(.notFound, "prepared image is unavailable") }
+        let selectedPlatform = try Self.platform(record.platform)
+        let selectedConfig = try await image.config(for: selectedPlatform)
+        let imageConfig = selectedConfig.config
         let resolvedArguments = (record.entrypoint ?? imageConfig?.entrypoint ?? []) + (record.command ?? imageConfig?.cmd ?? [])
-        let container = try await manager.create(
-            record.id,
-            reference: record.image,
-            rootfsSizeInBytes: max(record.memoryBytes * 4, 8 * 1_024 * 1_024 * 1_024),
-            readOnly: record.readOnlyRootfs,
-            networking: false
-        ) { config in
+        let containerPath = runtimeContainerRoot.appending(path: record.id, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: containerPath, withIntermediateDirectories: false)
+        let unpacker = EXT4Unpacker(blockSizeInBytes: max(record.memoryBytes * 4, 8 * 1_024 * 1_024 * 1_024))
+        var rootfs = try await unpacker.unpack(image, for: selectedPlatform, at: containerPath.appending(path: "rootfs.ext4"))
+        if record.readOnlyRootfs { rootfs.options.append("ro") }
+        let container = try LinuxContainer(record.id, rootfs: rootfs, vmm: vmm) { config in
+            if let imageConfig { config.process = .init(from: imageConfig) }
             config.cpus = max(record.cpus, 1)
             config.memoryInBytes = max(record.memoryBytes, 256 * 1_024 * 1_024)
             config.hostname = record.hostname
@@ -106,6 +120,7 @@ public actor AppleContainerBackend: ContainerBackend {
             config.interfaces = [interface]
             if let gateway = interface.ipv4Gateway { config.dns = .init(nameservers: [gateway.description]) }
             config.hosts = Hosts(entries: Hosts.default.entries + peerHosts)
+            config.bootLog = BootLog.file(path: containerPath.appending(path: "bootlog.log"))
             config.process.arguments = resolvedArguments
             if !record.environment.isEmpty { config.process.environmentVariables.append(contentsOf: record.environment) }
             if !config.process.environmentVariables.contains(where: { $0.hasPrefix("PATH=") }) {
@@ -154,7 +169,6 @@ public actor AppleContainerBackend: ContainerBackend {
                 }
             }
         }
-        self.manager = manager
         return container
     }
 
@@ -222,6 +236,7 @@ public actor AppleContainerBackend: ContainerBackend {
         waitTasks.removeValue(forKey: record.id)?.cancel()
         ioBridges.removeValue(forKey: record.id)?.finishOutput()
         preparedRecords.removeValue(forKey: record.id)
+        preparedImages.removeValue(forKey: record.id)
         interfaces.removeValue(forKey: record.id)
         try? network.releaseInterface(record.id)
         stagedCopies.removeValue(forKey: record.id)
@@ -458,6 +473,22 @@ public actor AppleContainerBackend: ContainerBackend {
             return ContainerizationOCI.User(uid: uid, gid: components.count == 2 ? UInt32(components[1]) ?? uid : uid)
         }
         return ContainerizationOCI.User(username: value)
+    }
+
+    private static func platform(_ value: String) throws -> ContainerizationOCI.Platform {
+        let parts = value.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2, parts[0] == "linux", parts[1] == "arm64" || parts[1] == "amd64" else {
+            throw EngineError(.unsupported, "unsupported platform \(value)")
+        }
+        return .init(arch: parts[1], os: parts[0])
+    }
+
+    private func image(reference: String, platform: String, pull: Bool) async throws -> Containerization.Image {
+        let selected = try Self.platform(platform)
+        if let existing = try? await manager.imageStore.get(reference: reference),
+           (try? await existing.config(for: selected)) != nil { return existing }
+        guard pull else { throw EngineError(.notFound, "image \(reference) does not contain \(platform)") }
+        return try await manager.imageStore.pull(reference: reference, platform: selected)
     }
 }
 

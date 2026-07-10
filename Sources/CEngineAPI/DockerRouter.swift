@@ -65,6 +65,7 @@ public struct DockerRouter: Sendable {
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
+            record.platform = query["platform"] ?? "linux/arm64"
             record.entrypoint = input.Entrypoint
             record.command = input.Cmd
             record.environment = input.Env ?? []
