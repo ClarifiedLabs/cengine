@@ -20,11 +20,17 @@ public actor EngineRuntime {
     private let store: AtomicStore<EngineSnapshot>
     let backend: any ContainerBackend
     private var execs: [String: ExecRecord] = [:]
+    private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
         self.backend = backend
         self.snapshot = try await store.load(default: EngineSnapshot())
+        if !snapshot.networks.contains(where: { $0.name == "default" }) {
+            snapshot.networks.append(NetworkRecord(
+                id: "cengine-default-network", name: "default", subnet: "192.168.64.0/24", gateway: "192.168.64.1"
+            ))
+        }
         for index in snapshot.containers.indices where snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused {
             snapshot.containers[index].phase = .exited
             snapshot.containers[index].exitCode = 137
@@ -32,6 +38,15 @@ public actor EngineRuntime {
         }
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
+        }
+        for index in snapshot.containers.indices where snapshot.containers[index].phase == .created {
+            do {
+                try await backend.prepare(snapshot.containers[index])
+            } catch {
+                snapshot.containers[index].phase = .dead
+                snapshot.containers[index].exitCode = 127
+                snapshot.containers[index].finishedAt = Date()
+            }
         }
         try await persist()
     }
@@ -60,6 +75,7 @@ public actor EngineRuntime {
         try await backend.prepare(record)
         snapshot.containers.append(record)
         try await persist()
+        emit(containerEvent("create", record))
         return record
     }
 
@@ -67,6 +83,10 @@ public actor EngineRuntime {
         let index = try containerIndex(identifier)
         guard snapshot.containers[index].phase != .running else { return }
         let record = snapshot.containers[index]
+        if record.phase == .exited || record.phase == .dead {
+            try await backend.delete(record)
+            try await backend.prepare(record)
+        }
         try await backend.start(record)
         guard let current = try? containerIndex(record.id) else {
             _ = try? await backend.stop(record, timeoutSeconds: 0)
@@ -78,7 +98,19 @@ public actor EngineRuntime {
         snapshot.containers[current].startedAt = startedAt
         snapshot.containers[current].finishedAt = nil
         snapshot.containers[current].exitCode = nil
+        if let address = await backend.ipv4Address(for: record) {
+            if snapshot.containers[current].networks.isEmpty {
+                if let network = snapshot.networks.first(where: { $0.name == "default" }) {
+                    snapshot.containers[current].networks = [.init(networkID: network.id, ipv4Address: address)]
+                }
+            } else {
+                for endpoint in snapshot.containers[current].networks.indices {
+                    snapshot.containers[current].networks[endpoint].ipv4Address = address
+                }
+            }
+        }
         try await persist()
+        emit(containerEvent("start", snapshot.containers[current]))
         Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
@@ -98,6 +130,7 @@ public actor EngineRuntime {
         let record = try container(identifier)
         guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         try await backend.kill(record, signal: signal)
+        emit(containerEvent("kill", record, extra: ["signal": signal]))
     }
 
     public func pauseContainer(_ identifier: String) async throws {
@@ -106,6 +139,7 @@ public actor EngineRuntime {
         try await backend.pause(snapshot.containers[index])
         snapshot.containers[index].phase = .paused
         try await persist()
+        emit(containerEvent("pause", snapshot.containers[index]))
     }
 
     public func resumeContainer(_ identifier: String) async throws {
@@ -114,6 +148,7 @@ public actor EngineRuntime {
         try await backend.resume(snapshot.containers[index])
         snapshot.containers[index].phase = .running
         try await persist()
+        emit(containerEvent("unpause", snapshot.containers[index]))
     }
 
     public func restartContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
@@ -132,6 +167,7 @@ public actor EngineRuntime {
         snapshot.containers[current].exitCode = nil
         snapshot.containers[current].restartCount += 1
         try await persist()
+        emit(containerEvent("restart", snapshot.containers[current]))
         Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
@@ -189,6 +225,7 @@ public actor EngineRuntime {
         snapshot.containers[current].exitCode = code
         snapshot.containers[current].finishedAt = Date()
         try await persist()
+        emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
     }
 
     public func waitContainer(_ identifier: String) async throws -> Int32 {
@@ -201,6 +238,7 @@ public actor EngineRuntime {
         snapshot.containers[current].exitCode = code
         snapshot.containers[current].finishedAt = Date()
         try await persist()
+        emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
         return code
     }
 
@@ -210,9 +248,11 @@ public actor EngineRuntime {
             guard force else { throw EngineError(.conflict, "You cannot remove a running container. Stop the container before attempting removal or force remove.") }
             _ = try await backend.stop(snapshot.containers[index], timeoutSeconds: 0)
         }
-        try await backend.delete(snapshot.containers[index])
+        let removed = snapshot.containers[index]
+        try await backend.delete(removed)
         snapshot.containers.remove(at: index)
         try await persist()
+        emit(containerEvent("destroy", removed))
     }
 
     public func listNetworks() -> [NetworkRecord] { snapshot.networks }
@@ -252,7 +292,10 @@ public actor EngineRuntime {
     }
 
     public func image(_ identifier: String) throws -> ImageRecord {
-        guard let image = snapshot.images.first(where: { $0.id == identifier || $0.id.hasPrefix(identifier) || $0.references.contains(identifier) }) else {
+        let normalized = ImageReference.normalized(identifier)
+        guard let image = snapshot.images.first(where: {
+            $0.id == identifier || $0.id.hasPrefix(identifier) || $0.references.contains(identifier) || $0.references.contains(normalized)
+        }) else {
             throw EngineError(.notFound, "No such image: \(identifier)")
         }
         return image
@@ -280,6 +323,9 @@ public actor EngineRuntime {
     public func removeNetwork(_ identifier: String) async throws {
         guard let index = snapshot.networks.firstIndex(where: { $0.id == identifier || $0.id.hasPrefix(identifier) || $0.name == identifier }) else {
             throw EngineError(.notFound, "network \(identifier) not found")
+        }
+        guard snapshot.networks[index].name != "default" else {
+            throw EngineError(.conflict, "default is a pre-defined network and cannot be removed")
         }
         guard !snapshot.containers.contains(where: { container in container.networks.contains { $0.networkID == snapshot.networks[index].id } }) else {
             throw EngineError(.conflict, "network \(snapshot.networks[index].name) has active endpoints")
@@ -319,8 +365,8 @@ public actor EngineRuntime {
 
     public func pruneNetworks() async throws -> [String] {
         let used = Set(snapshot.containers.flatMap(\.networks).map(\.networkID))
-        let removed = snapshot.networks.filter { !used.contains($0.id) }
-        snapshot.networks.removeAll { !used.contains($0.id) }
+        let removed = snapshot.networks.filter { $0.name != "default" && !used.contains($0.id) }
+        snapshot.networks.removeAll { $0.name != "default" && !used.contains($0.id) }
         try await persist()
         return removed.map(\.name)
     }
@@ -356,6 +402,23 @@ public actor EngineRuntime {
 
     func persist() async throws { try await store.save(snapshot) }
 
+    public func events() -> AsyncStream<RuntimeEvent> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            eventContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in Task { await self?.removeEventContinuation(id) } }
+        }
+    }
+
+    private func removeEventContinuation(_ id: UUID) { eventContinuations.removeValue(forKey: id) }
+    private func emit(_ event: RuntimeEvent) { eventContinuations.values.forEach { $0.yield(event) } }
+    private func containerEvent(_ action: String, _ record: ContainerRecord,
+                                extra: [String: String] = [:]) -> RuntimeEvent {
+        RuntimeEvent(type: "container", action: action, id: record.id,
+                     attributes: record.labels.merging(["name": record.name, "image": record.image]) { current, _ in current }
+                        .merging(extra) { _, new in new })
+    }
+
     private static func imageRecords(from images: [BackendImage]) -> [ImageRecord] {
         Dictionary(grouping: images, by: \ .id).map { id, values in
             ImageRecord(id: id, references: values.map(\ .reference).sorted(), createdAt: Date(),
@@ -377,9 +440,11 @@ public actor EngineRuntime {
         snapshot.containers[index].finishedAt = Date()
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
+        emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
         if autoRemove {
             try? await backend.delete(record)
             if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
+            emit(containerEvent("destroy", record))
         }
         try? await persist()
     }

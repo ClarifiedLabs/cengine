@@ -1,0 +1,10 @@
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:18081:80"
+  client:
+    image: alpine:latest
+    command: ["sh", "-c", "wget -qO- http://web/ | grep -q 'Welcome to nginx'"]
+    depends_on:
+      - web

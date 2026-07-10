@@ -127,6 +127,12 @@ private actor ImageStoreBackend: ContainerBackend {
         let inspected = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
         let state = try #require(inspected["State"] as? [String: Any])
         #expect(state["Running"] as? Bool == true)
+        let excluded = await router.route(.init(
+            method: .GET,
+            uri: "/v1.44/containers/json?all=1&filters=%7B%22label%22:%5B%22com.example=other%22%5D%7D"
+        ))
+        let excludedContainers = try #require(JSONSerialization.jsonObject(with: excluded.body) as? [[String: Any]])
+        #expect(excludedContainers.isEmpty)
 
         let kill = await router.route(.init(method: .POST, uri: "/v1.44/containers/web/kill?signal=TERM", body: Data()))
         #expect(kill.status == .noContent)
@@ -155,6 +161,19 @@ private actor ImageStoreBackend: ContainerBackend {
         #expect(createdVolume["Driver"] as? String == "local")
         let volumeInspect = await router.route(.init(method: .GET, uri: "/v1.44/volumes/dbdata", body: Data()))
         #expect(volumeInspect.status == .ok)
+    }
+
+    @Test func defaultNetworkIsAlwaysPresentAndCannotBeRemoved() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/networks/default"))
+        #expect(inspect.status == .ok)
+        let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/networks/default"))
+        #expect(remove.status == .conflict)
+        let prune = await router.route(.init(method: .POST, uri: "/v1.44/networks/prune"))
+        #expect(prune.status == .ok)
+        let after = await router.route(.init(method: .GET, uri: "/v1.44/networks/default"))
+        #expect(after.status == .ok)
     }
 
     @Test func composeNetworkingAndNetworkLifecyclePersistEndpoints() async throws {
@@ -255,6 +274,10 @@ private actor ImageStoreBackend: ContainerBackend {
 
         let inspect = await router.route(.init(method: .GET, uri: "/v1.44/images/docker.io/library/alpine:latest/json", body: Data()))
         #expect(inspect.status == .ok)
+        let shortInspect = await router.route(.init(method: .GET, uri: "/v1.44/images/alpine:latest/json", body: Data()))
+        #expect(shortInspect.status == .ok)
+        let shortJSON = try #require(JSONSerialization.jsonObject(with: shortInspect.body) as? [String: Any])
+        #expect(shortJSON["Config"] is [String: Any])
         let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/images/docker.io/library/alpine:latest", body: Data()))
         #expect(remove.status == .ok)
     }
@@ -396,5 +419,18 @@ private actor ImageStoreBackend: ContainerBackend {
         let restarted = try await runtime.container(record.id)
         #expect(restarted.phase == .running)
         #expect(restarted.restartCount == 1)
+    }
+
+    @Test func runtimePublishesDockerLifecycleEvents() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root)
+        let stream = await runtime.events()
+        var iterator = stream.makeAsyncIterator()
+        let record = try await runtime.createContainer(ContainerRecord(name: "eventful", image: "debian"))
+        let event = await iterator.next()
+        #expect(event?.action == "create")
+        #expect(event?.id == record.id)
+        #expect(event?.attributes["name"] == "eventful")
     }
 }

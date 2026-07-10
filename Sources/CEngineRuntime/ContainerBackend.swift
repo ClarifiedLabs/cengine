@@ -28,6 +28,7 @@ public protocol ContainerBackend: Sendable {
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
+    func ipv4Address(for container: ContainerRecord) async -> String?
 }
 
 public extension ContainerBackend {
@@ -66,6 +67,7 @@ public extension ContainerBackend {
         try await prepare(container)
         try await start(container)
     }
+    func ipv4Address(for _: ContainerRecord) async -> String? { nil }
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

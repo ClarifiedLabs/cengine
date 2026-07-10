@@ -12,6 +12,9 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private let router: DockerRouter
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
+    private var followIO: ContainerIOBridge?
+    private var followSubscription: UUID?
+    private var eventTask: Task<Void, Never>?
     private let maximumBodyBytes: Int
 
     public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
@@ -29,6 +32,14 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             body.writeBuffer(&chunk)
         case .end:
             guard let head else { return }
+            if Self.isEvents(head.uri) {
+                startEvents(channel: context.channel)
+                return
+            }
+            if Self.isFollowingLogs(head.uri) {
+                startFollowingLogs(head: head, channel: context.channel)
+                return
+            }
             let request = APIRequest(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView))
             let keepAlive = head.isKeepAlive
             let channel = context.channel
@@ -37,6 +48,87 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 channel.eventLoop.execute { Self.write(channel: channel, response: response, keepAlive: keepAlive) }
             }
         }
+    }
+
+    public func channelInactive(context: ChannelHandlerContext) {
+        if let followSubscription { followIO?.detach(followSubscription) }
+        eventTask?.cancel()
+        context.fireChannelInactive()
+    }
+
+    private func startFollowingLogs(head: HTTPRequestHead, channel: Channel) {
+        guard let id = Self.logContainerID(head.uri) else { return }
+        Task { [router] in
+            do {
+                let initial = try await router.containerLogs(id)
+                let io = try await router.containerIO(id)
+                channel.eventLoop.execute {
+                    self.followIO = io
+                    var headers = HTTPHeaders()
+                    headers.add(name: "Content-Type", value: "application/vnd.docker.raw-stream")
+                    headers.add(name: "Transfer-Encoding", value: "chunked")
+                    channel.write(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
+                    if !initial.isEmpty {
+                        var buffer = channel.allocator.buffer(capacity: initial.count)
+                        buffer.writeBytes(initial)
+                        channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                    } else { channel.flush() }
+                    self.followSubscription = io.attach(replayBuffered: false, output: { data in
+                        channel.eventLoop.execute {
+                            var buffer = channel.allocator.buffer(capacity: data.count)
+                            buffer.writeBytes(data)
+                            channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                        }
+                    }, closed: {
+                        channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
+                    })
+                }
+            } catch {
+                channel.eventLoop.execute {
+                    Self.write(channel: channel, response: .init(status: .notFound, body: Data(#"{"message":"container logs unavailable"}"#.utf8)), keepAlive: false)
+                }
+            }
+        }
+    }
+
+    private static func isFollowingLogs(_ uri: String) -> Bool {
+        guard let components = URLComponents(string: uri), components.path.hasSuffix("/logs") else { return false }
+        return components.queryItems?.contains { $0.name == "follow" && ($0.value == "1" || $0.value == "true") } == true
+    }
+
+    private static func logContainerID(_ uri: String) -> String? {
+        guard let components = URLComponents(string: uri) else { return nil }
+        let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
+        guard path.hasPrefix("/containers/"), path.hasSuffix("/logs") else { return nil }
+        return String(path.dropFirst("/containers/".count).dropLast("/logs".count))
+    }
+
+    private func startEvents(channel: Channel) {
+        eventTask = Task { [router] in
+            let stream = await router.events()
+            channel.eventLoop.execute {
+                var headers = HTTPHeaders()
+                headers.add(name: "Content-Type", value: "application/json")
+                headers.add(name: "Transfer-Encoding", value: "chunked")
+                channel.writeAndFlush(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
+            }
+            let encoder = JSONEncoder()
+            for await event in stream {
+                guard !Task.isCancelled else { break }
+                guard var data = try? encoder.encode(DockerEventResponse(event)) else { continue }
+                data.append(0x0a)
+                let payload = data
+                channel.eventLoop.execute {
+                    var buffer = channel.allocator.buffer(capacity: payload.count); buffer.writeBytes(payload)
+                    channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                }
+            }
+        }
+    }
+
+    private static func isEvents(_ uri: String) -> Bool {
+        guard let components = URLComponents(string: uri) else { return false }
+        return components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression) == "/events"
     }
 
     private static func write(channel: Channel, response: APIResponse, keepAlive: Bool) {
@@ -163,12 +255,13 @@ private final class ContainerAttachHandler: ChannelInboundHandler, @unchecked Se
     typealias InboundIn = ByteBuffer
     typealias OutboundOut = ByteBuffer
     private let io: ContainerIOBridge
+    private var subscription: UUID?
 
     init(io: ContainerIOBridge) { self.io = io }
 
     func handlerAdded(context: ChannelHandlerContext) {
         let context = SendableContext(context)
-        io.attach(
+        subscription = io.attach(
             output: { data in
                 context.value.eventLoop.execute {
                     var buffer = context.value.channel.allocator.buffer(capacity: data.count)
@@ -192,7 +285,7 @@ private final class ContainerAttachHandler: ChannelInboundHandler, @unchecked Se
 
     func channelInactive(context: ChannelHandlerContext) {
         io.finishInput()
-        io.detach()
+        if let subscription { io.detach(subscription) }
         context.fireChannelInactive()
     }
 

@@ -59,7 +59,8 @@ public struct DockerRouter: Sendable {
             ))
         case (.GET, "/containers/json"):
             let all = parseBool(query["all"]) ?? false
-            return json(status: .ok, await runtime.listContainers(all: all).map(ContainerSummaryResponse.init))
+            let containers = filteredContainers(await runtime.listContainers(all: all), filters: query["filters"])
+            return json(status: .ok, containers.map(ContainerSummaryResponse.init))
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
@@ -96,7 +97,7 @@ public struct DockerRouter: Sendable {
             return json(status: .created, ContainerCreateResponse(Id: created.id, Warnings: []))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/json".count))
-            return json(status: .ok, try await inspectContainer(runtime.container(id)))
+            return json(status: .ok, try await inspectContainer(id))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/logs"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/logs".count))
             _ = try await runtime.container(id)
@@ -286,11 +287,39 @@ public struct DockerRouter: Sendable {
     private func queryItems(_ components: URLComponents) -> [String: String] { Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") }) }
     private func parseBool(_ value: String?) -> Bool? { value.map { $0 == "1" || $0.lowercased() == "true" } }
 
-    private func inspectContainer(_ record: ContainerRecord) -> ContainerInspectResponse { .init(record) }
+    private func filteredContainers(_ containers: [ContainerRecord], filters encoded: String?) -> [ContainerRecord] {
+        guard let encoded, let data = encoded.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return containers }
+        func values(_ key: String) -> [String] {
+            if let array = object[key] as? [String] { return array }
+            if let map = object[key] as? [String: Bool] { return map.compactMap { $0.value ? $0.key : nil } }
+            return []
+        }
+        let labels = values("label")
+        let names = values("name")
+        let ids = values("id")
+        let statuses = values("status")
+        return containers.filter { container in
+            labels.allSatisfy { expression in
+                let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
+                guard let actual = container.labels[parts[0]] else { return false }
+                return parts.count == 1 || actual == parts[1]
+            } && (names.isEmpty || names.contains { container.name.contains($0) })
+              && (ids.isEmpty || ids.contains { container.id.hasPrefix($0) })
+              && (statuses.isEmpty || statuses.contains(container.phase.rawValue))
+        }
+    }
+
+    private func inspectContainer(_ identifier: String) async throws -> ContainerInspectResponse {
+        .init(try await runtime.container(identifier), networks: await runtime.listNetworks())
+    }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
         try await runtime.containerIO(identifier)
     }
+
+    public func containerLogs(_ identifier: String) async throws -> Data { try await runtime.containerLogs(identifier) }
+    public func events() async -> AsyncStream<RuntimeEvent> { await runtime.events() }
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
@@ -340,16 +369,47 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public let State: StateResponse
     public let Config: ConfigResponse
     public let RestartCount: Int
+    public let NetworkSettings: NetworkSettingsResponse
 
     public struct StateResponse: Codable, Sendable { let Status: String; let Running: Bool; let Paused: Bool; let Restarting: Bool; let OOMKilled: Bool; let Dead: Bool; let Pid: Int; let ExitCode: Int32; let Error: String; let StartedAt: String; let FinishedAt: String }
     public struct ConfigResponse: Codable, Sendable { let Hostname: String; let User: String; let Tty: Bool; let OpenStdin: Bool; let Env: [String]; let Cmd: [String]; let Image: String; let WorkingDir: String; let Labels: [String: String] }
+    public struct NetworkSettingsResponse: Codable, Sendable {
+        let Bridge: String; let SandboxID: String; let HairpinMode: Bool
+        let Ports: [String: [PortBindingResponse]?]
+        let Networks: [String: EndpointResponse]
+    }
+    public struct PortBindingResponse: Codable, Sendable { let HostIp: String; let HostPort: String }
+    public struct EndpointResponse: Codable, Sendable {
+        let IPAMConfig: [String: String]?; let Links: [String]?; let Aliases: [String]
+        let NetworkID: String; let EndpointID: String; let Gateway: String
+        let IPAddress: String; let IPPrefixLen: Int; let IPv6Gateway: String
+        let GlobalIPv6Address: String; let GlobalIPv6PrefixLen: Int; let MacAddress: String
+        let DNSNames: [String]
+    }
 
-    init(_ record: ContainerRecord) {
+    init(_ record: ContainerRecord, networks: [NetworkRecord] = []) {
         let formatter = ISO8601DateFormatter()
         Id = record.id; Name = "/\(record.name)"; Created = formatter.string(from: record.createdAt)
         Path = record.processArguments.first ?? ""; Args = Array(record.processArguments.dropFirst()); Image = record.image
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z")
         Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels)
         RestartCount = record.restartCount
+        let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
+        let endpoints = record.networks.reduce(into: [String: EndpointResponse]()) { result, endpoint in
+            let network = networkByID[endpoint.networkID]
+            let name = network?.name ?? endpoint.networkID
+            let aliases = Array(Set([record.name, record.hostname] + endpoint.aliases)).sorted()
+            result[name] = .init(
+                IPAMConfig: nil, Links: nil, Aliases: aliases, NetworkID: endpoint.networkID,
+                EndpointID: "\(record.id)-\(endpoint.networkID)", Gateway: network?.gateway ?? "",
+                IPAddress: endpoint.ipv4Address ?? "", IPPrefixLen: 24, IPv6Gateway: "",
+                GlobalIPv6Address: endpoint.ipv6Address ?? "", GlobalIPv6PrefixLen: 0,
+                MacAddress: "", DNSNames: aliases
+            )
+        }
+        let ports = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {
+            Optional($0.map { PortBindingResponse(HostIp: $0.hostIP, HostPort: String($0.hostPort)) })
+        }
+        NetworkSettings = .init(Bridge: "", SandboxID: record.id, HairpinMode: false, Ports: ports, Networks: endpoints)
     }
 }

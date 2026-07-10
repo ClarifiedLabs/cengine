@@ -3,6 +3,16 @@ import CEngineRuntime
 import Foundation
 
 public struct DockerErrorBody: Codable, Sendable { public let message: String }
+public struct DockerEventResponse: Encodable, Sendable {
+    public let status: String; public let id: String; public let `Type`: String; public let Action: String
+    public let Actor: ActorResponse; public let time: Int64; public let timeNano: Int64
+    public struct ActorResponse: Encodable, Sendable { public let ID: String; public let Attributes: [String: String] }
+    public init(_ event: RuntimeEvent) {
+        status = event.action; id = event.id; Type = event.type; Action = event.action
+        Actor = .init(ID: event.id, Attributes: event.attributes)
+        time = Int64(event.date.timeIntervalSince1970); timeNano = Int64(event.date.timeIntervalSince1970 * 1_000_000_000)
+    }
+}
 
 public struct DockerVersionResponse: Encodable, Sendable {
     public let Platform: PlatformInfo
@@ -147,7 +157,7 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Created: Int64
     public let State: String
     public let Status: String
-    public let Ports: [String]
+    public let Ports: [Port]
     public let Labels: [String: String]
 
     public init(_ record: ContainerRecord) {
@@ -155,7 +165,12 @@ public struct ContainerSummaryResponse: Codable, Sendable {
         Command = record.processArguments.joined(separator: " "); Created = Int64(record.createdAt.timeIntervalSince1970)
         State = record.phase.rawValue
         Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
-        Ports = []; Labels = record.labels
+        Ports = record.ports.map { .init(IP: $0.hostIP, PrivatePort: $0.containerPort, PublicPort: $0.hostPort, Type: $0.proto) }
+        Labels = record.labels
+    }
+
+    public struct Port: Codable, Sendable {
+        public let IP: String; public let PrivatePort: UInt16; public let PublicPort: UInt16; public let `Type`: String
     }
 }
 
@@ -218,9 +233,24 @@ public struct ImageSummaryResponse: Encodable, Sendable {
 public struct ImageInspectResponse: Encodable, Sendable {
     public let Id: String; public let RepoTags: [String]; public let RepoDigests: [String]
     public let Created: String; public let Architecture: String; public let Os: String; public let Size: Int64
+    public let Config: ConfigResponse
+    public let RootFS: RootFSResponse
+    public struct ConfigResponse: Encodable, Sendable {
+        public let Env: [String] = []
+        public let Cmd: [String]? = nil
+        public let Entrypoint: [String]? = nil
+        public let WorkingDir = ""
+        public let User = ""
+        public let Labels: [String: String] = [:]
+        public let ExposedPorts: [String: EmptyObject] = [:]
+        public let Volumes: [String: EmptyObject] = [:]
+    }
+    public struct RootFSResponse: Encodable, Sendable { public let `Type` = "layers"; public let Layers: [String] = [] }
+    public struct EmptyObject: Encodable, Sendable {}
     public init(_ image: ImageRecord) {
         Id = image.id; RepoTags = image.references; RepoDigests = []; Created = ISO8601DateFormatter().string(from: image.createdAt)
         Architecture = image.architecture; Os = image.os; Size = image.size
+        Config = .init(); RootFS = .init()
     }
 }
 

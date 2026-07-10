@@ -7,8 +7,11 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
     private let lock = NSLock()
     private let inputStream: AsyncStream<Data>
     private let inputContinuation: AsyncStream<Data>.Continuation
-    private var output: (@Sendable (Data) -> Void)?
-    private var outputClosed: (@Sendable () -> Void)?
+    private struct Subscriber: Sendable {
+        let output: @Sendable (Data) -> Void
+        let closed: @Sendable () -> Void
+    }
+    private var subscribers: [UUID: Subscriber] = [:]
     private var buffered: [Data] = []
     private var finished = false
     private let tty: Bool
@@ -30,32 +33,35 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
 
     public func writer(_ stream: OutputStream) -> any Writer { OutputWriter(bridge: self, stream: stream) }
 
+    @discardableResult
     public func attach(
+        replayBuffered: Bool = true,
         output: @escaping @Sendable (Data) -> Void,
         closed: @escaping @Sendable () -> Void
-    ) {
+    ) -> UUID {
+        let id = UUID()
         lock.lock()
-        self.output = output
-        self.outputClosed = closed
-        let pending = buffered
+        subscribers[id] = .init(output: output, closed: closed)
+        let pending = replayBuffered ? buffered : []
         buffered.removeAll(keepingCapacity: false)
         let alreadyFinished = finished
         lock.unlock()
         pending.forEach(output)
         if alreadyFinished { closed() }
+        return id
     }
 
-    public func detach() {
-        lock.withLock { output = nil; outputClosed = nil }
+    public func detach(_ id: UUID) {
+        lock.withLock { _ = subscribers.removeValue(forKey: id) }
     }
 
     public func finishOutput() {
         lock.lock()
         guard !finished else { lock.unlock(); return }
         finished = true
-        let close = outputClosed
+        let close = subscribers.values.map(\.closed)
         lock.unlock()
-        close?()
+        close.forEach { $0() }
     }
 
     public func logData() throws -> Data {
@@ -84,10 +90,10 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
                 try? handle.close()
             }
         }
-        let handler = output
-        if handler == nil { buffered.append(framed) }
+        let handlers = subscribers.values.map(\.output)
+        if handlers.isEmpty { buffered.append(framed) }
         lock.unlock()
-        handler?(framed)
+        handlers.forEach { $0(framed) }
     }
 }
 

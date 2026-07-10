@@ -38,6 +38,21 @@ private final class DataBox: @unchecked Sendable {
         #expect(Array(received.value) == [1, 0, 0, 0, 0, 0, 0, 2, 111, 107])
     }
 
+    @Test func containerIOBroadcastsToIndependentAttachments() throws {
+        let bridge = ContainerIOBridge(tty: true)
+        let first = DataBox()
+        let second = DataBox()
+        let firstID = bridge.attach(output: { first.append($0) }, closed: {})
+        _ = bridge.attach(output: { second.append($0) }, closed: {})
+        try bridge.writer(.stdout).write(Data("both".utf8))
+        #expect(first.value == Data("both".utf8))
+        #expect(second.value == Data("both".utf8))
+        bridge.detach(firstID)
+        try bridge.writer(.stdout).write(Data("-second".utf8))
+        #expect(first.value == Data("both".utf8))
+        #expect(second.value == Data("both-second".utf8))
+    }
+
     @Test func containerIOPersistsFramedLogs() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -11,6 +11,9 @@ public actor AppleContainerBackend: ContainerBackend {
     public static let defaultVminitReference = "ghcr.io/apple/containerization/vminit:0.37.0"
 
     private var manager: ContainerManager
+    private var network: VmnetNetwork
+    private var interfaces: [String: any Containerization.Interface] = [:]
+    private let portForwarder = PortForwarder()
     private var containers: [String: LinuxContainer] = [:]
     private var ioBridges: [String: ContainerIOBridge] = [:]
     private var waitTasks: [String: Task<Int32, Never>] = [:]
@@ -39,11 +42,13 @@ public actor AppleContainerBackend: ContainerBackend {
         try FileManager.default.createDirectory(at: volumeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        let network = try VmnetNetwork()
+        self.network = network
         self.manager = try await ContainerManager(
             kernel: Kernel(path: kernel, platform: .linuxArm),
             initfsReference: vminitReference,
             root: runtimeRoot,
-            network: try VmnetNetwork(),
+            network: nil,
             rosetta: rosetta
         )
     }
@@ -62,6 +67,9 @@ public actor AppleContainerBackend: ContainerBackend {
 
         let io = ContainerIOBridge(tty: record.tty, logURL: logRoot.appending(path: "\(record.id).log"))
         _ = try await manager.imageStore.get(reference: record.image, pull: true)
+        if interfaces[record.id] == nil {
+            interfaces[record.id] = try network.createInterface(record.id)
+        }
         preparedRecords[record.id] = record
         ioBridges[record.id] = io
     }
@@ -70,6 +78,14 @@ public actor AppleContainerBackend: ContainerBackend {
         guard let io = ioBridges[record.id] else { throw EngineError(.notFound, "container I/O is unavailable") }
         let volumeRoot = self.volumeRoot
         let staged = stagedCopies[record.id] ?? []
+        guard let interface = interfaces[record.id] else { throw EngineError(.internalError, "container network is unavailable") }
+        let networkIDs = Set(record.networks.map(\.networkID))
+        let peerHosts = preparedRecords.values.compactMap { peer -> Hosts.Entry? in
+            guard peer.id != record.id, !networkIDs.isDisjoint(with: peer.networks.map(\.networkID)),
+                  let peerInterface = interfaces[peer.id] else { return nil }
+            let aliases = Set([peer.name, peer.hostname] + peer.networks.flatMap(\.aliases))
+            return Hosts.Entry(ipAddress: peerInterface.ipv4Address.address.description, hostnames: aliases.sorted())
+        }
         var manager = self.manager
         let image = try await manager.imageStore.get(reference: record.image, pull: true)
         let imageConfig = try await image.config(for: .current).config
@@ -79,12 +95,15 @@ public actor AppleContainerBackend: ContainerBackend {
             reference: record.image,
             rootfsSizeInBytes: max(record.memoryBytes * 4, 8 * 1_024 * 1_024 * 1_024),
             readOnly: record.readOnlyRootfs,
-            networking: true
+            networking: false
         ) { config in
             config.cpus = max(record.cpus, 1)
             config.memoryInBytes = max(record.memoryBytes, 256 * 1_024 * 1_024)
             config.hostname = record.hostname
             config.useInit = record.useInit
+            config.interfaces = [interface]
+            if let gateway = interface.ipv4Gateway { config.dns = .init(nameservers: [gateway.description]) }
+            config.hosts = Hosts(entries: Hosts.default.entries + peerHosts)
             config.process.arguments = resolvedArguments
             if !record.environment.isEmpty { config.process.environmentVariables.append(contentsOf: record.environment) }
             if !config.process.environmentVariables.contains(where: { $0.hasPrefix("PATH=") }) {
@@ -143,6 +162,17 @@ public actor AppleContainerBackend: ContainerBackend {
         containers[record.id] = container
         try await container.create()
         try await container.start()
+        if !record.ports.isEmpty, let interface = interfaces[record.id] {
+            do {
+                try await portForwarder.start(
+                    containerID: record.id, guestAddress: interface.ipv4Address.address.description,
+                    bindings: record.ports
+                )
+            } catch {
+                try? await container.stop()
+                throw error
+            }
+        }
         let io = ioBridges[record.id]
         waitTasks[record.id] = Task {
             do {
@@ -178,6 +208,7 @@ public actor AppleContainerBackend: ContainerBackend {
             status = try await container.wait(timeoutInSeconds: 5)
         }
         try await container.stop()
+        portForwarder.stop(containerID: record.id)
         return status.exitCode
     }
 
@@ -185,9 +216,12 @@ public actor AppleContainerBackend: ContainerBackend {
         if let container = containers.removeValue(forKey: record.id) {
             try? await container.stop()
         }
+        portForwarder.stop(containerID: record.id)
         waitTasks.removeValue(forKey: record.id)?.cancel()
         ioBridges.removeValue(forKey: record.id)?.finishOutput()
         preparedRecords.removeValue(forKey: record.id)
+        interfaces.removeValue(forKey: record.id)
+        try? network.releaseInterface(record.id)
         stagedCopies.removeValue(forKey: record.id)
         try? FileManager.default.removeItem(at: stagingRoot.appending(path: record.id))
         try? FileManager.default.removeItem(at: logRoot.appending(path: "\(record.id).log"))
@@ -202,6 +236,10 @@ public actor AppleContainerBackend: ContainerBackend {
     public func resize(_ record: ContainerRecord, width: UInt16, height: UInt16) async throws {
         guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
         try await container.resize(to: Terminal.Size(width: width, height: height))
+    }
+
+    public func ipv4Address(for record: ContainerRecord) async -> String? {
+        interfaces[record.id]?.ipv4Address.address.description
     }
 
     public func completion(_ record: ContainerRecord) async -> Int32? {
