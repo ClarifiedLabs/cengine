@@ -1,7 +1,8 @@
 # Release Process
 
-cengine releases are signed, notarized `.pkg` installers published to GitHub
-Releases and `ClarifiedLabs/homebrew-tap`.
+cengine releases include signed, notarized `.pkg` installers for direct
+downloads and `.dmg` images used by Homebrew. Both are published to GitHub
+Releases; the DMG is also referenced by `ClarifiedLabs/homebrew-tap`.
 
 ## Workflows
 
@@ -9,9 +10,9 @@ Releases and `ClarifiedLabs/homebrew-tap`.
 `release.yml` runs for `release-ci`, `v*.*.*` tags, and manual dispatch. It waits
 for a successful test run for the same commit before packaging.
 
-`release-ci` exercises the full signing and notarization path and uploads the
-package as an Actions artifact. It does not create a GitHub Release or update
-Homebrew. Tag runs publish both.
+`release-ci` exercises the full signing and notarization paths and uploads both
+artifacts to Actions. It does not create a GitHub Release or update Homebrew.
+Tag runs publish both artifacts and update the Homebrew cask to use the DMG.
 
 ## Required Secrets
 
@@ -34,8 +35,8 @@ The Homebrew GitHub App must have Contents read/write access to
 git push origin HEAD:release-ci
 ```
 
-The resulting `cengine-<version>.pkg` artifact must pass `pkgutil` signature
-inspection, stapler validation, and Gatekeeper assessment.
+The resulting `cengine-<version>.pkg` and `cengine-<version>.dmg` artifacts must
+pass signature inspection, stapler validation, and Gatekeeper assessment.
 
 ## Create a Release
 
@@ -57,7 +58,12 @@ For a local payload-only package:
 ```bash
 make package
 pkgutil --payload-files dist/cengine-0.0.1.pkg
+hdiutil verify dist/cengine-0.0.1.dmg
 ```
 
 After installation, each user runs `cengine system install` to install their
 LaunchAgent, kernel, Docker context, and Buildx builder.
+
+The PKG installs directly into `/usr/local/bin` and therefore requests
+administrator authorization. Homebrew stages the executable from the DMG in
+its Caskroom and links it into the Homebrew prefix without administrator access.

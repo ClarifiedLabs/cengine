@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/dist}"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/.build/release}"
 PAYLOAD_ROOT="$BUILD_DIR/payload"
+DMG_ROOT="$BUILD_DIR/dmg"
 PROJECT_PATH="$ROOT_DIR/cengine.xcodeproj"
 DERIVED_DATA_PATH="${XCODE_DERIVED_DATA:-$ROOT_DIR/.build/xcode-derived}"
 SOURCE_PACKAGES_PATH="${XCODE_SOURCE_PACKAGES:-$ROOT_DIR/.build/xcode-source-packages}"
@@ -81,9 +82,10 @@ PRODUCT="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/$PRODUCT_NAME"
 require_file "$PRODUCT" "cengine product"
 
 rm -rf "$BUILD_DIR"
-mkdir -p "$OUTPUT_DIR" "$PAYLOAD_ROOT/usr/local/bin"
+mkdir -p "$OUTPUT_DIR" "$PAYLOAD_ROOT/usr/local/bin" "$DMG_ROOT"
 CLI_PATH="$PAYLOAD_ROOT/usr/local/bin/$PRODUCT_NAME"
 PKG_PATH="$OUTPUT_DIR/cengine-$VERSION.pkg"
+DMG_PATH="$OUTPUT_DIR/cengine-$VERSION.dmg"
 ditto --norsrc --noextattr "$PRODUCT" "$CLI_PATH"
 xattr -cr "$PAYLOAD_ROOT"
 
@@ -107,6 +109,8 @@ fi
 actual_version="$($CLI_PATH version)"
 [[ "$actual_version" == "cengine $VERSION" ]] || { echo "Built binary reported unexpected version: $actual_version" >&2; exit 1; }
 
+ditto --norsrc --noextattr "$CLI_PATH" "$DMG_ROOT/$PRODUCT_NAME"
+
 component_pkg="$BUILD_DIR/cengine-component.pkg"
 unsigned_pkg="$BUILD_DIR/cengine-$VERSION.unsigned.pkg"
 pkgbuild \
@@ -127,6 +131,22 @@ if enabled "$SIGN_RELEASE"; then
 else
   mv "$unsigned_pkg" "$PKG_PATH"
 fi
+
+hdiutil create \
+  -volname "$PRODUCT_NAME" \
+  -srcfolder "$DMG_ROOT" \
+  -format UDZO \
+  -ov \
+  "$DMG_PATH"
+
+if enabled "$SIGN_RELEASE"; then
+  codesign --force \
+    --timestamp \
+    --sign "$developer_id_application" \
+    "$DMG_PATH"
+  codesign --verify --strict --verbose=2 "$DMG_PATH"
+fi
+hdiutil verify "$DMG_PATH"
 
 if enabled "$NOTARIZE_RELEASE"; then
   notarytool_args=()
@@ -149,10 +169,14 @@ if enabled "$NOTARIZE_RELEASE"; then
     exit 2
   fi
 
-  xcrun notarytool submit "$PKG_PATH" --wait "${notarytool_args[@]}"
-  xcrun stapler staple "$PKG_PATH"
-  xcrun stapler validate "$PKG_PATH"
+  for artifact in "$PKG_PATH" "$DMG_PATH"; do
+    xcrun notarytool submit "$artifact" --wait "${notarytool_args[@]}"
+    xcrun stapler staple "$artifact"
+    xcrun stapler validate "$artifact"
+  done
   spctl --assess --type install --verbose=4 "$PKG_PATH"
+  spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
 fi
 
 echo "Built $PKG_PATH"
+echo "Built $DMG_PATH"

@@ -14,6 +14,8 @@ def main() -> None:
         '--options runtime', 'productsign --sign', 'notarytool submit',
         'stapler staple', 'spctl --assess --type install', 'verify-entitlements.sh',
         "sed -nE 's/.*MARKETING_VERSION", 'xattr -cr "$PAYLOAD_ROOT"',
+        'DMG_PATH="$OUTPUT_DIR/cengine-$VERSION.dmg"', 'hdiutil create',
+        'hdiutil verify', 'spctl --assess --type open',
     ):
         require_contains(script, needle, "package-release.sh")
     require_contains(entitlements, "com.apple.security.virtualization", "cengine.entitlements")

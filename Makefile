@@ -30,7 +30,7 @@ help:
 		'make test          Run the Xcode test suite' \
 		'make test-compat  Run Docker API and Compose compatibility tests against an isolated daemon' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
-		'make package       Build a local unsigned installer package for payload testing' \
+		'make package       Build local unsigned PKG and DMG release artifacts' \
 		'make release       Create a GitHub release tag (VERSION=patch|minor|major|X.Y.Z)' \
 		'make release-list  List the current release tag' \
 		'make test-release  Run release tooling regression checks' \

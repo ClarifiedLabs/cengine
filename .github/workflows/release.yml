@@ -97,7 +97,7 @@ jobs:
           PY
 
   build:
-    name: Build notarized package
+    name: Build notarized release artifacts
     needs: require-tests
     runs-on: macos-26
     timeout-minutes: 90
@@ -194,7 +194,7 @@ jobs:
           xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme "$SCHEME" \
             -clonedSourcePackagesDirPath "$PWD/$XCODE_SOURCE_PACKAGES_PATH" \
             -derivedDataPath "$PWD/$XCODE_DERIVED_DATA_PATH" -skipPackagePluginValidation
-      - name: Build signed notarized package
+      - name: Build signed notarized release artifacts
         env:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -205,11 +205,13 @@ jobs:
           XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
           XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
           ./Scripts/package-release.sh
-      - name: Upload package artifact
+      - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cengine-${{ steps.version.outputs.version }}.pkg
-          path: dist/cengine-${{ steps.version.outputs.version }}.pkg
+          name: cengine-${{ steps.version.outputs.version }}
+          path: |
+            dist/cengine-${{ steps.version.outputs.version }}.pkg
+            dist/cengine-${{ steps.version.outputs.version }}.dmg
           if-no-files-found: error
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -219,11 +221,12 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           package="dist/cengine-${VERSION}.pkg"
+          disk_image="dist/cengine-${VERSION}.dmg"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$package" --clobber
+            gh release upload "$tag" "$package" "$disk_image" --clobber
           else
-            gh release create "$tag" "$package" --title "cengine ${VERSION}" \
-              --notes "Download and open the signed, notarized installer package below." --verify-tag
+            gh release create "$tag" "$package" "$disk_image" --title "cengine ${VERSION}" \
+              --notes "Use the signed, notarized package for direct installation, or install the disk image through Homebrew without administrator access." --verify-tag
           fi
       - name: Cleanup
         if: always()
@@ -258,10 +261,10 @@ jobs:
           repository: ClarifiedLabs/homebrew-tap
           token: ${{ steps.tap-token.outputs.token }}
           path: homebrew-tap
-      - name: Download package
+      - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: cengine-${{ needs.build.outputs.version }}.pkg
+          name: cengine-${{ needs.build.outputs.version }}
           path: package
       - name: Update cask
         env:
@@ -269,7 +272,7 @@ jobs:
           TAP_DIR: ${{ github.workspace }}/homebrew-tap
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          PKG_SHA256="$(sha256sum "package/cengine-${VERSION}.pkg" | awk '{print $1}')" source/Scripts/homebrew-cask.sh
+          DMG_SHA256="$(sha256sum "package/cengine-${VERSION}.dmg" | awk '{print $1}')" source/Scripts/homebrew-cask.sh
       - name: Commit tap update
         env:
           TAG: ${{ github.ref_name }}

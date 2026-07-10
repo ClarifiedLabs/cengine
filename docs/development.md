@@ -13,7 +13,8 @@ make package
 
 `make test` runs `CEngineCoreTests` and `CEngineAPITests` through the shared
 `cengine` scheme. `make dist-cli` runs the tests and stages `dist/cengine`.
-`make package` creates `dist/cengine-0.0.1.pkg` for local payload testing.
+`make package` creates `dist/cengine-0.0.1.pkg` and
+`dist/cengine-0.0.1.dmg` for local release-artifact testing.
 
 `make test-compat` builds the debug daemon, creates a cached Python virtual
 environment under `.build`, and runs the Docker API and Docker Compose 5.3.1
@@ -91,8 +92,10 @@ DOCKER_HOST=unix://$HOME/.cengine/run/docker.sock docker info
 
 ## Releases
 
-Public releases are Developer ID signed, notarized, stapled `.pkg` installers
-published through GitHub Releases and `ClarifiedLabs/homebrew-tap`. See
+Public releases include Developer ID signed, notarized, stapled `.pkg`
+installers for direct download and `.dmg` images used by Homebrew without
+administrator access. They are published through GitHub Releases and
+`ClarifiedLabs/homebrew-tap`. See
 [`release.md`](release.md) for the release process.
 
 Note: this project was created as part of testing gpt-5.6-sol. Planning used

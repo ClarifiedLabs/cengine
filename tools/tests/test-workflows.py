@@ -12,7 +12,7 @@ def main() -> None:
         "- release-ci", "v*.*.*", "require-tests:", "needs: require-tests",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
-        "Upload package artifact",
+        "Upload release artifacts", ".pkg", ".dmg", "DMG_SHA256",
     ):
         require_contains(release, needle, "release.yml")
     for forbidden in ("draft: true", "--draft", "TestFlight"):
