@@ -314,6 +314,17 @@ public actor AppleContainerBackend: ContainerBackend {
         try await container.copyOut(from: URL(filePath: source), to: destination)
     }
 
+    public func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage] {
+        let images = try await manager.imageStore.load(from: directory)
+        return try await images.asyncMap { image in
+            let config = try await image.config(for: .current)
+            return BackendImage(
+                id: image.digest, reference: image.reference, size: image.descriptor.size,
+                architecture: config.architecture, os: config.os
+            )
+        }
+    }
+
     private static func parseUser(_ value: String) -> ContainerizationOCI.User {
         guard !value.isEmpty else { return ContainerizationOCI.User() }
         let components = value.split(separator: ":", maxSplits: 1).map(String.init)
@@ -321,6 +332,14 @@ public actor AppleContainerBackend: ContainerBackend {
             return ContainerizationOCI.User(uid: uid, gid: components.count == 2 ? UInt32(components[1]) ?? uid : uid)
         }
         return ContainerizationOCI.User(username: value)
+    }
+}
+
+private extension Sequence {
+    func asyncMap<T>(_ transform: (Element) async throws -> T) async rethrows -> [T] {
+        var result: [T] = []
+        for element in self { result.append(try await transform(element)) }
+        return result
     }
 }
 #endif

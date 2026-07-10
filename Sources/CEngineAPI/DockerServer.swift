@@ -14,7 +14,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var body = ByteBuffer()
     private let maximumBodyBytes: Int
 
-    public init(router: DockerRouter, maximumBodyBytes: Int = 32 * 1024 * 1024) {
+    public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
         self.router = router; self.maximumBodyBytes = maximumBodyBytes
     }
 

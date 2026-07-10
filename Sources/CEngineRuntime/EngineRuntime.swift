@@ -16,7 +16,7 @@ public struct EngineSnapshot: Codable, Sendable {
 }
 
 public actor EngineRuntime {
-    private var snapshot: EngineSnapshot
+    var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
     let backend: any ContainerBackend
     private var execs: [String: ExecRecord] = [:]
@@ -272,7 +272,7 @@ public actor EngineRuntime {
         return index
     }
 
-    private func persist() async throws { try await store.save(snapshot) }
+    func persist() async throws { try await store.save(snapshot) }
 
     private func monitorContainer(_ identifier: String) async {
         guard let record = try? container(identifier), let code = await backend.completion(record) else { return }

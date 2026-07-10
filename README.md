@@ -2,7 +2,7 @@
 
 `cengine` is an experimental, lightweight Docker Engine-compatible daemon for Apple silicon. It accepts Docker Engine API v1.44 requests on a user-owned Unix socket and runs Linux containers as lightweight virtual machines through Apple's [Containerization](https://github.com/apple/containerization) package.
 
-This repository is an early functional MVP, not yet a replacement for Docker Desktop. The daemon can pull and manage images, create/start/stop/remove containers, and persist container, volume, and network metadata. The API surface required for interactive attach, logs, exec, archive copy, health checks, port forwarding, and a Buildx container is still being implemented.
+This repository is an early functional MVP, not yet a replacement for Docker Desktop. It supports interactive containers, exec, logs, archive copy, image import, and a managed Buildx container, but substantial networking, observability, recovery, and Compose work remains.
 
 ## Requirements
 
@@ -74,7 +74,7 @@ State is JSON with an explicit schema envelope and atomic rename/fsync persisten
 
 ## Current compatibility
 
-Implemented API groups include server ping/version/info; image pull/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; interactive and non-interactive attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable non-following container logs; safe bidirectional archive copy before and after container start; bind, volume, and tmpfs mounts; Docker-shaped network and volume create/list/inspect/remove lifecycle; and a working managed Buildx container driver for local and pushed outputs. Direct `docker build` intentionally returns a message directing clients to Buildx.
+Implemented API groups include server ping/version/info; image pull/import/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; interactive and non-interactive attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable non-following container logs; safe bidirectional archive copy before and after container start; bind, volume, and tmpfs mounts; Docker-shaped network and volume create/list/inspect/remove lifecycle; and a working managed Buildx container driver with local, pushed, and Docker `--load` outputs. Direct `docker build` intentionally returns a message directing clients to Buildx.
 
 Known gaps:
 
@@ -84,7 +84,7 @@ Known gaps:
 - Network connect/disconnect, prune, and anonymous-volume lifecycle
 - Health checks, events, stats, top, restart, pause/unpause, update, and resource pruning
 - Complete image metadata/store synchronization, registry authentication, history, and real pull progress
-- Docker image import/load for Buildx's default `--load` behavior and Compose compatibility validation
+- Compose compatibility validation beyond the Buildx container path
 - Full `linux/amd64` image selection; the VM enables Rosetta, but the current Apple `ContainerManager` convenience pull path selects the host platform
 - Recovery or cleanup of live VM handles after daemon restart (persisted running containers are conservatively marked exited)
 

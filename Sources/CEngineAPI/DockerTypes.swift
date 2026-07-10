@@ -35,7 +35,7 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let ContainersStopped: Int
     public let Images = 0
     public let Driver = "apple-containerization"
-    public let DriverStatus = [["driver-type", "io.containerd.snapshotter.v1"]]
+    public let DriverStatus = [[String]]()
     public let DockerRootDir: String
     public let Name = Host.current().localizedName ?? "mac"
     public let ServerVersion = "0.1.0"

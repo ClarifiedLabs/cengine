@@ -22,6 +22,7 @@ public protocol ContainerBackend: Sendable {
     func resizeExec(_ exec: ExecRecord, width: UInt16, height: UInt16) async throws
     func copyIn(_ container: ContainerRecord, extractedDirectory: URL, destination: String) async throws
     func copyOut(_ container: ContainerRecord, source: String, destinationDirectory: URL) async throws
+    func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage]
 }
 
 public extension ContainerBackend {
@@ -46,6 +47,9 @@ public extension ContainerBackend {
     }
     func copyOut(_: ContainerRecord, source _: String, destinationDirectory _: URL) async throws {
         throw EngineError(.unsupported, "archive copy is unavailable for this backend")
+    }
+    func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
+        throw EngineError(.unsupported, "image import is unavailable for this backend")
     }
 }
 

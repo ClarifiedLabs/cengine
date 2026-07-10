@@ -209,6 +209,10 @@ public struct DockerRouter: Sendable {
             _ = try await runtime.pullImage(fullReference, platform: platform)
             let progress = "{\"status\":\"Pull complete\",\"id\":\"\(fullReference)\"}\n"
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(progress.utf8))
+        case (.POST, "/images/load"):
+            let images = try await runtime.loadImages(archive: request.body)
+            let output = images.map { "{\"stream\":\"Loaded image: \($0.references.first ?? $0.id)\\n\"}\n" }.joined()
+            return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/images/".count).dropLast("/json".count)).removingPercentEncoding ?? value
             return json(status: .ok, ImageInspectResponse(try await runtime.image(id)))

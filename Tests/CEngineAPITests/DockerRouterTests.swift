@@ -35,6 +35,15 @@ private actor CompletionBackend: ContainerBackend {
     func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge { try #require(execBridges[exec.id]) }
     func execPID(_: ExecRecord) async -> Int32 { 42 }
     func execStatus(_: ExecRecord) async -> Int32? { 0 }
+    func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
+        [BackendImage(
+            id: "sha256:0123456789abcdef",
+            reference: "docker.io/example/imported:latest",
+            size: 123,
+            architecture: "arm64",
+            os: "linux"
+        )]
+    }
 }
 
 private actor BlockingStartBackend: ContainerBackend {
@@ -185,6 +194,41 @@ private actor BlockingStartBackend: ContainerBackend {
         #expect(inspect.status == .ok)
         let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/images/docker.io/library/alpine:latest", body: Data()))
         #expect(remove.status == .ok)
+    }
+
+    @Test func loadImportsDockerArchiveAndMakesImageVisible() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = root.appending(path: "layout")
+        try FileManager.default.createDirectory(at: layout, withIntermediateDirectories: true)
+        try Data(#"{"imageLayoutVersion":"1.0.0"}"#.utf8).write(to: layout.appending(path: "oci-layout"))
+        let archive = root.appending(path: "image.tar")
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-cf", archive.path, "-C", layout.path, "."]
+        try tar.run()
+        tar.waitUntilExit()
+        #expect(tar.terminationStatus == 0)
+
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend())
+        let router = DockerRouter(runtime: runtime, root: root)
+        let response = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/images/load",
+            body: try Data(contentsOf: archive)
+        ))
+        #expect(response.status == .ok)
+        #expect(String(decoding: response.body, as: UTF8.self).contains("docker.io/example/imported:latest"))
+
+        let inspect = await router.route(.init(
+            method: .GET,
+            uri: "/v1.44/images/docker.io/example/imported:latest/json",
+            body: Data()
+        ))
+        #expect(inspect.status == .ok)
+        let image = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(image["Architecture"] as? String == "arm64")
+        #expect(image["Os"] as? String == "linux")
     }
 
     @Test func detachedExitIsReconciledAndLogsAreServed() async throws {
