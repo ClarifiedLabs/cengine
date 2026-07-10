@@ -14,7 +14,7 @@ XCODE_RESULT_BUNDLE ?=
 XCODE_COMMON_FLAGS = -clonedSourcePackagesDirPath "$(XCODE_SOURCE_PACKAGES)" -skipPackagePluginValidation -skipMacroValidation
 XCODE_RESULT_BUNDLE_FLAGS = $(if $(XCODE_RESULT_BUNDLE),-resultBundlePath "$(XCODE_RESULT_BUNDLE)",)
 
-.PHONY: all build test test-docker-py dist-cli package release release-list test-release clean help
+.PHONY: all build test test-compat dist-cli package release release-list test-release clean help
 
 all: dist-cli
 
@@ -23,7 +23,7 @@ help:
 		'make               Run tests and build the signed dist/cengine binary' \
 		'make build         Build cengine in debug mode with xcodebuild' \
 		'make test          Run the Xcode test suite' \
-		'make test-docker-py Run Docker SDK compatibility tests against an isolated daemon' \
+		'make test-compat  Run Docker API and Compose compatibility tests against an isolated daemon' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
 		'make package       Build a local unsigned installer package for payload testing' \
 		'make release       Create a GitHub release tag (VERSION=patch|minor|major|X.Y.Z)' \
@@ -37,10 +37,10 @@ build:
 test:
 	$(XCODEBUILD) -project "$(XCODE_PROJECT)" -scheme cengine -configuration Debug -derivedDataPath "$(XCODE_DERIVED_DATA)" $(XCODE_COMMON_FLAGS) -destination '$(XCODE_DESTINATION)' $(XCODE_RESULT_BUNDLE_FLAGS) test
 
-test-docker-py: build
-	@python3 -m venv .build/docker-py-venv
-	@.build/docker-py-venv/bin/pip install --disable-pip-version-check -q -r Tests/DockerPyCompat/requirements.txt
-	@.build/docker-py-venv/bin/python -m pytest -c Tests/DockerPyCompat/pytest.ini Tests/DockerPyCompat
+test-compat: build
+	@python3 -m venv .build/compat-venv
+	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
+	@.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility
 
 dist-cli: test
 	XCODE_DERIVED_DATA="$(XCODE_DERIVED_DATA)" XCODE_SOURCE_PACKAGES="$(XCODE_SOURCE_PACKAGES)" ./Scripts/build-release.sh

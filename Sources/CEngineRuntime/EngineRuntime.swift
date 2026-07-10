@@ -337,6 +337,18 @@ public actor EngineRuntime {
         emit(containerEvent("destroy", removed))
     }
 
+    public func renameContainer(_ identifier: String, name: String) async throws {
+        guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid container name: \(name)") }
+        let normalized = name.normalizedContainerName
+        let index = try containerIndex(identifier)
+        guard !snapshot.containers.indices.contains(where: { $0 != index && snapshot.containers[$0].name == normalized }) else {
+            throw EngineError(.conflict, "Conflict. The container name \"/\(normalized)\" is already in use.")
+        }
+        snapshot.containers[index].name = normalized
+        try await persist()
+        emit(containerEvent("rename", snapshot.containers[index]))
+    }
+
     public func listNetworks() -> [NetworkRecord] { snapshot.networks }
     public func listVolumes() -> [VolumeRecord] { snapshot.volumes }
 
@@ -401,6 +413,36 @@ public actor EngineRuntime {
         for reference in image.references { try await backend.deleteImage(reference: reference) }
         snapshot.images.removeAll { $0.id == image.id }
         try await persist()
+    }
+
+    public func tagImage(_ identifier: String, reference: String) async throws {
+        let image = try image(identifier)
+        let normalized = ImageReference.normalized(reference)
+        guard let existing = image.references.first else { throw EngineError(.notFound, "No such image: \(identifier)") }
+        try await backend.tagImage(existing: existing, new: normalized)
+        if let backendImages = try await backend.listImages() {
+            snapshot.images = Self.imageRecords(from: backendImages)
+        } else if let index = snapshot.images.firstIndex(where: { $0.id == image.id }),
+                  !snapshot.images[index].references.contains(normalized) {
+            snapshot.images[index].references.append(normalized)
+        }
+        try await persist()
+    }
+
+    public func pushImage(_ identifier: String, credentials: RegistryCredentials?) async throws {
+        let image = try image(identifier)
+        let normalized = ImageReference.normalized(identifier)
+        let reference = image.references.first(where: { $0 == identifier || $0 == normalized }) ?? normalized
+        try await backend.pushImage(
+            reference: reference, platform: "\(image.os)/\(image.architecture)", credentials: credentials
+        )
+    }
+
+    public func saveImage(_ identifier: String) async throws -> Data {
+        let image = try image(identifier)
+        return try await backend.saveImages(
+            references: [ImageReference.normalized(identifier)], platform: "\(image.os)/\(image.architecture)"
+        )
     }
 
     public func createNetwork(name: String, subnet: String = "172.30.0.0/24", gateway: String = "172.30.0.1", labels: [String: String] = [:]) async throws -> NetworkRecord {

@@ -1,4 +1,4 @@
-"""Docker SDK image compatibility tests adapted from Podman's suite."""
+"""Docker image API compatibility contracts, seeded from Podman's suite."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ BUSYBOX = "busybox:latest"
 KNOWN_GAP = pytest.mark.xfail(strict=True)
 
 
-@KNOWN_GAP(reason="IMG-001: image tagging endpoint is not implemented")
 @pytest.mark.compat("IMG-001")
 def test_tag_valid_image(client: docker.DockerClient):
     image = client.images.get(IMAGE)
@@ -24,7 +23,6 @@ def test_tag_valid_image(client: docker.DockerClient):
     assert any("alpine" in tag for tag in client.images.get(IMAGE).tags)
 
 
-@KNOWN_GAP(reason="IMG-002: image retagging endpoint is not implemented")
 @pytest.mark.compat("IMG-002")
 def test_retag_valid_image(client: docker.DockerClient):
     image = client.images.get(IMAGE)
@@ -32,7 +30,6 @@ def test_retag_valid_image(client: docker.DockerClient):
     assert "demo:test" not in client.images.get(IMAGE).tags
 
 
-@KNOWN_GAP(reason="IMG-003: image list reference filters are not implemented")
 @pytest.mark.compat("IMG-003")
 def test_list_images(client: docker.DockerClient):
     assert len(client.images.list(filters={"reference": "alpine"})) == 1
@@ -73,13 +70,11 @@ def test_get_image_exists_not(client: docker.DockerClient):
         client.images.get("image_does_not_exist")
 
 
-@KNOWN_GAP(reason="IMG-009: Docker image save/export is not implemented")
 @pytest.mark.compat("IMG-009")
 def test_save_image(client: docker.DockerClient):
     assert b"".join(client.images.get(IMAGE).save(named=True))
 
 
-@KNOWN_GAP(reason="IMG-010: Docker image save/load round trips are not implemented")
 @pytest.mark.compat("IMG-010")
 def test_load_image(client: docker.DockerClient):
     archive = b"".join(client.images.get(IMAGE).save(named=True))
@@ -105,8 +100,9 @@ def test_build_image_via_api_client(client: docker.DockerClient):
         assert "errorDetail" not in json.loads(line)
 
 
-@KNOWN_GAP(reason="IMG-014: image push is not implemented")
 @pytest.mark.compat("IMG-014")
 def test_push_error(client: docker.DockerClient):
+    client.images.get(IMAGE).tag("non-existent.lan:5000/alpine", "latest")
     response = client.images.push("non-existent.lan:5000/alpine", "latest")
-    assert "no such host" in response
+    assert "non-existent.lan" in response
+    assert "resolve" in response.lower() or "no such host" in response.lower()

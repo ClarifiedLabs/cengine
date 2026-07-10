@@ -1,4 +1,4 @@
-"""Docker SDK container compatibility tests adapted from Podman's suite."""
+"""Docker container API compatibility contracts, seeded from Podman's suite."""
 
 from __future__ import annotations
 
@@ -185,3 +185,22 @@ def test_container_inspect_compatibility(client: docker.DockerClient, top):
     required_host_config = {"Binds", "Mounts", "PortBindings", "LogConfig", "NetworkMode"}
     assert required_host_config <= inspect["HostConfig"].keys()
     assert {"Id", "Name", "State", "Config", "HostConfig", "Mounts", "NetworkSettings"} <= inspect.keys()
+
+
+@pytest.mark.compat("CTR-022")
+def test_rename_container(client: docker.DockerClient):
+    container = client.containers.create(image=IMAGE, name=f"before-{uuid.uuid4().hex[:8]}")
+    renamed = f"after-{uuid.uuid4().hex[:8]}"
+    container.rename(renamed)
+    container.reload()
+    assert container.name == renamed
+    assert client.containers.get(renamed).id == container.id
+
+
+@pytest.mark.compat("CTR-023")
+def test_rename_container_name_conflict(client: docker.DockerClient):
+    first = client.containers.create(image=IMAGE, name=f"first-{uuid.uuid4().hex[:8]}")
+    second = client.containers.create(image=IMAGE, name=f"second-{uuid.uuid4().hex[:8]}")
+    with pytest.raises(errors.APIError) as caught:
+        second.rename(first.name)
+    assert caught.value.response.status_code == 409

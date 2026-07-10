@@ -60,7 +60,8 @@ public struct DockerRouter: Sendable {
         case (.GET, "/containers/json"):
             let all = parseBool(query["all"]) ?? false
             let containers = filteredContainers(await runtime.listContainers(all: all), filters: query["filters"])
-            return json(status: .ok, containers.map(ContainerSummaryResponse.init))
+            let networks = await runtime.listNetworks()
+            return json(status: .ok, containers.map { ContainerSummaryResponse($0, networks: networks) })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
@@ -193,6 +194,11 @@ public struct DockerRouter: Sendable {
             let id = String(value.dropFirst("/containers/".count).dropLast("/restart".count))
             try await runtime.restartContainer(id, timeoutSeconds: query["t"].flatMap(Int.init))
             return APIResponse(status: .noContent)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/rename"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/rename".count))
+            guard let name = query["name"], !name.isEmpty else { throw EngineError(.badRequest, "name is required") }
+            try await runtime.renameContainer(id, name: name)
+            return APIResponse(status: .noContent)
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/update"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/update".count))
             let input = try decoder.decode(ContainerUpdateRequest.self, from: request.body)
@@ -232,7 +238,7 @@ public struct DockerRouter: Sendable {
             try await runtime.removeContainer(id, force: parseBool(query["force"]) ?? false, removeVolumes: parseBool(query["v"]) ?? false)
             return APIResponse(status: .noContent)
         case (.GET, "/networks"):
-            return json(status: .ok, await runtime.listNetworks().map(DockerNetworkResponse.init))
+            return json(status: .ok, filteredNetworks(await runtime.listNetworks(), filters: query["filters"]).map(DockerNetworkResponse.init))
         case (.GET, let value) where value.hasPrefix("/networks/"):
             return json(status: .ok, DockerNetworkResponse(try await runtime.network(String(value.dropFirst("/networks/".count)))))
         case (.POST, "/networks/create"):
@@ -264,7 +270,7 @@ public struct DockerRouter: Sendable {
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):
-            return json(status: .ok, VolumeListEnvelope(Volumes: await runtime.listVolumes().map(DockerVolumeResponse.init), Warnings: []))
+            return json(status: .ok, VolumeListEnvelope(Volumes: filteredVolumes(await runtime.listVolumes(), filters: query["filters"]).map(DockerVolumeResponse.init), Warnings: []))
         case (.GET, let value) where value.hasPrefix("/volumes/"):
             return json(status: .ok, DockerVolumeResponse(try await runtime.volume(String(value.dropFirst("/volumes/".count)))))
         case (.POST, "/volumes/create"):
@@ -274,7 +280,7 @@ public struct DockerRouter: Sendable {
         case (.DELETE, let value) where value.hasPrefix("/volumes/"):
             try await runtime.removeVolume(String(value.dropFirst("/volumes/".count)), force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
         case (.GET, "/images/json"):
-            return json(status: .ok, await runtime.listImages().map(ImageSummaryResponse.init))
+            return json(status: .ok, filteredImages(await runtime.listImages(), filters: query["filters"]).map(ImageSummaryResponse.init))
         case (.POST, "/images/create"):
             let collector = PullProgressCollector()
             let image = try await pullImage(request, progress: { await collector.append($0) })
@@ -300,6 +306,28 @@ public struct DockerRouter: Sendable {
                     Size: entry.emptyLayer ? 0 : image.size, Comment: entry.comment
                 )
             })
+        case (.POST, let value) where value.hasPrefix("/images/") && value.hasSuffix("/tag"):
+            let id = String(value.dropFirst("/images/".count).dropLast("/tag".count)).removingPercentEncoding ?? value
+            guard let repository = query["repo"], !repository.isEmpty else { throw EngineError(.badRequest, "repo is required") }
+            let reference = query["tag"].flatMap { $0.isEmpty ? nil : "\(repository):\($0)" } ?? repository
+            try await runtime.tagImage(id, reference: reference)
+            return APIResponse(status: .created)
+        case (.POST, let value) where value.hasPrefix("/images/") && value.hasSuffix("/push"):
+            let id = String(value.dropFirst("/images/".count).dropLast("/push".count)).removingPercentEncoding ?? value
+            let reference = query["tag"].flatMap { $0.isEmpty ? nil : "\(id):\($0)" } ?? id
+            let output: String
+            do {
+                try await runtime.pushImage(reference, credentials: registryCredentials(request.headers))
+                output = "{\"status\":\"Pushed\",\"progressDetail\":{}}\n"
+            } catch {
+                let message = error.localizedDescription
+                let escaped = message.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                output = "{\"errorDetail\":{\"message\":\"\(escaped)\"},\"error\":\"\(escaped)\"}\n"
+            }
+            return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
+        case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/get"):
+            let id = String(value.dropFirst("/images/".count).dropLast("/get".count)).removingPercentEncoding ?? value
+            return APIResponse(status: .ok, headers: ["Content-Type": "application/x-tar"], body: try await runtime.saveImage(id))
         case (.DELETE, let value) where value.hasPrefix("/images/"):
             let id = String(value.dropFirst("/images/".count)).removingPercentEncoding ?? value
             let image = try await runtime.image(id)
@@ -366,6 +394,48 @@ public struct DockerRouter: Sendable {
         }
     }
 
+    private func filterValues(_ encoded: String?, key: String) -> [String] {
+        guard let encoded, let data = encoded.replacingOccurrences(of: "+", with: " ").data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        if let array = object[key] as? [String] { return array }
+        if let map = object[key] as? [String: Bool] { return map.compactMap { $0.value ? $0.key : nil } }
+        return []
+    }
+
+    private func labelsMatch(_ labels: [String: String], expressions: [String]) -> Bool {
+        expressions.allSatisfy { expression in
+            let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
+            guard let actual = labels[parts[0]] else { return false }
+            return parts.count == 1 || actual == parts[1]
+        }
+    }
+
+    private func filteredNetworks(_ networks: [NetworkRecord], filters: String?) -> [NetworkRecord] {
+        let labels = filterValues(filters, key: "label")
+        let names = filterValues(filters, key: "name")
+        return networks.filter { labelsMatch($0.labels, expressions: labels) && (names.isEmpty || names.contains($0.name)) }
+    }
+
+    private func filteredVolumes(_ volumes: [VolumeRecord], filters: String?) -> [VolumeRecord] {
+        let labels = filterValues(filters, key: "label")
+        let names = filterValues(filters, key: "name")
+        return volumes.filter { labelsMatch($0.labels, expressions: labels) && (names.isEmpty || names.contains($0.name)) }
+    }
+
+    private func filteredImages(_ images: [ImageRecord], filters: String?) -> [ImageRecord] {
+        let references = filterValues(filters, key: "reference")
+        let dangling = filterValues(filters, key: "dangling").first.flatMap(parseBool)
+        return images.filter { image in
+            let referenceMatches = references.isEmpty || references.contains { pattern in
+                image.references.contains { reference in
+                    if pattern.hasSuffix("*") { return reference.hasPrefix(String(pattern.dropLast())) }
+                    return reference == ImageReference.normalized(pattern)
+                }
+            }
+            return referenceMatches && (dangling == nil || dangling == image.references.isEmpty)
+        }
+    }
+
     private func inspectContainer(_ identifier: String) async throws -> ContainerInspectResponse {
         .init(try await runtime.container(identifier), networks: await runtime.listNetworks())
     }
@@ -401,7 +471,8 @@ public struct DockerRouter: Sendable {
         var result = ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
             MountRecord(
                 kind: MountRecord.Kind(rawValue: mount.Type) ?? .bind,
-                source: mount.Source ?? "", destination: mount.Target, readOnly: mount.ReadOnly ?? false
+                source: mount.Source ?? "", destination: mount.Target, readOnly: mount.ReadOnly ?? false,
+                noCopy: mount.VolumeOptions?.NoCopy ?? false
             )
         }
         for bind in input.HostConfig?.Binds ?? [] {

@@ -1,11 +1,13 @@
 #if os(macOS)
 import CEngineCore
 import Containerization
+import ContainerizationArchive
 import ContainerizationEXT4
 import ContainerizationExtras
 import ContainerizationOCI
 import ContainerizationOS
 import Foundation
+import SystemPackage
 
 /// Executes Linux containers with Apple's Virtualization.framework-backed runtime.
 /// The actor owns ContainerManager because its image/network bookkeeping is mutable.
@@ -129,7 +131,9 @@ public actor AppleContainerBackend: ContainerBackend {
         let containerPath = runtimeContainerRoot.appending(path: record.id, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: containerPath, withIntermediateDirectories: false)
         let unpacker = EXT4Unpacker(blockSizeInBytes: max(record.memoryBytes * 4, 8 * 1_024 * 1_024 * 1_024))
-        var rootfs = try await unpacker.unpack(image, for: selectedPlatform, at: containerPath.appending(path: "rootfs.ext4"))
+        let rootfsURL = containerPath.appending(path: "rootfs.ext4")
+        var rootfs = try await unpacker.unpack(image, for: selectedPlatform, at: rootfsURL)
+        try populateEmptyVolumes(for: record, from: rootfsURL)
         if record.readOnlyRootfs { rootfs.options.append("ro") }
         let container = try LinuxContainer(record.id, rootfs: rootfs, vmm: vmm) { config in
             if let imageConfig { config.process = .init(from: imageConfig) }
@@ -190,6 +194,38 @@ public actor AppleContainerBackend: ContainerBackend {
             }
         }
         return container
+    }
+
+    private func populateEmptyVolumes(for record: ContainerRecord, from rootfs: URL) throws {
+        let candidates = try record.mounts.filter { mount in
+            guard mount.kind == .volume, !mount.noCopy else { return false }
+            let directory = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty
+        }
+        guard !candidates.isEmpty else { return }
+
+        let work = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let archive = work.appending(path: "rootfs.tar")
+        let extracted = work.appending(path: "rootfs", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfs.path))
+        try reader.export(archive: FilePath(archive.path))
+        _ = try ArchiveReader(file: archive).extractContents(to: extracted)
+
+        for mount in candidates {
+            let relative = mount.destination.split(separator: "/").map(String.init).joined(separator: "/")
+            guard !relative.contains("..") else { throw EngineError(.badRequest, "invalid volume destination: \(mount.destination)") }
+            let source = extracted.appending(path: relative, directoryHint: .isDirectory)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
+            let destination = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
+            for entry in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+                try FileManager.default.copyItem(at: entry, to: destination.appending(path: entry.lastPathComponent))
+            }
+        }
     }
 
     public func start(_ record: ContainerRecord) async throws -> [PortBinding] {
@@ -525,6 +561,34 @@ public actor AppleContainerBackend: ContainerBackend {
 
     public func deleteImage(reference: String) async throws {
         try await manager.imageStore.delete(reference: reference, performCleanup: true)
+    }
+
+    public func tagImage(existing: String, new: String) async throws {
+        _ = try await manager.imageStore.tag(existing: existing, new: new)
+    }
+
+    public func pushImage(reference: String, platform: String, credentials: RegistryCredentials?) async throws {
+        let authentication: (any Authentication)? = credentials.flatMap {
+            let secret = $0.identityToken.isEmpty ? $0.password : $0.identityToken
+            return $0.username.isEmpty && secret.isEmpty ? nil : BasicAuthentication(username: $0.username, password: secret)
+        }
+        let insecure = reference.hasPrefix("localhost:") || reference.hasPrefix("127.0.0.1:")
+        try await manager.imageStore.push(
+            reference: reference, platform: try Self.platform(platform), insecure: insecure, auth: authentication
+        )
+    }
+
+    public func saveImages(references: [String], platform: String) async throws -> Data {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let archive = directory.appending(path: "images.tar")
+        let layout = directory.appending(path: "layout", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await manager.imageStore.save(references: references, out: layout, platform: try Self.platform(platform))
+        let writer = try ArchiveWriter(format: .pax, filter: .none, file: archive)
+        try writer.archiveDirectory(layout)
+        try writer.finishEncoding()
+        return try Data(contentsOf: archive)
     }
 
     private func describe(_ images: [Containerization.Image]) async throws -> [BackendImage] {

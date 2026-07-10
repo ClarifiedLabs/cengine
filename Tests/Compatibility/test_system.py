@@ -1,4 +1,4 @@
-"""Docker SDK system compatibility tests adapted from Podman's suite."""
+"""Docker system API compatibility contracts, seeded from Podman's suite."""
 
 from __future__ import annotations
 

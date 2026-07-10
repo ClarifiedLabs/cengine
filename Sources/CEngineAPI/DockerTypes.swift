@@ -101,6 +101,8 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Source: String?
         public var Target: String
         public var ReadOnly: Bool?
+        public var VolumeOptions: VolumeOptionsRequest?
+        public struct VolumeOptionsRequest: Decodable, Sendable { public var NoCopy: Bool? }
     }
 
     public struct HostConfig: Decodable, Sendable {
@@ -215,15 +217,23 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Status: String
     public let Ports: [Port]
     public let Labels: [String: String]
+    public let NetworkSettings: NetworkSettingsSummary
 
-    public init(_ record: ContainerRecord) {
+    public init(_ record: ContainerRecord, networks: [NetworkRecord] = []) {
         Id = record.id; Names = ["/\(record.name)"]; Image = record.image; ImageID = ""
         Command = record.processArguments.joined(separator: " "); Created = Int64(record.createdAt.timeIntervalSince1970)
         State = record.phase.rawValue
         Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
         Ports = record.ports.map { .init(IP: $0.hostIP, PrivatePort: $0.containerPort, PublicPort: $0.hostPort, Type: $0.proto) }
         Labels = record.labels
+        NetworkSettings = .init(Networks: Dictionary(uniqueKeysWithValues: record.networks.compactMap { endpoint in
+            guard let network = networks.first(where: { $0.id == endpoint.networkID }) else { return nil }
+            return (network.name, EndpointSummary(NetworkID: network.id))
+        }))
     }
+
+    public struct NetworkSettingsSummary: Codable, Sendable { public let Networks: [String: EndpointSummary] }
+    public struct EndpointSummary: Codable, Sendable { public let NetworkID: String }
 
     public struct Port: Codable, Sendable {
         public let IP: String; public let PrivatePort: UInt16; public let PublicPort: UInt16; public let `Type`: String

@@ -303,6 +303,47 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((pruneJSON["NetworksDeleted"] as? [String])?.isEmpty == true)
     }
 
+    @Test func containerRenamePersistsAndRejectsConflicts() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=first",
+            body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=second",
+            body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        let renamed = await router.route(.init(method: .POST, uri: "/v1.44/containers/first/rename?name=renamed"))
+        #expect(renamed.status == .noContent)
+        #expect((await router.route(.init(method: .GET, uri: "/v1.44/containers/renamed/json"))).status == .ok)
+        let conflict = await router.route(.init(method: .POST, uri: "/v1.44/containers/second/rename?name=renamed"))
+        #expect(conflict.status == .conflict)
+    }
+
+    @Test func composeResourceListsHonorProjectLabelFilters() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (name, project) in [("first", "alpha"), ("second", "beta")] {
+            _ = await router.route(.init(
+                method: .POST, uri: "/v1.44/networks/create",
+                body: Data("{\"Name\":\"\(name)\",\"Labels\":{\"com.docker.compose.project\":\"\(project)\"}}".utf8)
+            ))
+            _ = await router.route(.init(
+                method: .POST, uri: "/v1.44/volumes/create",
+                body: Data("{\"Name\":\"\(name)\",\"Labels\":{\"com.docker.compose.project\":\"\(project)\"}}".utf8)
+            ))
+        }
+        let filters = "%7B%22label%22:%5B%22com.docker.compose.project=alpha%22%5D%7D"
+        let networks = await router.route(.init(method: .GET, uri: "/v1.44/networks?filters=\(filters)"))
+        let networkJSON = try #require(JSONSerialization.jsonObject(with: networks.body) as? [[String: Any]])
+        #expect(networkJSON.map { $0["Name"] as? String } == ["first"])
+        let volumes = await router.route(.init(method: .GET, uri: "/v1.44/volumes?filters=\(filters)"))
+        let volumeJSON = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
+        let items = try #require(volumeJSON["Volumes"] as? [[String: Any]])
+        #expect(items.map { $0["Name"] as? String } == ["first"])
+    }
+
     @Test func emptyHostnamePreservesDockerStyleDefault() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

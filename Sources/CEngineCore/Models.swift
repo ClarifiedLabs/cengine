@@ -28,9 +28,11 @@ public struct MountRecord: Codable, Hashable, Sendable {
     public var source: String
     public var destination: String
     public var readOnly: Bool
+    public var noCopy: Bool
 
-    public init(kind: Kind, source: String, destination: String, readOnly: Bool = false) {
+    public init(kind: Kind, source: String, destination: String, readOnly: Bool = false, noCopy: Bool = false) {
         self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly
+        self.noCopy = noCopy
     }
 }
 

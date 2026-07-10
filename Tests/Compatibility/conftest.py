@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,7 +20,7 @@ DEFAULT_IMAGE = "alpine:latest"
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
-    ledger = (REPO_ROOT / "docs/docker-py-compatibility.md").read_text()
+    ledger = (REPO_ROOT / "docs/docker-compatibility.md").read_text()
     seen: set[str] = set()
     for item in session.items:
         marker = item.get_closest_marker("compat")
@@ -29,8 +30,14 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         if compat_id in seen:
             raise pytest.UsageError(f"duplicate compatibility ID: {compat_id}")
         if f"`{compat_id}`" not in ledger:
-            raise pytest.UsageError(f"{compat_id} is missing from docs/docker-py-compatibility.md")
+            raise pytest.UsageError(f"{compat_id} is missing from docs/docker-compatibility.md")
         seen.add(compat_id)
+    documented = set(re.findall(r"^\| `([A-Z]+-[0-9]+)` \|", ledger, flags=re.MULTILINE))
+    requested = [pathlib.Path(str(value).split("::", 1)[0]).resolve() for value in session.config.args]
+    full_suite = requested == [pathlib.Path(__file__).parent.resolve()]
+    missing = documented - seen
+    if full_suite and missing:
+        raise pytest.UsageError(f"compatibility ledger IDs have no tests: {', '.join(sorted(missing))}")
 
 
 @pytest.fixture(scope="session")
@@ -44,7 +51,7 @@ def daemon() -> dict[str, pathlib.Path | subprocess.Popen[bytes]]:
             f"Linux kernel not found at {kernel}; run cengine system install or set CENGINE_KERNEL"
         )
 
-    work = pathlib.Path(tempfile.mkdtemp(prefix="cengine-docker-py-"))
+    work = pathlib.Path(tempfile.mkdtemp(prefix="cengine-compat-"))
     root, runtime = work / "root", work / "run"
     root.mkdir(); runtime.mkdir()
     socket = runtime / "docker.sock"

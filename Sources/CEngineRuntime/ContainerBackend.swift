@@ -36,6 +36,9 @@ public protocol ContainerBackend: Sendable {
     func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage]
     func listImages() async throws -> [BackendImage]?
     func deleteImage(reference: String) async throws
+    func tagImage(existing: String, new: String) async throws
+    func pushImage(reference: String, platform: String, credentials: RegistryCredentials?) async throws
+    func saveImages(references: [String], platform: String) async throws -> Data
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
@@ -79,6 +82,15 @@ public extension ContainerBackend {
     }
     func listImages() async throws -> [BackendImage]? { nil }
     func deleteImage(reference _: String) async throws {}
+    func tagImage(existing _: String, new _: String) async throws {
+        throw EngineError(.unsupported, "image tagging is unavailable for this backend")
+    }
+    func pushImage(reference _: String, platform _: String, credentials _: RegistryCredentials?) async throws {
+        throw EngineError(.unsupported, "image push is unavailable for this backend")
+    }
+    func saveImages(references _: [String], platform _: String) async throws -> Data {
+        throw EngineError(.unsupported, "image export is unavailable for this backend")
+    }
     func pause(_: ContainerRecord) async throws { throw EngineError(.unsupported, "pause is unavailable for this backend") }
     func resume(_: ContainerRecord) async throws { throw EngineError(.unsupported, "unpause is unavailable for this backend") }
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws {
