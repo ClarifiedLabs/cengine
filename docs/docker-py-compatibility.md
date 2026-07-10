@@ -62,6 +62,6 @@ are **Support**, **Intentional gap**, and **Undecided**.
 
 | ID | Upstream test | Status | Intent | Notes |
 |---|---|---|---|---|
-| `SYS-001` | `test_info` | Not assessed | Undecided | Podman's registry-mirror assertion must be adapted to Docker semantics. |
-| `SYS-002` | `test_info_container_details` | Not assessed | Undecided | System tranche backlog. |
-| `SYS-003` | `test_version` | Not assessed | Undecided | System tranche backlog. |
+| `SYS-001` | `test_info` | Pass | Support | Adapted from Podman registry configuration to cengine driver, platform, and root invariants. |
+| `SYS-002` | `test_info_container_details` | Pass | Support | Container totals update after create. |
+| `SYS-003` | `test_version` | Pass | Support | Platform name and negotiated API version. |
