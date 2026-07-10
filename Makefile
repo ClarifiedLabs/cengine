@@ -40,7 +40,8 @@ test:
 test-compat: build
 	@python3 -m venv .build/compat-venv
 	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
-	@.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility
+	@CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine" \
+		.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility
 
 dist-cli: test
 	XCODE_DERIVED_DATA="$(XCODE_DERIVED_DATA)" XCODE_SOURCE_PACKAGES="$(XCODE_SOURCE_PACKAGES)" ./Scripts/build-release.sh
