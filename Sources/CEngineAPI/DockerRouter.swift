@@ -274,13 +274,13 @@ public struct DockerRouter: Sendable {
         case (.GET, "/images/json"):
             return json(status: .ok, await runtime.listImages().map(ImageSummaryResponse.init))
         case (.POST, "/images/create"):
-            guard let reference = query["fromImage"], !reference.isEmpty else { throw EngineError(.badRequest, "fromImage is required") }
-            let tag = query["tag"].flatMap { $0.isEmpty ? nil : $0 }
-            let fullReference = ImageReference.normalized(tag.map { "\(reference):\($0)" } ?? reference)
-            let platform = query["platform"] ?? "linux/arm64"
-            _ = try await runtime.pullImage(fullReference, platform: platform)
-            let progress = "{\"status\":\"Pull complete\",\"id\":\"\(fullReference)\"}\n"
-            return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(progress.utf8))
+            let collector = PullProgressCollector()
+            let image = try await pullImage(request, progress: { await collector.append($0) })
+            let updates = await collector.values
+            let lines = updates.map {
+                "{\"status\":\"Downloading\",\"progressDetail\":{\"current\":\($0.completedBytes),\"total\":\($0.totalBytes)}}\n"
+            }.joined() + "{\"status\":\"Pull complete\",\"id\":\"\(image.id)\"}\n"
+            return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(lines.utf8))
         case (.POST, "/images/load"):
             let images = try await runtime.loadImages(archive: request.body)
             let output = images.map { "{\"stream\":\"Loaded image: \($0.references.first ?? $0.id)\\n\"}\n" }.joined()
@@ -288,6 +288,16 @@ public struct DockerRouter: Sendable {
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/images/".count).dropLast("/json".count)).removingPercentEncoding ?? value
             return json(status: .ok, ImageInspectResponse(try await runtime.image(id)))
+        case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/history"):
+            let id = String(value.dropFirst("/images/".count).dropLast("/history".count)).removingPercentEncoding ?? value
+            let (image, history) = try await runtime.imageHistory(id)
+            return json(status: .ok, history.enumerated().map { index, entry in
+                ImageHistoryResponse(
+                    Id: index == 0 ? image.id : "<missing>", Created: entry.created,
+                    CreatedBy: entry.createdBy, Tags: index == 0 ? image.references : [],
+                    Size: entry.emptyLayer ? 0 : image.size, Comment: entry.comment
+                )
+            })
         case (.DELETE, let value) where value.hasPrefix("/images/"):
             let id = String(value.dropFirst("/images/".count)).removingPercentEncoding ?? value
             let image = try await runtime.image(id)
@@ -323,6 +333,13 @@ public struct DockerRouter: Sendable {
     }
     private func queryItems(_ components: URLComponents) -> [String: String] { Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") }) }
     private func parseBool(_ value: String?) -> Bool? { value.map { $0 == "1" || $0.lowercased() == "true" } }
+
+    private func registryCredentials(_ headers: HTTPHeaders) -> RegistryCredentials? {
+        guard let encoded = headers.first(name: "X-Registry-Auth"),
+              let data = Data(base64Encoded: encoded),
+              let auth = try? decoder.decode(RegistryAuthRequest.self, from: data) else { return nil }
+        return .init(username: auth.username ?? "", password: auth.password ?? "", identityToken: auth.identitytoken ?? "")
+    }
 
     private func filteredContainers(_ containers: [ContainerRecord], filters encoded: String?) -> [ContainerRecord] {
         guard let encoded, let data = encoded.data(using: .utf8),
@@ -360,6 +377,19 @@ public struct DockerRouter: Sendable {
     public func statistics(_ identifier: String) async throws -> ContainerStatsResponse {
         let record = try await runtime.container(identifier)
         return ContainerStatsResponse(try await runtime.containerStatistics(identifier), container: record)
+    }
+    public func pullImage(_ request: APIRequest, progress: @escaping ImagePullProgressHandler) async throws -> ImageRecord {
+        let components = try parsedComponents(request.uri)
+        let query = queryItems(components)
+        guard let reference = query["fromImage"], !reference.isEmpty else {
+            throw EngineError(.badRequest, "fromImage is required")
+        }
+        let tag = query["tag"].flatMap { $0.isEmpty ? nil : $0 }
+        let fullReference = ImageReference.normalized(tag.map { "\(reference):\($0)" } ?? reference)
+        return try await runtime.pullImage(
+            fullReference, platform: query["platform"] ?? "linux/arm64",
+            credentials: registryCredentials(request.headers), progress: progress
+        )
     }
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
@@ -399,6 +429,11 @@ public struct DockerRouter: Sendable {
 }
 
 private struct VolumeListEnvelope: Encodable { let Volumes: [DockerVolumeResponse]; let Warnings: [String] }
+private struct RegistryAuthRequest: Decodable { let username: String?; let password: String?; let identitytoken: String? }
+private actor PullProgressCollector {
+    private(set) var values: [ImagePullProgress] = []
+    func append(_ value: ImagePullProgress) { values.append(value) }
+}
 
 public struct ContainerInspectResponse: Codable, Sendable {
     public let Id: String

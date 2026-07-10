@@ -320,3 +320,7 @@ public struct ImageInspectResponse: Encodable, Sendable {
 }
 
 public struct ImageDeleteResponse: Encodable, Sendable { public let Deleted: String }
+public struct ImageHistoryResponse: Encodable, Sendable {
+    public let Id: String; public let Created: Int64; public let CreatedBy: String
+    public let Tags: [String]; public let Size: Int64; public let Comment: String
+}

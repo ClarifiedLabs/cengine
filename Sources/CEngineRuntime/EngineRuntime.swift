@@ -339,9 +339,11 @@ public actor EngineRuntime {
     public func listImages() -> [ImageRecord] { snapshot.images }
 
     @discardableResult
-    public func pullImage(_ reference: String, platform: String = "linux/arm64") async throws -> ImageRecord {
+    public func pullImage(_ reference: String, platform: String = "linux/arm64",
+                          credentials: RegistryCredentials? = nil,
+                          progress: @escaping ImagePullProgressHandler = { _ in }) async throws -> ImageRecord {
         if let existing = snapshot.images.first(where: { $0.references.contains(reference) }) { return existing }
-        try await backend.pullImage(reference, platform: platform)
+        try await backend.pullImage(reference, platform: platform, credentials: credentials, progress: progress)
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
             try await persist()
@@ -364,6 +366,14 @@ public actor EngineRuntime {
             throw EngineError(.notFound, "No such image: \(identifier)")
         }
         return image
+    }
+
+    public func imageHistory(_ identifier: String) async throws -> (ImageRecord, [ImageHistoryEntry]) {
+        let image = try image(identifier)
+        guard let reference = image.references.first else { return (image, []) }
+        return (image, try await backend.imageHistory(
+            reference: reference, platform: "\(image.os)/\(image.architecture)"
+        ))
     }
 
     public func removeImage(_ identifier: String, force: Bool) async throws {

@@ -2,6 +2,7 @@
 import CEngineCore
 import Containerization
 import ContainerizationEXT4
+import ContainerizationExtras
 import ContainerizationOCI
 import ContainerizationOS
 import Foundation
@@ -72,6 +73,31 @@ public actor AppleContainerBackend: ContainerBackend {
             throw EngineError(.unsupported, "unsupported platform \(platform)")
         }
         _ = try await image(reference: reference, platform: platform, pull: true)
+    }
+
+    public func pullImage(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws {
+        let selected = try Self.platform(platform)
+        let authentication: (any Authentication)? = credentials.flatMap {
+            let secret = $0.identityToken.isEmpty ? $0.password : $0.identityToken
+            return $0.username.isEmpty && secret.isEmpty ? nil : BasicAuthentication(username: $0.username, password: secret)
+        }
+        let accumulator = PullProgressAccumulator()
+        _ = try await manager.imageStore.pull(
+            reference: reference, platform: selected, auth: authentication,
+            progress: { events in await progress(await accumulator.apply(events)) }
+        )
+    }
+
+    public func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry] {
+        let image = try await image(reference: reference, platform: platform, pull: false)
+        let config = try await image.config(for: Self.platform(platform))
+        let formatter = ISO8601DateFormatter()
+        return (config.history ?? []).reversed().map {
+            ImageHistoryEntry(
+                created: $0.created.flatMap { formatter.date(from: $0) }.map { Int64($0.timeIntervalSince1970) } ?? 0,
+                createdBy: $0.createdBy ?? "", comment: $0.comment ?? "", emptyLayer: $0.emptyLayer ?? false
+            )
+        }
     }
 
     public func prepare(_ record: ContainerRecord) async throws {
@@ -506,5 +532,23 @@ private final class CaptureWriter: Writer, @unchecked Sendable {
     var string: String { lock.withLock { String(decoding: data, as: UTF8.self) } }
     func write(_ value: Data) throws { lock.withLock { data.append(value) } }
     func close() throws {}
+}
+
+private actor PullProgressAccumulator {
+    private var value = ImagePullProgress()
+    func apply(_ events: [ProgressEvent]) -> ImagePullProgress {
+        var items = value.completedItems, totalItems = value.totalItems
+        var bytes = value.completedBytes, totalBytes = value.totalBytes
+        for event in events {
+            switch event {
+            case .addItems(let amount): items += amount
+            case .addTotalItems(let amount): totalItems += amount
+            case .addSize(let amount): bytes += amount
+            case .addTotalSize(let amount): totalBytes += amount
+            }
+        }
+        value = .init(completedItems: items, totalItems: totalItems, completedBytes: bytes, totalBytes: totalBytes)
+        return value
+    }
 }
 #endif

@@ -34,6 +34,8 @@ public protocol ContainerBackend: Sendable {
     func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String)
     func deleteVolume(_ name: String) async throws
     func cleanupOrphans(keeping containerIDs: Set<String>) async throws
+    func pullImage(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws
+    func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry]
 }
 
 public extension ContainerBackend {
@@ -84,6 +86,11 @@ public extension ContainerBackend {
     }
     func deleteVolume(_: String) async throws {}
     func cleanupOrphans(keeping _: Set<String>) async throws {}
+    func pullImage(_ reference: String, platform: String, credentials _: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws {
+        try await pullImage(reference, platform: platform)
+        await progress(.init(completedItems: 1, totalItems: 1))
+    }
+    func imageHistory(reference _: String, platform _: String) async throws -> [ImageHistoryEntry] { [] }
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

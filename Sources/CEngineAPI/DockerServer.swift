@@ -16,6 +16,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var followSubscription: UUID?
     private var eventTask: Task<Void, Never>?
     private var statsTask: Task<Void, Never>?
+    private var pullTask: Task<Void, Never>?
     private let maximumBodyBytes: Int
 
     public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
@@ -33,6 +34,10 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             body.writeBuffer(&chunk)
         case .end:
             guard let head else { return }
+            if Self.isImagePull(head) {
+                startImagePull(request: .init(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView)), channel: context.channel)
+                return
+            }
             if Self.isStreamingStats(head.uri), let id = Self.statsContainerID(head.uri) {
                 startStats(identifier: id, channel: context.channel)
                 return
@@ -59,6 +64,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         if let followSubscription { followIO?.detach(followSubscription) }
         eventTask?.cancel()
         statsTask?.cancel()
+        pullTask?.cancel()
         context.fireChannelInactive()
     }
 
@@ -170,6 +176,40 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
         guard path.hasPrefix("/containers/"), path.hasSuffix("/stats") else { return nil }
         return String(path.dropFirst("/containers/".count).dropLast("/stats".count))
+    }
+
+    private func startImagePull(request: APIRequest, channel: Channel) {
+        channel.write(HTTPServerResponsePart.head(.init(
+            version: .http1_1, status: .ok,
+            headers: ["Content-Type": "application/json", "Transfer-Encoding": "chunked"]
+        )), promise: nil)
+        channel.flush()
+        pullTask = Task { [router] in
+            do {
+                let image = try await router.pullImage(request, progress: { progress in
+                    let line = "{\"status\":\"Downloading\",\"progressDetail\":{\"current\":\(progress.completedBytes),\"total\":\(progress.totalBytes)}}\n"
+                    Self.writeChunk(Data(line.utf8), channel: channel)
+                })
+                Self.writeChunk(Data("{\"status\":\"Pull complete\",\"id\":\"\(image.id)\"}\n".utf8), channel: channel)
+            } catch {
+                let message = error.localizedDescription
+                let data = (try? JSONSerialization.data(withJSONObject: ["error": message, "errorDetail": ["message": message]])) ?? Data()
+                Self.writeChunk(data + Data([0x0a]), channel: channel)
+            }
+            channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
+        }
+    }
+
+    private static func writeChunk(_ data: Data, channel: Channel) {
+        channel.eventLoop.execute {
+            var buffer = channel.allocator.buffer(capacity: data.count); buffer.writeBytes(data)
+            channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+        }
+    }
+
+    private static func isImagePull(_ head: HTTPRequestHead) -> Bool {
+        guard head.method == .POST, let components = URLComponents(string: head.uri) else { return false }
+        return components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression) == "/images/create"
     }
 
     private static func write(channel: Channel, response: APIResponse, keepAlive: Bool) {

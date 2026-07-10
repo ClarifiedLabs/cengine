@@ -116,6 +116,29 @@ private actor RestartBackend: ContainerBackend {
     func startCount() -> Int { starts }
 }
 
+private actor AuthImageBackend: ContainerBackend {
+    private var credentials: RegistryCredentials?
+    private var pulled = false
+    func pullImage(_: String, platform _: String) async throws {}
+    func pullImage(_ reference: String, platform _: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws {
+        self.credentials = credentials; pulled = true
+        await progress(.init(completedItems: 1, totalItems: 2, completedBytes: 50, totalBytes: 100))
+    }
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_: ContainerRecord) async throws {}
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func listImages() async throws -> [BackendImage]? {
+        pulled ? [.init(id: "sha256:authenticated", reference: "registry.example/team/app:latest", size: 42,
+                         architecture: "arm64", os: "linux")] : []
+    }
+    func imageHistory(reference _: String, platform _: String) async throws -> [ImageHistoryEntry] {
+        [.init(created: 123, createdBy: "RUN true", comment: "test", emptyLayer: false)]
+    }
+    func username() -> String? { credentials?.username }
+}
+
 @Suite struct DockerRouterTests {
     private func fixture() async throws -> (DockerRouter, URL) {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -574,5 +597,29 @@ private actor RestartBackend: ContainerBackend {
         #expect(try await recovered.container(daemonRecord.id).phase == .running)
         #expect(try await recovered.container(daemonRecord.id).restartCount == 1)
         #expect(await recoveredBackend.startCount() == 1)
+    }
+
+    @Test func registryAuthProgressAndImageHistoryAreForwarded() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = AuthImageBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let auth = Data(#"{"username":"alice","password":"secret"}"#.utf8).base64EncodedString()
+        let pull = await router.route(.init(
+            method: .POST, uri: "/v1.44/images/create?fromImage=registry.example%2Fteam%2Fapp&tag=latest",
+            headers: ["X-Registry-Auth": auth]
+        ))
+        #expect(pull.status == .ok)
+        #expect(await backend.username() == "alice")
+        let output = String(decoding: pull.body, as: UTF8.self)
+        #expect(output.contains(#""current":50"#))
+        #expect(output.contains(#""total":100"#))
+        let history = await router.route(.init(
+            method: .GET, uri: "/v1.44/images/registry.example%2Fteam%2Fapp:latest/history"
+        ))
+        #expect(history.status == .ok)
+        let entries = try #require(JSONSerialization.jsonObject(with: history.body) as? [[String: Any]])
+        #expect(entries.first?["CreatedBy"] as? String == "RUN true")
     }
 }
