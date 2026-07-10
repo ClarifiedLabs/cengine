@@ -15,25 +15,52 @@ public struct DockerEventResponse: Encodable, Sendable {
 }
 
 public struct DockerVersionResponse: Encodable, Sendable {
+    private static let apiVersion = "1.44"
+
     public let Platform: PlatformInfo
     public let Components: [Component]
-    public let Version = CEngineVersion.shortVersion()
-    public let ApiVersion = "1.44"
-    public let MinAPIVersion = "1.44"
-    public let GitCommit = "unknown"
+    public let Version: String
+    public let ApiVersion = apiVersion
+    public let MinAPIVersion = apiVersion
+    public let GitCommit: String
     public let GoVersion = ""
     public let Os = "linux"
     public let Arch = "arm64"
     public let KernelVersion = "6.18"
     public let Experimental = true
-    public let BuildTime = ""
+    public let BuildTime: String
 
     public struct PlatformInfo: Encodable, Sendable { public let Name: String }
     public struct Component: Encodable, Sendable { public let Name: String; public let Version: String; public let Details: [String: String] }
 
-    public init() {
+    public init(bundle: Bundle = .main) {
+        Version = CEngineVersion.shortVersion(bundle: bundle)
+        GitCommit = CEngineVersion.gitCommit(bundle: bundle)
+        BuildTime = CEngineVersion.buildTime(bundle: bundle)
         Platform = .init(Name: "cengine")
-        Components = [.init(Name: "Engine", Version: CEngineVersion.shortVersion(), Details: ["ApiVersion": "1.44", "Arch": "arm64", "Os": "linux"])]
+        Components = [.init(Name: "Engine", Version: Version, Details: [
+            "ApiVersion": Self.apiVersion,
+            "MinAPIVersion": Self.apiVersion,
+            "Arch": "arm64",
+            "Os": "linux",
+            "GitCommit": GitCommit,
+            "BuildTime": Self.displayBuildTime(BuildTime),
+        ])]
+    }
+
+    private static func displayBuildTime(_ value: String) -> String {
+        guard !value.isEmpty, let date = ISO8601DateFormatter().date(from: value) else { return value }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE MMM"
+        let prefix = formatter.string(from: date)
+        formatter.dateFormat = "HH:mm:ss yyyy"
+        let suffix = formatter.string(from: date)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let day = calendar.component(.day, from: date)
+        return String(format: "%@ %2d %@", prefix, day, suffix)
     }
 }
 

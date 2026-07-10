@@ -5,6 +5,23 @@ import Foundation
 import NIOHTTP1
 import Testing
 
+private func versionMetadataBundle() throws -> (Bundle, URL) {
+    let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    let bundleURL = root.appending(path: "VersionFixture.bundle", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
+    let info: [String: Any] = [
+        "CFBundleIdentifier": "dev.cengine.api-version-fixture",
+        "CFBundleName": "VersionFixture",
+        "CFBundlePackageType": "BNDL",
+        "CFBundleShortVersionString": "2.3.4",
+        "CEngineGitCommit": "abcdef0",
+        "CEngineBuildTime": "2026-02-02T17:16:40Z",
+    ]
+    let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+    try data.write(to: bundleURL.appending(path: "Info.plist"))
+    return (try #require(Bundle(url: bundleURL)), root)
+}
+
 private actor CompletionBackend: ContainerBackend {
     private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private let log: Data
@@ -158,6 +175,22 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(version.status == .ok)
         let json = try #require(JSONSerialization.jsonObject(with: version.body) as? [String: Any])
         #expect(json["ApiVersion"] as? String == "1.44")
+    }
+
+    @Test func versionIncludesBuildMetadataInEngineDetails() throws {
+        let (bundle, root) = try versionMetadataBundle()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = try JSONEncoder().encode(DockerVersionResponse(bundle: bundle))
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(json["GitCommit"] as? String == "abcdef0")
+        #expect(json["BuildTime"] as? String == "2026-02-02T17:16:40Z")
+        #expect(json["MinAPIVersion"] as? String == "1.44")
+        let components = try #require(json["Components"] as? [[String: Any]])
+        let engine = try #require(components.first)
+        let details = try #require(engine["Details"] as? [String: String])
+        #expect(details["GitCommit"] == "abcdef0")
+        #expect(details["BuildTime"] == "Mon Feb  2 17:16:40 2026")
+        #expect(details["MinAPIVersion"] == "1.44")
     }
 
     @Test func createStartInspectAndRemoveContainer() async throws {

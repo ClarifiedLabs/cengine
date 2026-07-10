@@ -21,13 +21,19 @@ private final class DataBox: @unchecked Sendable {
             "CFBundleName": "VersionFixture",
             "CFBundlePackageType": "BNDL",
             "CFBundleShortVersionString": "2.3.4",
+            "CEngineGitCommit": "abcdef0",
+            "CEngineBuildTime": "2026-07-10T22:08:24Z",
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
         try data.write(to: bundleURL.appending(path: "Info.plist"))
         let bundle = try #require(Bundle(url: bundleURL))
 
         #expect(CEngineVersion.shortVersion(bundle: bundle) == "2.3.4")
+        #expect(CEngineVersion.gitCommit(bundle: bundle) == "abcdef0")
+        #expect(CEngineVersion.buildTime(bundle: bundle) == "2026-07-10T22:08:24Z")
         #expect(CEngineVersion.shortVersion(bundle: Bundle()) == "0.0.1")
+        #expect(CEngineVersion.gitCommit(bundle: Bundle()) == "unknown")
+        #expect(CEngineVersion.buildTime(bundle: Bundle()) == "")
     }
 
     @Test func kataKernelUsesPublishedZstdAsset() {

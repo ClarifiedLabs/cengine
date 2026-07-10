@@ -49,6 +49,8 @@ require_nonempty() {
 
 VERSION="$(resolve_version)"
 BUILD_NUMBER="${CENGINE_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-1}}"
+GIT_COMMIT="${CENGINE_GIT_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short=7 HEAD 2>/dev/null || printf unknown)}"
+BUILD_TIME="${CENGINE_BUILD_TIME:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
 SIGN_RELEASE="${CENGINE_SIGN_RELEASE:-0}"
 NOTARIZE_RELEASE="${CENGINE_NOTARIZE:-0}"
 
@@ -69,6 +71,8 @@ xcodebuild \
   -skipMacroValidation \
   MARKETING_VERSION="$VERSION" \
   CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+  CENGINE_GIT_COMMIT="$GIT_COMMIT" \
+  CENGINE_BUILD_TIME="$BUILD_TIME" \
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="-" \
   build
