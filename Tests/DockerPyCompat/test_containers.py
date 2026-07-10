@@ -169,7 +169,6 @@ def test_mount_options_by_default(client: docker.DockerClient, top):
     assert inspect["Mounts"][0]["Destination"] == "/vol-mnt"
 
 
-@KNOWN_GAP(reason="CTR-020: wait ignores the next-exit condition for a created container")
 @pytest.mark.compat("CTR-020")
 def test_wait_next_exit(client: docker.DockerClient, top):
     container = client.containers.create(image=IMAGE, command=["true"])

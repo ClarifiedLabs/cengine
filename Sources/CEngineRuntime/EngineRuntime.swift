@@ -22,6 +22,7 @@ public actor EngineRuntime {
     private var execs: [String: ExecRecord] = [:]
     private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
     private var healthTasks: [String: Task<Void, Never>] = [:]
+    private var nextExitWaiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -293,13 +294,20 @@ public actor EngineRuntime {
         snapshot.containers[current].phase = .exited
         snapshot.containers[current].exitCode = code
         snapshot.containers[current].finishedAt = Date()
+        resumeNextExitWaiters(record.id, code: code)
         try await persist()
         emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
         healthTasks.removeValue(forKey: record.id)?.cancel()
     }
 
-    public func waitContainer(_ identifier: String) async throws -> Int32 {
+    public func waitContainer(_ identifier: String, condition: String? = nil) async throws -> Int32 {
         let index = try containerIndex(identifier)
+        if condition == "next-exit" {
+            let id = snapshot.containers[index].id
+            return await withCheckedContinuation { continuation in
+                nextExitWaiters[id, default: []].append(continuation)
+            }
+        }
         if snapshot.containers[index].phase != .running { return snapshot.containers[index].exitCode ?? 0 }
         let record = snapshot.containers[index]
         let code = try await backend.wait(record)
@@ -307,6 +315,7 @@ public actor EngineRuntime {
         snapshot.containers[current].phase = .exited
         snapshot.containers[current].exitCode = code
         snapshot.containers[current].finishedAt = Date()
+        resumeNextExitWaiters(record.id, code: code)
         try await persist()
         emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
         return code
@@ -319,6 +328,7 @@ public actor EngineRuntime {
             _ = try await backend.stop(snapshot.containers[index], timeoutSeconds: 0)
         }
         let removed = snapshot.containers[index]
+        resumeNextExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
         snapshot.containers.remove(at: index)
@@ -592,6 +602,7 @@ public actor EngineRuntime {
         snapshot.containers[index].phase = .exited
         snapshot.containers[index].exitCode = code
         snapshot.containers[index].finishedAt = Date()
+        resumeNextExitWaiters(identifier, code: code)
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
         healthTasks.removeValue(forKey: record.id)?.cancel()
@@ -618,6 +629,11 @@ public actor EngineRuntime {
             emit(containerEvent("destroy", record))
         }
         try? await persist()
+    }
+
+    private func resumeNextExitWaiters(_ identifier: String, code: Int32) {
+        let waiters = nextExitWaiters.removeValue(forKey: identifier) ?? []
+        waiters.forEach { $0.resume(returning: code) }
     }
 
     private static func shouldRestart(_ record: ContainerRecord, exitCode: Int32) -> Bool {

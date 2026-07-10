@@ -364,6 +364,33 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(result["StatusCode"] as? Int == 0)
     }
 
+    @Test func waitNextExitBlocksUntilCreatedContainerRunsAndExits() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = CompletionBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=next-exit",
+            body: Data(#"{"Image":"alpine","Cmd":["true"]}"#.utf8)
+        ))
+        let body = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let id = try #require(body["Id"] as? String)
+        let wait = Task {
+            await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/\(id)/wait?condition=next-exit"
+            ))
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(!wait.isCancelled)
+        _ = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/start"))
+        try await Task.sleep(for: .milliseconds(50))
+        await backend.finish(id, code: 23)
+        let response = await wait.value
+        let result = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        #expect(result["StatusCode"] as? Int == 23)
+    }
+
     @Test func pullInspectAndDeleteImage() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

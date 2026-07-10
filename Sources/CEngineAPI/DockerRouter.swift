@@ -169,7 +169,9 @@ public struct DockerRouter: Sendable {
             try await runtime.stopContainer(id, timeoutSeconds: query["t"].flatMap(Int.init)); return APIResponse(status: .noContent)
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/wait"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/wait".count))
-            return json(status: .ok, ContainerWaitResponse(StatusCode: try await runtime.waitContainer(id), Error: nil))
+            return json(status: .ok, ContainerWaitResponse(
+                StatusCode: try await runtime.waitContainer(id, condition: query["condition"]), Error: nil
+            ))
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/resize"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/resize".count))
             guard let width = query["w"].flatMap(UInt16.init), let height = query["h"].flatMap(UInt16.init) else {

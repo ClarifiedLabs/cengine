@@ -36,7 +36,7 @@ are **Support**, **Intentional gap**, and **Undecided**.
 | `CTR-017` | `test_non_existent_workdir` | Known fail | Intentional gap | Requires direct `docker build`; cengine requires Buildx. |
 | `CTR-018` | `test_build_pull` | Known fail | Intentional gap | Requires direct `docker build`; cengine requires Buildx. |
 | `CTR-019` | `test_mount_options_by_default` | Pass | Support | Checks normalized `HostConfig.Binds` and top-level `Mounts`. |
-| `CTR-020` | `test_wait_next_exit` | Known fail | Undecided | Strengthened to require blocking until the next start and exit. |
+| `CTR-020` | `test_wait_next_exit` | Pass | Support | Blocks until the next start and exit, including from the created state. |
 | `CTR-021` | `test_container_inspect_compatibility` | Known fail | Undecided | Inspect is usable by docker-py but not yet schema-complete. |
 
 ## Images
