@@ -45,7 +45,7 @@ public actor EngineRuntime {
                 var restarted = snapshot.containers[index]
                 restarted.restartCount += 1
                 try await backend.prepare(restarted)
-                try await backend.start(restarted)
+                restarted.ports = try await backend.start(restarted)
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let startedAt = Date(); restarted.startedAt = startedAt
                 snapshot.containers[index] = restarted
@@ -111,13 +111,14 @@ public actor EngineRuntime {
             try await backend.delete(record)
             try await backend.prepare(record)
         }
-        try await backend.start(record)
+        let resolvedPorts = try await backend.start(record)
         guard let current = try? containerIndex(record.id) else {
             _ = try? await backend.stop(record, timeoutSeconds: 0)
             try? await backend.delete(record)
             throw EngineError(.conflict, "container was removed while it was starting")
         }
         snapshot.containers[current].phase = .running
+        snapshot.containers[current].ports = resolvedPorts
         let startedAt = Date()
         snapshot.containers[current].startedAt = startedAt
         snapshot.containers[current].finishedAt = nil
@@ -175,7 +176,7 @@ public actor EngineRuntime {
             _ = try await backend.stop(old, timeoutSeconds: old.stopTimeoutSeconds)
             try await backend.delete(old)
             try await backend.prepare(updated)
-            try await backend.start(updated)
+            updated.ports = try await backend.start(updated)
             updated.phase = .running; updated.startedAt = Date(); updated.finishedAt = nil; updated.exitCode = nil
         }
         snapshot.containers[index] = updated
@@ -193,6 +194,11 @@ public actor EngineRuntime {
         guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         try await backend.kill(record, signal: signal)
         emit(containerEvent("kill", record, extra: ["signal": signal]))
+        let normalized = signal.uppercased()
+        if normalized == "KILL" || normalized == "SIGKILL", let startedAt = record.startedAt {
+            let code = try await backend.wait(record)
+            await recordCompletion(record.id, startedAt: startedAt, code: code)
+        }
     }
 
     public func pauseContainer(_ identifier: String) async throws {
@@ -593,7 +599,8 @@ public actor EngineRuntime {
         if !autoRemove, Self.shouldRestart(record, exitCode: code) {
             do {
                 var restarted = record; restarted.restartCount += 1
-                try await backend.delete(record); try await backend.prepare(restarted); try await backend.start(restarted)
+                try await backend.delete(record); try await backend.prepare(restarted)
+                restarted.ports = try await backend.start(restarted)
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let restartedAt = Date(); restarted.startedAt = restartedAt
                 if let current = try? containerIndex(identifier) { snapshot.containers[current] = restarted }

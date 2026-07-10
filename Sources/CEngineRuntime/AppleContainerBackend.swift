@@ -192,15 +192,16 @@ public actor AppleContainerBackend: ContainerBackend {
         return container
     }
 
-    public func start(_ record: ContainerRecord) async throws {
+    public func start(_ record: ContainerRecord) async throws -> [PortBinding] {
         guard preparedRecords[record.id] != nil else { throw EngineError(.notFound, "container was not prepared") }
         let container = try await createPreparedContainer(record)
         containers[record.id] = container
         try await container.create()
         try await container.start()
+        var resolvedPorts = record.ports
         if !record.ports.isEmpty, let interface = interfaces[record.id] {
             do {
-                try await portForwarder.start(
+                resolvedPorts = try await portForwarder.start(
                     containerID: record.id, guestAddress: interface.ipv4Address.address.description,
                     bindings: record.ports
                 )
@@ -222,6 +223,7 @@ public actor AppleContainerBackend: ContainerBackend {
             }
         }
         await synchronizeHosts()
+        return resolvedPorts
     }
 
     public func wait(_ record: ContainerRecord) async throws -> Int32 {

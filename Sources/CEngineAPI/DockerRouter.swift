@@ -396,7 +396,7 @@ public struct DockerRouter: Sendable {
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
 
     private func mounts(from input: ContainerCreateRequest) throws -> [MountRecord] {
-        var result = (input.Mounts ?? []).map { mount in
+        var result = ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
             MountRecord(
                 kind: MountRecord.Kind(rawValue: mount.Type) ?? .bind,
                 source: mount.Source ?? "", destination: mount.Target, readOnly: mount.ReadOnly ?? false
@@ -421,7 +421,8 @@ public struct DockerRouter: Sendable {
             let parts = key.split(separator: "/", maxSplits: 1).map(String.init)
             guard let containerPort = UInt16(parts[0]) else { return [] }
             return bindings.compactMap { binding in
-                guard let hostPort = UInt16(binding.HostPort ?? "") else { return nil }
+                let rawHostPort = binding.HostPort ?? ""
+                guard let hostPort = rawHostPort.isEmpty ? 0 : UInt16(rawHostPort) else { return nil }
                 return PortBinding(hostIP: binding.HostIp ?? "0.0.0.0", hostPort: hostPort, containerPort: containerPort, proto: parts.count == 2 ? parts[1] : "tcp")
             }
         }
@@ -447,6 +448,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public let RestartCount: Int
     public let NetworkSettings: NetworkSettingsResponse
     public let HostConfig: HostConfigResponse
+    public let Mounts: [MountResponse]
 
     public struct StateResponse: Codable, Sendable {
         let Status: String; let Running: Bool; let Paused: Bool; let Restarting: Bool; let OOMKilled: Bool
@@ -465,7 +467,13 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let AutoRemove: Bool; let Privileged: Bool
         let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
+        let Binds: [String]; let Mounts: [MountResponse]
+        let PortBindings: [String: [PortBindingResponse]]
         struct RestartPolicy: Codable, Sendable { let Name: String; let MaximumRetryCount: Int }
+    }
+    public struct MountResponse: Codable, Sendable {
+        let `Type`: String; let Name: String?; let Source: String; let Destination: String
+        let Driver: String; let Mode: String; let RW: Bool; let Propagation: String
     }
     public struct NetworkSettingsResponse: Codable, Sendable {
         let Bridge: String; let SandboxID: String; let HairpinMode: Bool
@@ -488,12 +496,27 @@ public struct ContainerInspectResponse: Codable, Sendable {
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
         Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds) })
         RestartCount = record.restartCount
+        let mounts = record.mounts.map { mount in
+            MountResponse(
+                Type: mount.kind.rawValue, Name: mount.kind == .volume ? mount.source : nil,
+                Source: mount.source, Destination: mount.destination, Driver: mount.kind == .volume ? "local" : "",
+                Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly, Propagation: "rprivate"
+            )
+        }
+        let portBindings = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {
+            $0.map { PortBindingResponse(HostIp: $0.hostIP, HostPort: String($0.hostPort)) }
+        }
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,
-            RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount)
+            RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount),
+            Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
+                "\($0.source):\($0.destination)\($0.readOnly ? ":ro" : "")"
+            },
+            Mounts: mounts, PortBindings: portBindings
         )
+        Mounts = mounts
         let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
         let endpoints = record.networks.reduce(into: [String: EndpointResponse]()) { result, endpoint in
             let network = networkByID[endpoint.networkID]

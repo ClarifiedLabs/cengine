@@ -4,7 +4,7 @@ import Foundation
 public protocol ContainerBackend: Sendable {
     func pullImage(_ reference: String, platform: String) async throws
     func prepare(_ container: ContainerRecord) async throws
-    func start(_ container: ContainerRecord) async throws
+    func start(_ container: ContainerRecord) async throws -> [PortBinding]
     func stop(_ container: ContainerRecord, timeoutSeconds: Int) async throws -> Int32
     func wait(_ container: ContainerRecord) async throws -> Int32
     func delete(_ container: ContainerRecord) async throws
@@ -73,7 +73,7 @@ public extension ContainerBackend {
         _ = try await stop(container, timeoutSeconds: timeoutSeconds)
         try await delete(container)
         try await prepare(container)
-        try await start(container)
+        _ = try await start(container)
     }
     func ipv4Address(for _: ContainerRecord) async -> String? { nil }
     func statistics(_: ContainerRecord) async throws -> BackendStatistics {
@@ -99,7 +99,7 @@ public struct MetadataOnlyBackend: ContainerBackend {
     public init() {}
     public func pullImage(_: String, platform _: String) async throws {}
     public func prepare(_: ContainerRecord) async throws {}
-    public func start(_: ContainerRecord) async throws {}
+    public func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     public func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     public func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     public func delete(_: ContainerRecord) async throws {}

@@ -6,6 +6,7 @@ entrypoints are:
 ```bash
 make build
 make test
+make test-docker-py
 make dist-cli
 make package
 ```
@@ -13,6 +14,12 @@ make package
 `make test` runs `CEngineCoreTests` and `CEngineAPITests` through the shared
 `cengine` scheme. `make dist-cli` runs the tests and stages `dist/cengine`.
 `make package` creates `dist/cengine-0.0.1.pkg` for local payload testing.
+
+`make test-docker-py` builds the debug daemon, creates a cached Python virtual
+environment under `.build`, and runs the container compatibility suite against
+a temporary root and Unix socket. The command uses the kernel installed by
+`cengine system install`; override it with `CENGINE_KERNEL`, or override the
+daemon and fixture image with `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`.
 
 The CLI target is ad-hoc signed for local development with
 `Configuration/cengine.entitlements`. That file intentionally contains only

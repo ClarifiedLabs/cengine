@@ -10,8 +10,9 @@ final class PortForwarder: @unchecked Sendable {
     private let lock = NSLock()
     private var listeners: [String: [Channel]] = [:]
 
-    func start(containerID: String, guestAddress: String, bindings: [PortBinding]) async throws {
+    func start(containerID: String, guestAddress: String, bindings: [PortBinding]) async throws -> [PortBinding] {
         var started: [Channel] = []
+        var resolved: [PortBinding] = []
         do {
             for binding in bindings {
                 if binding.proto.lowercased() == "udp" {
@@ -22,6 +23,9 @@ final class PortForwarder: @unchecked Sendable {
                         }
                         .bind(host: binding.hostIP.isEmpty ? "0.0.0.0" : binding.hostIP, port: Int(binding.hostPort)).get()
                     started.append(channel)
+                    var value = binding
+                    value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
+                    resolved.append(value)
                     continue
                 }
                 guard binding.proto.lowercased() == "tcp" else { throw EngineError(.unsupported, "unsupported port protocol \(binding.proto)") }
@@ -44,8 +48,12 @@ final class PortForwarder: @unchecked Sendable {
                     port: Int(binding.hostPort)
                 ).get()
                 started.append(channel)
+                var value = binding
+                value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
+                resolved.append(value)
             }
             lock.withLock { listeners[containerID, default: []].append(contentsOf: started) }
+            return resolved
         } catch {
             started.forEach { $0.close(promise: nil) }
             throw error

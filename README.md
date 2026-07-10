@@ -15,6 +15,7 @@ This repository is an experimental engine rather than a complete implementation 
 
 ```sh
 make test
+make test-docker-py
 make dist-cli
 make package
 ```
@@ -23,6 +24,12 @@ make package
 entrypoint. `make test` runs both Xcode test bundles, `make dist-cli` stages the
 release CLI at `dist/cengine`, and `make package` builds a local unsigned
 installer for payload inspection.
+
+`make test-docker-py` runs the Docker SDK compatibility suite against an
+isolated real daemon and temporary engine root. It requires the installed Kata
+kernel and never uses the normal cengine socket or persisted state. See
+[`docs/docker-py-compatibility.md`](docs/docker-py-compatibility.md) for the
+current compatibility ledger.
 
 Local CLI builds are ad-hoc signed with
 `com.apple.security.virtualization`. The project deliberately does not request

@@ -6,4 +6,5 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 __pycache__/
+.pytest_cache/
 *.profraw

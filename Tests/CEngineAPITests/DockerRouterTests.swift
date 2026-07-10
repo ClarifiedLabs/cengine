@@ -17,7 +17,7 @@ private actor CompletionBackend: ContainerBackend {
     }
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
-    func start(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     func delete(_: ContainerRecord) async throws {}
@@ -69,9 +69,10 @@ private actor BlockingStartBackend: ContainerBackend {
     private var entered = false
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
-    func start(_: ContainerRecord) async throws {
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
         entered = true
         await withCheckedContinuation { continuation = $0 }
+        return container.ports
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
@@ -85,7 +86,7 @@ private actor ImageStoreBackend: ContainerBackend {
     private var deleted: [String] = []
     func pullImage(_ reference: String, platform _: String) async throws { references.append(reference) }
     func prepare(_: ContainerRecord) async throws {}
-    func start(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     func delete(_: ContainerRecord) async throws {}
@@ -108,7 +109,7 @@ private actor RestartBackend: ContainerBackend {
     init(exitCode: Int32? = nil) { self.exitCode = exitCode }
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
-    func start(_: ContainerRecord) async throws { starts += 1 }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { starts += 1; return container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     func delete(_: ContainerRecord) async throws {}
@@ -125,7 +126,7 @@ private actor AuthImageBackend: ContainerBackend {
         await progress(.init(completedItems: 1, totalItems: 2, completedBytes: 50, totalBytes: 100))
     }
     func prepare(_: ContainerRecord) async throws {}
-    func start(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     func delete(_: ContainerRecord) async throws {}
@@ -189,6 +190,47 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(conflict.status == .conflict)
         let removed = await router.route(.init(method: .DELETE, uri: "/v1.44/containers/web?force=1", headers: [:], body: Data()))
         #expect(removed.status == .noContent)
+    }
+
+    @Test func killReconcilesSigkillBeforeReturning() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=killed",
+            body: Data(#"{"Image":"alpine","Cmd":["top"]}"#.utf8)
+        ))
+        let body = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let id = try #require(body["Id"] as? String)
+        _ = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/start"))
+        let kill = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/kill?signal=SIGKILL"))
+        #expect(kill.status == .noContent)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let inspected = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let state = try #require(inspected["State"] as? [String: Any])
+        #expect(state["Status"] as? String == "exited")
+        #expect(state["Running"] as? Bool == false)
+    }
+
+    @Test func inspectReportsNormalizedMountsAndBlankHostPorts() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=shape",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Source":"data","Target":"/data","ReadOnly":true}],"PortBindings":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":""}]}}}"#.utf8)
+        ))
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let mounts = try #require(object["Mounts"] as? [[String: Any]])
+        #expect(mounts.first?["Destination"] as? String == "/data")
+        #expect(mounts.first?["RW"] as? Bool == false)
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        #expect((host["Binds"] as? [String]) == ["data:/data:ro"])
+        let bindings = try #require(host["PortBindings"] as? [String: [[String: String]]])
+        #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
     }
 
     @Test func networkAndVolumeResponsesUseDockerSchema() async throws {

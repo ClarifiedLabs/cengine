@@ -112,6 +112,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var NanoCpus: Int64?
         public var RestartPolicy: RestartPolicy?
         public var Binds: [String]?
+        public var Mounts: [Mount]?
         public var PortBindings: [String: [PortBindingRequest]]?
         public var Tmpfs: [String: String]?
         public struct RestartPolicy: Decodable, Sendable { public var Name: String?; public var MaximumRetryCount: Int? }
