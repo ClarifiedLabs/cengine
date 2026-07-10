@@ -18,7 +18,7 @@ public struct EngineSnapshot: Codable, Sendable {
 public actor EngineRuntime {
     private var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
-    private let backend: any ContainerBackend
+    let backend: any ContainerBackend
     private var execs: [String: ExecRecord] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {

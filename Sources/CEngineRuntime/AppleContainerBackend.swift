@@ -93,9 +93,11 @@ public actor AppleContainerBackend: ContainerBackend {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                     source = directory.path
                 case .tmpfs:
-                    // Containerization's default OCI mounts already provide /tmp and /run.
-                    // Additional tmpfs destinations need guest-side mount orchestration.
-                    throw EngineError(.unsupported, "tmpfs mount \(mount.destination) is not supported yet")
+                    config.mounts.append(.any(
+                        type: "tmpfs", source: "tmpfs", destination: mount.destination,
+                        options: (["nosuid", "nodev"] + (mount.readOnly ? ["ro"] : []))
+                    ))
+                    continue
                 }
                 config.mounts.append(.share(
                     source: source,
@@ -256,6 +258,16 @@ public actor AppleContainerBackend: ContainerBackend {
         execExitCodes[id] = code
         io.finishOutput()
         try? await process.delete()
+    }
+
+    public func copyIn(_ record: ContainerRecord, extractedDirectory: URL, destination: String) async throws {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: extractedDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        )
+        for entry in entries {
+            try await container.copyIn(from: entry, to: URL(filePath: destination, directoryHint: .isDirectory))
+        }
     }
 
     private static func parseUser(_ value: String) -> ContainerizationOCI.User {

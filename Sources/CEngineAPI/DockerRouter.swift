@@ -98,6 +98,21 @@ public struct DockerRouter: Sendable {
                 headers: ["Content-Type": "application/vnd.docker.raw-stream"],
                 body: try await runtime.containerLogs(id)
             )
+        case (.PUT, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/archive"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/archive".count))
+            guard let path = query["path"], !path.isEmpty else { throw EngineError(.badRequest, "path is required") }
+            try await runtime.copyArchiveIntoContainer(id, path: path, archive: request.body)
+            return APIResponse(status: .ok)
+        case (.HEAD, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/archive"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/archive".count))
+            _ = try await runtime.container(id)
+            guard let path = query["path"], !path.isEmpty else { throw EngineError(.badRequest, "path is required") }
+            let stat = ContainerPathStat(
+                name: URL(filePath: path).lastPathComponent, size: 0,
+                mode: 2_147_484_141, mtime: ISO8601DateFormatter().string(from: Date()), linkTarget: ""
+            )
+            let encoded = try encoder.encode(stat).base64EncodedString()
+            return APIResponse(status: .ok, headers: ["X-Docker-Container-Path-Stat": encoded])
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/start"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/start".count))
             try await runtime.startContainer(id); return APIResponse(status: .noContent)
@@ -236,6 +251,12 @@ public struct DockerRouter: Sendable {
             let fields = bind.split(separator: ":", maxSplits: 2).map(String.init)
             guard fields.count >= 2 else { throw EngineError(.badRequest, "invalid bind mount: \(bind)") }
             result.append(.init(kind: fields[0].hasPrefix("/") ? .bind : .volume, source: fields[0], destination: fields[1], readOnly: fields.count == 3 && fields[2].split(separator: ",").contains("ro")))
+        }
+        for (destination, options) in input.HostConfig?.Tmpfs ?? [:] {
+            result.append(.init(
+                kind: .tmpfs, source: options, destination: destination,
+                readOnly: options.split(separator: ",").contains("ro")
+            ))
         }
         return result
     }

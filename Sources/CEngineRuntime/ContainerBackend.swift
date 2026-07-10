@@ -20,6 +20,7 @@ public protocol ContainerBackend: Sendable {
     func execPID(_ exec: ExecRecord) async -> Int32
     func execStatus(_ exec: ExecRecord) async -> Int32?
     func resizeExec(_ exec: ExecRecord, width: UInt16, height: UInt16) async throws
+    func copyIn(_ container: ContainerRecord, extractedDirectory: URL, destination: String) async throws
 }
 
 public extension ContainerBackend {
@@ -39,6 +40,9 @@ public extension ContainerBackend {
     func execPID(_: ExecRecord) async -> Int32 { 0 }
     func execStatus(_: ExecRecord) async -> Int32? { nil }
     func resizeExec(_: ExecRecord, width _: UInt16, height _: UInt16) async throws {}
+    func copyIn(_: ContainerRecord, extractedDirectory _: URL, destination _: String) async throws {
+        throw EngineError(.unsupported, "archive copy is unavailable for this backend")
+    }
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

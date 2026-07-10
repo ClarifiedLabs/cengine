@@ -82,6 +82,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var RestartPolicy: RestartPolicy?
         public var Binds: [String]?
         public var PortBindings: [String: [PortBindingRequest]]?
+        public var Tmpfs: [String: String]?
         public struct RestartPolicy: Decodable, Sendable { public var Name: String?; public var MaximumRetryCount: Int? }
         public struct PortBindingRequest: Decodable, Sendable { public var HostIp: String?; public var HostPort: String? }
     }
@@ -117,6 +118,9 @@ public struct ExecInspectResponse: Encodable, Sendable {
             tty: exec.configuration.tty
         )
     }
+}
+public struct ContainerPathStat: Codable, Sendable {
+    public let name: String; public let size: Int64; public let mode: UInt32; public let mtime: String; public let linkTarget: String
 }
 
 public struct ContainerSummaryResponse: Codable, Sendable {
