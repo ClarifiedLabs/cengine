@@ -60,10 +60,33 @@ private actor CompletionBackend: ContainerBackend {
         let state = try #require(inspected["State"] as? [String: Any])
         #expect(state["Running"] as? Bool == true)
 
+        let kill = await router.route(.init(method: .POST, uri: "/v1.44/containers/web/kill?signal=TERM", body: Data()))
+        #expect(kill.status == .noContent)
+
         let conflict = await router.route(.init(method: .DELETE, uri: "/v1.44/containers/web", headers: [:], body: Data()))
         #expect(conflict.status == .conflict)
         let removed = await router.route(.init(method: .DELETE, uri: "/v1.44/containers/web?force=1", headers: [:], body: Data()))
         #expect(removed.status == .noContent)
+    }
+
+    @Test func networkAndVolumeResponsesUseDockerSchema() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let networkCreate = await router.route(.init(method: .POST, uri: "/v1.44/networks/create", body: Data(#"{"Name":"frontend","Labels":{"app":"demo"}}"#.utf8)))
+        #expect(networkCreate.status == .created)
+        let networkInspect = await router.route(.init(method: .GET, uri: "/v1.44/networks/frontend", body: Data()))
+        let network = try #require(JSONSerialization.jsonObject(with: networkInspect.body) as? [String: Any])
+        #expect(network["Name"] as? String == "frontend")
+        #expect(network["Driver"] as? String == "bridge")
+        #expect(network["IPAM"] is [String: Any])
+
+        let volumeCreate = await router.route(.init(method: .POST, uri: "/v1.44/volumes/create", body: Data(#"{"Name":"dbdata","Labels":{"app":"demo"}}"#.utf8)))
+        #expect(volumeCreate.status == .created)
+        let createdVolume = try #require(JSONSerialization.jsonObject(with: volumeCreate.body) as? [String: Any])
+        #expect(createdVolume["Name"] as? String == "dbdata")
+        #expect(createdVolume["Driver"] as? String == "local")
+        let volumeInspect = await router.route(.init(method: .GET, uri: "/v1.44/volumes/dbdata", body: Data()))
+        #expect(volumeInspect.status == .ok)
     }
 
     @Test func emptyHostnamePreservesDockerStyleDefault() async throws {

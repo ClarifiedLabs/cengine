@@ -84,6 +84,12 @@ public actor EngineRuntime {
         try await backend.logs(for: container(identifier))
     }
 
+    public func killContainer(_ identifier: String, signal: String) async throws {
+        let record = try container(identifier)
+        guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
+        try await backend.kill(record, signal: signal)
+    }
+
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
         guard snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused else { return }
@@ -118,6 +124,20 @@ public actor EngineRuntime {
 
     public func listNetworks() -> [NetworkRecord] { snapshot.networks }
     public func listVolumes() -> [VolumeRecord] { snapshot.volumes }
+
+    public func network(_ identifier: String) throws -> NetworkRecord {
+        guard let value = snapshot.networks.first(where: { $0.id == identifier || $0.id.hasPrefix(identifier) || $0.name == identifier }) else {
+            throw EngineError(.notFound, "network \(identifier) not found")
+        }
+        return value
+    }
+
+    public func volume(_ name: String) throws -> VolumeRecord {
+        guard let value = snapshot.volumes.first(where: { $0.name == name }) else {
+            throw EngineError(.notFound, "get \(name): no such volume")
+        }
+        return value
+    }
     public func listImages() -> [ImageRecord] { snapshot.images }
 
     @discardableResult

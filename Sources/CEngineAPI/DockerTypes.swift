@@ -117,6 +117,33 @@ public struct NetworkCreateRequest: Decodable, Sendable { public let Name: Strin
 public struct NetworkCreateResponse: Codable, Sendable { public let Id: String; public let Warning: String }
 public struct VolumeCreateRequest: Decodable, Sendable { public var Name: String?; public var Driver: String?; public var DriverOpts: [String: String]?; public var Labels: [String: String]? }
 
+public struct DockerVolumeResponse: Encodable, Sendable {
+    public let Name: String; public let Driver = "local"; public let Mountpoint: String
+    public let CreatedAt: String; public let Status: [String: String]? = nil
+    public let Labels: [String: String]; public let Scope = "local"; public let Options: [String: String]
+    public init(_ volume: VolumeRecord) {
+        Name = volume.name; Mountpoint = "cengine://volumes/\(volume.name)"
+        CreatedAt = ISO8601DateFormatter().string(from: volume.createdAt); Labels = volume.labels; Options = volume.options
+    }
+}
+
+public struct DockerNetworkResponse: Encodable, Sendable {
+    public let Name: String; public let Id: String; public let Created: String
+    public let Scope = "local"; public let Driver = "bridge"; public let EnableIPv6 = false
+    public let IPAM: IPAMResponse; public let Internal: Bool; public let Attachable = false; public let Ingress = false
+    public let ConfigFrom: [String: String] = [:]; public let ConfigOnly = false
+    public let Containers: [String: String] = [:]; public let Options: [String: String] = [:]; public let Labels: [String: String]
+    public struct IPAMResponse: Encodable, Sendable {
+        public let Driver = "default"; public let Options: [String: String]? = nil; public let Config: [ConfigResponse]
+    }
+    public struct ConfigResponse: Encodable, Sendable { public let Subnet: String; public let Gateway: String }
+    public init(_ network: NetworkRecord) {
+        Name = network.name; Id = network.id; Created = ISO8601DateFormatter().string(from: network.createdAt)
+        IPAM = .init(Config: [.init(Subnet: network.subnet, Gateway: network.gateway)])
+        Internal = network.internalNetwork; Labels = network.labels
+    }
+}
+
 public struct ImageSummaryResponse: Encodable, Sendable {
     public let Id: String; public let RepoTags: [String]; public let RepoDigests: [String]
     public let Created: Int64; public let Size: Int64; public let SharedSize: Int64; public let VirtualSize: Int64

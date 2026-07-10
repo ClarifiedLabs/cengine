@@ -183,6 +183,11 @@ public actor AppleContainerBackend: ContainerBackend {
         return try io.logData()
     }
 
+    public func kill(_ record: ContainerRecord, signal: String) async throws {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        try await container.kill(try Signal(signal))
+    }
+
     private static func parseUser(_ value: String) -> ContainerizationOCI.User {
         guard !value.isEmpty else { return ContainerizationOCI.User() }
         let components = value.split(separator: ":", maxSplits: 1).map(String.init)

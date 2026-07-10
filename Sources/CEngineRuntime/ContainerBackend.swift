@@ -12,6 +12,7 @@ public protocol ContainerBackend: Sendable {
     func resize(_ container: ContainerRecord, width: UInt16, height: UInt16) async throws
     func completion(_ container: ContainerRecord) async -> Int32?
     func logs(for container: ContainerRecord) async throws -> Data
+    func kill(_ container: ContainerRecord, signal: String) async throws
 }
 
 public extension ContainerBackend {
@@ -21,6 +22,7 @@ public extension ContainerBackend {
     func resize(_: ContainerRecord, width _: UInt16, height _: UInt16) async throws {}
     func completion(_: ContainerRecord) async -> Int32? { nil }
     func logs(for _: ContainerRecord) async throws -> Data { Data() }
+    func kill(_: ContainerRecord, signal _: String) async throws {}
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

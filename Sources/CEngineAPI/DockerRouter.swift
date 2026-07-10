@@ -114,11 +114,17 @@ public struct DockerRouter: Sendable {
             }
             try await runtime.resizeContainer(id, width: width, height: height)
             return APIResponse(status: .ok)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/kill"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/kill".count))
+            try await runtime.killContainer(id, signal: query["signal"] ?? "SIGKILL")
+            return APIResponse(status: .noContent)
         case (.DELETE, let value) where value.hasPrefix("/containers/"):
             let id = String(value.dropFirst("/containers/".count))
             try await runtime.removeContainer(id, force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
         case (.GET, "/networks"):
-            return json(status: .ok, await runtime.listNetworks())
+            return json(status: .ok, await runtime.listNetworks().map(DockerNetworkResponse.init))
+        case (.GET, let value) where value.hasPrefix("/networks/"):
+            return json(status: .ok, DockerNetworkResponse(try await runtime.network(String(value.dropFirst("/networks/".count)))))
         case (.POST, "/networks/create"):
             let input = try decoder.decode(NetworkCreateRequest.self, from: request.body)
             let network = try await runtime.createNetwork(name: input.Name, labels: input.Labels ?? [:])
@@ -126,11 +132,13 @@ public struct DockerRouter: Sendable {
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):
-            return json(status: .ok, VolumeListEnvelope(Volumes: await runtime.listVolumes(), Warnings: []))
+            return json(status: .ok, VolumeListEnvelope(Volumes: await runtime.listVolumes().map(DockerVolumeResponse.init), Warnings: []))
+        case (.GET, let value) where value.hasPrefix("/volumes/"):
+            return json(status: .ok, DockerVolumeResponse(try await runtime.volume(String(value.dropFirst("/volumes/".count)))))
         case (.POST, "/volumes/create"):
             let input = try decoder.decode(VolumeCreateRequest.self, from: request.body)
             let name = input.Name.flatMap { $0.isEmpty ? nil : $0 } ?? Identifier.random()
-            return json(status: .created, try await runtime.createVolume(name: name, labels: input.Labels ?? [:], options: input.DriverOpts ?? [:]))
+            return json(status: .created, DockerVolumeResponse(try await runtime.createVolume(name: name, labels: input.Labels ?? [:], options: input.DriverOpts ?? [:])))
         case (.DELETE, let value) where value.hasPrefix("/volumes/"):
             try await runtime.removeVolume(String(value.dropFirst("/volumes/".count)), force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
         case (.GET, "/images/json"):
@@ -215,7 +223,7 @@ public struct DockerRouter: Sendable {
     }
 }
 
-private struct VolumeListEnvelope: Encodable { let Volumes: [VolumeRecord]; let Warnings: [String] }
+private struct VolumeListEnvelope: Encodable { let Volumes: [DockerVolumeResponse]; let Warnings: [String] }
 
 public struct ContainerInspectResponse: Codable, Sendable {
     public let Id: String
