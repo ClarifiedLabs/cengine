@@ -74,18 +74,18 @@ State is JSON with an explicit schema envelope and atomic rename/fsync persisten
 
 ## Current compatibility
 
-Implemented API groups include server ping/version/info; image pull/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; interactive and non-interactive attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable non-following container logs; safe archive upload into running containers; bind, volume, and tmpfs mounts; and Docker-shaped network and volume create/list/inspect/remove lifecycle. Direct `docker build` intentionally returns a message directing clients to Buildx.
+Implemented API groups include server ping/version/info; image pull/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; interactive and non-interactive attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable non-following container logs; safe archive upload before and after container start; bind, volume, and tmpfs mounts; Docker-shaped network and volume create/list/inspect/remove lifecycle; and a working managed Buildx container driver for local and pushed outputs. Direct `docker build` intentionally returns a message directing clients to Buildx.
 
 Known gaps:
 
 - Restart policies and recovery after daemon or process failure
 - Following logs and post-start/multi-client attach
-- Pre-start archive upload and `GET /containers/{id}/archive` for complete copy/Buildx configuration behavior
+- `GET /containers/{id}/archive` for container-to-host copy
 - Host port publishing, shared user-defined networks, network aliases, and Compose service DNS
 - Network connect/disconnect, prune, and anonymous-volume lifecycle
 - Health checks, events, stats, top, restart, pause/unpause, update, and resource pruning
 - Complete image metadata/store synchronization, registry authentication, history, and real pull progress
-- A working managed Buildx container driver and Compose compatibility validation
+- Docker image import/load for Buildx's default `--load` behavior and Compose compatibility validation
 - Full `linux/amd64` image selection; the VM enables Rosetta, but the current Apple `ContainerManager` convenience pull path selects the host platform
 - Recovery or cleanup of live VM handles after daemon restart (persisted running containers are conservatively marked exited)
 

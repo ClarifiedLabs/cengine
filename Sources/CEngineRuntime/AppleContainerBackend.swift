@@ -18,8 +18,12 @@ public actor AppleContainerBackend: ContainerBackend {
     private var execBridges: [String: ContainerIOBridge] = [:]
     private var execWaitTasks: [String: Task<Int32, Never>] = [:]
     private var execExitCodes: [String: Int32] = [:]
+    private var preparedRecords: [String: ContainerRecord] = [:]
+    private struct StagedCopy: Sendable { let source: URL; let destination: String }
+    private var stagedCopies: [String: [StagedCopy]] = [:]
     private let volumeRoot: URL
     private let logRoot: URL
+    private let stagingRoot: URL
 
     public init(
         root: URL,
@@ -30,9 +34,11 @@ public actor AppleContainerBackend: ContainerBackend {
         let runtimeRoot = root.appending(path: "runtime", directoryHint: .isDirectory)
         self.volumeRoot = root.appending(path: "volumes", directoryHint: .isDirectory)
         self.logRoot = root.appending(path: "container-logs", directoryHint: .isDirectory)
+        self.stagingRoot = root.appending(path: "staged-copies", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: volumeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
         self.manager = try await ContainerManager(
             kernel: Kernel(path: kernel, platform: .linuxArm),
             initfsReference: vminitReference,
@@ -54,9 +60,20 @@ public actor AppleContainerBackend: ContainerBackend {
             throw EngineError(.unsupported, "unsupported platform \(record.platform); expected linux/arm64 or linux/amd64")
         }
 
-        let volumeRoot = self.volumeRoot
         let io = ContainerIOBridge(tty: record.tty, logURL: logRoot.appending(path: "\(record.id).log"))
+        _ = try await manager.imageStore.get(reference: record.image, pull: true)
+        preparedRecords[record.id] = record
+        ioBridges[record.id] = io
+    }
+
+    private func createPreparedContainer(_ record: ContainerRecord) async throws -> LinuxContainer {
+        guard let io = ioBridges[record.id] else { throw EngineError(.notFound, "container I/O is unavailable") }
+        let volumeRoot = self.volumeRoot
+        let staged = stagedCopies[record.id] ?? []
         var manager = self.manager
+        let image = try await manager.imageStore.get(reference: record.image, pull: true)
+        let imageConfig = try await image.config(for: .current).config
+        let resolvedArguments = (record.entrypoint ?? imageConfig?.entrypoint ?? []) + (record.command ?? imageConfig?.cmd ?? [])
         let container = try await manager.create(
             record.id,
             reference: record.image,
@@ -68,7 +85,7 @@ public actor AppleContainerBackend: ContainerBackend {
             config.memoryInBytes = max(record.memoryBytes, 256 * 1_024 * 1_024)
             config.hostname = record.hostname
             config.useInit = record.useInit
-            if !record.processArguments.isEmpty { config.process.arguments = record.processArguments }
+            config.process.arguments = resolvedArguments
             if !record.environment.isEmpty { config.process.environmentVariables.append(contentsOf: record.environment) }
             if !config.process.environmentVariables.contains(where: { $0.hasPrefix("PATH=") }) {
                 config.process.environmentVariables.append("PATH=\(LinuxProcessConfiguration.defaultPath)")
@@ -105,16 +122,25 @@ public actor AppleContainerBackend: ContainerBackend {
                     options: mount.readOnly ? ["ro"] : []
                 ))
             }
+            for copy in staged {
+                let entries = try FileManager.default.contentsOfDirectory(
+                    at: copy.source, includingPropertiesForKeys: nil, options: []
+                )
+                for entry in entries {
+                    let destination = URL(filePath: copy.destination, directoryHint: .isDirectory)
+                        .appending(path: entry.lastPathComponent).path
+                    config.mounts.append(.share(source: entry.path, destination: destination))
+                }
+            }
         }
         self.manager = manager
-        containers[record.id] = container
-        ioBridges[record.id] = io
+        return container
     }
 
     public func start(_ record: ContainerRecord) async throws {
-        guard let container = containers[record.id] else {
-            throw EngineError(.notFound, "runtime state for container \(record.id) is unavailable; recreate the container")
-        }
+        guard preparedRecords[record.id] != nil else { throw EngineError(.notFound, "container was not prepared") }
+        let container = try await createPreparedContainer(record)
+        containers[record.id] = container
         try await container.create()
         try await container.start()
         let io = ioBridges[record.id]
@@ -161,8 +187,11 @@ public actor AppleContainerBackend: ContainerBackend {
         }
         waitTasks.removeValue(forKey: record.id)?.cancel()
         ioBridges.removeValue(forKey: record.id)?.finishOutput()
+        preparedRecords.removeValue(forKey: record.id)
+        stagedCopies.removeValue(forKey: record.id)
+        try? FileManager.default.removeItem(at: stagingRoot.appending(path: record.id))
         try? FileManager.default.removeItem(at: logRoot.appending(path: "\(record.id).log"))
-        try manager.delete(record.id)
+        try? manager.delete(record.id)
     }
 
     public func io(for record: ContainerRecord) async throws -> ContainerIOBridge {
@@ -261,6 +290,14 @@ public actor AppleContainerBackend: ContainerBackend {
     }
 
     public func copyIn(_ record: ContainerRecord, extractedDirectory: URL, destination: String) async throws {
+        if containers[record.id] == nil {
+            guard preparedRecords[record.id] != nil else { throw EngineError(.notFound, "container runtime is unavailable") }
+            let directory = stagingRoot.appending(path: record.id).appending(path: UUID().uuidString, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: directory.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: extractedDirectory, to: directory)
+            stagedCopies[record.id, default: []].append(.init(source: directory, destination: destination))
+            return
+        }
         guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
         let entries = try FileManager.default.contentsOfDirectory(
             at: extractedDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]

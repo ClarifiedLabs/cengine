@@ -65,10 +65,15 @@ public actor EngineRuntime {
         guard snapshot.containers[index].phase != .running else { return }
         let record = snapshot.containers[index]
         try await backend.start(record)
-        snapshot.containers[index].phase = .running
-        snapshot.containers[index].startedAt = Date()
-        snapshot.containers[index].finishedAt = nil
-        snapshot.containers[index].exitCode = nil
+        guard let current = try? containerIndex(record.id) else {
+            _ = try? await backend.stop(record, timeoutSeconds: 0)
+            try? await backend.delete(record)
+            throw EngineError(.conflict, "container was removed while it was starting")
+        }
+        snapshot.containers[current].phase = .running
+        snapshot.containers[current].startedAt = Date()
+        snapshot.containers[current].finishedAt = nil
+        snapshot.containers[current].exitCode = nil
         try await persist()
         Task { [weak self] in await self?.monitorContainer(record.id) }
     }
@@ -138,20 +143,24 @@ public actor EngineRuntime {
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
         guard snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused else { return }
-        let code = try await backend.stop(snapshot.containers[index], timeoutSeconds: timeoutSeconds ?? snapshot.containers[index].stopTimeoutSeconds)
-        snapshot.containers[index].phase = .exited
-        snapshot.containers[index].exitCode = code
-        snapshot.containers[index].finishedAt = Date()
+        let record = snapshot.containers[index]
+        let code = try await backend.stop(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+        guard let current = try? containerIndex(record.id) else { return }
+        snapshot.containers[current].phase = .exited
+        snapshot.containers[current].exitCode = code
+        snapshot.containers[current].finishedAt = Date()
         try await persist()
     }
 
     public func waitContainer(_ identifier: String) async throws -> Int32 {
         let index = try containerIndex(identifier)
         if snapshot.containers[index].phase != .running { return snapshot.containers[index].exitCode ?? 0 }
-        let code = try await backend.wait(snapshot.containers[index])
-        snapshot.containers[index].phase = .exited
-        snapshot.containers[index].exitCode = code
-        snapshot.containers[index].finishedAt = Date()
+        let record = snapshot.containers[index]
+        let code = try await backend.wait(record)
+        guard let current = try? containerIndex(record.id) else { return code }
+        snapshot.containers[current].phase = .exited
+        snapshot.containers[current].exitCode = code
+        snapshot.containers[current].finishedAt = Date()
         try await persist()
         return code
     }

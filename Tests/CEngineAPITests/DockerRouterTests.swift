@@ -37,6 +37,22 @@ private actor CompletionBackend: ContainerBackend {
     func execStatus(_: ExecRecord) async -> Int32? { 0 }
 }
 
+private actor BlockingStartBackend: ContainerBackend {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var entered = false
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_: ContainerRecord) async throws {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_: ContainerRecord) async throws {}
+    func hasEnteredStart() -> Bool { entered }
+    func releaseStart() { continuation?.resume(); continuation = nil }
+}
+
 @Suite struct DockerRouterTests {
     private func fixture() async throws -> (DockerRouter, URL) {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -222,5 +238,23 @@ private actor CompletionBackend: ContainerBackend {
         #expect(value["Running"] as? Bool == false)
         #expect(value["ExitCode"] as? Int == 0)
         #expect(value["ContainerID"] as? String == container.id)
+    }
+
+    @Test func concurrentRemovalWhileStartingReturnsConflictInsteadOfCrashing() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "start-race", image: "debian"))
+        let start = Task { try await runtime.startContainer(record.id) }
+        while !(await backend.hasEnteredStart()) { await Task.yield() }
+        try await runtime.removeContainer(record.id, force: true)
+        await backend.releaseStart()
+        do {
+            try await start.value
+            Issue.record("start should fail when the container is concurrently removed")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
     }
 }

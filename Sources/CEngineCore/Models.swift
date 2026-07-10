@@ -70,6 +70,8 @@ public struct ContainerRecord: Codable, Sendable {
     public var finishedAt: Date?
     public var exitCode: Int32?
     public var processArguments: [String]
+    public var entrypoint: [String]?
+    public var command: [String]?
     public var environment: [String]
     public var workingDirectory: String
     public var user: String
@@ -103,6 +105,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.createdAt = Date()
         self.phase = .created
         self.processArguments = processArguments
+        self.entrypoint = nil
+        self.command = processArguments.isEmpty ? nil : processArguments
         self.environment = []
         self.workingDirectory = ""
         self.user = ""
