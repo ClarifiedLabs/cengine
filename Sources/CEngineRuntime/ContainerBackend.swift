@@ -23,6 +23,8 @@ public protocol ContainerBackend: Sendable {
     func copyIn(_ container: ContainerRecord, extractedDirectory: URL, destination: String) async throws
     func copyOut(_ container: ContainerRecord, source: String, destinationDirectory: URL) async throws
     func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage]
+    func listImages() async throws -> [BackendImage]?
+    func deleteImage(reference: String) async throws
 }
 
 public extension ContainerBackend {
@@ -51,6 +53,8 @@ public extension ContainerBackend {
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
         throw EngineError(.unsupported, "image import is unavailable for this backend")
     }
+    func listImages() async throws -> [BackendImage]? { nil }
+    func deleteImage(reference _: String) async throws {}
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

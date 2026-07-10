@@ -30,6 +30,9 @@ public actor EngineRuntime {
             snapshot.containers[index].exitCode = 137
             snapshot.containers[index].finishedAt = Date()
         }
+        if let backendImages = try await backend.listImages() {
+            snapshot.images = Self.imageRecords(from: backendImages)
+        }
         try await persist()
     }
 
@@ -198,6 +201,11 @@ public actor EngineRuntime {
     public func pullImage(_ reference: String, platform: String = "linux/arm64") async throws -> ImageRecord {
         if let existing = snapshot.images.first(where: { $0.references.contains(reference) }) { return existing }
         try await backend.pullImage(reference, platform: platform)
+        if let backendImages = try await backend.listImages() {
+            snapshot.images = Self.imageRecords(from: backendImages)
+            try await persist()
+            if let image = snapshot.images.first(where: { $0.references.contains(reference) }) { return image }
+        }
         let image = ImageRecord(
             id: "sha256:\(Identifier.random())", references: [reference], createdAt: Date(), size: 0,
             architecture: platform.hasSuffix("amd64") ? "amd64" : "arm64", os: "linux"
@@ -219,6 +227,7 @@ public actor EngineRuntime {
         guard force || !snapshot.containers.contains(where: { image.references.contains($0.image) }) else {
             throw EngineError(.conflict, "conflict: image is being used by a container")
         }
+        for reference in image.references { try await backend.deleteImage(reference: reference) }
         snapshot.images.removeAll { $0.id == image.id }
         try await persist()
     }
@@ -273,6 +282,14 @@ public actor EngineRuntime {
     }
 
     func persist() async throws { try await store.save(snapshot) }
+
+    private static func imageRecords(from images: [BackendImage]) -> [ImageRecord] {
+        Dictionary(grouping: images, by: \ .id).map { id, values in
+            ImageRecord(id: id, references: values.map(\ .reference).sorted(), createdAt: Date(),
+                        size: values.map(\ .size).max() ?? 0,
+                        architecture: values.first?.architecture ?? "arm64", os: values.first?.os ?? "linux")
+        }.sorted { $0.references.first ?? "" < $1.references.first ?? "" }
+    }
 
     private func monitorContainer(_ identifier: String) async {
         guard let record = try? container(identifier), let code = await backend.completion(record) else { return }

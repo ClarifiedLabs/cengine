@@ -62,6 +62,28 @@ private actor BlockingStartBackend: ContainerBackend {
     func releaseStart() { continuation?.resume(); continuation = nil }
 }
 
+private actor ImageStoreBackend: ContainerBackend {
+    private var references = ["docker.io/library/existing:latest"]
+    private var deleted: [String] = []
+    func pullImage(_ reference: String, platform _: String) async throws { references.append(reference) }
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_: ContainerRecord) async throws {}
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func listImages() async throws -> [BackendImage]? {
+        references.map {
+            BackendImage(id: "sha256:" + $0.data(using: .utf8)!.base64EncodedString(), reference: $0,
+                         size: 456, architecture: "arm64", os: "linux")
+        }
+    }
+    func deleteImage(reference: String) async throws {
+        references.removeAll { $0 == reference }
+        deleted.append(reference)
+    }
+    func deletedReferences() -> [String] { deleted }
+}
+
 @Suite struct DockerRouterTests {
     private func fixture() async throws -> (DockerRouter, URL) {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -194,6 +216,21 @@ private actor BlockingStartBackend: ContainerBackend {
         #expect(inspect.status == .ok)
         let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/images/docker.io/library/alpine:latest", body: Data()))
         #expect(remove.status == .ok)
+    }
+
+    @Test func imageMetadataSynchronizesWithBackendAndDeleteReachesStore() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ImageStoreBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        #expect(await runtime.listImages().map(\.references) == [["docker.io/library/existing:latest"]])
+
+        let pulled = try await runtime.pullImage("docker.io/library/new:latest")
+        #expect(pulled.id.hasPrefix("sha256:"))
+        #expect(pulled.size == 456)
+        try await runtime.removeImage("docker.io/library/new:latest", force: false)
+        #expect(await backend.deletedReferences() == ["docker.io/library/new:latest"])
+        #expect(await runtime.listImages().map(\.references) == [["docker.io/library/existing:latest"]])
     }
 
     @Test func loadImportsDockerArchiveAndMakesImageVisible() async throws {

@@ -316,12 +316,22 @@ public actor AppleContainerBackend: ContainerBackend {
 
     public func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage] {
         let images = try await manager.imageStore.load(from: directory)
-        return try await images.asyncMap { image in
+        return try await describe(images)
+    }
+
+    public func listImages() async throws -> [BackendImage]? {
+        try await describe(manager.imageStore.list())
+    }
+
+    public func deleteImage(reference: String) async throws {
+        try await manager.imageStore.delete(reference: reference, performCleanup: true)
+    }
+
+    private func describe(_ images: [Containerization.Image]) async throws -> [BackendImage] {
+        try await images.asyncMap { image in
             let config = try await image.config(for: .current)
-            return BackendImage(
-                id: image.digest, reference: image.reference, size: image.descriptor.size,
-                architecture: config.architecture, os: config.os
-            )
+            return BackendImage(id: image.digest, reference: image.reference, size: image.descriptor.size,
+                                architecture: config.architecture, os: config.os)
         }
     }
 
