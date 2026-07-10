@@ -4,6 +4,8 @@
 
 This repository is an experimental engine rather than a complete implementation of every Docker API. Its focused runtime surface now covers interactive Docker CLI use, Compose application lifecycle, Buildx container builds, networking, observability, and daemon recovery.
 
+Note: this project was created as part of testing out gpt-5.6-sol for the first time. All planning was done with `xhigh` effort and implementation was done with `low` effort as of commit f78d30dcb6eae948fbdd271f08e5c82d1656457a.
+
 ## Requirements
 
 - Apple silicon
