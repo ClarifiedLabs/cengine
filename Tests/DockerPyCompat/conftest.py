@@ -92,6 +92,11 @@ def client(daemon: dict[str, pathlib.Path | subprocess.Popen[bytes]]) -> docker.
 
 @pytest.fixture(autouse=True)
 def clean_resources(client: docker.DockerClient):
+    image = os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE)
+    try:
+        client.images.get(image)
+    except docker.errors.NotFound:
+        client.images.pull(image)
     yield
     errors: list[str] = []
     for container in client.containers.list(all=True):
@@ -119,6 +124,13 @@ def clean_resources(client: docker.DockerClient):
             network.remove()
         except Exception as error:
             errors.append(f"network {network.name}: {error}")
+    for value in client.images.list():
+        if any("alpine" in tag for tag in value.tags):
+            continue
+        try:
+            client.images.remove(value.id, force=True)
+        except Exception as error:
+            errors.append(f"image {value.id}: {error}")
     if errors:
         pytest.fail("resource cleanup failed:\n" + "\n".join(errors))
 

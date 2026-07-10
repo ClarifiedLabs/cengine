@@ -43,20 +43,20 @@ are **Support**, **Intentional gap**, and **Undecided**.
 
 | ID | Upstream test | Status | Intent | Notes |
 |---|---|---|---|---|
-| `IMG-001` | `test_tag_valid_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-002` | `test_retag_valid_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-003` | `test_list_images` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-004` | `test_search_image` | Not assessed | Undecided | Upstream currently skips this case. |
-| `IMG-005` | `test_search_bogus_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-006` | `test_remove_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-007` | `test_image_history` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-008` | `test_get_image_exists_not` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-009` | `test_save_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-010` | `test_load_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-011` | `test_load_corrupt_image` | Not assessed | Undecided | Image tranche backlog. |
-| `IMG-012` | `test_build_image` | Not assessed | Intentional gap | Direct build is intentionally unsupported. |
-| `IMG-013` | `test_build_image_via_api_client` | Not assessed | Intentional gap | Direct build is intentionally unsupported. |
-| `IMG-014` | `test_push_error` | Not assessed | Undecided | Image tranche backlog. |
+| `IMG-001` | `test_tag_valid_image` | Known fail | Undecided | Image tagging endpoint is missing. |
+| `IMG-002` | `test_retag_valid_image` | Known fail | Undecided | Image retagging endpoint is missing. |
+| `IMG-003` | `test_list_images` | Known fail | Support | Listing works; reference filters are missing. |
+| `IMG-004` | `test_search_image` | Known fail | Undecided | Registry search is not implemented; upstream currently skips this case. |
+| `IMG-005` | `test_search_bogus_image` | Pass | Support | Unsupported search is surfaced as an API error. |
+| `IMG-006` | `test_remove_image` | Pass | Support | Missing-image and successful removal behavior. |
+| `IMG-007` | `test_image_history` | Pass | Support | History includes the image identifier. |
+| `IMG-008` | `test_get_image_exists_not` | Pass | Support | Missing images return NotFound. |
+| `IMG-009` | `test_save_image` | Known fail | Undecided | Docker archive export endpoint is missing. |
+| `IMG-010` | `test_load_image` | Known fail | Undecided | Load exists, but save/load round trips cannot yet run. |
+| `IMG-011` | `test_load_corrupt_image` | Pass | Support | Corrupt archives are rejected. |
+| `IMG-012` | `test_build_image` | Known fail | Intentional gap | Direct build is intentionally unsupported. |
+| `IMG-013` | `test_build_image_via_api_client` | Known fail | Intentional gap | Direct build is intentionally unsupported. |
+| `IMG-014` | `test_push_error` | Known fail | Undecided | Image push endpoint is missing. |
 
 ## System
 
