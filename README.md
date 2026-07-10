@@ -81,7 +81,7 @@ Known gaps:
 - Restart policies and recovery after daemon or process failure
 - Following logs and post-start/multi-client attach
 - Host port publishing, shared user-defined networks, network aliases, and Compose service DNS
-- Network connect/disconnect, prune, and anonymous-volume lifecycle
+- Anonymous-volume lifecycle
 - Health checks, events, stats, top, update, and resource pruning
 - Registry authentication, image history, and real pull progress
 - Compose compatibility validation beyond the Buildx container path

@@ -39,6 +39,11 @@ public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
     public var aliases: [String]
     public var ipv4Address: String?
     public var ipv6Address: String?
+
+    public init(networkID: String, aliases: [String] = [], ipv4Address: String? = nil, ipv6Address: String? = nil) {
+        self.networkID = networkID; self.aliases = aliases
+        self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
+    }
 }
 
 public struct RestartPolicyRecord: Codable, Hashable, Sendable {

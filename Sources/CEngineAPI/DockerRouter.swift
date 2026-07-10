@@ -84,6 +84,14 @@ public struct DockerRouter: Sendable {
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)
             record.mounts = try mounts(from: input)
             record.ports = ports(from: input)
+            for (networkName, endpoint) in input.NetworkingConfig?.EndpointsConfig ?? [:] {
+                let network = try await runtime.network(networkName)
+                record.networks.append(.init(
+                    networkID: network.id, aliases: endpoint.Aliases ?? [],
+                    ipv4Address: endpoint.IPAMConfig?.IPv4Address ?? endpoint.IPAddress,
+                    ipv6Address: endpoint.IPAMConfig?.IPv6Address ?? endpoint.GlobalIPv6Address
+                ))
+            }
             let created = try await runtime.createContainer(record)
             return json(status: .created, ContainerCreateResponse(Id: created.id, Warnings: []))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/json"):
@@ -197,6 +205,22 @@ public struct DockerRouter: Sendable {
             let input = try decoder.decode(NetworkCreateRequest.self, from: request.body)
             let network = try await runtime.createNetwork(name: input.Name, labels: input.Labels ?? [:])
             return json(status: .created, NetworkCreateResponse(Id: network.id, Warning: ""))
+        case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/connect"):
+            let id = String(value.dropFirst("/networks/".count).dropLast("/connect".count))
+            let input = try decoder.decode(NetworkConnectRequest.self, from: request.body)
+            try await runtime.connectNetwork(
+                id, container: input.Container, aliases: input.EndpointConfig?.Aliases ?? [],
+                ipv4Address: input.EndpointConfig?.IPAMConfig?.IPv4Address ?? input.EndpointConfig?.IPAddress,
+                ipv6Address: input.EndpointConfig?.IPAMConfig?.IPv6Address ?? input.EndpointConfig?.GlobalIPv6Address
+            )
+            return APIResponse(status: .ok)
+        case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/disconnect"):
+            let id = String(value.dropFirst("/networks/".count).dropLast("/disconnect".count))
+            let input = try decoder.decode(NetworkDisconnectRequest.self, from: request.body)
+            try await runtime.disconnectNetwork(id, container: input.Container, force: input.Force ?? false)
+            return APIResponse(status: .ok)
+        case (.POST, "/networks/prune"):
+            return json(status: .ok, PruneResponse(networks: try await runtime.pruneNetworks()))
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):

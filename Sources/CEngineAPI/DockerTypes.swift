@@ -64,6 +64,21 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     public var StopTimeout: Int?
     public var HostConfig: HostConfig?
     public var Mounts: [Mount]?
+    public var NetworkingConfig: NetworkingConfigRequest?
+
+    public struct NetworkingConfigRequest: Decodable, Sendable {
+        public var EndpointsConfig: [String: EndpointSettingsRequest]
+    }
+    public struct EndpointSettingsRequest: Decodable, Sendable {
+        public var Aliases: [String]?
+        public var IPAddress: String?
+        public var GlobalIPv6Address: String?
+        public var IPAMConfig: EndpointIPAMRequest?
+    }
+    public struct EndpointIPAMRequest: Decodable, Sendable {
+        public var IPv4Address: String?
+        public var IPv6Address: String?
+    }
 
     public struct Mount: Decodable, Sendable {
         public var `Type`: String
@@ -146,6 +161,21 @@ public struct ContainerSummaryResponse: Codable, Sendable {
 
 public struct NetworkCreateRequest: Decodable, Sendable { public let Name: String; public var Internal: Bool?; public var Labels: [String: String]? }
 public struct NetworkCreateResponse: Codable, Sendable { public let Id: String; public let Warning: String }
+public struct NetworkConnectRequest: Decodable, Sendable {
+    public let Container: String
+    public var EndpointConfig: ContainerCreateRequest.EndpointSettingsRequest?
+}
+public struct NetworkDisconnectRequest: Decodable, Sendable { public let Container: String; public var Force: Bool? }
+public struct PruneResponse: Encodable, Sendable {
+    public let ContainersDeleted: [String]?
+    public let ImagesDeleted: [ImageDeleteResponse]?
+    public let NetworksDeleted: [String]?
+    public let VolumesDeleted: [String]?
+    public let SpaceReclaimed: UInt64
+    public init(networks: [String]) {
+        ContainersDeleted = nil; ImagesDeleted = nil; NetworksDeleted = networks; VolumesDeleted = nil; SpaceReclaimed = 0
+    }
+}
 public struct VolumeCreateRequest: Decodable, Sendable { public var Name: String?; public var Driver: String?; public var DriverOpts: [String: String]?; public var Labels: [String: String]? }
 
 public struct DockerVolumeResponse: Encodable, Sendable {

@@ -157,6 +157,40 @@ private actor ImageStoreBackend: ContainerBackend {
         #expect(volumeInspect.status == .ok)
     }
 
+    @Test func composeNetworkingAndNetworkLifecyclePersistEndpoints() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let networkCreate = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/create", body: Data(#"{"Name":"project_default"}"#.utf8)
+        ))
+        #expect(networkCreate.status == .created)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=web",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"project_default":{"Aliases":["web","api"],"IPAMConfig":{"IPv4Address":"172.30.0.20"}}}}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspected = await router.route(.init(method: .GET, uri: "/v1.44/containers/web/json"))
+        #expect(inspected.status == .ok)
+
+        let second = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=worker", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(second.status == .created)
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/project_default/connect",
+            body: Data(#"{"Container":"worker","EndpointConfig":{"Aliases":["jobs"]}}"#.utf8)
+        ))
+        #expect(connect.status == .ok)
+        let disconnect = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/project_default/disconnect",
+            body: Data(#"{"Container":"worker"}"#.utf8)
+        ))
+        #expect(disconnect.status == .ok)
+        let pruneWhileUsed = await router.route(.init(method: .POST, uri: "/v1.44/networks/prune", body: Data(#"{"filters":{}}"#.utf8)))
+        let pruneJSON = try #require(JSONSerialization.jsonObject(with: pruneWhileUsed.body) as? [String: Any])
+        #expect((pruneJSON["NetworksDeleted"] as? [String])?.isEmpty == true)
+    }
+
     @Test func emptyHostnamePreservesDockerStyleDefault() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

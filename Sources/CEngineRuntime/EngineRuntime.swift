@@ -288,6 +288,43 @@ public actor EngineRuntime {
         try await persist()
     }
 
+    public func connectNetwork(_ networkIdentifier: String, container containerIdentifier: String,
+                               aliases: [String] = [], ipv4Address: String? = nil,
+                               ipv6Address: String? = nil) async throws {
+        let network = try network(networkIdentifier)
+        let index = try containerIndex(containerIdentifier)
+        guard snapshot.containers[index].phase == .created else {
+            throw EngineError(.unsupported, "live network attachment is not supported by the VM backend")
+        }
+        guard !snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else { return }
+        snapshot.containers[index].networks.append(.init(
+            networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address
+        ))
+        try await persist()
+    }
+
+    public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
+        let network = try network(networkIdentifier)
+        let index = try containerIndex(containerIdentifier)
+        guard snapshot.containers[index].phase == .created || force else {
+            throw EngineError(.unsupported, "live network detachment is not supported by the VM backend")
+        }
+        guard snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else {
+            if force { return }
+            throw EngineError(.notFound, "container is not connected to network (network.name)")
+        }
+        snapshot.containers[index].networks.removeAll { $0.networkID == network.id }
+        try await persist()
+    }
+
+    public func pruneNetworks() async throws -> [String] {
+        let used = Set(snapshot.containers.flatMap(\.networks).map(\.networkID))
+        let removed = snapshot.networks.filter { !used.contains($0.id) }
+        snapshot.networks.removeAll { !used.contains($0.id) }
+        try await persist()
+        return removed.map(\.name)
+    }
+
     public func createVolume(name: String, sizeBytes: UInt64 = 512 * 1024 * 1024 * 1024, labels: [String: String] = [:], options: [String: String] = [:]) async throws -> VolumeRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
         if let existing = snapshot.volumes.first(where: { $0.name == name }) { return existing }
