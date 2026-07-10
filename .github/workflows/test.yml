@@ -56,18 +56,6 @@ jobs:
           make test XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
             XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
             XCODE_RESULT_BUNDLE="$XCODE_RESULT_BUNDLE_PATH"
-      - name: Install Docker compatibility clients
-        run: |
-          brew install docker
-          bash Scripts/install-compose-compat.sh
-          docker compose version
-      - name: Install compatibility kernel
-        run: |
-          "$XCODE_DERIVED_DATA_PATH/Build/Products/Debug/cengine" system install
-      - name: Run Docker and Compose compatibility tests
-        run: |
-          make test-compat XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
-            XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH"
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

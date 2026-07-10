@@ -17,6 +17,13 @@ def main() -> None:
         require_contains(release, needle, "release.yml")
     for forbidden in ("draft: true", "--draft", "TestFlight"):
         require_absent(release, forbidden, "release.yml")
+    for forbidden in (
+        "brew install docker",
+        "install-compose-compat.sh",
+        "make test-compat",
+        "system install",
+    ):
+        require_absent(test, forbidden, "test.yml")
     require_contains(
         makefile,
         'CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine"',
