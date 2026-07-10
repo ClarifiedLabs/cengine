@@ -20,6 +20,10 @@ extension EngineRuntime {
         defer { try? FileManager.default.removeItem(at: temporary) }
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         try archive.write(to: archiveURL, options: .atomic)
+        let ownership = try ArchiveReader(file: archiveURL).compactMap { entry, _ -> ArchiveOwnership? in
+            guard let entryPath = entry.path, let owner = entry.owner, let group = entry.group else { return nil }
+            return ArchiveOwnership(path: entryPath, user: UInt32(owner), group: UInt32(group))
+        }
         let rejected: [String]
         do {
             rejected = try ArchiveReader(file: archiveURL).extractContents(to: extracted)
@@ -31,7 +35,7 @@ extension EngineRuntime {
         guard rejected.isEmpty else {
             throw EngineError(.badRequest, "archive contains unsafe paths: \(rejected.joined(separator: ", "))")
         }
-        try await backend.copyIn(container, extractedDirectory: extracted, destination: path)
+        try await backend.copyIn(container, extractedDirectory: extracted, destination: path, ownership: ownership)
     }
 }
 

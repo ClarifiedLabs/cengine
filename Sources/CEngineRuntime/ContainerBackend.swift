@@ -1,6 +1,16 @@
 import CEngineCore
 import Foundation
 
+public struct ArchiveOwnership: Sendable {
+    public let path: String
+    public let user: UInt32
+    public let group: UInt32
+
+    public init(path: String, user: UInt32, group: UInt32) {
+        self.path = path; self.user = user; self.group = group
+    }
+}
+
 public protocol ContainerBackend: Sendable {
     func pullImage(_ reference: String, platform: String) async throws
     func prepare(_ container: ContainerRecord) async throws
@@ -20,7 +30,8 @@ public protocol ContainerBackend: Sendable {
     func execPID(_ exec: ExecRecord) async -> Int32
     func execStatus(_ exec: ExecRecord) async -> Int32?
     func resizeExec(_ exec: ExecRecord, width: UInt16, height: UInt16) async throws
-    func copyIn(_ container: ContainerRecord, extractedDirectory: URL, destination: String) async throws
+    func copyIn(_ container: ContainerRecord, extractedDirectory: URL, destination: String,
+                ownership: [ArchiveOwnership]) async throws
     func copyOut(_ container: ContainerRecord, source: String, destinationDirectory: URL) async throws
     func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage]
     func listImages() async throws -> [BackendImage]?
@@ -56,7 +67,8 @@ public extension ContainerBackend {
     func execPID(_: ExecRecord) async -> Int32 { 0 }
     func execStatus(_: ExecRecord) async -> Int32? { nil }
     func resizeExec(_: ExecRecord, width _: UInt16, height _: UInt16) async throws {}
-    func copyIn(_: ContainerRecord, extractedDirectory _: URL, destination _: String) async throws {
+    func copyIn(_: ContainerRecord, extractedDirectory _: URL, destination _: String,
+                ownership _: [ArchiveOwnership]) async throws {
         throw EngineError(.unsupported, "archive copy is unavailable for this backend")
     }
     func copyOut(_: ContainerRecord, source _: String, destinationDirectory _: URL) async throws {

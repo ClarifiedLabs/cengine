@@ -31,7 +31,7 @@ are **Support**, **Intentional gap**, and **Undecided**.
 | `CTR-012` | `test_unpause_container` | Pass | Support | Resume and inspect. |
 | `CTR-013` | `test_list_container` | Pass | Support | List all containers. |
 | `CTR-014` | `test_filters` | Pass | Support | Enabled even though Podman currently skips it. |
-| `CTR-015` | `test_copy_to_container` | Known fail | Undecided | Content is preserved, but tar UID/GID becomes `0:0`. |
+| `CTR-015` | `test_copy_to_container` | Pass | Support | Content, mode, and numeric tar UID/GID are preserved inside the guest. |
 | `CTR-016` | `test_mount_preexisting_dir` | Known fail | Intentional gap | Requires direct `docker build`; cengine requires Buildx. |
 | `CTR-017` | `test_non_existent_workdir` | Known fail | Intentional gap | Requires direct `docker build`; cengine requires Buildx. |
 | `CTR-018` | `test_build_pull` | Known fail | Intentional gap | Requires direct `docker build`; cengine requires Buildx. |

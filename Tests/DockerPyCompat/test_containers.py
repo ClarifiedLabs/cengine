@@ -112,7 +112,6 @@ def test_filters(client: docker.DockerClient, top):
     assert client.containers.list(all=True, filters={"name": top.name}) == [top]
 
 
-@KNOWN_GAP(reason="CTR-015: archive extraction does not preserve tar UID/GID")
 @pytest.mark.compat("CTR-015")
 def test_copy_to_container(client: docker.DockerClient, top):
     content = b"Hello World!"

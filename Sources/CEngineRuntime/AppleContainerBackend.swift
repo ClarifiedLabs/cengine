@@ -476,7 +476,8 @@ public actor AppleContainerBackend: ContainerBackend {
         try? await process.delete()
     }
 
-    public func copyIn(_ record: ContainerRecord, extractedDirectory: URL, destination: String) async throws {
+    public func copyIn(_ record: ContainerRecord, extractedDirectory: URL, destination: String,
+                       ownership: [ArchiveOwnership]) async throws {
         if containers[record.id] == nil {
             guard preparedRecords[record.id] != nil else { throw EngineError(.notFound, "container runtime is unavailable") }
             let directory = stagingRoot.appending(path: record.id).appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -491,6 +492,18 @@ public actor AppleContainerBackend: ContainerBackend {
         )
         for entry in entries {
             try await container.copyIn(from: entry, to: URL(filePath: destination, directoryHint: .isDirectory))
+        }
+        for value in ownership {
+            let target = URL(filePath: destination, directoryHint: .isDirectory).appending(path: value.path).path
+            let process = try await container.exec("chown-\(UUID().uuidString)") { config in
+                config.arguments = ["/bin/chown", "\(value.user):\(value.group)", target]
+            }
+            try await process.start()
+            let status = try await process.wait()
+            try? await process.delete()
+            guard status.exitCode == 0 else {
+                throw EngineError(.internalError, "failed to preserve archive ownership for \(value.path)")
+            }
         }
     }
 
