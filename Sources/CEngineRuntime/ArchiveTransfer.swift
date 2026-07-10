@@ -1,6 +1,7 @@
 import CEngineCore
 import ContainerizationArchive
 import Foundation
+import SystemPackage
 
 extension EngineRuntime {
     public func copyArchiveIntoContainer(_ identifier: String, path: String, archive: Data) async throws {
@@ -31,5 +32,23 @@ extension EngineRuntime {
             throw EngineError(.badRequest, "archive contains unsafe paths: \(rejected.joined(separator: ", "))")
         }
         try await backend.copyIn(container, extractedDirectory: extracted, destination: path)
+    }
+}
+
+extension EngineRuntime {
+    public func copyArchiveOutOfContainer(_ identifier: String, path: String) async throws -> Data {
+        let container = try container(identifier)
+        guard container.phase == .running else { throw EngineError(.conflict, "archive copy requires a running container") }
+        guard path.hasPrefix("/") else { throw EngineError(.badRequest, "container path must be absolute") }
+        let temporary = FileManager.default.temporaryDirectory.appending(path: "cengine-copyout-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let contents = temporary.appending(path: "contents", directoryHint: .isDirectory)
+        let archiveURL = temporary.appending(path: "download.tar")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        try await backend.copyOut(container, source: path, destinationDirectory: contents)
+        let writer = try ArchiveWriter(format: .pax, filter: .none, file: archiveURL)
+        try writer.archiveDirectory(contents)
+        try writer.finishEncoding()
+        return try Data(contentsOf: archiveURL)
     }
 }

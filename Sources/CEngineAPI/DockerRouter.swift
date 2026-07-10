@@ -115,6 +115,21 @@ public struct DockerRouter: Sendable {
             )
             let encoded = try encoder.encode(stat).base64EncodedString()
             return APIResponse(status: .ok, headers: ["X-Docker-Container-Path-Stat": encoded])
+        case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/archive"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/archive".count))
+            guard let path = query["path"], !path.isEmpty else { throw EngineError(.badRequest, "path is required") }
+            let stat = ContainerPathStat(
+                name: URL(filePath: path).lastPathComponent, size: 0,
+                mode: 0, mtime: ISO8601DateFormatter().string(from: Date()), linkTarget: ""
+            )
+            return APIResponse(
+                status: .ok,
+                headers: [
+                    "Content-Type": "application/x-tar",
+                    "X-Docker-Container-Path-Stat": try encoder.encode(stat).base64EncodedString(),
+                ],
+                body: try await runtime.copyArchiveOutOfContainer(id, path: path)
+            )
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/start"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/start".count))
             try await runtime.startContainer(id); return APIResponse(status: .noContent)

@@ -307,6 +307,13 @@ public actor AppleContainerBackend: ContainerBackend {
         }
     }
 
+    public func copyOut(_ record: ContainerRecord, source: String, destinationDirectory: URL) async throws {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+        let destination = destinationDirectory.appending(path: URL(filePath: source).lastPathComponent)
+        try await container.copyOut(from: URL(filePath: source), to: destination)
+    }
+
     private static func parseUser(_ value: String) -> ContainerizationOCI.User {
         guard !value.isEmpty else { return ContainerizationOCI.User() }
         let components = value.split(separator: ":", maxSplits: 1).map(String.init)
