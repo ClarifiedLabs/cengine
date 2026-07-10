@@ -14,6 +14,10 @@ public actor AppleContainerBackend: ContainerBackend {
     private var containers: [String: LinuxContainer] = [:]
     private var ioBridges: [String: ContainerIOBridge] = [:]
     private var waitTasks: [String: Task<Int32, Never>] = [:]
+    private var execProcesses: [String: LinuxProcess] = [:]
+    private var execBridges: [String: ContainerIOBridge] = [:]
+    private var execWaitTasks: [String: Task<Int32, Never>] = [:]
+    private var execExitCodes: [String: Int32] = [:]
     private let volumeRoot: URL
     private let logRoot: URL
 
@@ -186,6 +190,72 @@ public actor AppleContainerBackend: ContainerBackend {
     public func kill(_ record: ContainerRecord, signal: String) async throws {
         guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
         try await container.kill(try Signal(signal))
+    }
+
+    public func prepareExec(_ exec: ExecRecord, container record: ContainerRecord) async throws -> ContainerIOBridge {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        let io = ContainerIOBridge(tty: exec.configuration.tty)
+        let process = try await container.exec(exec.id) { config in
+            config.arguments = exec.configuration.arguments
+            config.environmentVariables = record.environment + exec.configuration.environment
+            if !config.environmentVariables.contains(where: { $0.hasPrefix("PATH=") }) {
+                config.environmentVariables.append("PATH=\(LinuxProcessConfiguration.defaultPath)")
+            }
+            config.workingDirectory = exec.configuration.workingDirectory.isEmpty
+                ? (record.workingDirectory.isEmpty ? "/" : record.workingDirectory)
+                : exec.configuration.workingDirectory
+            let user = exec.configuration.user.isEmpty ? record.user : exec.configuration.user
+            if !user.isEmpty { config.user = Self.parseUser(user) }
+            config.terminal = exec.configuration.tty
+            if exec.configuration.attachStdin { config.stdin = io }
+            if exec.configuration.attachStdout { config.stdout = io.writer(.stdout) }
+            if exec.configuration.attachStderr && !exec.configuration.tty { config.stderr = io.writer(.stderr) }
+            if exec.configuration.privileged { config.capabilities = .allCapabilities }
+        }
+        execProcesses[exec.id] = process
+        execBridges[exec.id] = io
+        return io
+    }
+
+    public func startExec(_ exec: ExecRecord) async throws {
+        guard let process = execProcesses[exec.id], let io = execBridges[exec.id] else {
+            throw EngineError(.notFound, "No such exec instance: \(exec.id)")
+        }
+        try await process.start()
+        execWaitTasks[exec.id] = Task { [weak self] in
+            do {
+                let status = try await process.wait()
+                await self?.recordExecExit(exec.id, code: status.exitCode, io: io, process: process)
+                return status.exitCode
+            } catch {
+                await self?.recordExecExit(exec.id, code: 127, io: io, process: process)
+                return 127
+            }
+        }
+    }
+
+    public func execCompletion(_ exec: ExecRecord) async -> Int32? {
+        guard let task = execWaitTasks[exec.id] else { return nil }
+        return await task.value
+    }
+
+    public func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge {
+        guard let io = execBridges[exec.id] else { throw EngineError(.notFound, "No such exec instance: \(exec.id)") }
+        return io
+    }
+
+    public func execPID(_ exec: ExecRecord) async -> Int32 { execProcesses[exec.id]?.pid ?? 0 }
+    public func execStatus(_ exec: ExecRecord) async -> Int32? { execExitCodes[exec.id] }
+
+    public func resizeExec(_ exec: ExecRecord, width: UInt16, height: UInt16) async throws {
+        guard let process = execProcesses[exec.id] else { throw EngineError(.notFound, "No such exec instance: \(exec.id)") }
+        try await process.resize(to: Terminal.Size(width: width, height: height))
+    }
+
+    private func recordExecExit(_ id: String, code: Int32, io: ContainerIOBridge, process: LinuxProcess) async {
+        execExitCodes[id] = code
+        io.finishOutput()
+        try? await process.delete()
     }
 
     private static func parseUser(_ value: String) -> ContainerizationOCI.User {

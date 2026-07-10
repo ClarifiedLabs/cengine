@@ -8,6 +8,7 @@ import Testing
 private actor CompletionBackend: ContainerBackend {
     private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private let log: Data
+    private var execBridges: [String: ContainerIOBridge] = [:]
 
     init(log: Data = Data()) { self.log = log }
     func pullImage(_: String, platform _: String) async throws {}
@@ -21,6 +22,19 @@ private actor CompletionBackend: ContainerBackend {
     }
     func logs(for _: ContainerRecord) async throws -> Data { log }
     func finish(_ id: String, code: Int32) { continuations.removeValue(forKey: id)?.resume(returning: code) }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        let bridge = ContainerIOBridge(tty: exec.configuration.tty)
+        execBridges[exec.id] = bridge
+        return bridge
+    }
+    func startExec(_ exec: ExecRecord) async throws {
+        try execBridges[exec.id]?.writer(.stdout).write(Data("exec-ok\n".utf8))
+        execBridges[exec.id]?.finishOutput()
+    }
+    func execCompletion(_: ExecRecord) async -> Int32? { 0 }
+    func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge { try #require(execBridges[exec.id]) }
+    func execPID(_: ExecRecord) async -> Int32 { 42 }
+    func execStatus(_: ExecRecord) async -> Int32? { 0 }
 }
 
 @Suite struct DockerRouterTests {
@@ -179,5 +193,34 @@ private actor CompletionBackend: ContainerBackend {
         let logs = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(record.id)/logs?stdout=1", body: Data()))
         #expect(logs.status == .ok)
         #expect(logs.body == payload)
+    }
+
+    @Test func execCreateStartAndInspectLifecycle() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = CompletionBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let container = try await runtime.createContainer(ContainerRecord(name: "exec-host", image: "debian"))
+        try await runtime.startContainer(container.id)
+
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/\(container.id)/exec",
+            body: Data(#"{"AttachStdout":true,"AttachStderr":true,"Cmd":["echo","ok"]}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let execID = try #require(created["Id"] as? String)
+        let start = await router.route(.init(method: .POST, uri: "/v1.44/exec/\(execID)/start", body: Data(#"{"Detach":true,"Tty":false}"#.utf8)))
+        #expect(start.status == .ok)
+        for _ in 0..<20 {
+            if try await runtime.exec(execID).exitCode != nil { break }
+            await Task.yield()
+        }
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/exec/\(execID)/json", body: Data()))
+        let value = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(value["Running"] as? Bool == false)
+        #expect(value["ExitCode"] as? Int == 0)
+        #expect(value["ContainerID"] as? String == container.id)
     }
 }

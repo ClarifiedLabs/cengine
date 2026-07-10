@@ -74,12 +74,12 @@ State is JSON with an explicit schema envelope and atomic rename/fsync persisten
 
 ## Current compatibility
 
-Implemented API groups include server ping/version/info; image pull/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; interactive and non-interactive attach with stdin, TTY resize, and Docker stream framing; durable non-following container logs; and Docker-shaped network and volume create/list/inspect/remove lifecycle. Direct `docker build` intentionally returns a message directing clients to Buildx.
+Implemented API groups include server ping/version/info; image pull/list/inspect/delete with Docker short-name normalization and automatic pull-on-run; container create/start/stop/kill/wait/remove/list/inspect; automatic exit reconciliation and auto-remove; interactive and non-interactive attach with stdin, TTY resize, and Docker stream framing; exec create/start/inspect with attached, detached, TTY, stdin, resize, and exit-code handling; durable non-following container logs; and Docker-shaped network and volume create/list/inspect/remove lifecycle. Direct `docker build` intentionally returns a message directing clients to Buildx.
 
 Known gaps:
 
 - Restart policies and recovery after daemon or process failure
-- Following logs, post-start/multi-client attach, and `docker exec`
+- Following logs and post-start/multi-client attach
 - `PUT/GET /containers/{id}/archive`, required by the Buildx container driver
 - Host port publishing, shared user-defined networks, network aliases, and Compose service DNS
 - Network connect/disconnect, prune, anonymous-volume lifecycle, and `tmpfs` mounts

@@ -19,6 +19,7 @@ public actor EngineRuntime {
     private var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
     private let backend: any ContainerBackend
+    private var execs: [String: ExecRecord] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -88,6 +89,50 @@ public actor EngineRuntime {
         let record = try container(identifier)
         guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         try await backend.kill(record, signal: signal)
+    }
+
+    public func createExec(container identifier: String, configuration: ExecConfiguration) async throws -> ExecRecord {
+        let container = try container(identifier)
+        guard container.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
+        guard !configuration.arguments.isEmpty else { throw EngineError(.badRequest, "exec command cannot be empty") }
+        let exec = ExecRecord(containerID: container.id, configuration: configuration)
+        _ = try await backend.prepareExec(exec, container: container)
+        execs[exec.id] = exec
+        return exec
+    }
+
+    public func exec(_ identifier: String) throws -> ExecRecord {
+        guard let exec = execs[identifier] else { throw EngineError(.notFound, "No such exec instance: \(identifier)") }
+        return exec
+    }
+
+    public func inspectExec(_ identifier: String) async throws -> ExecRecord {
+        var value = try exec(identifier)
+        if value.running, let code = await backend.execStatus(value) {
+            value.running = false
+            value.exitCode = code
+            value.pid = await backend.execPID(value)
+            execs[identifier] = value
+        }
+        return value
+    }
+
+    public func execIO(_ identifier: String) async throws -> ContainerIOBridge {
+        try await backend.execIO(exec(identifier))
+    }
+
+    public func startExec(_ identifier: String) async throws {
+        var exec = try exec(identifier)
+        guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
+        try await backend.startExec(exec)
+        exec.running = true
+        exec.pid = await backend.execPID(exec)
+        execs[identifier] = exec
+        Task { [weak self] in await self?.monitorExec(identifier) }
+    }
+
+    public func resizeExec(_ identifier: String, width: UInt16, height: UInt16) async throws {
+        try await backend.resizeExec(exec(identifier), width: width, height: height)
     }
 
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
@@ -237,5 +282,14 @@ public actor EngineRuntime {
             if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
         }
         try? await persist()
+    }
+
+    private func monitorExec(_ identifier: String) async {
+        guard let exec = try? exec(identifier), let code = await backend.execCompletion(exec) else { return }
+        guard var current = execs[identifier] else { return }
+        current.running = false
+        current.exitCode = code
+        current.pid = await backend.execPID(current)
+        execs[identifier] = current
     }
 }

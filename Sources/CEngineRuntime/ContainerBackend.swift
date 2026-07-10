@@ -13,6 +13,13 @@ public protocol ContainerBackend: Sendable {
     func completion(_ container: ContainerRecord) async -> Int32?
     func logs(for container: ContainerRecord) async throws -> Data
     func kill(_ container: ContainerRecord, signal: String) async throws
+    func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge
+    func startExec(_ exec: ExecRecord) async throws
+    func execCompletion(_ exec: ExecRecord) async -> Int32?
+    func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge
+    func execPID(_ exec: ExecRecord) async -> Int32
+    func execStatus(_ exec: ExecRecord) async -> Int32?
+    func resizeExec(_ exec: ExecRecord, width: UInt16, height: UInt16) async throws
 }
 
 public extension ContainerBackend {
@@ -23,6 +30,15 @@ public extension ContainerBackend {
     func completion(_: ContainerRecord) async -> Int32? { nil }
     func logs(for _: ContainerRecord) async throws -> Data { Data() }
     func kill(_: ContainerRecord, signal _: String) async throws {}
+    func prepareExec(_: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        throw EngineError(.unsupported, "exec is unavailable for this backend")
+    }
+    func startExec(_: ExecRecord) async throws { throw EngineError(.unsupported, "exec is unavailable for this backend") }
+    func execCompletion(_: ExecRecord) async -> Int32? { nil }
+    func execIO(_: ExecRecord) async throws -> ContainerIOBridge { throw EngineError(.notFound, "exec I/O is unavailable") }
+    func execPID(_: ExecRecord) async -> Int32 { 0 }
+    func execStatus(_: ExecRecord) async -> Int32? { nil }
+    func resizeExec(_: ExecRecord, width _: UInt16, height _: UInt16) async throws {}
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

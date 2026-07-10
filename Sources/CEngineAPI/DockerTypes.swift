@@ -1,4 +1,5 @@
 import CEngineCore
+import CEngineRuntime
 import Foundation
 
 public struct DockerErrorBody: Codable, Sendable { public let message: String }
@@ -90,6 +91,32 @@ public struct ContainerCreateResponse: Codable, Sendable { public let Id: String
 public struct ContainerWaitResponse: Encodable, Sendable {
     public let StatusCode: Int32
     public let Error: DockerErrorBody?
+}
+
+public struct ExecCreateRequest: Decodable, Sendable {
+    public var AttachStdin: Bool?; public var AttachStdout: Bool?; public var AttachStderr: Bool?
+    public var DetachKeys: String?; public var Tty: Bool?; public var Cmd: [String]
+    public var Env: [String]?; public var WorkingDir: String?; public var Privileged: Bool?; public var User: String?
+}
+public struct ExecCreateResponse: Encodable, Sendable { public let Id: String }
+public struct ExecStartRequest: Decodable, Sendable { public var Detach: Bool?; public var Tty: Bool? }
+public struct ExecInspectResponse: Encodable, Sendable {
+    public let ID: String; public let Running: Bool; public let ExitCode: Int32; public let ProcessConfig: Process
+    public let OpenStdin: Bool; public let OpenStdout: Bool; public let OpenStderr: Bool; public let ContainerID: String
+    public let CanRemove = false; public let DetachKeys = ""; public let Pid: Int32
+    public struct Process: Encodable, Sendable {
+        public let entrypoint: String; public let arguments: [String]; public let privileged: Bool; public let tty: Bool
+    }
+    public init(_ exec: ExecRecord) {
+        ID = exec.id; Running = exec.running; ExitCode = exec.exitCode ?? 0; ContainerID = exec.containerID; Pid = exec.pid
+        OpenStdin = exec.configuration.attachStdin; OpenStdout = exec.configuration.attachStdout; OpenStderr = exec.configuration.attachStderr
+        ProcessConfig = .init(
+            entrypoint: exec.configuration.arguments.first ?? "",
+            arguments: Array(exec.configuration.arguments.dropFirst()),
+            privileged: exec.configuration.privileged,
+            tty: exec.configuration.tty
+        )
+    }
 }
 
 public struct ContainerSummaryResponse: Codable, Sendable {

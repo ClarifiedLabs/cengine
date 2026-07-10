@@ -92,7 +92,8 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
     let requiredUpgradeHeaders: [String] = []
     private let router: DockerRouter
     private let lock = NSLock()
-    private var pending: [ObjectIdentifier: ContainerIOBridge] = [:]
+    private struct Pending: Sendable { let io: ContainerIOBridge; let execID: String? }
+    private var pending: [ObjectIdentifier: Pending] = [:]
 
     init(router: DockerRouter) { self.router = router }
 
@@ -102,14 +103,18 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
         initialResponseHeaders: HTTPHeaders
     ) -> EventLoopFuture<HTTPHeaders> {
         let promise = channel.eventLoop.makePromise(of: HTTPHeaders.self)
-        guard upgradeRequest.method == .POST, let id = Self.attachIdentifier(from: upgradeRequest.uri) else {
+        guard upgradeRequest.method == .POST, let target = Self.upgradeTarget(from: upgradeRequest.uri) else {
             promise.fail(EngineError(.notFound, "attach endpoint not found"))
             return promise.futureResult
         }
         Task { [router] in
             do {
-                let io = try await router.containerIO(id)
-                self.lock.withLock { self.pending[ObjectIdentifier(channel as AnyObject)] = io }
+                let pending: Pending
+                switch target {
+                case .container(let id): pending = try await .init(io: router.containerIO(id), execID: nil)
+                case .exec(let id): pending = try await .init(io: router.execIO(id), execID: id)
+                }
+                self.lock.withLock { self.pending[ObjectIdentifier(channel as AnyObject)] = pending }
                 channel.eventLoop.execute {
                     var headers = initialResponseHeaders
                     headers.replaceOrAdd(name: "Content-Type", value: "application/vnd.docker.raw-stream")
@@ -124,20 +129,33 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
 
     func upgrade(context: ChannelHandlerContext, upgradeRequest _: HTTPRequestHead) -> EventLoopFuture<Void> {
         let key = ObjectIdentifier(context.channel as AnyObject)
-        guard let io = lock.withLock({ pending.removeValue(forKey: key) }) else {
+        guard let pending = lock.withLock({ pending.removeValue(forKey: key) }) else {
             return context.eventLoop.makeFailedFuture(EngineError(.internalError, "attach I/O was not prepared"))
         }
         let pipeline = context.pipeline
         return pipeline.removeHandler(name: "docker-http").flatMap {
-            pipeline.addHandler(ContainerAttachHandler(io: io))
+            pipeline.addHandler(ContainerAttachHandler(io: pending.io))
+        }.map {
+            if let execID = pending.execID {
+                Task {
+                    do { try await self.router.startExec(execID) }
+                    catch { pending.io.finishOutput() }
+                }
+            }
         }
     }
 
-    private static func attachIdentifier(from uri: String) -> String? {
+    private enum UpgradeTarget: Sendable { case container(String), exec(String) }
+    private static func upgradeTarget(from uri: String) -> UpgradeTarget? {
         guard let components = URLComponents(string: uri) else { return nil }
         let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
-        guard path.hasPrefix("/containers/"), path.hasSuffix("/attach") else { return nil }
-        return String(path.dropFirst("/containers/".count).dropLast("/attach".count))
+        if path.hasPrefix("/containers/"), path.hasSuffix("/attach") {
+            return .container(String(path.dropFirst("/containers/".count).dropLast("/attach".count)))
+        }
+        if path.hasPrefix("/exec/"), path.hasSuffix("/start") {
+            return .exec(String(path.dropFirst("/exec/".count).dropLast("/start".count)))
+        }
+        return nil
     }
 }
 

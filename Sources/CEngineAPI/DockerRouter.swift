@@ -118,6 +118,32 @@ public struct DockerRouter: Sendable {
             let id = String(value.dropFirst("/containers/".count).dropLast("/kill".count))
             try await runtime.killContainer(id, signal: query["signal"] ?? "SIGKILL")
             return APIResponse(status: .noContent)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
+            let input = try decoder.decode(ExecCreateRequest.self, from: request.body)
+            let exec = try await runtime.createExec(container: id, configuration: .init(
+                arguments: input.Cmd, environment: input.Env ?? [], workingDirectory: input.WorkingDir ?? "",
+                user: input.User ?? "", tty: input.Tty ?? false, attachStdin: input.AttachStdin ?? false,
+                attachStdout: input.AttachStdout ?? true, attachStderr: input.AttachStderr ?? true,
+                privileged: input.Privileged ?? false
+            ))
+            return json(status: .created, ExecCreateResponse(Id: exec.id))
+        case (.POST, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/start"):
+            let id = String(value.dropFirst("/exec/".count).dropLast("/start".count))
+            let input = try decoder.decode(ExecStartRequest.self, from: request.body)
+            guard input.Detach == true else { throw EngineError(.badRequest, "attached exec requires a connection upgrade") }
+            try await runtime.startExec(id)
+            return APIResponse(status: .ok)
+        case (.GET, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/json"):
+            let id = String(value.dropFirst("/exec/".count).dropLast("/json".count))
+            return json(status: .ok, ExecInspectResponse(try await runtime.inspectExec(id)))
+        case (.POST, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/resize"):
+            let id = String(value.dropFirst("/exec/".count).dropLast("/resize".count))
+            guard let width = query["w"].flatMap(UInt16.init), let height = query["h"].flatMap(UInt16.init) else {
+                throw EngineError(.badRequest, "resize requires w and h")
+            }
+            try await runtime.resizeExec(id, width: width, height: height)
+            return APIResponse(status: .ok)
         case (.DELETE, let value) where value.hasPrefix("/containers/"):
             let id = String(value.dropFirst("/containers/".count))
             try await runtime.removeContainer(id, force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
@@ -195,6 +221,9 @@ public struct DockerRouter: Sendable {
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
         try await runtime.containerIO(identifier)
     }
+
+    public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
+    public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
 
     private func mounts(from input: ContainerCreateRequest) throws -> [MountRecord] {
         var result = (input.Mounts ?? []).map { mount in
