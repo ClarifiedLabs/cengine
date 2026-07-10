@@ -27,6 +27,7 @@ public actor AppleContainerBackend: ContainerBackend {
     private let volumeRoot: URL
     private let logRoot: URL
     private let stagingRoot: URL
+    private let runtimeContainerRoot: URL
 
     public init(
         root: URL,
@@ -38,6 +39,7 @@ public actor AppleContainerBackend: ContainerBackend {
         self.volumeRoot = root.appending(path: "volumes", directoryHint: .isDirectory)
         self.logRoot = root.appending(path: "container-logs", directoryHint: .isDirectory)
         self.stagingRoot = root.appending(path: "staged-copies", directoryHint: .isDirectory)
+        self.runtimeContainerRoot = runtimeRoot.appending(path: "containers", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: volumeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logRoot, withIntermediateDirectories: true)
@@ -298,6 +300,14 @@ public actor AppleContainerBackend: ContainerBackend {
     public func deleteVolume(_ name: String) async throws {
         let url = volumeRoot.appending(path: name, directoryHint: .isDirectory)
         if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+    }
+
+    public func cleanupOrphans(keeping containerIDs: Set<String>) async throws {
+        guard FileManager.default.fileExists(atPath: runtimeContainerRoot.path) else { return }
+        for entry in try FileManager.default.contentsOfDirectory(at: runtimeContainerRoot, includingPropertiesForKeys: nil) {
+            guard !containerIDs.contains(entry.lastPathComponent) else { continue }
+            try FileManager.default.removeItem(at: entry)
+        }
     }
 
     public func completion(_ record: ContainerRecord) async -> Int32? {

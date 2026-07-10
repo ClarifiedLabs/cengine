@@ -78,10 +78,8 @@ Implemented API groups include server ping/version/info and live events; image p
 
 Known gaps:
 
-- Restart policies and recovery after daemon or process failure
 - UDP host port publishing and dynamic DNS updates when peers join after a container starts
 - Registry authentication, image history, and real pull progress
 - Full `linux/amd64` image selection; the VM enables Rosetta, but the current Apple `ContainerManager` convenience pull path selects the host platform
-- Recovery or cleanup of live VM handles after daemon restart (persisted running containers are conservatively marked exited)
 
 These gaps are reported as unsupported or absent rather than silently emulated.

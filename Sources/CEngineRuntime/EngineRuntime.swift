@@ -32,10 +32,28 @@ public actor EngineRuntime {
                 id: "cengine-default-network", name: "default", subnet: "192.168.64.0/24", gateway: "192.168.64.1"
             ))
         }
+        try await backend.cleanupOrphans(keeping: Set(snapshot.containers.map(\.id)))
+        var recovered: [(String, Date)] = []
         for index in snapshot.containers.indices where snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused {
+            let stale = snapshot.containers[index]
+            try? await backend.delete(stale)
             snapshot.containers[index].phase = .exited
             snapshot.containers[index].exitCode = 137
             snapshot.containers[index].finishedAt = Date()
+            guard Self.shouldRestart(stale, exitCode: 137) else { continue }
+            do {
+                var restarted = snapshot.containers[index]
+                restarted.restartCount += 1
+                try await backend.prepare(restarted)
+                try await backend.start(restarted)
+                restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
+                let startedAt = Date(); restarted.startedAt = startedAt
+                snapshot.containers[index] = restarted
+                recovered.append((restarted.id, startedAt))
+            } catch {
+                snapshot.containers[index].phase = .dead
+                snapshot.containers[index].exitCode = 127
+            }
         }
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
@@ -50,6 +68,10 @@ public actor EngineRuntime {
             }
         }
         try await persist()
+        for (id, startedAt) in recovered {
+            Task { [weak self] in await self?.monitorContainer(id, startedAt: startedAt) }
+            startHealthMonitor(id)
+        }
     }
 
     public func listContainers(all: Bool) -> [ContainerRecord] {
@@ -561,6 +583,20 @@ public actor EngineRuntime {
         let record = snapshot.containers[index]
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
+        if !autoRemove, Self.shouldRestart(record, exitCode: code) {
+            do {
+                var restarted = record; restarted.restartCount += 1
+                try await backend.delete(record); try await backend.prepare(restarted); try await backend.start(restarted)
+                restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
+                let restartedAt = Date(); restarted.startedAt = restartedAt
+                if let current = try? containerIndex(identifier) { snapshot.containers[current] = restarted }
+                try await persist(); emit(containerEvent("restart", restarted)); startHealthMonitor(identifier)
+                Task { [weak self] in await self?.monitorContainer(identifier, startedAt: restartedAt) }
+                return
+            } catch {
+                if let current = try? containerIndex(identifier) { snapshot.containers[current].phase = .dead }
+            }
+        }
         if autoRemove {
             try? await backend.delete(record)
             try? await removeAnonymousVolumes(usedBy: record)
@@ -568,6 +604,15 @@ public actor EngineRuntime {
             emit(containerEvent("destroy", record))
         }
         try? await persist()
+    }
+
+    private static func shouldRestart(_ record: ContainerRecord, exitCode: Int32) -> Bool {
+        switch record.restartPolicy.name {
+        case "always", "unless-stopped": return true
+        case "on-failure":
+            return exitCode != 0 && (record.restartPolicy.maximumRetryCount == 0 || record.restartCount < record.restartPolicy.maximumRetryCount)
+        default: return false
+        }
     }
 
     private func monitorExec(_ identifier: String) async {

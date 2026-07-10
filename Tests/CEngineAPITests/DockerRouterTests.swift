@@ -102,6 +102,20 @@ private actor ImageStoreBackend: ContainerBackend {
     func deletedReferences() -> [String] { deleted }
 }
 
+private actor RestartBackend: ContainerBackend {
+    private var exitCode: Int32?
+    private var starts = 0
+    init(exitCode: Int32? = nil) { self.exitCode = exitCode }
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_: ContainerRecord) async throws { starts += 1 }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? { defer { exitCode = nil }; return exitCode }
+    func startCount() -> Int { starts }
+}
+
 @Suite struct DockerRouterTests {
     private func fixture() async throws -> (DockerRouter, URL) {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -515,5 +529,37 @@ private actor ImageStoreBackend: ContainerBackend {
         let after = await router.route(.init(method: .GET, uri: "/v1.44/volumes"))
         let afterEnvelope = try #require(JSONSerialization.jsonObject(with: after.body) as? [String: Any])
         #expect((afterEnvelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+    }
+
+    @Test func restartPolicyHandlesProcessAndDaemonFailure() async throws {
+        let processRoot = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: processRoot) }
+        let processBackend = RestartBackend(exitCode: 9)
+        let runtime = try await EngineRuntime(root: processRoot, backend: processBackend)
+        var record = ContainerRecord(name: "process-restart", image: "debian")
+        record.restartPolicy = .init(name: "on-failure", maximumRetryCount: 1)
+        record = try await runtime.createContainer(record)
+        try await runtime.startContainer(record.id)
+        for _ in 0..<100 {
+            if try await runtime.container(record.id).restartCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(try await runtime.container(record.id).phase == .running)
+        #expect(try await runtime.container(record.id).restartCount == 1)
+        #expect(await processBackend.startCount() == 2)
+
+        let daemonRoot = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: daemonRoot) }
+        let firstBackend = RestartBackend()
+        let first = try await EngineRuntime(root: daemonRoot, backend: firstBackend)
+        var daemonRecord = ContainerRecord(name: "daemon-restart", image: "debian")
+        daemonRecord.restartPolicy = .init(name: "always")
+        daemonRecord = try await first.createContainer(daemonRecord)
+        try await first.startContainer(daemonRecord.id)
+        let recoveredBackend = RestartBackend()
+        let recovered = try await EngineRuntime(root: daemonRoot, backend: recoveredBackend)
+        #expect(try await recovered.container(daemonRecord.id).phase == .running)
+        #expect(try await recovered.container(daemonRecord.id).restartCount == 1)
+        #expect(await recoveredBackend.startCount() == 1)
     }
 }

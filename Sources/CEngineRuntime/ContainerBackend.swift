@@ -33,6 +33,7 @@ public protocol ContainerBackend: Sendable {
     func top(_ container: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]])
     func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String)
     func deleteVolume(_ name: String) async throws
+    func cleanupOrphans(keeping containerIDs: Set<String>) async throws
 }
 
 public extension ContainerBackend {
@@ -82,6 +83,7 @@ public extension ContainerBackend {
         throw EngineError(.unsupported, "health checks are unavailable for this backend")
     }
     func deleteVolume(_: String) async throws {}
+    func cleanupOrphans(keeping _: Set<String>) async throws {}
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {
