@@ -15,6 +15,7 @@ public actor AppleContainerBackend: ContainerBackend {
     private var ioBridges: [String: ContainerIOBridge] = [:]
     private var waitTasks: [String: Task<Int32, Never>] = [:]
     private let volumeRoot: URL
+    private let logRoot: URL
 
     public init(
         root: URL,
@@ -24,8 +25,10 @@ public actor AppleContainerBackend: ContainerBackend {
     ) async throws {
         let runtimeRoot = root.appending(path: "runtime", directoryHint: .isDirectory)
         self.volumeRoot = root.appending(path: "volumes", directoryHint: .isDirectory)
+        self.logRoot = root.appending(path: "container-logs", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: volumeRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: logRoot, withIntermediateDirectories: true)
         self.manager = try await ContainerManager(
             kernel: Kernel(path: kernel, platform: .linuxArm),
             initfsReference: vminitReference,
@@ -48,7 +51,7 @@ public actor AppleContainerBackend: ContainerBackend {
         }
 
         let volumeRoot = self.volumeRoot
-        let io = ContainerIOBridge(tty: record.tty)
+        let io = ContainerIOBridge(tty: record.tty, logURL: logRoot.appending(path: "\(record.id).log"))
         var manager = self.manager
         let container = try await manager.create(
             record.id,
@@ -152,6 +155,7 @@ public actor AppleContainerBackend: ContainerBackend {
         }
         waitTasks.removeValue(forKey: record.id)?.cancel()
         ioBridges.removeValue(forKey: record.id)?.finishOutput()
+        try? FileManager.default.removeItem(at: logRoot.appending(path: "\(record.id).log"))
         try manager.delete(record.id)
     }
 
@@ -163,6 +167,20 @@ public actor AppleContainerBackend: ContainerBackend {
     public func resize(_ record: ContainerRecord, width: UInt16, height: UInt16) async throws {
         guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
         try await container.resize(to: Terminal.Size(width: width, height: height))
+    }
+
+    public func completion(_ record: ContainerRecord) async -> Int32? {
+        guard let task = waitTasks[record.id] else { return nil }
+        return await task.value
+    }
+
+    public func logs(for record: ContainerRecord) async throws -> Data {
+        guard let io = ioBridges[record.id] else {
+            let url = logRoot.appending(path: "\(record.id).log")
+            guard FileManager.default.fileExists(atPath: url.path) else { return Data() }
+            return try Data(contentsOf: url)
+        }
+        return try io.logData()
     }
 
     private static func parseUser(_ value: String) -> ContainerizationOCI.User {

@@ -1,4 +1,5 @@
 import CEngineCore
+import Foundation
 
 public protocol ContainerBackend: Sendable {
     func pullImage(_ reference: String, platform: String) async throws
@@ -9,6 +10,8 @@ public protocol ContainerBackend: Sendable {
     func delete(_ container: ContainerRecord) async throws
     func io(for container: ContainerRecord) async throws -> ContainerIOBridge
     func resize(_ container: ContainerRecord, width: UInt16, height: UInt16) async throws
+    func completion(_ container: ContainerRecord) async -> Int32?
+    func logs(for container: ContainerRecord) async throws -> Data
 }
 
 public extension ContainerBackend {
@@ -16,6 +19,8 @@ public extension ContainerBackend {
         throw EngineError(.unsupported, "container I/O is unavailable for this backend")
     }
     func resize(_: ContainerRecord, width _: UInt16, height _: UInt16) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? { nil }
+    func logs(for _: ContainerRecord) async throws -> Data { Data() }
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

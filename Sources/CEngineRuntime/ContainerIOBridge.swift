@@ -12,10 +12,16 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
     private var buffered: [Data] = []
     private var finished = false
     private let tty: Bool
+    private let logURL: URL?
 
-    public init(tty: Bool) {
+    public init(tty: Bool, logURL: URL? = nil) {
         self.tty = tty
+        self.logURL = logURL
         (inputStream, inputContinuation) = AsyncStream.makeStream(of: Data.self)
+        if let logURL {
+            try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
     }
 
     public func stream() -> AsyncStream<Data> { inputStream }
@@ -52,6 +58,11 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
         close?()
     }
 
+    public func logData() throws -> Data {
+        guard let logURL else { return Data() }
+        return try lock.withLock { try Data(contentsOf: logURL) }
+    }
+
     fileprivate func write(_ data: Data, stream: OutputStream) {
         let framed: Data
         if tty {
@@ -64,6 +75,15 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
             framed = header
         }
         lock.lock()
+        if let logURL, let handle = try? FileHandle(forWritingTo: logURL) {
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: framed)
+                try handle.close()
+            } catch {
+                try? handle.close()
+            }
+        }
         let handler = output
         if handler == nil { buffered.append(framed) }
         lock.unlock()

@@ -38,6 +38,16 @@ private final class DataBox: @unchecked Sendable {
         #expect(Array(received.value) == [1, 0, 0, 0, 0, 0, 0, 2, 111, 107])
     }
 
+    @Test func containerIOPersistsFramedLogs() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appending(path: "container.log")
+        let bridge = ContainerIOBridge(tty: false, logURL: log)
+        try bridge.writer(.stderr).write(Data("failure\n".utf8))
+        #expect(Array(try bridge.logData().prefix(8)) == [2, 0, 0, 0, 0, 0, 0, 8])
+        #expect(String(decoding: try bridge.logData().dropFirst(8), as: UTF8.self) == "failure\n")
+    }
+
     @Test func atomicStoreRoundTrips() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -87,6 +87,17 @@ public struct DockerRouter: Sendable {
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/json".count))
             return json(status: .ok, try await inspectContainer(runtime.container(id)))
+        case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/logs"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/logs".count))
+            _ = try await runtime.container(id)
+            guard parseBool(query["follow"]) != true else {
+                throw EngineError(.unsupported, "follow logs is not supported yet")
+            }
+            return APIResponse(
+                status: .ok,
+                headers: ["Content-Type": "application/vnd.docker.raw-stream"],
+                body: try await runtime.containerLogs(id)
+            )
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/start"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/start".count))
             try await runtime.startContainer(id); return APIResponse(status: .noContent)

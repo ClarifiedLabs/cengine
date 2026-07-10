@@ -1,8 +1,27 @@
 import CEngineAPI
+import CEngineCore
 import CEngineRuntime
 import Foundation
 import NIOHTTP1
 import Testing
+
+private actor CompletionBackend: ContainerBackend {
+    private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
+    private let log: Data
+
+    init(log: Data = Data()) { self.log = log }
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_: ContainerRecord) async throws {}
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_ container: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { continuations[container.id] = $0 }
+    }
+    func logs(for _: ContainerRecord) async throws -> Data { log }
+    func finish(_ id: String, code: Int32) { continuations.removeValue(forKey: id)?.resume(returning: code) }
+}
 
 @Suite struct DockerRouterTests {
     private func fixture() async throws -> (DockerRouter, URL) {
@@ -113,5 +132,29 @@ import Testing
         #expect(inspect.status == .ok)
         let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/images/docker.io/library/alpine:latest", body: Data()))
         #expect(remove.status == .ok)
+    }
+
+    @Test func detachedExitIsReconciledAndLogsAreServed() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data([1, 0, 0, 0, 0, 0, 0, 3, 111, 107, 10])
+        let backend = CompletionBackend(log: payload)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let record = try await runtime.createContainer(ContainerRecord(name: "detached", image: "debian"))
+        try await runtime.startContainer(record.id)
+
+        for _ in 0..<100 {
+            await backend.finish(record.id, code: 23)
+            if try await runtime.container(record.id).phase == .exited { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let completed = try await runtime.container(record.id)
+        #expect(completed.phase == .exited)
+        #expect(completed.exitCode == 23)
+
+        let logs = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(record.id)/logs?stdout=1", body: Data()))
+        #expect(logs.status == .ok)
+        #expect(logs.body == payload)
     }
 }

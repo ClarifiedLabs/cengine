@@ -69,6 +69,7 @@ public actor EngineRuntime {
         snapshot.containers[index].finishedAt = nil
         snapshot.containers[index].exitCode = nil
         try await persist()
+        Task { [weak self] in await self?.monitorContainer(record.id) }
     }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
@@ -77,6 +78,10 @@ public actor EngineRuntime {
 
     public func resizeContainer(_ identifier: String, width: UInt16, height: UInt16) async throws {
         try await backend.resize(container(identifier), width: width, height: height)
+    }
+
+    public func containerLogs(_ identifier: String) async throws -> Data {
+        try await backend.logs(for: container(identifier))
     }
 
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
@@ -194,4 +199,23 @@ public actor EngineRuntime {
     }
 
     private func persist() async throws { try await store.save(snapshot) }
+
+    private func monitorContainer(_ identifier: String) async {
+        guard let record = try? container(identifier), let code = await backend.completion(record) else { return }
+        await recordCompletion(identifier, code: code)
+    }
+
+    private func recordCompletion(_ identifier: String, code: Int32) async {
+        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .running else { return }
+        snapshot.containers[index].phase = .exited
+        snapshot.containers[index].exitCode = code
+        snapshot.containers[index].finishedAt = Date()
+        let autoRemove = snapshot.containers[index].autoRemove
+        let record = snapshot.containers[index]
+        if autoRemove {
+            try? await backend.delete(record)
+            if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
+        }
+        try? await persist()
+    }
 }
