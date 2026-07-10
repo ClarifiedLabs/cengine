@@ -456,6 +456,25 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(remove.status == .ok)
     }
 
+    @Test func pullImageByDigestUsesDigestSeparator() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ImageStoreBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let digest = "sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+
+        let response = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/images/create?fromImage=kindest%2Fnode&tag=\(digest)"
+        ))
+
+        #expect(response.status == .ok)
+        #expect(try await runtime.image("docker.io/kindest/node@\(digest)").references == [
+            "docker.io/kindest/node@\(digest)"
+        ])
+    }
+
     @Test func imageMetadataSynchronizesWithBackendAndDeleteReachesStore() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

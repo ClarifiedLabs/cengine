@@ -457,7 +457,9 @@ public struct DockerRouter: Sendable {
             throw EngineError(.badRequest, "fromImage is required")
         }
         let tag = query["tag"].flatMap { $0.isEmpty ? nil : $0 }
-        let fullReference = ImageReference.normalized(tag.map { "\(reference):\($0)" } ?? reference)
+        let fullReference = ImageReference.normalized(tag.map {
+            $0.hasPrefix("sha256:") ? "\(reference)@\($0)" : "\(reference):\($0)"
+        } ?? reference)
         return try await runtime.pullImage(
             fullReference, platform: query["platform"] ?? "linux/arm64",
             credentials: registryCredentials(request.headers), progress: progress
