@@ -8,9 +8,13 @@ import Testing
 private actor CompletionBackend: ContainerBackend {
     private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private let log: Data
+    private let completionEnabled: Bool
     private var execBridges: [String: ContainerIOBridge] = [:]
 
-    init(log: Data = Data()) { self.log = log }
+    init(log: Data = Data(), completionEnabled: Bool = true) {
+        self.log = log
+        self.completionEnabled = completionEnabled
+    }
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
     func start(_: ContainerRecord) async throws {}
@@ -18,7 +22,8 @@ private actor CompletionBackend: ContainerBackend {
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     func delete(_: ContainerRecord) async throws {}
     func completion(_ container: ContainerRecord) async -> Int32? {
-        await withCheckedContinuation { continuations[container.id] = $0 }
+        guard completionEnabled else { return nil }
+        return await withCheckedContinuation { continuations[container.id] = $0 }
     }
     func logs(for _: ContainerRecord) async throws -> Data { log }
     func finish(_ id: String, code: Int32) { continuations.removeValue(forKey: id)?.resume(returning: code) }
@@ -35,6 +40,8 @@ private actor CompletionBackend: ContainerBackend {
     func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge { try #require(execBridges[exec.id]) }
     func execPID(_: ExecRecord) async -> Int32 { 42 }
     func execStatus(_: ExecRecord) async -> Int32? { 0 }
+    func pause(_: ContainerRecord) async throws {}
+    func resume(_: ContainerRecord) async throws {}
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
         [BackendImage(
             id: "sha256:0123456789abcdef",
@@ -337,5 +344,23 @@ private actor ImageStoreBackend: ContainerBackend {
         } catch let error as EngineError {
             #expect(error.code == .conflict)
         }
+    }
+
+    @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let record = try await runtime.createContainer(ContainerRecord(name: "controls", image: "debian"))
+        try await runtime.startContainer(record.id)
+
+        #expect((await router.route(.init(method: .POST, uri: "/v1.44/containers/controls/pause"))).status == .noContent)
+        #expect(try await runtime.container(record.id).phase == .paused)
+        #expect((await router.route(.init(method: .POST, uri: "/v1.44/containers/controls/unpause"))).status == .noContent)
+        #expect(try await runtime.container(record.id).phase == .running)
+        #expect((await router.route(.init(method: .POST, uri: "/v1.44/containers/controls/restart?t=0"))).status == .noContent)
+        let restarted = try await runtime.container(record.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.restartCount == 1)
     }
 }

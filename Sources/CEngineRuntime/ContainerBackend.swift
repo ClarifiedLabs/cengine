@@ -25,6 +25,9 @@ public protocol ContainerBackend: Sendable {
     func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage]
     func listImages() async throws -> [BackendImage]?
     func deleteImage(reference: String) async throws
+    func pause(_ container: ContainerRecord) async throws
+    func resume(_ container: ContainerRecord) async throws
+    func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
 }
 
 public extension ContainerBackend {
@@ -55,6 +58,14 @@ public extension ContainerBackend {
     }
     func listImages() async throws -> [BackendImage]? { nil }
     func deleteImage(reference _: String) async throws {}
+    func pause(_: ContainerRecord) async throws { throw EngineError(.unsupported, "pause is unavailable for this backend") }
+    func resume(_: ContainerRecord) async throws { throw EngineError(.unsupported, "unpause is unavailable for this backend") }
+    func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws {
+        _ = try await stop(container, timeoutSeconds: timeoutSeconds)
+        try await delete(container)
+        try await prepare(container)
+        try await start(container)
+    }
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

@@ -74,11 +74,12 @@ public actor EngineRuntime {
             throw EngineError(.conflict, "container was removed while it was starting")
         }
         snapshot.containers[current].phase = .running
-        snapshot.containers[current].startedAt = Date()
+        let startedAt = Date()
+        snapshot.containers[current].startedAt = startedAt
         snapshot.containers[current].finishedAt = nil
         snapshot.containers[current].exitCode = nil
         try await persist()
-        Task { [weak self] in await self?.monitorContainer(record.id) }
+        Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
@@ -97,6 +98,41 @@ public actor EngineRuntime {
         let record = try container(identifier)
         guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         try await backend.kill(record, signal: signal)
+    }
+
+    public func pauseContainer(_ identifier: String) async throws {
+        let index = try containerIndex(identifier)
+        guard snapshot.containers[index].phase == .running else { throw EngineError(.conflict, "Container (identifier) is not running") }
+        try await backend.pause(snapshot.containers[index])
+        snapshot.containers[index].phase = .paused
+        try await persist()
+    }
+
+    public func resumeContainer(_ identifier: String) async throws {
+        let index = try containerIndex(identifier)
+        guard snapshot.containers[index].phase == .paused else { throw EngineError(.conflict, "Container (identifier) is not paused") }
+        try await backend.resume(snapshot.containers[index])
+        snapshot.containers[index].phase = .running
+        try await persist()
+    }
+
+    public func restartContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
+        let index = try containerIndex(identifier)
+        let record = snapshot.containers[index]
+        guard record.phase == .running || record.phase == .paused else {
+            try await startContainer(identifier)
+            return
+        }
+        try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+        guard let current = try? containerIndex(record.id) else { throw EngineError(.conflict, "container was removed while restarting") }
+        snapshot.containers[current].phase = .running
+        let startedAt = Date()
+        snapshot.containers[current].startedAt = startedAt
+        snapshot.containers[current].finishedAt = nil
+        snapshot.containers[current].exitCode = nil
+        snapshot.containers[current].restartCount += 1
+        try await persist()
+        Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
     public func createExec(container identifier: String, configuration: ExecConfiguration) async throws -> ExecRecord {
@@ -291,13 +327,14 @@ public actor EngineRuntime {
         }.sorted { $0.references.first ?? "" < $1.references.first ?? "" }
     }
 
-    private func monitorContainer(_ identifier: String) async {
+    private func monitorContainer(_ identifier: String, startedAt: Date) async {
         guard let record = try? container(identifier), let code = await backend.completion(record) else { return }
-        await recordCompletion(identifier, code: code)
+        await recordCompletion(identifier, startedAt: startedAt, code: code)
     }
 
-    private func recordCompletion(_ identifier: String, code: Int32) async {
-        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .running else { return }
+    private func recordCompletion(_ identifier: String, startedAt: Date, code: Int32) async {
+        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .running,
+              snapshot.containers[index].startedAt == startedAt else { return }
         snapshot.containers[index].phase = .exited
         snapshot.containers[index].exitCode = code
         snapshot.containers[index].finishedAt = Date()

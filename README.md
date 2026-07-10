@@ -82,7 +82,7 @@ Known gaps:
 - Following logs and post-start/multi-client attach
 - Host port publishing, shared user-defined networks, network aliases, and Compose service DNS
 - Network connect/disconnect, prune, and anonymous-volume lifecycle
-- Health checks, events, stats, top, restart, pause/unpause, update, and resource pruning
+- Health checks, events, stats, top, update, and resource pruning
 - Registry authentication, image history, and real pull progress
 - Compose compatibility validation beyond the Buildx container path
 - Full `linux/amd64` image selection; the VM enables Rosetta, but the current Apple `ContainerManager` convenience pull path selects the host platform

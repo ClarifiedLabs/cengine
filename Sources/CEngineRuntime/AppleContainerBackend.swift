@@ -223,6 +223,16 @@ public actor AppleContainerBackend: ContainerBackend {
         try await container.kill(try Signal(signal))
     }
 
+    public func pause(_ record: ContainerRecord) async throws {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        try await container.withVirtualMachineInstance { try await $0.pause() }
+    }
+
+    public func resume(_ record: ContainerRecord) async throws {
+        guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
+        try await container.withVirtualMachineInstance { try await $0.resume() }
+    }
+
     public func prepareExec(_ exec: ExecRecord, container record: ContainerRecord) async throws -> ContainerIOBridge {
         guard let container = containers[record.id] else { throw EngineError(.notFound, "container runtime is unavailable") }
         let io = ContainerIOBridge(tty: exec.configuration.tty)

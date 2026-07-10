@@ -150,6 +150,16 @@ public struct DockerRouter: Sendable {
             let id = String(value.dropFirst("/containers/".count).dropLast("/kill".count))
             try await runtime.killContainer(id, signal: query["signal"] ?? "SIGKILL")
             return APIResponse(status: .noContent)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/pause"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/pause".count))
+            try await runtime.pauseContainer(id); return APIResponse(status: .noContent)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/unpause"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/unpause".count))
+            try await runtime.resumeContainer(id); return APIResponse(status: .noContent)
+        case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/restart"):
+            let id = String(value.dropFirst("/containers/".count).dropLast("/restart".count))
+            try await runtime.restartContainer(id, timeoutSeconds: query["t"].flatMap(Int.init))
+            return APIResponse(status: .noContent)
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
             let input = try decoder.decode(ExecCreateRequest.self, from: request.body)
