@@ -68,8 +68,19 @@ enum SystemManager {
         }
         _ = try? runDocker(["context", "rm", "-f", "cengine"])
         try runDocker(["context", "create", "cengine", "--docker", "host=unix://\(paths.socket.path)", "--description", "cengine (Apple Containerization)"])
-        // The builder container is created lazily once the daemon is healthy.
-        _ = try? runDocker(["buildx", "create", "--name", "cengine-builder", "--driver", "docker-container", "cengine"])
+        guard (try? runDocker(["buildx", "version"])) != nil else {
+            print("Docker Buildx not found; container builds will be unavailable")
+            return
+        }
+        // BuildKit's overlayfs snapshotter cannot use a VirtioFS-backed named
+        // volume as its upper/work filesystem. The native snapshotter retains
+        // the managed builder's state on that volume without nested overlayfs.
+        _ = try? runDocker(["buildx", "rm", "--force", "cengine-builder"])
+        try runDocker([
+            "buildx", "create", "--name", "cengine-builder", "--driver", "docker-container",
+            "--driver-opt", "image=moby/buildkit:v0.27.1",
+            "--buildkitd-flags", "--oci-worker-snapshotter=native", "cengine",
+        ])
     }
 
     @discardableResult private static func runDocker(_ arguments: [String]) throws -> String {

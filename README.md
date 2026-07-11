@@ -44,11 +44,11 @@ docker --context cengine run --rm hello-world
 docker --context cengine ps
 docker --context cengine images
 docker --context cengine compose up
-docker buildx build --builder cengine-builder .
+docker --context cengine buildx build --builder cengine-builder --load .
 ```
 
-Buildx is the intended build path, but non-scratch builds currently have a
-strict known compatibility failure; see `BLD-001` in the compatibility ledger.
+Buildx is the intended build path. The managed `cengine-builder` uses BuildKit's
+native snapshotter so non-scratch builds work with cengine-backed volumes.
 
 To make `cengine` the default engine for subsequent Docker commands, activate
 its Docker context:

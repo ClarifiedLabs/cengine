@@ -1,0 +1,15 @@
+services:
+  gate:
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    command: ["sleep", "300"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/ready || (touch /tmp/ready; exit 1)"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+  dependent:
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    command: ["true"]
+    depends_on:
+      gate:
+        condition: service_healthy

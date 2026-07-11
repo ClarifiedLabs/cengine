@@ -35,6 +35,9 @@ public struct DockerRouter: Sendable {
     public func route(_ request: APIRequest) async -> APIResponse {
         do { return try await handle(request) }
         catch let error as EngineError { return dockerErrorResponse(error) }
+        catch let error as DecodingError {
+            return dockerErrorResponse(EngineError(.badRequest, "invalid request body: \(error.localizedDescription)"))
+        }
         catch { return json(status: .internalServerError, DockerErrorBody(message: error.localizedDescription)) }
     }
 
@@ -107,9 +110,9 @@ public struct DockerRouter: Sendable {
             for (networkName, endpoint) in input.NetworkingConfig?.EndpointsConfig ?? [:] {
                 let network = try await runtime.network(networkName)
                 record.networks.append(.init(
-                    networkID: network.id, aliases: endpoint.Aliases ?? [],
-                    ipv4Address: endpoint.IPAMConfig?.IPv4Address ?? endpoint.IPAddress,
-                    ipv6Address: endpoint.IPAMConfig?.IPv6Address ?? endpoint.GlobalIPv6Address
+                    networkID: network.id, aliases: endpoint?.Aliases ?? [],
+                    ipv4Address: endpoint?.IPAMConfig?.IPv4Address ?? endpoint?.IPAddress,
+                    ipv6Address: endpoint?.IPAMConfig?.IPv6Address ?? endpoint?.GlobalIPv6Address
                 ))
             }
             let created = try await runtime.createContainer(record)

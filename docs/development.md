@@ -73,14 +73,14 @@ implementation of every Docker API. Its focused runtime surface covers
 interactive Docker CLI use, Compose application lifecycle, Buildx container
 builds, networking, observability, and daemon recovery.
 
-Implemented API groups include server ping/version/info and live events;
+Implemented API groups include server ping/version/info and filtered live events;
 authenticated, platform-aware image pull with live progress,
 import/list/inspect/history/delete and pruning; container lifecycle, health,
 stats, top, logs, attach, exec, archive copy, mounts, networking, ports, and
 pruning; and Docker-shaped network and volume lifecycle APIs. Direct
-`docker build` intentionally directs clients to Buildx. The VM-backed Buildx
-contract is tracked in the compatibility ledger and currently records a strict
-known failure while copying into a non-scratch image.
+`docker build` intentionally directs clients to Buildx. The managed Buildx
+builder pins BuildKit and uses its native snapshotter because overlayfs upper
+layers are incompatible with the VirtioFS-backed builder volume.
 
 See [`docker-compatibility.md`](docker-compatibility.md) for the detailed
 compatibility ledger and test provenance.
@@ -89,8 +89,8 @@ compatibility ledger and test provenance.
 
 `cengine system install` downloads the pinned Kata kernel and verifies its
 SHA-256 digest, installs the `dev.cengine.engine` LaunchAgent, creates the
-`cengine` Docker context, and attempts to create the `cengine-builder` Buildx
-builder. It does not change the active Docker context.
+`cengine` Docker context, and creates the pinned `cengine-builder` Buildx
+builder when Buildx is installed. It does not change the active Docker context.
 
 To develop without downloading a kernel or starting VMs:
 

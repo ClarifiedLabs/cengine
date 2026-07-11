@@ -17,6 +17,7 @@ from docker import errors
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose.yaml"
 COMPOSE_VOLUMES_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-volumes.yaml"
+COMPOSE_HEALTH_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-health.yaml"
 COMPOSE_VERSION = "5.3.1"
 
 
@@ -146,3 +147,19 @@ def test_compose_named_volume_down_semantics(daemon, compose_project, client):
     compose(daemon, compose_project, "down", "--volumes", compose_file=COMPOSE_VOLUMES_FILE)
     with pytest.raises(errors.NotFound):
         client.volumes.get(f"{compose_project}_data")
+
+
+@pytest.mark.compat("CMP-007")
+def test_compose_waits_for_healthy_dependency(daemon, compose_project, client):
+    try:
+        compose(daemon, compose_project, "up", "-d", compose_file=COMPOSE_HEALTH_FILE)
+        gate = client.containers.get(f"{compose_project}-gate-1")
+        gate.reload()
+        assert gate.attrs["State"]["Health"]["Status"] == "healthy"
+        dependent = client.containers.get(f"{compose_project}-dependent-1")
+        assert dependent.wait(timeout=60)["StatusCode"] == 0
+    finally:
+        compose(
+            daemon, compose_project, "down", "--volumes", "--remove-orphans",
+            compose_file=COMPOSE_HEALTH_FILE,
+        )

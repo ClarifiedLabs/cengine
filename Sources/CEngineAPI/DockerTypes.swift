@@ -110,7 +110,18 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     }
 
     public struct NetworkingConfigRequest: Decodable, Sendable {
-        public var EndpointsConfig: [String: EndpointSettingsRequest]
+        public var EndpointsConfig: [String: EndpointSettingsRequest?]
+
+        private enum CodingKeys: String, CodingKey { case EndpointsConfig }
+
+        public init(from decoder: Decoder) throws {
+            let keyed = try decoder.container(keyedBy: CodingKeys.self)
+            if keyed.contains(.EndpointsConfig) {
+                EndpointsConfig = try keyed.decode([String: EndpointSettingsRequest?].self, forKey: .EndpointsConfig)
+            } else {
+                EndpointsConfig = try decoder.singleValueContainer().decode([String: EndpointSettingsRequest?].self)
+            }
+        }
     }
     public struct EndpointSettingsRequest: Decodable, Sendable {
         public var Aliases: [String]?

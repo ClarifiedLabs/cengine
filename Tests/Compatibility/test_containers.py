@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import socket
 import subprocess
 import tarfile
 import threading
@@ -263,6 +264,41 @@ def test_top_and_update(client: docker.DockerClient, top):
     assert top.attrs["HostConfig"]["RestartPolicy"]["Name"] == "always"
 
 
+@pytest.mark.compat("CTR-029")
+def test_follow_logs_streams_output_and_closes(client: docker.DockerClient):
+    container = client.containers.create(
+        IMAGE, command=["sh", "-c", "printf stdout-line; printf stderr-line >&2"]
+    )
+    container.start()
+    output = b"".join(container.logs(stream=True, follow=True))
+    assert b"stdout-line" in output
+    assert b"stderr-line" in output
+
+
+@pytest.mark.compat("CTR-030")
+def test_streaming_stats_produces_multiple_samples(top):
+    stream = top.stats(stream=True, decode=True)
+    try:
+        first = next(stream)
+        second = next(stream)
+    finally:
+        stream.close()
+    for sample in (first, second):
+        assert sample["read"]
+        assert "cpu_stats" in sample
+        assert "memory_stats" in sample
+
+
+@pytest.mark.compat("CTR-031")
+def test_container_and_exec_tty_resize(client: docker.DockerClient):
+    container = client.containers.create(IMAGE, command="top", tty=True)
+    container.start()
+    container.resize(height=40, width=120)
+    exec_id = client.api.exec_create(container.id, ["sh", "-c", "sleep 10"], tty=True)["Id"]
+    client.api.exec_start(exec_id, detach=True, tty=True)
+    client.api.exec_resize(exec_id, height=50, width=140)
+
+
 @pytest.mark.compat("NET-002")
 def test_network_connect_disconnect(client: docker.DockerClient):
     first = client.networks.create(f"compat-{uuid.uuid4().hex[:8]}")
@@ -278,13 +314,49 @@ def test_network_connect_disconnect(client: docker.DockerClient):
     assert second.name not in container.attrs["NetworkSettings"]["Networks"]
 
 
-@KNOWN_GAP(reason="NET-003: docker-py network= create requests with an empty endpoint object return HTTP 500")
 @pytest.mark.compat("NET-003")
 def test_create_container_on_network(client: docker.DockerClient):
     network = client.networks.create(f"compat-{uuid.uuid4().hex[:8]}")
     container = client.containers.create(IMAGE, command="top", network=network.name)
     container.reload()
     assert network.name in container.attrs["NetworkSettings"]["Networks"]
+
+
+@pytest.mark.compat("NET-004")
+def test_udp_port_forwarding(client: docker.DockerClient):
+    container = client.containers.create(
+        IMAGE,
+        command=["sh", "-c", "while true; do printf udp-ok | nc -u -l -p 1234; done"],
+        ports={"1234/udp": ("127.0.0.1", None)},
+    )
+    container.start(); container.reload()
+    binding = container.attrs["NetworkSettings"]["Ports"]["1234/udp"][0]
+    address = (binding["HostIp"], int(binding["HostPort"]))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as value:
+        value.settimeout(1)
+        deadline = time.monotonic() + 10
+        while True:
+            value.sendto(b"ping", address)
+            try:
+                payload, _ = value.recvfrom(1024)
+                assert payload == b"udp-ok"
+                break
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    raise
+
+
+@pytest.mark.compat("NET-005")
+def test_occupied_host_port_returns_server_error(client: docker.DockerClient):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0)); listener.listen()
+        port = listener.getsockname()[1]
+        container = client.containers.create(
+            IMAGE, command="top", ports={"1234/tcp": ("127.0.0.1", port)}
+        )
+        with pytest.raises(errors.APIError) as caught:
+            container.start()
+        assert caught.value.response.status_code == 500
 
 
 @pytest.mark.compat("CTR-022")

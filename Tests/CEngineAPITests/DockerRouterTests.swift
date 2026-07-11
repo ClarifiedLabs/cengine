@@ -454,6 +454,36 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((pruneJSON["NetworksDeleted"] as? [String])?.isEmpty == true)
     }
 
+    @Test func containerCreateAcceptsNullNetworkEndpointSettings() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/create",
+            body: Data(#"{"Name":"selected"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=null-endpoint",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"selected":null}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(
+            method: .GET, uri: "/v1.44/containers/null-endpoint/json"
+        ))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let settings = try #require(object["NetworkSettings"] as? [String: Any])
+        let networks = try #require(settings["Networks"] as? [String: Any])
+        #expect(networks["selected"] != nil)
+    }
+
+    @Test func malformedContainerCreateBodyReturnsBadRequest() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create", body: Data(#"{"Image":42}"#.utf8)
+        ))
+        #expect(response.status == .badRequest)
+    }
+
     @Test func containerRenamePersistsAndRejectsConflicts() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

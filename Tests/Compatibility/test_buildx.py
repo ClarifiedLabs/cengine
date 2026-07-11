@@ -15,31 +15,39 @@ from docker.types import Mount
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BUILD_CONTEXT = REPO_ROOT / "Tests/Fixtures/buildx"
 BUILDKIT_IMAGE = "moby/buildkit:v0.27.1"
-KNOWN_GAP = pytest.mark.xfail(strict=True)
 
 
-def buildx(*arguments: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["DOCKER_HOST"] = docker_host
     result = subprocess.run(
-        ["docker", "buildx", *arguments], cwd=REPO_ROOT, env=os.environ.copy(), text=True,
+        ["docker", "buildx", *arguments], cwd=REPO_ROOT, env=environment, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
     )
     assert result.returncode == 0, f"docker buildx {' '.join(arguments)} failed:\n{result.stdout}"
     return result
 
 
-@KNOWN_GAP(reason="BLD-001: BuildKit COPY into an Alpine rootfs fails with a read-only filesystem")
 @pytest.mark.compat("BLD-001")
 def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClient):
     suffix = uuid.uuid4().hex[:8]
     builder = f"compat-builder-{suffix}"
     tag = f"compat-buildx:{suffix}"
+    docker_host = f"unix://{daemon.socket}"
     try:
         buildx(
             "create", "--name", builder, "--driver", "docker-container",
-            "--driver-opt", f"image={BUILDKIT_IMAGE}", f"unix://{daemon.socket}",
+            "--driver-opt", f"image={BUILDKIT_IMAGE}",
+            "--buildkitd-flags", "--oci-worker-snapshotter=native",
+            docker_host, docker_host=docker_host,
         )
-        first = buildx("build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT))
+        first = buildx(
+            "build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT),
+            docker_host=docker_host,
+        )
         assert "ERROR" not in first.stdout
+        image = client.images.get(tag)
+        assert tag in image.tags
         assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"
 
         volume = client.volumes.create(
@@ -52,10 +60,15 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
         container.start()
         assert container.wait(timeout=60)["StatusCode"] == 0
 
-        second = buildx("build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT))
+        second = buildx(
+            "build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT),
+            docker_host=docker_host,
+        )
         assert "ERROR" not in second.stdout
     finally:
+        environment = os.environ.copy()
+        environment["DOCKER_HOST"] = docker_host
         subprocess.run(
             ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
         )

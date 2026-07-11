@@ -618,10 +618,24 @@ public actor AppleContainerBackend: ContainerBackend {
 
     private func image(reference: String, platform: String, pull: Bool) async throws -> Containerization.Image {
         let selected = try Self.platform(platform)
-        if let existing = try? await manager.imageStore.get(reference: reference),
-           (try? await existing.config(for: selected)) != nil { return existing }
+        for candidate in Self.imageLookupCandidates(reference) {
+            if let existing = try? await manager.imageStore.get(reference: candidate),
+               (try? await existing.config(for: selected)) != nil { return existing }
+        }
         guard pull else { throw EngineError(.notFound, "image \(reference) does not contain \(platform)") }
         return try await manager.imageStore.pull(reference: reference, platform: selected)
+    }
+
+    private static func imageLookupCandidates(_ reference: String) -> [String] {
+        let normalized = ImageReference.normalized(reference)
+        var candidates = [reference, normalized]
+        if normalized.hasPrefix("docker.io/library/") {
+            candidates.append(String(normalized.dropFirst("docker.io/library/".count)))
+        } else if normalized.hasPrefix("docker.io/") {
+            candidates.append(String(normalized.dropFirst("docker.io/".count)))
+        }
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0).inserted }
     }
 }
 

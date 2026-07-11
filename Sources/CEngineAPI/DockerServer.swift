@@ -52,7 +52,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 return
             }
             if target.path == "/events" {
-                startEvents(version: target.version, channel: context.channel)
+                startEvents(target: target, channel: context.channel)
                 return
             }
             if Self.isFollowingLogs(target), let id = Self.logContainerID(target) {
@@ -122,7 +122,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         return String(path.dropFirst("/containers/".count).dropLast("/logs".count))
     }
 
-    private func startEvents(version: DockerAPIVersion, channel: Channel) {
+    private func startEvents(target: DockerRequestTarget, channel: Channel) {
+        let filters = Self.eventFilters(target)
         eventTask = Task { [router] in
             let stream = await router.events()
             channel.eventLoop.execute {
@@ -134,7 +135,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             let encoder = JSONEncoder()
             for await event in stream {
                 guard !Task.isCancelled else { break }
-                guard var data = try? encoder.encode(DockerEventResponse(event, version: version)) else { continue }
+                guard Self.matches(event, filters: filters) else { continue }
+                guard var data = try? encoder.encode(DockerEventResponse(event, version: target.version)) else { continue }
                 data.append(0x0a)
                 let payload = data
                 channel.eventLoop.execute {
@@ -143,6 +145,37 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 }
             }
         }
+    }
+
+    private static func eventFilters(_ target: DockerRequestTarget) -> [String: [String]] {
+        guard let raw = target.components.queryItems?.first(where: { $0.name == "filters" })?.value,
+              let data = raw.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: [String]] else {
+            return [:]
+        }
+        return value
+    }
+
+    private static func matches(_ event: RuntimeEvent, filters: [String: [String]]) -> Bool {
+        filters.allSatisfy { key, values in
+            guard !values.isEmpty else { return true }
+            return values.contains { value in
+                return switch key {
+                case "type": event.type == value
+                case "event": event.action == value
+                case "container":
+                    event.id == value || event.id.hasPrefix(value) || event.attributes["name"] == value
+                case "label": matchesLabel(event, value: value)
+                default: true
+                }
+            }
+        }
+    }
+
+    private static func matchesLabel(_ event: RuntimeEvent, value: String) -> Bool {
+        let fields = value.split(separator: "=", maxSplits: 1).map(String.init)
+        guard let actual = event.attributes[fields[0]] else { return false }
+        return fields.count == 1 || actual == fields[1]
     }
 
     private func startStats(identifier: String, version: DockerAPIVersion, channel: Channel) {
