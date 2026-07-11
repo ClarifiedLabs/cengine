@@ -4,11 +4,11 @@ import CryptoKit
 import Foundation
 
 public enum KernelInstaller {
-    public static let version = "3.28.0"
-    public static let archiveURL = URL(string: "https://github.com/kata-containers/kata-containers/releases/download/3.28.0/kata-static-3.28.0-arm64.tar.zst")!
-    public static let archiveSHA256 = "f63d54507d1f18635d94475077e4c2330de4d8e05cedf25f7c38f063b0e66a91"
-    public static let archiveMember = "opt/kata/share/kata-containers/vmlinux-6.18.15-186"
-    public static let kernelSHA256 = "2fe4a58d2885d623bcb4d705900ac8c1d4f02371152da8126b3b00c8c47fc3a1"
+    public static let version = "3.32.0"
+    public static let archiveURL = URL(string: "https://github.com/kata-containers/kata-containers/releases/download/3.32.0/kata-static-3.32.0-arm64.tar.zst")!
+    public static let archiveSHA256 = "8736c054d9223974735394f822000823baef509e1c33405ec798240fa9b6e4b5"
+    public static let archiveMember = "opt/kata/share/kata-containers/vmlinux-6.18.35-197"
+    public static let kernelSHA256 = "f437320bab94f19105d12b932aa29735f0d54d2588218872254367f312c1027c"
 
     public static func isInstalled(at destination: URL) -> Bool {
         guard FileManager.default.fileExists(atPath: destination.path) else { return false }

@@ -37,7 +37,9 @@ private final class DataBox: @unchecked Sendable {
     }
 
     @Test func kataKernelUsesPublishedZstdAsset() {
-        #expect(KernelInstaller.archiveURL.lastPathComponent == "kata-static-3.28.0-arm64.tar.zst")
+        #expect(KernelInstaller.version == "3.32.0")
+        #expect(KernelInstaller.archiveURL.lastPathComponent == "kata-static-3.32.0-arm64.tar.zst")
+        #expect(KernelInstaller.archiveMember == "opt/kata/share/kata-containers/vmlinux-6.18.35-197")
         #expect(KernelInstaller.archiveSHA256.count == 64)
         #expect(KernelInstaller.kernelSHA256.count == 64)
     }
