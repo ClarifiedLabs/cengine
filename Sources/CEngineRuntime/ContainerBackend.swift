@@ -18,10 +18,12 @@ public protocol ContainerBackend: Sendable {
     func stop(_ container: ContainerRecord, timeoutSeconds: Int) async throws -> Int32
     func wait(_ container: ContainerRecord) async throws -> Int32
     func delete(_ container: ContainerRecord) async throws
+    func deleteLogs(for container: ContainerRecord) async throws
     func io(for container: ContainerRecord) async throws -> ContainerIOBridge
     func resize(_ container: ContainerRecord, width: UInt16, height: UInt16) async throws
     func completion(_ container: ContainerRecord) async -> Int32?
     func logs(for container: ContainerRecord) async throws -> Data
+    func logs(for container: ContainerRecord, options: DockerLogOptions) async throws -> Data
     func kill(_ container: ContainerRecord, signal: String) async throws
     func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge
     func startExec(_ exec: ExecRecord) async throws
@@ -54,6 +56,8 @@ public protocol ContainerBackend: Sendable {
 }
 
 public extension ContainerBackend {
+    func deleteLogs(for _: ContainerRecord) async throws {}
+    func logs(for container: ContainerRecord, options _: DockerLogOptions) async throws -> Data { try await logs(for: container) }
     func io(for _: ContainerRecord) async throws -> ContainerIOBridge {
         throw EngineError(.unsupported, "container I/O is unavailable for this backend")
     }

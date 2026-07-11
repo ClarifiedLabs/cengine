@@ -21,6 +21,7 @@ public actor EngineRuntime {
     let backend: any ContainerBackend
     private var execs: [String: ExecRecord] = [:]
     private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
+    private var eventHistory: [RuntimeEvent] = []
     private var healthTasks: [String: Task<Void, Never>] = [:]
     private var nextExitWaiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
 
@@ -149,8 +150,8 @@ public actor EngineRuntime {
         try await backend.resize(container(identifier), width: width, height: height)
     }
 
-    public func containerLogs(_ identifier: String) async throws -> Data {
-        try await backend.logs(for: container(identifier))
+    public func containerLogs(_ identifier: String, options: DockerLogOptions = .init()) async throws -> Data {
+        try await backend.logs(for: container(identifier), options: options)
     }
 
     public func containerStatistics(_ identifier: String) async throws -> BackendStatistics {
@@ -332,6 +333,7 @@ public actor EngineRuntime {
         resumeNextExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
+        try await backend.deleteLogs(for: removed)
         guard let current = try? containerIndex(removed.id) else { return }
         snapshot.containers.remove(at: current)
         if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
@@ -505,7 +507,7 @@ public actor EngineRuntime {
 
     public func pruneContainers() async throws -> [String] {
         let removed = snapshot.containers.filter { $0.phase != .running && $0.phase != .paused }
-        for record in removed { try await backend.delete(record) }
+        for record in removed { try await backend.delete(record); try await backend.deleteLogs(for: record) }
         let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
         try await persist()
         removed.forEach { emit(containerEvent("destroy", $0)) }
@@ -560,16 +562,34 @@ public actor EngineRuntime {
 
     func persist() async throws { try await store.save(snapshot) }
 
-    public func events() -> AsyncStream<RuntimeEvent> {
+    public func events(since: Date? = nil, until: Date? = nil) -> AsyncStream<RuntimeEvent> {
         let id = UUID()
-        return AsyncStream { continuation in
-            eventContinuations[id] = continuation
-            continuation.onTermination = { [weak self] _ in Task { await self?.removeEventContinuation(id) } }
+        let (stream, continuation) = AsyncStream.makeStream(of: RuntimeEvent.self)
+        for event in eventHistory where (since == nil || event.date >= since!) && (until == nil || event.date <= until!) {
+            continuation.yield(event)
         }
+        if let until, until <= Date() {
+            continuation.finish()
+            return stream
+        }
+        eventContinuations[id] = continuation
+        continuation.onTermination = { [weak self] _ in Task { await self?.removeEventContinuation(id) } }
+        if let until {
+            Task {
+                let delay = max(until.timeIntervalSinceNow, 0)
+                try? await Task.sleep(for: .seconds(delay))
+                continuation.finish()
+            }
+        }
+        return stream
     }
 
     private func removeEventContinuation(_ id: UUID) { eventContinuations.removeValue(forKey: id) }
-    private func emit(_ event: RuntimeEvent) { eventContinuations.values.forEach { $0.yield(event) } }
+    private func emit(_ event: RuntimeEvent) {
+        eventHistory.append(event)
+        if eventHistory.count > 256 { eventHistory.removeFirst(eventHistory.count - 256) }
+        eventContinuations.values.forEach { $0.yield(event) }
+    }
     private func containerEvent(_ action: String, _ record: ContainerRecord,
                                 extra: [String: String] = [:]) -> RuntimeEvent {
         RuntimeEvent(type: "container", action: action, id: record.id,
@@ -668,6 +688,7 @@ public actor EngineRuntime {
         }
         if autoRemove {
             try? await backend.delete(record)
+            try? await backend.deleteLogs(for: record)
             try? await removeAnonymousVolumes(usedBy: record)
             if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
             emit(containerEvent("destroy", record))

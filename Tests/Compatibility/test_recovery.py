@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 
@@ -47,5 +48,67 @@ def test_daemon_restart_recovers_resources_and_restart_policy(daemon, client: do
         assert recovered.volumes.get(volume.name).name == volume.name
         assert value.attrs["HostConfig"]["RestartPolicy"]["Name"] == "always"
         assert any(mount["Name"] == volume.name for mount in value.attrs["Mounts"])
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("REC-002")
+def test_daemon_restart_during_active_io_and_stats(daemon, client: docker.DockerClient):
+    container = client.containers.create(
+        IMAGE,
+        command=["sh", "-c", "i=0; while true; do echo tick-$i; i=$((i+1)); sleep 1; done"],
+        name=f"recovery-streams-{uuid.uuid4().hex[:8]}",
+        restart_policy={"Name": "always"},
+    )
+    container.start()
+    received: dict[str, list[object]] = {"logs": [], "stats": []}
+
+    def consume(name: str, stream) -> None:
+        try:
+            for value in stream:
+                if len(received[name]) < 5:
+                    received[name].append(value)
+        except Exception:
+            pass  # abrupt daemon termination is expected to close active HTTP streams
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except OSError:
+                    pass
+
+    stream_clients = {
+        name: docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+        for name in ("logs", "stats")
+    }
+    streams = {
+        "logs": stream_clients["logs"].containers.get(container.id).logs(stream=True, follow=True),
+        "stats": stream_clients["stats"].containers.get(container.id).stats(stream=True, decode=True),
+    }
+    readers = [threading.Thread(target=consume, args=(name, stream), daemon=True) for name, stream in streams.items()]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + 15
+    while not all(received.values()):
+        if time.monotonic() >= deadline:
+            pytest.fail(f"streams did not become active before restart: {received}")
+        time.sleep(0.1)
+
+    daemon.restart(kill=True)
+
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(container.name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"streaming container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        sample = value.stats(stream=False)
+        assert sample["read"] and "cpu_stats" in sample
     finally:
         recovered.close()

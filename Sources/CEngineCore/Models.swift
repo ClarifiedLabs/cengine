@@ -29,10 +29,14 @@ public struct MountRecord: Codable, Hashable, Sendable {
     public var destination: String
     public var readOnly: Bool
     public var noCopy: Bool
+    public var subpath: String?
+    public var tmpfsSizeBytes: Int64?
+    public var tmpfsMode: UInt32?
 
-    public init(kind: Kind, source: String, destination: String, readOnly: Bool = false, noCopy: Bool = false) {
+    public init(kind: Kind, source: String, destination: String, readOnly: Bool = false, noCopy: Bool = false,
+                subpath: String? = nil, tmpfsSizeBytes: Int64? = nil, tmpfsMode: UInt32? = nil) {
         self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly
-        self.noCopy = noCopy
+        self.noCopy = noCopy; self.subpath = subpath; self.tmpfsSizeBytes = tmpfsSizeBytes; self.tmpfsMode = tmpfsMode
     }
 }
 

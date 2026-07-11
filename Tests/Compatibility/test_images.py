@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
+import pathlib
+import time
+import urllib.error
+import urllib.request
+import uuid
 
 import docker
 import pytest
@@ -13,6 +19,9 @@ from docker import errors
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 BUSYBOX = "busybox:latest"
+REGISTRY_IMAGE = "registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
+REGISTRY_AUTH = {"username": "compat", "password": "compat-password"}
+REGISTRY_FIXTURE = pathlib.Path(__file__).resolve().parents[1] / "Fixtures/registry"
 KNOWN_GAP = pytest.mark.xfail(strict=True)
 
 
@@ -107,3 +116,52 @@ def test_push_error(client: docker.DockerClient):
     response = client.images.push("non-existent.lan:5000/alpine", "latest")
     assert "non-existent.lan" in response
     assert "resolve" in response.lower() or "no such host" in response.lower()
+
+
+@pytest.mark.compat("IMG-015")
+def test_authenticated_push_round_trip(client: docker.DockerClient):
+    client.images.pull(REGISTRY_IMAGE)
+    registry = client.containers.create(
+        REGISTRY_IMAGE,
+        name=f"compat-registry-{uuid.uuid4().hex[:8]}",
+        environment={
+            "REGISTRY_AUTH": "htpasswd",
+            "REGISTRY_AUTH_HTPASSWD_REALM": "compatibility registry",
+            "REGISTRY_AUTH_HTPASSWD_PATH": "/auth/htpasswd",
+        },
+        mounts=[docker.types.Mount("/auth", str(REGISTRY_FIXTURE), type="bind", read_only=True)],
+        ports={"5000/tcp": None},
+    )
+    registry.start()
+    registry.reload()
+    host_port = registry.attrs["NetworkSettings"]["Ports"]["5000/tcp"][0]["HostPort"]
+    endpoint = f"127.0.0.1:{host_port}"
+    request = urllib.request.Request(f"http://{endpoint}/v2/")
+    credentials = base64.b64encode(b"compat:compat-password").decode()
+    request.add_header("Authorization", f"Basic {credentials}")
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                assert response.status == 200
+            break
+        except (OSError, urllib.error.URLError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+
+    reference = f"{endpoint}/compat/alpine:roundtrip"
+    source = client.images.get(IMAGE)
+    assert source.tag(reference)
+    messages = list(client.images.push(reference, auth_config=REGISTRY_AUTH, stream=True, decode=True))
+    assert not [message for message in messages if message.get("error")]
+    assert any(message.get("status") == "Pushed" for message in messages)
+
+    client.images.remove(reference)
+    pulled = list(client.api.pull(reference, auth_config=REGISTRY_AUTH, stream=True, decode=True))
+    assert not [message for message in pulled if message.get("error")]
+    assert any(message.get("status") == "Pull complete" for message in pulled)
+    restored = client.images.get(reference)
+    assert reference in restored.tags
+    output = client.containers.run(reference, ["echo", "registry-roundtrip"], remove=True)
+    assert output.strip() == b"registry-roundtrip"

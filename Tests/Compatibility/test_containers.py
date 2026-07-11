@@ -299,6 +299,51 @@ def test_container_and_exec_tty_resize(client: docker.DockerClient):
     client.api.exec_resize(exec_id, height=50, width=140)
 
 
+@pytest.mark.compat("CTR-032")
+def test_log_time_tail_stream_and_timestamp_filters(client: docker.DockerClient):
+    container = client.containers.create(
+        IMAGE, command=["sh", "-c", "echo old; sleep 1; echo new; echo hidden >&2"]
+    )
+    container.start()
+    time.sleep(0.4)
+    since = time.time()
+    assert container.wait(timeout=60)["StatusCode"] == 0
+    output = container.logs(stdout=True, stderr=False, since=since, tail=1, timestamps=True)
+    assert b"new" in output and b"old" not in output and b"hidden" not in output
+    assert b"T" in output.split(b" ", 1)[0]
+
+    following = client.containers.create(
+        IMAGE, command=["sh", "-c", "sleep 1; echo followed; echo ignored >&2"]
+    )
+    following.start()
+    streamed = b"".join(following.logs(
+        stream=True, follow=True, stdout=True, stderr=False, tail=0, timestamps=True,
+    ))
+    assert b"followed" in streamed and b"ignored" not in streamed
+    assert following.wait(timeout=60)["StatusCode"] == 0
+
+
+@pytest.mark.compat("CTR-033")
+def test_multiple_containers_stream_stats_concurrently(client: docker.DockerClient):
+    containers = [client.containers.run(IMAGE, "top", detach=True) for _ in range(2)]
+    samples: dict[str, list[dict]] = {}
+
+    def collect(container) -> None:
+        stream = container.stats(stream=True, decode=True)
+        try:
+            samples[container.id] = [next(stream), next(stream)]
+        finally:
+            stream.close()
+
+    readers = [threading.Thread(target=collect, args=(container,)) for container in containers]
+    for reader in readers:
+        reader.start()
+    for reader in readers:
+        reader.join(timeout=15)
+    assert all(not reader.is_alive() for reader in readers)
+    assert all(len(values) == 2 for values in samples.values())
+
+
 @pytest.mark.compat("NET-002")
 def test_network_connect_disconnect(client: docker.DockerClient):
     first = client.networks.create(f"compat-{uuid.uuid4().hex[:8]}")
@@ -357,6 +402,32 @@ def test_occupied_host_port_returns_server_error(client: docker.DockerClient):
         with pytest.raises(errors.APIError) as caught:
             container.start()
         assert caught.value.response.status_code == 500
+
+
+@pytest.mark.compat("NET-006")
+def test_concurrent_random_port_allocation_is_unique(client: docker.DockerClient):
+    containers = [
+        client.containers.create(IMAGE, command="top", ports={"8080/tcp": ("127.0.0.1", None)})
+        for _ in range(8)
+    ]
+    failures: list[Exception] = []
+
+    def start(container) -> None:
+        try:
+            container.start()
+        except Exception as error:
+            failures.append(error)
+
+    starters = [threading.Thread(target=start, args=(container,)) for container in containers]
+    for starter in starters:
+        starter.start()
+    for starter in starters:
+        starter.join(timeout=60)
+    assert not failures
+    for container in containers:
+        container.reload()
+    ports = [container.attrs["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"] for container in containers]
+    assert len(set(ports)) == len(containers)
 
 
 @pytest.mark.compat("CTR-022")

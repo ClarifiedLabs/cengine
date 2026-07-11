@@ -98,6 +98,21 @@ private final class DataBox: @unchecked Sendable {
         #expect(String(decoding: try bridge.logData().dropFirst(8), as: UTF8.self) == "failure\n")
     }
 
+    @Test func containerIOFiltersLogStreamsTailAndTimestamps() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bridge = ContainerIOBridge(tty: false, logURL: root.appending(path: "container.log"))
+        try bridge.writer(.stdout).write(Data("first\nsecond\n".utf8))
+        try bridge.writer(.stderr).write(Data("failure\n".utf8))
+
+        let stdout = try bridge.logData(options: .init(stdout: true, stderr: false, tail: 1))
+        #expect(String(decoding: stdout.dropFirst(8), as: UTF8.self) == "second\n")
+        let stderr = try bridge.logData(options: .init(stdout: false, stderr: true, timestamps: true))
+        let rendered = String(decoding: stderr.dropFirst(8), as: UTF8.self)
+        #expect(rendered.contains("T")); #expect(rendered.hasSuffix(" failure\n"))
+        #expect(try bridge.logData(options: .init(since: Date().addingTimeInterval(60))).isEmpty)
+    }
+
     @Test func atomicStoreRoundTrips() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

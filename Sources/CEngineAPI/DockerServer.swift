@@ -52,11 +52,11 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 return
             }
             if target.path == "/events" {
-                startEvents(target: target, channel: context.channel)
+                startEvents(target: target, requestHeaders: head.headers, channel: context.channel)
                 return
             }
             if Self.isFollowingLogs(target), let id = Self.logContainerID(target) {
-                startFollowingLogs(identifier: id, channel: context.channel)
+                startFollowingLogs(identifier: id, target: target, channel: context.channel)
                 return
             }
             let request = APIRequest(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView))
@@ -77,10 +77,10 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         context.fireChannelInactive()
     }
 
-    private func startFollowingLogs(identifier id: String, channel: Channel) {
+    private func startFollowingLogs(identifier id: String, target: DockerRequestTarget, channel: Channel) {
+        let options = Self.logOptions(target)
         Task { [router] in
             do {
-                let initial = try await router.containerLogs(id)
                 let io = try await router.containerIO(id)
                 channel.eventLoop.execute {
                     self.followIO = io
@@ -88,12 +88,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                     headers.add(name: "Content-Type", value: "application/vnd.docker.raw-stream")
                     headers.add(name: "Transfer-Encoding", value: "chunked")
                     channel.write(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
-                    if !initial.isEmpty {
-                        var buffer = channel.allocator.buffer(capacity: initial.count)
-                        buffer.writeBytes(initial)
-                        channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
-                    } else { channel.flush() }
-                    self.followSubscription = io.attach(replayBuffered: false, output: { data in
+                    let subscription = io.attachLogs(options: options, replayExisting: true, output: { data in
                         channel.eventLoop.execute {
                             var buffer = channel.allocator.buffer(capacity: data.count)
                             buffer.writeBytes(data)
@@ -102,6 +97,23 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                     }, closed: {
                         channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
                     })
+                    self.followSubscription = subscription.id
+                    if !subscription.initial.isEmpty {
+                        let initial = subscription.initial
+                        var buffer = channel.allocator.buffer(capacity: initial.count)
+                        buffer.writeBytes(initial)
+                        channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                    } else { channel.flush() }
+                    if let until = options.until {
+                        let delay = max(until.timeIntervalSinceNow, 0)
+                        self.eventTask = Task {
+                            try? await Task.sleep(for: .seconds(delay))
+                            channel.eventLoop.execute {
+                                if let subscription = self.followSubscription { io.detach(subscription) }
+                                channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
+                            }
+                        }
+                    }
                 }
             } catch {
                 channel.eventLoop.execute {
@@ -122,13 +134,30 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         return String(path.dropFirst("/containers/".count).dropLast("/logs".count))
     }
 
-    private func startEvents(target: DockerRequestTarget, channel: Channel) {
+    private static func logOptions(_ target: DockerRequestTarget) -> DockerLogOptions {
+        let query = Dictionary(uniqueKeysWithValues: (target.components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+        return .init(
+            stdout: query["stdout"].map { $0 == "1" || $0 == "true" } ?? true,
+            stderr: query["stderr"].map { $0 == "1" || $0 == "true" } ?? true,
+            since: query["since"].flatMap(parseDockerTimestamp),
+            until: query["until"].flatMap(parseDockerTimestamp),
+            timestamps: query["timestamps"].map { $0 == "1" || $0 == "true" } ?? false,
+            tail: query["tail"].flatMap { $0 == "all" ? nil : Int($0) }
+        )
+    }
+
+    private func startEvents(target: DockerRequestTarget, requestHeaders: HTTPHeaders, channel: Channel) {
         let filters = Self.eventFilters(target)
+        let query = Dictionary(uniqueKeysWithValues: (target.components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+        let since = query["since"].flatMap(parseDockerTimestamp)
+        let until = query["until"].flatMap(parseDockerTimestamp)
+        let jsonl = target.version >= .init(major: 1, minor: 53)
+            && requestHeaders["Accept"].contains(where: { $0.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == "application/jsonl" } })
         eventTask = Task { [router] in
-            let stream = await router.events()
+            let stream = await router.events(since: since, until: until)
             channel.eventLoop.execute {
                 var headers = HTTPHeaders()
-                headers.add(name: "Content-Type", value: "application/json")
+                headers.add(name: "Content-Type", value: jsonl ? "application/jsonl" : "application/json")
                 headers.add(name: "Transfer-Encoding", value: "chunked")
                 channel.writeAndFlush(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
             }
@@ -144,6 +173,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                     channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
                 }
             }
+            channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
         }
     }
 
@@ -203,7 +233,9 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
 
     private static func isStreamingStats(_ target: DockerRequestTarget) -> Bool {
         guard target.path.hasSuffix("/stats") else { return false }
-        return !((target.components.queryItems ?? []).contains { $0.name == "stream" && ($0.value == "0" || $0.value == "false") })
+        return !((target.components.queryItems ?? []).contains {
+            $0.name == "stream" && ($0.value == "0" || $0.value?.lowercased() == "false")
+        })
     }
 
     private static func statsContainerID(_ target: DockerRequestTarget) -> String? {

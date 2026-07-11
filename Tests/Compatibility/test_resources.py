@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import docker
 import pytest
 from docker.types import Mount
+
+
+IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 
 
 @pytest.mark.compat("NET-001")
@@ -65,3 +69,40 @@ def test_volume_nocopy_leaves_empty_volume_empty(client: docker.DockerClient):
     container.start()
     code, _ = container.exec_run(["test", "-f", "/usr/share/nginx/html/index.html"])
     assert code != 0
+
+
+@pytest.mark.compat("VOL-004")
+def test_volume_subpath_mounts_existing_directory(client: docker.DockerClient):
+    volume = client.volumes.create(
+        f"compat-volume-{uuid.uuid4().hex[:8]}", labels={"dev.cengine.compat": "true"}
+    )
+    client.containers.run(
+        IMAGE, ["sh", "-c", "mkdir -p /seed/nested && printf subpath-ok >/seed/nested/marker"],
+        mounts=[Mount(target="/seed", source=volume.name, type="volume")], remove=True,
+    )
+    container = client.containers.create(
+        IMAGE, ["cat", "/data/marker"],
+        mounts=[Mount(target="/data", source=volume.name, type="volume", read_only=True, subpath="nested")],
+    )
+    inspect = client.api.inspect_container(container.id)
+    assert inspect["HostConfig"]["Mounts"][0]["VolumeOptions"]["Subpath"] == "nested"
+    container.start()
+    assert container.wait(timeout=60)["StatusCode"] == 0
+    assert container.logs().strip() == b"subpath-ok"
+    with pytest.raises(docker.errors.APIError) as caught:
+        client.containers.create(
+            IMAGE, ["true"],
+            mounts=[Mount(target="/data", source=volume.name, type="volume", subpath="../escape")],
+        )
+    assert caught.value.response.status_code == 400
+
+
+@pytest.mark.compat("VOL-005")
+def test_tmpfs_size_and_mode_options(client: docker.DockerClient):
+    output = client.containers.run(
+        IMAGE, ["sh", "-c", "stat -c %a /cache; df -k /cache | tail -1 | awk '{print $2}'"],
+        mounts=[Mount(target="/cache", source="", type="tmpfs", tmpfs_size=1_048_576, tmpfs_mode=0o700)],
+        remove=True,
+    ).decode().splitlines()
+    assert output[0] == "700"
+    assert int(output[1]) == 1024

@@ -26,11 +26,11 @@ digests.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-014`, `CTR-019`–`CTR-024`, `CTR-026`, `CTR-029`, `CTR-031`, `EVT-001`, `CLI-002`–`CLI-004` | Historical event replay, log time/tail filters, and concurrent stress are not assessed. |
-| Archive, exec, observability, update | `CTR-015`, `CTR-025`, `CTR-027`, `CTR-028`, `CTR-030` | Multi-container stats streaming is not assessed. |
-| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `NET-001`–`NET-005`, `VOL-001`–`VOL-003`, `CLI-005` | SCTP and concurrent port-allocation stress are not assessed. |
-| Images and build | `IMG-001`–`IMG-014`, `BLD-001` | Successful authenticated push remains a gap. |
-| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001` | Daemon recovery during active I/O is not assessed. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-014`, `CTR-019`–`CTR-024`, `CTR-026`, `CTR-029`, `CTR-031`–`CTR-033`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
+| Archive, exec, observability, update | `CTR-015`, `CTR-025`, `CTR-027`, `CTR-028`, `CTR-030`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
+| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `NET-001`–`NET-006`, `VOL-001`–`VOL-005`, `CLI-005` | SCTP is not assessed. |
+| Images and build | `IMG-001`–`IMG-015`, `BLD-001` | Authenticated push and pull-back use a pinned local registry. |
+| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-002` | Recovery is covered during log following and stats streaming. |
 | Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
 
 ## API version envelope
@@ -51,9 +51,9 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | API | Change affecting cengine's surface | Status | Notes |
 |---|---|---|---|
 | 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
-| 1.45 | Named-volume mount `VolumeOptions.Subpath` | Gap | The field is not persisted or applied by the runtime. |
+| 1.45 | Named-volume mount `VolumeOptions.Subpath` | Supported | Existing subdirectories are safely resolved beneath the named-volume root. |
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
-| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Gap | The base info, create, push, and event operations remain available without these additions. |
+| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Tmpfs size and mode are applied; the other additions remain gaps. |
 | 1.47 | Image-list manifest summaries | Gap | The `manifests` option and `Manifests` response are not implemented. |
 | 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Gap | These optional parameters and response fields are not implemented. |
 | 1.49 | Platform-specific image inspect and firewall backend info | Gap | Image inspect uses the stored image platform; `FirewallBackend` is absent. |
@@ -62,8 +62,8 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | 1.51 | Image summary container usage count | Supported | v1.44-v1.50 report `-1`; v1.51+ calculate the number of containers using each image. |
 | 1.52 | Event legacy-field removal and container/image response omissions | Supported | Responses branch at v1.52 while older API requests retain their legacy shape. |
 | 1.52 | Container summary health and stats OS type | Supported | v1.52+ responses include `Health` and `os_type`. |
-| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Gap | The existing single-platform and JSON event behavior remains. `/system/df` is not implemented. |
-| 1.53 | NRI info, JSONL event negotiation, and image identity | Gap | `NRI`, `application/jsonl`, and image `Identity` are not implemented. |
+| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Partial | Base and verbose `/system/df` are implemented; multi-platform image and IPAM additions remain gaps. |
+| 1.53 | NRI info, JSONL event negotiation, and image identity | Partial | Event streams negotiate `application/jsonl`; `NRI` and image `Identity` remain gaps. |
 | 1.54 | Image-list identity and endpoint MAC application | Gap | The `identity` option and endpoint `MacAddress` are ignored. |
 | 1.55 | Image attestations and per-device blkio updates | Gap | `GET /images/{name}/attestations` and the five blkio device arrays are not implemented. |
 
@@ -109,6 +109,8 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-029` | `test_follow_logs_streams_output_and_closes` | ✅ Pass | Support | **cengine-owned.** Follow mode streams multiplexed output and closes at container exit. |
 | `CTR-030` | `test_streaming_stats_produces_multiple_samples` | ✅ Pass | Support | **cengine-owned.** Streaming stats returns successive Docker-shaped samples. |
 | `CTR-031` | `test_container_and_exec_tty_resize` | ✅ Pass | Support | **cengine-owned.** Running container and exec terminals accept resize requests. |
+| `CTR-032` | `test_log_time_tail_stream_and_timestamp_filters` | ✅ Pass | Support | **cengine-owned.** Snapshot and follow logs honor stream, time, tail, and timestamp options. |
+| `CTR-033` | `test_multiple_containers_stream_stats_concurrently` | ✅ Pass | Support | **cengine-owned.** Multiple simultaneous stats streams produce independent samples. |
 
 ## Images
 
@@ -128,6 +130,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `IMG-012` | `test_build_image` | ❌ Known fail | Intentional gap | Direct build is intentionally unsupported. |
 | `IMG-013` | `test_build_image_via_api_client` | ❌ Known fail | Intentional gap | Direct build is intentionally unsupported. |
 | `IMG-014` | `test_push_error` | ✅ Pass | Support | Push streams registry failures in Docker's response shape. |
+| `IMG-015` | `test_authenticated_push_round_trip` | ✅ Pass | Support | **cengine-owned.** Basic-auth push, removal, pull-back, and execution use a pinned local registry. |
 
 ## System
 
@@ -142,6 +145,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
 | `EVT-001` | `test_filtered_container_events` | ✅ Pass | Support | **cengine-owned.** Type, container, and label filters isolate live create, start, die, and destroy events. |
+| `EVT-002` | `test_historical_events_honor_time_window_and_jsonl` | ✅ Pass | Support | **cengine-owned.** A bounded history honors time windows and API v1.53+ JSONL negotiation. |
 
 ## Resources
 
@@ -152,9 +156,12 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `NET-003` | `test_create_container_on_network` | ✅ Pass | Support | **cengine-owned.** docker-py's nullable endpoint configuration selects a network during create. |
 | `NET-004` | `test_udp_port_forwarding` | ✅ Pass | Support | **cengine-owned.** Dynamically assigned UDP bindings forward request and response datagrams. |
 | `NET-005` | `test_occupied_host_port_returns_server_error` | ✅ Pass | Support | **cengine-owned.** Occupied host ports fail container start without stealing the listener. |
+| `NET-006` | `test_concurrent_random_port_allocation_is_unique` | ✅ Pass | Support | **cengine-owned.** Concurrent ephemeral TCP bindings remain unique. |
 | `VOL-001` | `test_volume_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
 | `VOL-002` | `test_empty_named_volume_copies_image_directory` | ✅ Pass | Support | **cengine-owned.** Empty named volumes receive image directory contents. |
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |
+| `VOL-004` | `test_volume_subpath_mounts_existing_directory` | ✅ Pass | Support | **cengine-owned.** Existing volume subdirectories mount safely and traversal is rejected. |
+| `VOL-005` | `test_tmpfs_size_and_mode_options` | ✅ Pass | Support | **cengine-owned.** Structured tmpfs size and mode options are applied in the guest. |
 
 ## Docker Compose 5.3.1
 
@@ -179,6 +186,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
 | `REC-001` | `test_daemon_restart_recovers_resources_and_restart_policy` | ✅ Pass | Support | **cengine-owned.** An abrupt daemon restart preserves resources and restarts an `always` container. |
+| `REC-002` | `test_daemon_restart_during_active_io_and_stats` | ✅ Pass | Support | **cengine-owned.** Recovery remains correct while log and stats streams are active. |
 
 ## Docker CLI
 
@@ -189,6 +197,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CLI-003` | `test_cli_run_attached_output` | ✅ Pass | Support | Attached `docker run` output and automatic removal. |
 | `CLI-004` | `test_cli_run_attached_stdin` | ✅ Pass | Support | Interactive stdin over the hijacked attach connection. |
 | `CLI-005` | `test_cli_network_and_volume_lifecycle` | ✅ Pass | Support | Network and volume create, list, and remove commands. |
+| `CLI-006` | `test_cli_system_disk_usage` | ✅ Pass | Support | Base and verbose `docker system df` render engine-owned usage. |
 
 ## Optional Docker differential oracle
 

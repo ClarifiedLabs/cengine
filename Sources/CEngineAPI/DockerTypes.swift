@@ -140,7 +140,9 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Target: String
         public var ReadOnly: Bool?
         public var VolumeOptions: VolumeOptionsRequest?
-        public struct VolumeOptionsRequest: Decodable, Sendable { public var NoCopy: Bool? }
+        public var TmpfsOptions: TmpfsOptionsRequest?
+        public struct VolumeOptionsRequest: Decodable, Sendable { public var NoCopy: Bool?; public var Subpath: String? }
+        public struct TmpfsOptionsRequest: Decodable, Sendable { public var SizeBytes: Int64?; public var Mode: UInt32? }
     }
 
     public struct HostConfig: Decodable, Sendable {
@@ -318,9 +320,50 @@ public struct DockerVolumeResponse: Encodable, Sendable {
     public let Name: String; public let Driver = "local"; public let Mountpoint: String
     public let CreatedAt: String; public let Status: [String: String]? = nil
     public let Labels: [String: String]; public let Scope = "local"; public let Options: [String: String]
-    public init(_ volume: VolumeRecord) {
+    public let UsageData: Usage?
+    public struct Usage: Encodable, Sendable { public let RefCount: Int; public let Size: Int64 }
+    public init(_ volume: VolumeRecord, refCount: Int? = nil) {
         Name = volume.name; Mountpoint = "cengine://volumes/\(volume.name)"
         CreatedAt = ISO8601DateFormatter().string(from: volume.createdAt); Labels = volume.labels; Options = volume.options
+        UsageData = refCount.map { .init(RefCount: $0, Size: Int64(volume.sizeBytes)) }
+    }
+}
+
+public struct SystemDiskUsageResponse: Encodable, Sendable {
+    public let LayersSize: Int64
+    public let Images: [ImageSummaryResponse]
+    public let Containers: [Container]
+    public let Volumes: [DockerVolumeResponse]
+    public let BuildCache: [BuildCacheRecord]
+
+    public struct Container: Encodable, Sendable {
+        public let Id: String; public let Names: [String]; public let Image: String; public let ImageID: String
+        public let Command: String; public let Created: Int64; public let State: String; public let Status: String
+        public let SizeRw: Int64; public let SizeRootFs: Int64; public let Labels: [String: String]
+        init(_ record: ContainerRecord, image: ImageRecord?) {
+            Id = record.id; Names = ["/\(record.name)"]; Image = record.image; ImageID = image?.id ?? ""
+            Command = record.processArguments.joined(separator: " "); Created = Int64(record.createdAt.timeIntervalSince1970)
+            State = record.phase.rawValue; Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
+            SizeRw = 0; SizeRootFs = image?.size ?? 0; Labels = record.labels
+        }
+    }
+
+    public struct BuildCacheRecord: Encodable, Sendable {}
+
+    public init(containers: [ContainerRecord], images: [ImageRecord], volumes: [VolumeRecord]) {
+        LayersSize = images.reduce(0) { $0 + max($1.size, 0) }
+        Images = images.map { image in
+            ImageSummaryResponse(image, containers: containers.filter { $0.image == image.id || image.references.contains($0.image) }.count)
+        }
+        Containers = containers.map { container in
+            Container(container, image: images.first { $0.id == container.image || $0.references.contains(container.image) })
+        }
+        Volumes = volumes.map { volume in
+            DockerVolumeResponse(volume, refCount: containers.filter { container in
+                container.mounts.contains { $0.kind == .volume && $0.source == volume.name }
+            }.count)
+        }
+        BuildCache = []
     }
 }
 

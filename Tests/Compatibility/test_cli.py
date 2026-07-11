@@ -70,3 +70,12 @@ def test_cli_network_and_volume_lifecycle(daemon):
     docker(daemon, "volume", "create", volume)
     assert volume in docker(daemon, "volume", "ls", "--format", "{{.Name}}").stdout
     docker(daemon, "volume", "rm", volume)
+
+
+@pytest.mark.compat("CLI-006")
+def test_cli_system_disk_usage(daemon):
+    summary = docker(daemon, "system", "df").stdout
+    assert all(heading in summary for heading in ("Images", "Containers", "Local Volumes", "Build Cache"))
+    verbose = docker(daemon, "system", "df", "--verbose").stdout
+    assert "Images space usage" in verbose
+    assert "Local Volumes space usage" in verbose

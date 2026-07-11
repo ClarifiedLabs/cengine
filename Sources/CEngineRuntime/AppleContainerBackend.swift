@@ -50,7 +50,7 @@ public actor AppleContainerBackend: ContainerBackend {
         try FileManager.default.createDirectory(at: volumeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
-        let network = try VmnetNetwork()
+        let network = try await Self.createNetwork()
         self.network = network
         let imageStore = try ImageStore(path: runtimeRoot)
         let initPath = runtimeRoot.appending(path: "initfs.ext4")
@@ -70,6 +70,19 @@ public actor AppleContainerBackend: ContainerBackend {
         )
     }
 
+    private static func createNetwork() async throws -> VmnetNetwork {
+        var lastError: Error?
+        for attempt in 0..<30 {
+            do { return try VmnetNetwork() }
+            catch {
+                lastError = error
+                guard attempt < 29 else { break }
+                try await Task.sleep(for: .seconds(1))
+            }
+        }
+        throw lastError ?? EngineError(.internalError, "failed to create vmnet network")
+    }
+
     public func pullImage(_ reference: String, platform: String) async throws {
         guard platform == "linux/arm64" || platform == "linux/amd64" else {
             throw EngineError(.unsupported, "unsupported platform \(platform)")
@@ -83,11 +96,23 @@ public actor AppleContainerBackend: ContainerBackend {
             let secret = $0.identityToken.isEmpty ? $0.password : $0.identityToken
             return $0.username.isEmpty && secret.isEmpty ? nil : BasicAuthentication(username: $0.username, password: secret)
         }
-        let accumulator = PullProgressAccumulator()
-        _ = try await manager.imageStore.pull(
-            reference: reference, platform: selected, auth: authentication,
-            progress: { events in await progress(await accumulator.apply(events)) }
-        )
+        let insecure = reference.hasPrefix("localhost:") || reference.hasPrefix("127.0.0.1:")
+        var lastError: Error?
+        for attempt in 0..<3 {
+            let accumulator = PullProgressAccumulator()
+            do {
+                _ = try await manager.imageStore.pull(
+                    reference: reference, platform: selected, insecure: insecure, auth: authentication,
+                    progress: { events in await progress(await accumulator.apply(events)) }
+                )
+                return
+            } catch {
+                lastError = error
+                guard attempt < 2 else { break }
+                try await Task.sleep(for: .milliseconds(500 * (attempt + 1)))
+            }
+        }
+        throw lastError ?? EngineError(.internalError, "image pull failed")
     }
 
     public func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry] {
@@ -168,11 +193,33 @@ public actor AppleContainerBackend: ContainerBackend {
                 case .volume:
                     let directory = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    source = directory.path
+                    if let subpath = mount.subpath, !subpath.isEmpty {
+                        let components = subpath.split(separator: "/", omittingEmptySubsequences: false)
+                        guard !subpath.hasPrefix("/"), !components.contains(".."), !components.contains(".") else {
+                            throw EngineError(.badRequest, "invalid volume subpath: \(subpath)")
+                        }
+                        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+                        let candidate = root.appending(path: subpath, directoryHint: .isDirectory)
+                            .standardizedFileURL.resolvingSymlinksInPath()
+                        guard candidate.path.hasPrefix(root.path + "/") else {
+                            throw EngineError(.badRequest, "volume subpath escapes the volume root: \(subpath)")
+                        }
+                        var isDirectory: ObjCBool = false
+                        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                            throw EngineError(.badRequest, "volume subpath does not exist: \(subpath)")
+                        }
+                        source = candidate.path
+                    } else {
+                        source = directory.path
+                    }
                 case .tmpfs:
+                    var options = ["nosuid", "nodev"]
+                    if mount.readOnly { options.append("ro") }
+                    if let size = mount.tmpfsSizeBytes { options.append("size=\(size)") }
+                    if let mode = mount.tmpfsMode { options.append("mode=\(String(mode, radix: 8))") }
                     config.mounts.append(.any(
                         type: "tmpfs", source: "tmpfs", destination: mount.destination,
-                        options: (["nosuid", "nodev"] + (mount.readOnly ? ["ro"] : []))
+                        options: options
                     ))
                     continue
                 }
@@ -300,8 +347,12 @@ public actor AppleContainerBackend: ContainerBackend {
         try? network.releaseInterface(record.id)
         stagedCopies.removeValue(forKey: record.id)
         try? FileManager.default.removeItem(at: stagingRoot.appending(path: record.id))
-        try? FileManager.default.removeItem(at: logRoot.appending(path: "\(record.id).log"))
         try? manager.delete(record.id)
+    }
+
+    public func deleteLogs(for record: ContainerRecord) async throws {
+        try? FileManager.default.removeItem(at: logRoot.appending(path: "\(record.id).log"))
+        try? FileManager.default.removeItem(at: logRoot.appending(path: "\(record.id).log.entries"))
     }
 
     public func io(for record: ContainerRecord) async throws -> ContainerIOBridge {
@@ -382,6 +433,11 @@ public actor AppleContainerBackend: ContainerBackend {
             guard !containerIDs.contains(entry.lastPathComponent) else { continue }
             try FileManager.default.removeItem(at: entry)
         }
+        for entry in try FileManager.default.contentsOfDirectory(at: logRoot, includingPropertiesForKeys: nil) {
+            let name = entry.lastPathComponent
+            let id = name.split(separator: ".", maxSplits: 1).first.map(String.init) ?? name
+            if !containerIDs.contains(id) { try? FileManager.default.removeItem(at: entry) }
+        }
     }
 
     public func updateNetworkRecords(_ records: [ContainerRecord]) async throws {
@@ -429,6 +485,11 @@ public actor AppleContainerBackend: ContainerBackend {
             return try Data(contentsOf: url)
         }
         return try io.logData()
+    }
+
+    public func logs(for record: ContainerRecord, options: DockerLogOptions) async throws -> Data {
+        if let io = ioBridges[record.id] { return try io.logData(options: options) }
+        return try await logs(for: record)
     }
 
     public func kill(_ record: ContainerRecord, signal: String) async throws {

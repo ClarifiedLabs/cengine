@@ -62,6 +62,12 @@ public struct DockerRouter: Sendable {
                 ContainersStopped: all.filter { $0.phase == .exited || $0.phase == .created }.count,
                 DockerRootDir: root.path
             ))
+        case (.GET, "/system/df"):
+            return json(status: .ok, SystemDiskUsageResponse(
+                containers: await runtime.listContainers(all: true),
+                images: await runtime.listImages(),
+                volumes: await runtime.listVolumes()
+            ))
         case (.GET, "/containers/json"):
             let all = parseBool(query["all"]) ?? false
             let containers = filteredContainers(await runtime.listContainers(all: all), filters: query["filters"])
@@ -129,7 +135,7 @@ public struct DockerRouter: Sendable {
             return APIResponse(
                 status: .ok,
                 headers: ["Content-Type": "application/vnd.docker.raw-stream"],
-                body: try await runtime.containerLogs(id)
+                body: try await runtime.containerLogs(id, options: logOptions(components))
             )
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/stats"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/stats".count))
@@ -277,7 +283,7 @@ public struct DockerRouter: Sendable {
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):
-            return json(status: .ok, VolumeListEnvelope(Volumes: filteredVolumes(await runtime.listVolumes(), filters: query["filters"]).map(DockerVolumeResponse.init), Warnings: []))
+            return json(status: .ok, VolumeListEnvelope(Volumes: filteredVolumes(await runtime.listVolumes(), filters: query["filters"]).map { DockerVolumeResponse($0) }, Warnings: []))
         case (.GET, let value) where value.hasPrefix("/volumes/"):
             return json(status: .ok, DockerVolumeResponse(try await runtime.volume(String(value.dropFirst("/volumes/".count)))))
         case (.POST, "/volumes/create"):
@@ -447,8 +453,12 @@ public struct DockerRouter: Sendable {
         try await runtime.containerIO(identifier)
     }
 
-    public func containerLogs(_ identifier: String) async throws -> Data { try await runtime.containerLogs(identifier) }
-    public func events() async -> AsyncStream<RuntimeEvent> { await runtime.events() }
+    public func containerLogs(_ identifier: String, options: DockerLogOptions = .init()) async throws -> Data {
+        try await runtime.containerLogs(identifier, options: options)
+    }
+    public func events(since: Date? = nil, until: Date? = nil) async -> AsyncStream<RuntimeEvent> {
+        await runtime.events(since: since, until: until)
+    }
     public func statistics(_ identifier: String, version: DockerAPIVersion = .maximum) async throws -> ContainerStatsResponse {
         let record = try await runtime.container(identifier)
         return ContainerStatsResponse(try await runtime.containerStatistics(identifier), container: record, version: version)
@@ -473,11 +483,18 @@ public struct DockerRouter: Sendable {
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
 
     private func mounts(from input: ContainerCreateRequest) throws -> [MountRecord] {
-        var result = ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
-            MountRecord(
+        var result = try ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
+            if let subpath = mount.VolumeOptions?.Subpath, !subpath.isEmpty {
+                let components = subpath.split(separator: "/", omittingEmptySubsequences: false)
+                guard !subpath.hasPrefix("/"), !components.contains(".."), !components.contains(".") else {
+                    throw EngineError(.badRequest, "invalid volume subpath: \(subpath)")
+                }
+            }
+            return MountRecord(
                 kind: MountRecord.Kind(rawValue: mount.Type) ?? .bind,
                 source: mount.Source ?? "", destination: mount.Target, readOnly: mount.ReadOnly ?? false,
-                noCopy: mount.VolumeOptions?.NoCopy ?? false
+                noCopy: mount.VolumeOptions?.NoCopy ?? false, subpath: mount.VolumeOptions?.Subpath,
+                tmpfsSizeBytes: mount.TmpfsOptions?.SizeBytes, tmpfsMode: mount.TmpfsOptions?.Mode
             )
         }
         for bind in input.HostConfig?.Binds ?? [] {
@@ -486,12 +503,32 @@ public struct DockerRouter: Sendable {
             result.append(.init(kind: fields[0].hasPrefix("/") ? .bind : .volume, source: fields[0], destination: fields[1], readOnly: fields.count == 3 && fields[2].split(separator: ",").contains("ro")))
         }
         for (destination, options) in input.HostConfig?.Tmpfs ?? [:] {
+            let values = options.split(separator: ",").map(String.init)
             result.append(.init(
                 kind: .tmpfs, source: options, destination: destination,
-                readOnly: options.split(separator: ",").contains("ro")
+                readOnly: values.contains("ro"),
+                tmpfsSizeBytes: values.first(where: { $0.hasPrefix("size=") }).flatMap {
+                    parseDockerByteSize(String($0.dropFirst("size=".count)))
+                },
+                tmpfsMode: values.first(where: { $0.hasPrefix("mode=") }).flatMap {
+                    UInt32($0.dropFirst("mode=".count), radix: 8)
+                }
             ))
         }
         return result
+    }
+
+    private func logOptions(_ components: URLComponents) -> DockerLogOptions {
+        let query = queryItems(components)
+        let tail: Int? = query["tail"].flatMap { $0 == "all" ? nil : Int($0) }
+        return .init(
+            stdout: parseBool(query["stdout"]) ?? true,
+            stderr: parseBool(query["stderr"]) ?? true,
+            since: query["since"].flatMap(parseDockerTimestamp),
+            until: query["until"].flatMap(parseDockerTimestamp),
+            timestamps: parseBool(query["timestamps"]) ?? false,
+            tail: tail
+        )
     }
 
     private func ports(from input: ContainerCreateRequest) -> [PortBinding] {
@@ -505,6 +542,21 @@ public struct DockerRouter: Sendable {
             }
         }
     }
+}
+
+func parseDockerTimestamp(_ value: String) -> Date? {
+    if let seconds = Double(value) { return Date(timeIntervalSince1970: seconds) }
+    let fractional = ISO8601DateFormatter(); fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+}
+
+private func parseDockerByteSize(_ value: String) -> Int64? {
+    let normalized = value.lowercased()
+    let units: [(String, Int64)] = [("gb", 1 << 30), ("g", 1 << 30), ("mb", 1 << 20), ("m", 1 << 20), ("kb", 1 << 10), ("k", 1 << 10), ("b", 1)]
+    for (suffix, multiplier) in units where normalized.hasSuffix(suffix) {
+        return Int64(normalized.dropLast(suffix.count)).map { $0 * multiplier }
+    }
+    return Int64(normalized)
 }
 
 private struct VolumeListEnvelope: Encodable { let Volumes: [DockerVolumeResponse]; let Warnings: [String] }
@@ -554,6 +606,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public struct MountResponse: Codable, Sendable {
         let `Type`: String; let Name: String?; let Source: String; let Destination: String
         let Driver: String; let Mode: String; let RW: Bool; let Propagation: String
+        let VolumeOptions: VolumeOptionsResponse?; let TmpfsOptions: TmpfsOptionsResponse?
+        struct VolumeOptionsResponse: Codable, Sendable { let NoCopy: Bool; let Subpath: String? }
+        struct TmpfsOptionsResponse: Codable, Sendable { let SizeBytes: Int64?; let Mode: UInt32? }
     }
     public struct NetworkSettingsResponse: Codable, Sendable {
         let Bridge: String?; let SandboxID: String; let HairpinMode: Bool?
@@ -580,7 +635,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
             MountResponse(
                 Type: mount.kind.rawValue, Name: mount.kind == .volume ? mount.source : nil,
                 Source: mount.source, Destination: mount.destination, Driver: mount.kind == .volume ? "local" : "",
-                Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly, Propagation: "rprivate"
+                Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly, Propagation: "rprivate",
+                VolumeOptions: mount.kind == .volume ? .init(NoCopy: mount.noCopy, Subpath: mount.subpath) : nil,
+                TmpfsOptions: mount.kind == .tmpfs ? .init(SizeBytes: mount.tmpfsSizeBytes, Mode: mount.tmpfsMode) : nil
             )
         }
         let portBindings = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {

@@ -820,6 +820,44 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(event?.attributes["name"] == "eventful")
     }
 
+    @Test func runtimeReplaysBoundedEventHistory() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root)
+        let record = try await runtime.createContainer(ContainerRecord(name: "historical", image: "debian"))
+        let stream = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var iterator = stream.makeAsyncIterator()
+        #expect(await iterator.next()?.id == record.id)
+        #expect(await iterator.next() == nil)
+    }
+
+    @Test func systemDiskUsageAndMountOptionsUseDockerSchemas() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/volumes/create",
+            body: Data(#"{"Name":"schema-volume"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=mount-schema",
+            body: Data(#"{"Image":"debian","HostConfig":{"Mounts":[{"Type":"volume","Source":"schema-volume","Target":"/data","VolumeOptions":{"NoCopy":true,"Subpath":"nested"}},{"Type":"tmpfs","Target":"/run/cache","TmpfsOptions":{"SizeBytes":1048576,"Mode":448}}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/mount-schema/json"))
+        let inspectJSON = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(inspectJSON["HostConfig"] as? [String: Any])
+        let mounts = try #require(host["Mounts"] as? [[String: Any]])
+        #expect((mounts[0]["VolumeOptions"] as? [String: Any])?["Subpath"] as? String == "nested")
+        #expect((mounts[1]["TmpfsOptions"] as? [String: Any])?["SizeBytes"] as? Int == 1_048_576)
+
+        let usage = await router.route(.init(method: .GET, uri: "/v1.55/system/df?verbose=true"))
+        #expect(usage.status == .ok)
+        let usageJSON = try #require(JSONSerialization.jsonObject(with: usage.body) as? [String: Any])
+        #expect((usageJSON["Containers"] as? [[String: Any]])?.count == 1)
+        #expect((usageJSON["Volumes"] as? [[String: Any]])?.count == 1)
+        #expect((usageJSON["BuildCache"] as? [[String: Any]])?.isEmpty == true)
+    }
+
     @Test func statsTopUpdateAndPruneUseDockerSchemas() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
