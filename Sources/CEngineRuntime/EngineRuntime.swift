@@ -15,6 +15,12 @@ public struct EngineSnapshot: Codable, Sendable {
     }
 }
 
+public struct ContainerWaitSubscription: Sendable {
+    public let stream: AsyncStream<Int32>
+
+    init(stream: AsyncStream<Int32>) { self.stream = stream }
+}
+
 public actor EngineRuntime {
     var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
@@ -23,7 +29,8 @@ public actor EngineRuntime {
     private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
     private var eventHistory: [RuntimeEvent] = []
     private var healthTasks: [String: Task<Void, Never>] = [:]
-    private var nextExitWaiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
+    private var exitWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
+    private var removalWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -295,31 +302,34 @@ public actor EngineRuntime {
         snapshot.containers[current].phase = .exited
         snapshot.containers[current].exitCode = code
         snapshot.containers[current].finishedAt = Date()
-        resumeNextExitWaiters(record.id, code: code)
+        resumeExitWaiters(record.id, code: code)
         try await persist()
         emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
         healthTasks.removeValue(forKey: record.id)?.cancel()
     }
 
     public func waitContainer(_ identifier: String, condition: String? = nil) async throws -> Int32 {
+        let subscription = try subscribeContainerWait(identifier, condition: condition)
+        for await code in subscription.stream { return code }
+        throw EngineError(.internalError, "container wait ended without a result")
+    }
+
+    public func subscribeContainerWait(_ identifier: String, condition: String? = nil) throws -> ContainerWaitSubscription {
         let index = try containerIndex(identifier)
-        if condition == "next-exit" {
-            let id = snapshot.containers[index].id
-            return await withCheckedContinuation { continuation in
-                nextExitWaiters[id, default: []].append(continuation)
-            }
-        }
-        if snapshot.containers[index].phase != .running { return snapshot.containers[index].exitCode ?? 0 }
         let record = snapshot.containers[index]
-        let code = try await backend.wait(record)
-        guard let current = try? containerIndex(record.id) else { return code }
-        snapshot.containers[current].phase = .exited
-        snapshot.containers[current].exitCode = code
-        snapshot.containers[current].finishedAt = Date()
-        resumeNextExitWaiters(record.id, code: code)
-        try await persist()
-        emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
-        return code
+        switch condition ?? "not-running" {
+        case "", "not-running":
+            guard record.phase == .running || record.phase == .paused else {
+                return immediateWaitSubscription(code: record.exitCode ?? 0)
+            }
+            return waitSubscription(containerID: record.id, removal: false)
+        case "next-exit":
+            return waitSubscription(containerID: record.id, removal: false)
+        case "removed":
+            return waitSubscription(containerID: record.id, removal: true)
+        default:
+            throw EngineError(.badRequest, "unsupported wait condition: \(condition ?? "")")
+        }
     }
 
     public func removeContainer(_ identifier: String, force: Bool, removeVolumes: Bool = false) async throws {
@@ -330,13 +340,14 @@ public actor EngineRuntime {
             _ = try await backend.stop(removed, timeoutSeconds: 0)
         }
         guard (try? containerIndex(removed.id)) != nil else { return }
-        resumeNextExitWaiters(removed.id, code: removed.exitCode ?? 137)
+        resumeExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
         try await backend.deleteLogs(for: removed)
         guard let current = try? containerIndex(removed.id) else { return }
         snapshot.containers.remove(at: current)
         if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
+        resumeRemovalWaiters(removed.id, code: removed.exitCode ?? 0)
         try await persist()
         emit(containerEvent("destroy", removed))
     }
@@ -666,7 +677,7 @@ public actor EngineRuntime {
         snapshot.containers[index].phase = .exited
         snapshot.containers[index].exitCode = code
         snapshot.containers[index].finishedAt = Date()
-        resumeNextExitWaiters(identifier, code: code)
+        resumeExitWaiters(identifier, code: code)
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
         healthTasks.removeValue(forKey: record.id)?.cancel()
@@ -691,14 +702,56 @@ public actor EngineRuntime {
             try? await backend.deleteLogs(for: record)
             try? await removeAnonymousVolumes(usedBy: record)
             if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
+            resumeRemovalWaiters(identifier, code: code)
             emit(containerEvent("destroy", record))
         }
         try? await persist()
     }
 
-    private func resumeNextExitWaiters(_ identifier: String, code: Int32) {
-        let waiters = nextExitWaiters.removeValue(forKey: identifier) ?? []
-        waiters.forEach { $0.resume(returning: code) }
+    private func waitSubscription(containerID: String, removal: Bool) -> ContainerWaitSubscription {
+        let token = UUID()
+        let (stream, continuation) = AsyncStream<Int32>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeWaiter(containerID: containerID, token: token, removal: removal) }
+        }
+        if removal {
+            removalWaiters[containerID, default: [:]][token] = continuation
+        } else {
+            exitWaiters[containerID, default: [:]][token] = continuation
+        }
+        return ContainerWaitSubscription(stream: stream)
+    }
+
+    private func immediateWaitSubscription(code: Int32) -> ContainerWaitSubscription {
+        let (stream, continuation) = AsyncStream<Int32>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        continuation.yield(code)
+        continuation.finish()
+        return ContainerWaitSubscription(stream: stream)
+    }
+
+    private func removeWaiter(containerID: String, token: UUID, removal: Bool) {
+        if removal {
+            removalWaiters[containerID]?.removeValue(forKey: token)
+            if removalWaiters[containerID]?.isEmpty == true { removalWaiters.removeValue(forKey: containerID) }
+        } else {
+            exitWaiters[containerID]?.removeValue(forKey: token)
+            if exitWaiters[containerID]?.isEmpty == true { exitWaiters.removeValue(forKey: containerID) }
+        }
+    }
+
+    private func resumeExitWaiters(_ identifier: String, code: Int32) {
+        finishWaiters(exitWaiters.removeValue(forKey: identifier) ?? [:], code: code)
+    }
+
+    private func resumeRemovalWaiters(_ identifier: String, code: Int32) {
+        finishWaiters(removalWaiters.removeValue(forKey: identifier) ?? [:], code: code)
+    }
+
+    private func finishWaiters(_ waiters: [UUID: AsyncStream<Int32>.Continuation], code: Int32) {
+        for continuation in waiters.values {
+            continuation.yield(code)
+            continuation.finish()
+        }
     }
 
     private static func shouldRestart(_ record: ContainerRecord, exitCode: Int32) -> Bool {

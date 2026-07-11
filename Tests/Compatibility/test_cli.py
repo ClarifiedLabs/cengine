@@ -33,6 +33,7 @@ def docker(daemon, *arguments: str, input: str | None = None) -> subprocess.Comp
 def test_cli_system_and_image_commands(daemon):
     assert "cengine" in docker(daemon, "version", "--format", "{{.Server.Platform.Name}}").stdout
     assert docker(daemon, "info", "--format", "{{.Driver}}").stdout.strip() == "apple-containerization"
+    assert docker(daemon, "info", "--format", "{{.CgroupVersion}}").stdout.strip() == "2"
     docker(daemon, "pull", IMAGE)
     assert IMAGE.split(":", 1)[0] in docker(daemon, "image", "ls", "--format", "{{.Repository}}").stdout
 
@@ -79,3 +80,23 @@ def test_cli_system_disk_usage(daemon):
     verbose = docker(daemon, "system", "df", "--verbose").stdout
     assert "Images space usage" in verbose
     assert "Local Volumes space usage" in verbose
+
+
+@pytest.mark.compat("CLI-007")
+def test_cli_detached_kind_shaped_run(daemon):
+    name = f"kind-shaped-{uuid.uuid4().hex[:8]}"
+    network = f"compat-kind-{uuid.uuid4().hex[:8]}"
+    docker(daemon, "network", "create", network)
+    result = docker(
+        daemon, "run", "--detach", "--tty", "--name", name,
+        "--privileged", "--tmpfs", "/tmp", "--tmpfs", "/run",
+        "--volume", "/var", "--volume", "/lib/modules:/lib/modules:ro",
+        "--network", network, IMAGE, "top",
+    )
+    assert len(result.stdout.strip()) == 64
+    assert docker(daemon, "inspect", "--format", "{{.State.Status}}", name).stdout.strip() == "running"
+    assert docker(daemon, "inspect", "--format", "{{.HostConfig.NetworkMode}}", name).stdout.strip() == network
+    mounts = docker(daemon, "inspect", "--format", "{{json .Mounts}}", name).stdout
+    assert '"Destination":"/var"' in mounts and '"Source":"/lib/modules"' in mounts
+    docker(daemon, "rm", "--force", "--volumes", name)
+    docker(daemon, "network", "rm", network)

@@ -82,6 +82,7 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let NCPU = ProcessInfo.processInfo.activeProcessorCount
     public let MemTotal = ProcessInfo.processInfo.physicalMemory
     public let CgroupDriver = "cgroupfs"
+    public let CgroupVersion = "2"
     public let SecurityOptions = ["name=vm"]
 }
 
@@ -97,12 +98,15 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     public var WorkingDir: String?
     public var Entrypoint: [String]?
     public var Labels: [String: String]?
+    public var Volumes: [String: EmptyObject]?
     public var StopSignal: String?
     public var StopTimeout: Int?
     public var HostConfig: HostConfig?
     public var Mounts: [Mount]?
     public var NetworkingConfig: NetworkingConfigRequest?
     public var Healthcheck: HealthcheckRequest?
+
+    public struct EmptyObject: Decodable, Sendable {}
 
     public struct HealthcheckRequest: Decodable, Sendable {
         public var Test: [String]?; public var Interval: Int64?; public var Timeout: Int64?
@@ -153,6 +157,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Memory: Int64?
         public var NanoCpus: Int64?
         public var RestartPolicy: RestartPolicy?
+        public var NetworkMode: String?
         public var Binds: [String]?
         public var Mounts: [Mount]?
         public var PortBindings: [String: [PortBindingRequest]]?

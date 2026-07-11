@@ -44,6 +44,7 @@ private actor CompletionBackend: ContainerBackend {
     }
     func logs(for _: ContainerRecord) async throws -> Data { log }
     func finish(_ id: String, code: Int32) { continuations.removeValue(forKey: id)?.resume(returning: code) }
+    func isWaitingForCompletion(_ id: String) -> Bool { continuations[id] != nil }
     func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
         let bridge = ContainerIOBridge(tty: exec.configuration.tty)
         execBridges[exec.id] = bridge
@@ -575,15 +576,24 @@ private actor AuthImageBackend: ContainerBackend {
     }
 
     @Test func waitReturnsDockerExitStatus() async throws {
-        let (router, root) = try await fixture()
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
+        let backend = CompletionBackend()
+        let router = DockerRouter(runtime: try await EngineRuntime(root: root, backend: backend), root: root)
         let create = await router.route(.init(method: .POST, uri: "/v1.44/containers/create?name=waiter", body: Data(#"{"Image":"debian","Cmd":["true"]}"#.utf8)))
         let body = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
         let id = try #require(body["Id"] as? String)
         _ = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/start", body: Data()))
         let resize = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/resize?w=120&h=40", body: Data()))
         #expect(resize.status == .ok)
-        let wait = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/wait", body: Data()))
+        let waiting = Task {
+            await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/wait", body: Data()))
+        }
+        for _ in 0..<100 where !(await backend.isWaitingForCompletion(id)) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await backend.finish(id, code: 0)
+        let wait = await waiting.value
         #expect(wait.status == .ok)
         let result = try #require(JSONSerialization.jsonObject(with: wait.body) as? [String: Any])
         #expect(result["StatusCode"] as? Int == 0)
@@ -601,19 +611,50 @@ private actor AuthImageBackend: ContainerBackend {
         ))
         let body = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
         let id = try #require(body["Id"] as? String)
+        let subscription = try await router.containerWait(id, condition: "next-exit")
         let wait = Task {
-            await router.route(.init(
-                method: .POST, uri: "/v1.44/containers/\(id)/wait?condition=next-exit"
-            ))
+            for await code in subscription.stream { return code }
+            return -1
         }
-        try await Task.sleep(for: .milliseconds(50))
-        #expect(!wait.isCancelled)
         _ = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/start"))
-        try await Task.sleep(for: .milliseconds(50))
+        for _ in 0..<100 where !(await backend.isWaitingForCompletion(id)) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await backend.isWaitingForCompletion(id))
         await backend.finish(id, code: 23)
-        let response = await wait.value
-        let result = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
-        #expect(result["StatusCode"] as? Int == 23)
+        #expect(await wait.value == 23)
+    }
+
+    @Test func kindContainerCreateOptionsRoundTrip() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/create",
+            body: Data(#"{"Name":"kind"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=kind-control-plane",
+            body: Data(#"{"Image":"kindest/node:v1.36.1","Volumes":{"/var":{}},"HostConfig":{"NetworkMode":"kind","Binds":["/lib/modules:/lib/modules:ro"]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/kind-control-plane/json"))
+        let json = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(json["HostConfig"] as? [String: Any])
+        #expect(host["NetworkMode"] as? String == "kind")
+        let mounts = try #require(json["Mounts"] as? [[String: Any]])
+        #expect(mounts.contains { $0["Type"] as? String == "volume" && $0["Destination"] as? String == "/var" })
+        #expect(mounts.contains { $0["Type"] as? String == "bind" && $0["Source"] as? String == "/lib/modules" })
+        let networkSettings = try #require(json["NetworkSettings"] as? [String: Any])
+        let networks = try #require(networkSettings["Networks"] as? [String: Any])
+        #expect(networks["kind"] != nil)
+
+        let stored = try Data(contentsOf: root.appending(path: "engine.json"))
+        let serialized = String(decoding: stored, as: UTF8.self)
+        #expect(serialized.contains(#""createSourceIfMissing":true"#))
+
+        let info = await router.route(.init(method: .GET, uri: "/v1.55/info"))
+        let infoJSON = try #require(JSONSerialization.jsonObject(with: info.body) as? [String: Any])
+        #expect(infoJSON["CgroupVersion"] as? String == "2")
     }
 
     @Test func pullInspectAndDeleteImage() async throws {

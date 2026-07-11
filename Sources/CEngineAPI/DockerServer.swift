@@ -17,6 +17,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var eventTask: Task<Void, Never>?
     private var statsTask: Task<Void, Never>?
     private var pullTask: Task<Void, Never>?
+    private var waitTask: Task<Void, Never>?
     private let maximumBodyBytes: Int
 
     public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
@@ -59,6 +60,11 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 startFollowingLogs(identifier: id, target: target, channel: context.channel)
                 return
             }
+            if head.method == .POST, let id = Self.waitContainerID(target) {
+                let condition = target.components.queryItems?.first(where: { $0.name == "condition" })?.value
+                startContainerWait(identifier: id, condition: condition, channel: context.channel, keepAlive: head.isKeepAlive)
+                return
+            }
             let request = APIRequest(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView))
             let keepAlive = head.isKeepAlive
             let channel = context.channel
@@ -74,7 +80,48 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         eventTask?.cancel()
         statsTask?.cancel()
         pullTask?.cancel()
+        waitTask?.cancel()
         context.fireChannelInactive()
+    }
+
+    private func startContainerWait(identifier: String, condition: String?, channel: Channel, keepAlive: Bool) {
+        waitTask = Task { [router] in
+            do {
+                let subscription = try await router.containerWait(identifier, condition: condition)
+                channel.eventLoop.execute {
+                    var headers = HTTPHeaders()
+                    headers.add(name: "Content-Type", value: "application/json")
+                    headers.add(name: "Transfer-Encoding", value: "chunked")
+                    if keepAlive { headers.add(name: "Connection", value: "keep-alive") }
+                    channel.writeAndFlush(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
+                }
+                for await code in subscription.stream {
+                    guard !Task.isCancelled else { return }
+                    let payload = try JSONEncoder().encode(ContainerWaitResponse(StatusCode: code, Error: nil))
+                    channel.eventLoop.execute {
+                        var buffer = channel.allocator.buffer(capacity: payload.count)
+                        buffer.writeBytes(payload)
+                        channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                        channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
+                    }
+                    return
+                }
+            } catch let error as EngineError {
+                channel.eventLoop.execute {
+                    Self.write(channel: channel, response: dockerErrorResponse(error), keepAlive: keepAlive)
+                }
+            } catch {
+                channel.eventLoop.execute {
+                    Self.write(channel: channel, response: dockerErrorResponse(EngineError(.internalError, error.localizedDescription)), keepAlive: keepAlive)
+                }
+            }
+        }
+    }
+
+    private static func waitContainerID(_ target: DockerRequestTarget) -> String? {
+        let path = target.path
+        guard path.hasPrefix("/containers/"), path.hasSuffix("/wait") else { return nil }
+        return String(path.dropFirst("/containers/".count).dropLast("/wait".count))
     }
 
     private func startFollowingLogs(identifier id: String, target: DockerRequestTarget, channel: Channel) {

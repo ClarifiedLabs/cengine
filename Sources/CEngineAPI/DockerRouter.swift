@@ -107,6 +107,10 @@ public struct DockerRouter: Sendable {
                 record.healthStatus = "starting"; record.healthFailingStreak = 0
             }
             record.mounts = try mounts(from: input)
+            for destination in (input.Volumes ?? [:]).keys.sorted()
+                where !record.mounts.contains(where: { $0.destination == destination }) {
+                record.mounts.append(.init(kind: .volume, source: "", destination: destination))
+            }
             for index in record.mounts.indices where record.mounts[index].kind == .volume && record.mounts[index].source.isEmpty {
                 let name = Identifier.random()
                 _ = try await runtime.createVolume(name: name, anonymous: true)
@@ -120,6 +124,13 @@ public struct DockerRouter: Sendable {
                     ipv4Address: endpoint?.IPAMConfig?.IPv4Address ?? endpoint?.IPAddress,
                     ipv6Address: endpoint?.IPAMConfig?.IPv6Address ?? endpoint?.GlobalIPv6Address
                 ))
+            }
+            if let networkMode = input.HostConfig?.NetworkMode,
+               !networkMode.isEmpty, networkMode != "default", networkMode != "bridge", networkMode != "none" {
+                let network = try await runtime.network(networkMode)
+                if !record.networks.contains(where: { $0.networkID == network.id }) {
+                    record.networks.append(.init(networkID: network.id))
+                }
             }
             let created = try await runtime.createContainer(record)
             return json(status: .created, ContainerCreateResponse(Id: created.id, Warnings: []))
@@ -481,6 +492,9 @@ public struct DockerRouter: Sendable {
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
+    public func containerWait(_ identifier: String, condition: String?) async throws -> ContainerWaitSubscription {
+        try await runtime.subscribeContainerWait(identifier, condition: condition)
+    }
 
     private func mounts(from input: ContainerCreateRequest) throws -> [MountRecord] {
         var result = try ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
@@ -500,7 +514,12 @@ public struct DockerRouter: Sendable {
         for bind in input.HostConfig?.Binds ?? [] {
             let fields = bind.split(separator: ":", maxSplits: 2).map(String.init)
             guard fields.count >= 2 else { throw EngineError(.badRequest, "invalid bind mount: \(bind)") }
-            result.append(.init(kind: fields[0].hasPrefix("/") ? .bind : .volume, source: fields[0], destination: fields[1], readOnly: fields.count == 3 && fields[2].split(separator: ",").contains("ro")))
+            let kind: MountRecord.Kind = fields[0].hasPrefix("/") ? .bind : .volume
+            result.append(.init(
+                kind: kind, source: fields[0], destination: fields[1],
+                readOnly: fields.count == 3 && fields[2].split(separator: ",").contains("ro"),
+                createSourceIfMissing: kind == .bind ? true : nil
+            ))
         }
         for (destination, options) in input.HostConfig?.Tmpfs ?? [:] {
             let values = options.split(separator: ",").map(String.init)
@@ -643,6 +662,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let portBindings = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {
             $0.map { PortBindingResponse(HostIp: $0.hostIP, HostPort: String($0.hostPort)) }
         }
+        let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
+        let networkMode = record.networks.first.flatMap { networkByID[$0.networkID]?.name } ?? "default"
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             AutoRemove: record.autoRemove, Privileged: record.privileged,
@@ -651,11 +672,10 @@ public struct ContainerInspectResponse: Codable, Sendable {
             Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
                 "\($0.source):\($0.destination)\($0.readOnly ? ":ro" : "")"
             },
-            Mounts: mounts, PortBindings: portBindings, NetworkMode: "default",
+            Mounts: mounts, PortBindings: portBindings, NetworkMode: networkMode,
             LogConfig: .init(Type: "json-file", Config: [:])
         )
         Mounts = mounts
-        let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
         let endpoints = record.networks.reduce(into: [String: EndpointResponse]()) { result, endpoint in
             let network = networkByID[endpoint.networkID]
             let name = network?.name ?? endpoint.networkID

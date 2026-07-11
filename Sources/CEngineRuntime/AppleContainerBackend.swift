@@ -158,7 +158,8 @@ public actor AppleContainerBackend: ContainerBackend {
         let unpacker = EXT4Unpacker(blockSizeInBytes: max(record.memoryBytes * 4, 8 * 1_024 * 1_024 * 1_024))
         let rootfsURL = containerPath.appending(path: "rootfs.ext4")
         var rootfs = try await unpacker.unpack(image, for: selectedPlatform, at: rootfsURL)
-        try populateEmptyVolumes(for: record, from: rootfsURL)
+        try await populateEmptyVolumes(for: record, from: image, platform: selectedPlatform)
+        try await prepareVolumeImages(for: record)
         if record.readOnlyRootfs { rootfs.options.append("ro") }
         let container = try LinuxContainer(record.id, rootfs: rootfs, vmm: vmm) { config in
             if let imageConfig { config.process = .init(from: imageConfig) }
@@ -185,32 +186,53 @@ public actor AppleContainerBackend: ContainerBackend {
                 config.process.capabilities = .allCapabilities
             }
 
-            for mount in record.mounts {
-                let source: String
+            for (mountIndex, mount) in record.mounts.enumerated() {
                 switch mount.kind {
                 case .bind:
-                    source = URL(filePath: mount.source).standardizedFileURL.path
+                    let requested = URL(filePath: mount.source).standardizedFileURL
+                    let source: String
+                    if FileManager.default.fileExists(atPath: requested.path) || mount.createSourceIfMissing != true {
+                        source = requested.path
+                    } else {
+                        let directory = containerPath.appending(path: "bind-sources/\(mountIndex)", directoryHint: .isDirectory)
+                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                        source = directory.path
+                    }
+                    config.mounts.append(.share(
+                        source: source, destination: mount.destination,
+                        options: mount.readOnly ? ["ro"] : []
+                    ))
                 case .volume:
                     let directory = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
-                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    if let subpath = mount.subpath, !subpath.isEmpty {
+                    if record.privileged, mount.destination == "/var" {
+                        config.mounts.append(.block(
+                            format: "ext4", source: directory.appending(path: "volume.ext4").path,
+                            destination: mount.destination, options: mount.readOnly ? ["ro"] : []
+                        ))
+                    } else if let subpath = mount.subpath, !subpath.isEmpty {
                         let components = subpath.split(separator: "/", omittingEmptySubsequences: false)
                         guard !subpath.hasPrefix("/"), !components.contains(".."), !components.contains(".") else {
                             throw EngineError(.badRequest, "invalid volume subpath: \(subpath)")
                         }
                         let root = directory.standardizedFileURL.resolvingSymlinksInPath()
-                        let candidate = root.appending(path: subpath, directoryHint: .isDirectory)
+                        let source = root.appending(path: subpath, directoryHint: .isDirectory)
                             .standardizedFileURL.resolvingSymlinksInPath()
-                        guard candidate.path.hasPrefix(root.path + "/") else {
+                        guard source.path.hasPrefix(root.path + "/") else {
                             throw EngineError(.badRequest, "volume subpath escapes the volume root: \(subpath)")
                         }
                         var isDirectory: ObjCBool = false
-                        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                        guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory), isDirectory.boolValue else {
                             throw EngineError(.badRequest, "volume subpath does not exist: \(subpath)")
                         }
-                        source = candidate.path
+                        config.mounts.append(.share(
+                            source: source.path, destination: mount.destination,
+                            options: mount.readOnly ? ["ro"] : []
+                        ))
                     } else {
-                        source = directory.path
+                        config.mounts.append(.share(
+                            source: directory.path, destination: mount.destination,
+                            options: mount.readOnly ? ["ro"] : []
+                        ))
                     }
                 case .tmpfs:
                     var options = ["nosuid", "nodev"]
@@ -221,13 +243,7 @@ public actor AppleContainerBackend: ContainerBackend {
                         type: "tmpfs", source: "tmpfs", destination: mount.destination,
                         options: options
                     ))
-                    continue
                 }
-                config.mounts.append(.share(
-                    source: source,
-                    destination: mount.destination,
-                    options: mount.readOnly ? ["ro"] : []
-                ))
             }
             for copy in staged {
                 let entries = try FileManager.default.contentsOfDirectory(
@@ -243,7 +259,9 @@ public actor AppleContainerBackend: ContainerBackend {
         return container
     }
 
-    private func populateEmptyVolumes(for record: ContainerRecord, from rootfs: URL) throws {
+    private func populateEmptyVolumes(
+        for record: ContainerRecord, from image: Containerization.Image, platform: Platform
+    ) async throws {
         let candidates = try record.mounts.filter { mount in
             guard mount.kind == .volume, !mount.noCopy else { return false }
             let directory = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
@@ -253,14 +271,32 @@ public actor AppleContainerBackend: ContainerBackend {
         guard !candidates.isEmpty else { return }
 
         let work = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
-        let archive = work.appending(path: "rootfs.tar")
         let extracted = work.appending(path: "rootfs", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: extracted, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
 
-        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfs.path))
-        try reader.export(archive: FilePath(archive.path))
-        _ = try ArchiveReader(file: archive).extractContents(to: extracted)
+        let selectedPaths = candidates.map { $0.destination.split(separator: "/").map(String.init) }
+        let manifest = try await image.manifest(for: platform)
+        for (index, descriptor) in manifest.layers.enumerated() {
+            let layer = work.appending(path: "layer-\(index)", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: layer, withIntermediateDirectories: true)
+            let content = try await image.getContent(digest: descriptor.digest)
+            do {
+                try Self.extractImageLayer(ArchiveReader(file: content.path), paths: selectedPaths, to: layer)
+            } catch {
+                throw EngineError(
+                    .internalError,
+                    "failed to extract image layer \(index) for volume copy-up: \(String(describing: error))"
+                )
+            }
+            for path in selectedPaths {
+                let relative = path.joined(separator: "/")
+                let source = layer.appending(path: relative, directoryHint: .isDirectory)
+                guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                try Self.applyImageLayer(source, to: extracted.appending(path: relative, directoryHint: .isDirectory))
+            }
+            try FileManager.default.removeItem(at: layer)
+        }
 
         for mount in candidates {
             let relative = mount.destination.split(separator: "/").map(String.init).joined(separator: "/")
@@ -271,6 +307,119 @@ public actor AppleContainerBackend: ContainerBackend {
             let destination = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
             for entry in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
                 try FileManager.default.copyItem(at: entry, to: destination.appending(path: entry.lastPathComponent))
+            }
+        }
+    }
+
+    private func prepareVolumeImages(for record: ContainerRecord) async throws {
+        for mount in record.mounts
+            where mount.kind == .volume && record.privileged && mount.destination == "/var" {
+            let directory = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let image = directory.appending(path: "volume.ext4")
+            guard !FileManager.default.fileExists(atPath: image.path) else { continue }
+
+            let entries = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            if entries.isEmpty {
+                let formatter = try EXT4.Formatter(FilePath(image.path), minDiskSize: 8 * 1_024 * 1_024 * 1_024)
+                try formatter.close()
+                continue
+            }
+
+            let work = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+            let archive = work.appending(path: "volume.tar")
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: work) }
+            let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: archive)
+            try writer.archiveDirectory(directory)
+            try writer.finishEncoding()
+            let unpacker = EXT4Unpacker(blockSizeInBytes: 8 * 1_024 * 1_024 * 1_024)
+            try await unpacker.unpack(archive: archive, compression: .none, at: image)
+        }
+    }
+
+    private static func extractImageLayer(
+        _ reader: ArchiveReader, paths selectedPaths: [[String]], to destination: URL
+    ) throws {
+        let manager = FileManager.default
+        var hardlinks: [(URL, URL)] = []
+        for (entry, data) in reader.makeStreamingIterator() {
+            guard let rawPath = entry.path else { continue }
+            let components = rawPath.split(separator: "/").map(String.init).filter { $0 != "." }
+            guard !components.contains(".."), selectedPaths.contains(where: { components.starts(with: $0) }) else { continue }
+            let target = destination.appending(path: components.joined(separator: "/"))
+            try manager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+            if let hardlink = entry.hardlink {
+                let linkComponents = hardlink.split(separator: "/").map(String.init).filter { $0 != "." }
+                guard !linkComponents.contains(".."), selectedPaths.contains(where: { linkComponents.starts(with: $0) }) else { continue }
+                hardlinks.append((target, destination.appending(path: linkComponents.joined(separator: "/"))))
+                continue
+            }
+            if itemExists(target) { try manager.removeItem(at: target) }
+            switch entry.fileType {
+            case .directory:
+                try manager.createDirectory(at: target, withIntermediateDirectories: true)
+            case .symbolicLink:
+                if let link = entry.symlinkTarget { try manager.createSymbolicLink(atPath: target.path, withDestinationPath: link) }
+            case .regular:
+                guard manager.createFile(atPath: target.path, contents: nil) else {
+                    throw EngineError(.internalError, "failed to create volume copy-up file: \(target.path)")
+                }
+                let handle = try FileHandle(forWritingTo: target)
+                defer { try? handle.close() }
+                var buffer = [UInt8](repeating: 0, count: 128 * 1_024)
+                while true {
+                    let count = data.read(&buffer, maxLength: buffer.count)
+                    guard count >= 0 else { throw EngineError(.internalError, "failed to read image layer entry: \(rawPath)") }
+                    guard count > 0 else { break }
+                    try handle.write(contentsOf: Data(buffer.prefix(count)))
+                }
+            default:
+                continue
+            }
+            try? manager.setAttributes([.posixPermissions: NSNumber(value: entry.permissions & 0o7777)], ofItemAtPath: target.path)
+        }
+        for (target, source) in hardlinks where itemExists(source) {
+            if itemExists(target) { try manager.removeItem(at: target) }
+            try manager.linkItem(at: source, to: target)
+        }
+    }
+
+    private static func itemExists(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+            || (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+
+    private static func applyImageLayer(_ source: URL, to destination: URL) throws {
+        let manager = FileManager.default
+        try manager.createDirectory(at: destination, withIntermediateDirectories: true)
+        let entries = try manager.contentsOfDirectory(
+            at: source, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+
+        if entries.contains(where: { $0.lastPathComponent == ".wh..wh..opq" }) {
+            for existing in try manager.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil) {
+                try manager.removeItem(at: existing)
+            }
+        }
+        for entry in entries where entry.lastPathComponent.hasPrefix(".wh.") {
+            guard entry.lastPathComponent != ".wh..wh..opq" else { continue }
+            let target = destination.appending(path: String(entry.lastPathComponent.dropFirst(4)))
+            if itemExists(target) { try manager.removeItem(at: target) }
+        }
+        for entry in entries where !entry.lastPathComponent.hasPrefix(".wh.") {
+            let target = destination.appending(path: entry.lastPathComponent)
+            let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if values.isDirectory == true, values.isSymbolicLink != true {
+                var targetIsDirectory: ObjCBool = false
+                if manager.fileExists(atPath: target.path, isDirectory: &targetIsDirectory), !targetIsDirectory.boolValue {
+                    try manager.removeItem(at: target)
+                }
+                try applyImageLayer(entry, to: target)
+            } else {
+                if itemExists(target) { try manager.removeItem(at: target) }
+                try manager.copyItem(at: entry, to: target)
             }
         }
     }
