@@ -198,29 +198,37 @@ public actor AppleContainerBackend: ContainerBackend {
         let used = Set(networkRecords.values.map(\.subnet))
         var candidates: [String] = []
         if !requested.subnet.isEmpty { candidates.append(requested.subnet) }
-        if requested.allocationMode == .automatic, allowAutomaticRemap {
+        if requested.ipv4AllocationMode == .automatic, allowAutomaticRemap {
             candidates.append(contentsOf: subnetCandidates.filter { !used.contains($0) && $0 != requested.subnet })
         }
+        guard !candidates.isEmpty else {
+            throw EngineError(.conflict, "no available IPv4 /24 subnets in the configured network pools")
+        }
         for subnet in candidates {
-            let ipv6 = requested.ipv6Subnet.isEmpty || (restoring && subnet != requested.subnet)
-                ? Self.randomIPv6Prefix() : requested.ipv6Subnet
+            let ipv6: String
+            if requested.ipv6AllocationMode == .explicit {
+                ipv6 = requested.ipv6Subnet
+            } else if restoring, subnet == requested.subnet, !requested.ipv6Subnet.isEmpty {
+                ipv6 = requested.ipv6Subnet
+            } else {
+                ipv6 = Self.randomIPv6Prefix()
+            }
             do {
                 let ipv4CIDR = try CIDRv4(subnet)
                 let ipv6CIDR = try CIDRv6(ipv6)
                 guard ipv4CIDR.prefix.length == 24 else {
                     throw EngineError(.badRequest, "cengine networks require an IPv4 /24 subnet: \(subnet)")
                 }
-                guard ipv6CIDR.prefix.length == 64, ipv6CIDR.lower.description.lowercased().hasPrefix("fd") else {
+                guard Self.isUniqueLocal(prefix: ipv6CIDR) else {
                     throw EngineError(.badRequest, "cengine networks require an RFC 4193 ULA /64 prefix: \(ipv6)")
                 }
                 let mode: vmnet.operating_modes_t = requested.internalNetwork ? .VMNET_HOST_MODE : .VMNET_SHARED_MODE
                 let value = try ManagedVmnetNetwork(mode: mode, subnet: ipv4CIDR, prefixV6: ipv6CIDR)
-                let retainingRequestedSubnet = subnet == requested.subnet
-                if retainingRequestedSubnet, !requested.gateway.isEmpty,
+                if requested.ipv4AllocationMode == .explicit, !requested.gateway.isEmpty,
                    requested.gateway != value.ipv4Gateway.description {
                     throw EngineError(.badRequest, "IPv4 gateway must be \(value.ipv4Gateway) for subnet \(subnet)")
                 }
-                if retainingRequestedSubnet, !requested.ipv6Gateway.isEmpty,
+                if requested.ipv6AllocationMode == .explicit, !requested.ipv6Gateway.isEmpty,
                    requested.ipv6Gateway != value.ipv6Gateway?.description {
                     throw EngineError(.badRequest, "IPv6 gateway must be \(value.ipv6Gateway?.description ?? "") for prefix \(ipv6)")
                 }
@@ -236,6 +244,10 @@ public actor AppleContainerBackend: ContainerBackend {
         }
         let details = attempts.map { "\($0.0): \($0.1)" }.joined(separator: "; ")
         throw EngineError(.internalError, "could not allocate network \(requested.name) (\(details))")
+    }
+
+    static func isUniqueLocal(prefix: CIDRv6) -> Bool {
+        prefix.prefix.length == 64 && (UInt8(prefix.lower.value >> 120) & 0xfe) == 0xfc
     }
 
     public func pullImage(_ reference: String, platform: String) async throws {

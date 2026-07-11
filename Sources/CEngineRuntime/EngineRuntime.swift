@@ -510,7 +510,8 @@ public actor EngineRuntime {
         let requested = NetworkRecord(
             id: Identifier.random(), name: name, createdAt: Date(), subnet: requestedSubnet, gateway: gateway ?? "",
             ipv6Subnet: requestedIPv6, ipv6Gateway: ipv6Gateway ?? "",
-            allocationMode: subnet == nil && ipv6Subnet == nil ? .automatic : .explicit,
+            ipv4AllocationMode: subnet == nil ? .automatic : .explicit,
+            ipv6AllocationMode: ipv6Subnet == nil ? .automatic : .explicit,
             internalNetwork: internalNetwork, labels: labels
         )
         let record = try await backend.createNetwork(requested)
@@ -544,9 +545,9 @@ public actor EngineRuntime {
             throw EngineError(.conflict, "cannot connect a network while container \(snapshot.containers[index].name) is running")
         }
         guard !snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else { return }
-        guard (ipv4Address == nil && ipv6Address == nil) || network.allocationMode == .explicit else {
-            throw EngineError(.badRequest, "static endpoint addresses require an explicitly configured network subnet")
-        }
+        try validateStaticEndpointModes(
+            network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
+        )
         let previous = snapshot.containers[index]
         snapshot.containers[index].networks.append(.init(
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
@@ -645,9 +646,11 @@ public actor EngineRuntime {
             guard let network = snapshot.networks.first(where: { $0.id == endpoint.networkID }) else {
                 throw EngineError(.notFound, "network \(endpoint.networkID) not found")
             }
-            guard (!endpoint.ipv4AddressIsStatic && !endpoint.ipv6AddressIsStatic) || network.allocationMode == .explicit else {
-                throw EngineError(.badRequest, "static endpoint addresses require an explicitly configured network subnet")
-            }
+            try validateStaticEndpointModes(
+                network: network,
+                ipv4IsStatic: endpoint.ipv4AddressIsStatic,
+                ipv6IsStatic: endpoint.ipv6AddressIsStatic
+            )
             for peer in snapshot.containers where peer.id != record.id {
                 for existing in peer.networks where existing.networkID == endpoint.networkID {
                     if endpoint.ipv4AddressIsStatic, endpoint.ipv4Address == existing.ipv4Address {
@@ -658,6 +661,17 @@ public actor EngineRuntime {
                     }
                 }
             }
+        }
+    }
+
+    private func validateStaticEndpointModes(
+        network: NetworkRecord, ipv4IsStatic: Bool, ipv6IsStatic: Bool
+    ) throws {
+        if ipv4IsStatic, network.ipv4AllocationMode != .explicit {
+            throw EngineError(.badRequest, "static IPv4 addresses require an explicitly configured IPv4 subnet")
+        }
+        if ipv6IsStatic, network.ipv6AllocationMode != .explicit {
+            throw EngineError(.badRequest, "static IPv6 addresses require an explicitly configured IPv6 subnet")
         }
     }
 

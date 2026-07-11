@@ -201,6 +201,12 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CLI-006` | `test_cli_system_disk_usage` | ✅ Pass | Support | Base and verbose `docker system df` render engine-owned usage. |
 | `CLI-007` | `test_cli_detached_kind_shaped_run` | ✅ Pass | Support | Detached runs acknowledge next-exit waits before start and preserve kind-style network and mount configuration. |
 
+## kind 0.32.0
+
+| ID | Contract | Status | Intent | Notes |
+|---|---|---|---|---|
+| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster reaches readiness and is deleted through the isolated cengine daemon. |
+
 ## Optional Docker differential oracle
 
 | ID | Contract | Status | Intent | Notes |

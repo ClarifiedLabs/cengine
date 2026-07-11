@@ -22,10 +22,10 @@ compatibility suites against a temporary root and Unix socket. The command uses
 the kernel installed by the managed service or `cengine system install`; override it with
 `CENGINE_KERNEL`, or override the daemon and fixture image with
 `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`. The suite requires Docker Compose
-5.3.1; install the checksum-pinned plugin with
-`Scripts/install-compose-compat.sh`. GitHub-hosted runners cannot execute the
-VM-backed suite, so compatibility tests are currently a local gate rather than
-part of `.github/workflows/test.yml`.
+5.3.1 and kind (v0.32.0 is the reference version); install the checksum-pinned
+Compose plugin with `Scripts/install-compose-compat.sh`. GitHub-hosted runners
+cannot execute the VM-backed suite, so compatibility tests are currently a
+local gate rather than part of `.github/workflows/test.yml`.
 
 Use `make test-compat-soak` to run three fresh-daemon passes with shuffled test
 ordering. To compare normalized behavior with a real Docker Engine, run

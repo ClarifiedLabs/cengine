@@ -105,6 +105,7 @@ def pytest_report_header() -> list[str]:
         "Docker CLI": ["docker", "--version"],
         "Docker Compose": ["docker", "compose", "version", "--short"],
         "Docker Buildx": ["docker", "buildx", "version"],
+        "kind": ["kind", "version"],
     }
     versions = []
     for name, command in commands.items():

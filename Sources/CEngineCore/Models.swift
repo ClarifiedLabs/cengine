@@ -168,17 +168,20 @@ public struct NetworkRecord: Codable, Sendable {
     public var gateway: String
     public var ipv6Subnet: String
     public var ipv6Gateway: String
-    public var allocationMode: NetworkAllocationMode
+    public var ipv4AllocationMode: NetworkAllocationMode
+    public var ipv6AllocationMode: NetworkAllocationMode
     public var vmnetSerialization: Data?
     public var internalNetwork: Bool
     public var labels: [String: String]
 
     public init(id: String, name: String, createdAt: Date = Date(), subnet: String, gateway: String,
                 ipv6Subnet: String = "", ipv6Gateway: String = "",
-                allocationMode: NetworkAllocationMode = .automatic, vmnetSerialization: Data? = nil,
+                ipv4AllocationMode: NetworkAllocationMode = .automatic,
+                ipv6AllocationMode: NetworkAllocationMode = .automatic, vmnetSerialization: Data? = nil,
                 internalNetwork: Bool = false, labels: [String: String] = [:]) {
         self.id = id; self.name = name; self.createdAt = createdAt; self.subnet = subnet; self.gateway = gateway
-        self.ipv6Subnet = ipv6Subnet; self.ipv6Gateway = ipv6Gateway; self.allocationMode = allocationMode
+        self.ipv6Subnet = ipv6Subnet; self.ipv6Gateway = ipv6Gateway
+        self.ipv4AllocationMode = ipv4AllocationMode; self.ipv6AllocationMode = ipv6AllocationMode
         self.vmnetSerialization = vmnetSerialization
         self.internalNetwork = internalNetwork; self.labels = labels
     }

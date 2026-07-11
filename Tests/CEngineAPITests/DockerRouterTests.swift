@@ -1,6 +1,7 @@
 @testable import CEngineAPI
 import CEngineCore
 @testable import CEngineRuntime
+import ContainerizationExtras
 import Foundation
 import NIOHTTP1
 import Testing
@@ -80,6 +81,27 @@ private actor CompletionBackend: ContainerBackend {
             os: "linux"
         )]
     }
+}
+
+private actor NetworkRecordingBackend: ContainerBackend {
+    private var requests: [String: NetworkRecord] = [:]
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+
+    func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {
+        requests[network.name] = network
+        var result = network
+        if result.subnet.isEmpty { result.subnet = "192.168.250.0/24"; result.gateway = "192.168.250.1" }
+        if result.ipv6Subnet.isEmpty { result.ipv6Subnet = "fd00:ce::/64"; result.ipv6Gateway = "fd00:ce::1" }
+        return result
+    }
+
+    func request(named name: String) -> NetworkRecord? { requests[name] }
 }
 
 private actor BlockingStartBackend: ContainerBackend {
@@ -395,6 +417,69 @@ private actor AuthImageBackend: ContainerBackend {
             "192.168.250.0/24", "172.29.8.0/24", "10.240.8.0/24",
             "192.168.251.0/24", "172.29.9.0/24", "10.240.9.0/24",
         ])
+    }
+
+    @Test func networkAllocationModesAreTrackedPerAddressFamily() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+
+        _ = try await runtime.createNetwork(name: "automatic")
+        _ = try await runtime.createNetwork(name: "ipv4", subnet: "172.30.0.0/24")
+        _ = try await runtime.createNetwork(name: "ipv6", ipv6Subnet: "fc00:f853:ccd:e793::/64")
+        _ = try await runtime.createNetwork(
+            name: "dual", subnet: "172.31.0.0/24", ipv6Subnet: "fd00:1234::/64"
+        )
+
+        let automatic = try #require(await backend.request(named: "automatic"))
+        #expect(automatic.ipv4AllocationMode == .automatic)
+        #expect(automatic.ipv6AllocationMode == .automatic)
+        let ipv4 = try #require(await backend.request(named: "ipv4"))
+        #expect(ipv4.ipv4AllocationMode == .explicit)
+        #expect(ipv4.ipv6AllocationMode == .automatic)
+        let ipv6 = try #require(await backend.request(named: "ipv6"))
+        #expect(ipv6.ipv4AllocationMode == .automatic)
+        #expect(ipv6.ipv6AllocationMode == .explicit)
+        let dual = try #require(await backend.request(named: "dual"))
+        #expect(dual.ipv4AllocationMode == .explicit)
+        #expect(dual.ipv6AllocationMode == .explicit)
+    }
+
+    @Test func kindIPv6OnlyNetworkRequestAllocatesIPv4AndAllowsOnlyStaticIPv6() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let router = DockerRouter(runtime: try await EngineRuntime(root: root, backend: backend), root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"kind","EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fc00:f853:ccd:e793::/64"}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let request = try #require(await backend.request(named: "kind"))
+        #expect(request.subnet.isEmpty)
+        #expect(request.ipv4AllocationMode == .automatic)
+        #expect(request.ipv6Subnet == "fc00:f853:ccd:e793::/64")
+        #expect(request.ipv6AllocationMode == .explicit)
+
+        let staticIPv6 = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=static-v6",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"kind":{"IPAMConfig":{"IPv6Address":"fc00:f853:ccd:e793::2"}}}}}"#.utf8)
+        ))
+        #expect(staticIPv6.status == .created)
+        let staticIPv4 = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=static-v4",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"kind":{"IPAMConfig":{"IPv4Address":"192.168.250.20"}}}}}"#.utf8)
+        ))
+        #expect(staticIPv4.status == .badRequest)
+    }
+
+    @Test func uniqueLocalIPv6ValidationAcceptsTheFullRFC4193Range() throws {
+        #expect(AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fc00::/64")))
+        #expect(AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fdff:ffff:ffff:ffff::/64")))
+        #expect(!AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fbff:ffff::/64")))
+        #expect(!AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fe00::/64")))
+        #expect(!AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fc00::/48")))
     }
 
     @Test func responseShapesFollowRequestedAPIVersion() async throws {
