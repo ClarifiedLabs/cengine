@@ -292,7 +292,15 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     }
 }
 
-public struct NetworkCreateRequest: Decodable, Sendable { public let Name: String; public var Internal: Bool?; public var Labels: [String: String]? }
+public struct NetworkCreateRequest: Decodable, Sendable {
+    public let Name: String
+    public var Internal: Bool?
+    public var EnableIPv6: Bool?
+    public var Labels: [String: String]?
+    public var IPAM: IPAMRequest?
+    public struct IPAMRequest: Decodable, Sendable { public var Config: [ConfigRequest]? }
+    public struct ConfigRequest: Decodable, Sendable { public var Subnet: String?; public var Gateway: String? }
+}
 public struct NetworkCreateResponse: Codable, Sendable { public let Id: String; public let Warning: String }
 public struct NetworkConnectRequest: Decodable, Sendable {
     public let Container: String
@@ -374,7 +382,7 @@ public struct SystemDiskUsageResponse: Encodable, Sendable {
 
 public struct DockerNetworkResponse: Encodable, Sendable {
     public let Name: String; public let Id: String; public let Created: String
-    public let Scope = "local"; public let Driver = "bridge"; public let EnableIPv6 = false
+    public let Scope = "local"; public let Driver = "bridge"; public let EnableIPv6 = true
     public let IPAM: IPAMResponse; public let Internal: Bool; public let Attachable = false; public let Ingress = false
     public let ConfigFrom: [String: String] = [:]; public let ConfigOnly = false
     public let Containers: [String: String] = [:]; public let Options: [String: String] = [:]; public let Labels: [String: String]
@@ -384,7 +392,10 @@ public struct DockerNetworkResponse: Encodable, Sendable {
     public struct ConfigResponse: Encodable, Sendable { public let Subnet: String; public let Gateway: String }
     public init(_ network: NetworkRecord) {
         Name = network.name; Id = network.id; Created = ISO8601DateFormatter().string(from: network.createdAt)
-        IPAM = .init(Config: [.init(Subnet: network.subnet, Gateway: network.gateway)])
+        IPAM = .init(Config: [
+            .init(Subnet: network.subnet, Gateway: network.gateway),
+            .init(Subnet: network.ipv6Subnet, Gateway: network.ipv6Gateway),
+        ])
         Internal = network.internalNetwork; Labels = network.labels
     }
 }

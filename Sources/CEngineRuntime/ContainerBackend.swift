@@ -11,7 +11,17 @@ public struct ArchiveOwnership: Sendable {
     }
 }
 
+public struct BackendEndpointAddress: Sendable {
+    public let ipv4Address: String
+    public let ipv6Address: String
+
+    public init(ipv4Address: String, ipv6Address: String) {
+        self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
+    }
+}
+
 public protocol ContainerBackend: Sendable {
+    func shutdown() async
     func pullImage(_ reference: String, platform: String) async throws
     func prepare(_ container: ContainerRecord) async throws
     func start(_ container: ContainerRecord) async throws -> [PortBinding]
@@ -44,7 +54,7 @@ public protocol ContainerBackend: Sendable {
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
-    func ipv4Address(for container: ContainerRecord) async -> String?
+    func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress]
     func statistics(_ container: ContainerRecord) async throws -> BackendStatistics
     func top(_ container: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]])
     func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String)
@@ -53,9 +63,13 @@ public protocol ContainerBackend: Sendable {
     func pullImage(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws
     func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry]
     func updateNetworkRecords(_ containers: [ContainerRecord]) async throws
+    func restoreNetworks(_ networks: [NetworkRecord]) async throws -> [NetworkRecord]
+    func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord
+    func deleteNetwork(_ network: NetworkRecord) async throws
 }
 
 public extension ContainerBackend {
+    func shutdown() async {}
     func deleteLogs(for _: ContainerRecord) async throws {}
     func logs(for container: ContainerRecord, options _: DockerLogOptions) async throws -> Data { try await logs(for: container) }
     func io(for _: ContainerRecord) async throws -> ContainerIOBridge {
@@ -103,7 +117,7 @@ public extension ContainerBackend {
         try await prepare(container)
         _ = try await start(container)
     }
-    func ipv4Address(for _: ContainerRecord) async -> String? { nil }
+    func endpointAddresses(for _: ContainerRecord) async -> [String: BackendEndpointAddress] { [:] }
     func statistics(_: ContainerRecord) async throws -> BackendStatistics {
         throw EngineError(.unsupported, "container statistics are unavailable for this backend")
     }
@@ -121,6 +135,18 @@ public extension ContainerBackend {
     }
     func imageHistory(reference _: String, platform _: String) async throws -> [ImageHistoryEntry] { [] }
     func updateNetworkRecords(_: [ContainerRecord]) async throws {}
+    func restoreNetworks(_ networks: [NetworkRecord]) async throws -> [NetworkRecord] { networks }
+    func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {
+        var value = network
+        if value.subnet.isEmpty { value.subnet = "192.168.64.0/24"; value.gateway = "192.168.64.1" }
+        else if value.gateway.isEmpty {
+            var octets = value.subnet.split(separator: "/")[0].split(separator: ".").map(String.init)
+            if octets.count == 4 { octets[3] = "1"; value.gateway = octets.joined(separator: ".") }
+        }
+        if value.ipv6Subnet.isEmpty { value.ipv6Subnet = "fd00:ce::/64"; value.ipv6Gateway = "fd00:ce::1" }
+        return value
+    }
+    func deleteNetwork(_: NetworkRecord) async throws {}
 }
 
 public struct MetadataOnlyBackend: ContainerBackend {

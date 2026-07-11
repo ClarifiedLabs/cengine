@@ -48,10 +48,14 @@ public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
     public var aliases: [String]
     public var ipv4Address: String?
     public var ipv6Address: String?
+    public var ipv4AddressIsStatic: Bool
+    public var ipv6AddressIsStatic: Bool
 
-    public init(networkID: String, aliases: [String] = [], ipv4Address: String? = nil, ipv6Address: String? = nil) {
+    public init(networkID: String, aliases: [String] = [], ipv4Address: String? = nil, ipv6Address: String? = nil,
+                ipv4AddressIsStatic: Bool = false, ipv6AddressIsStatic: Bool = false) {
         self.networkID = networkID; self.aliases = aliases
         self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
+        self.ipv4AddressIsStatic = ipv4AddressIsStatic; self.ipv6AddressIsStatic = ipv6AddressIsStatic
     }
 }
 
@@ -154,17 +158,28 @@ public struct ContainerRecord: Codable, Sendable {
     }
 }
 
+public enum NetworkAllocationMode: String, Codable, Sendable { case automatic, explicit }
+
 public struct NetworkRecord: Codable, Sendable {
     public var id: String
     public var name: String
     public var createdAt: Date
     public var subnet: String
     public var gateway: String
+    public var ipv6Subnet: String
+    public var ipv6Gateway: String
+    public var allocationMode: NetworkAllocationMode
+    public var vmnetSerialization: Data?
     public var internalNetwork: Bool
     public var labels: [String: String]
 
-    public init(id: String, name: String, createdAt: Date = Date(), subnet: String, gateway: String, internalNetwork: Bool = false, labels: [String: String] = [:]) {
+    public init(id: String, name: String, createdAt: Date = Date(), subnet: String, gateway: String,
+                ipv6Subnet: String = "", ipv6Gateway: String = "",
+                allocationMode: NetworkAllocationMode = .automatic, vmnetSerialization: Data? = nil,
+                internalNetwork: Bool = false, labels: [String: String] = [:]) {
         self.id = id; self.name = name; self.createdAt = createdAt; self.subnet = subnet; self.gateway = gateway
+        self.ipv6Subnet = ipv6Subnet; self.ipv6Gateway = ipv6Gateway; self.allocationMode = allocationMode
+        self.vmnetSerialization = vmnetSerialization
         self.internalNetwork = internalNetwork; self.labels = labels
     }
 }

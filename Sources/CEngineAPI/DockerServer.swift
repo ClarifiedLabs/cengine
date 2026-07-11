@@ -202,35 +202,34 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             && requestHeaders["Accept"].contains(where: { $0.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == "application/jsonl" } })
         eventTask = Task { [router] in
             let stream = await router.events(since: since, until: until)
-            channel.eventLoop.execute {
+            do {
                 var headers = HTTPHeaders()
                 headers.add(name: "Content-Type", value: jsonl ? "application/jsonl" : "application/json")
                 headers.add(name: "Transfer-Encoding", value: "chunked")
-                channel.writeAndFlush(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
-            }
-            let encoder = JSONEncoder()
-            for await event in stream {
-                guard !Task.isCancelled else { break }
-                guard Self.matches(event, filters: filters) else { continue }
-                guard var data = try? encoder.encode(DockerEventResponse(event, version: target.version)) else { continue }
-                data.append(0x0a)
-                let payload = data
-                channel.eventLoop.execute {
-                    var buffer = channel.allocator.buffer(capacity: payload.count); buffer.writeBytes(payload)
-                    channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                try await channel.writeAndFlush(HTTPServerResponsePart.head(.init(
+                    version: .http1_1, status: .ok, headers: headers
+                ))).get()
+                let encoder = JSONEncoder()
+                for await event in stream {
+                    guard !Task.isCancelled else { break }
+                    guard Self.matches(event, filters: filters) else { continue }
+                    guard var data = try? encoder.encode(DockerEventResponse(event, version: target.version)) else { continue }
+                    data.append(0x0a)
+                    var buffer = channel.allocator.buffer(capacity: data.count)
+                    buffer.writeBytes(data)
+                    try await channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer))).get()
                 }
-            }
-            channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
+                try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+            } catch {}
         }
     }
 
-    private static func eventFilters(_ target: DockerRequestTarget) -> [String: [String]] {
+    static func eventFilters(_ target: DockerRequestTarget) -> [String: [String]] {
         guard let raw = target.components.queryItems?.first(where: { $0.name == "filters" })?.value,
-              let data = raw.data(using: .utf8),
-              let value = try? JSONSerialization.jsonObject(with: data) as? [String: [String]] else {
+              let data = raw.replacingOccurrences(of: "+", with: " ").data(using: .utf8) else {
             return [:]
         }
-        return value
+        return (try? JSONDecoder().decode([String: [String]].self, from: data)) ?? [:]
     }
 
     private static func matches(_ event: RuntimeEvent, filters: [String: [String]]) -> Bool {

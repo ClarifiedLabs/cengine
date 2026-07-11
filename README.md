@@ -39,6 +39,26 @@ cengine system doctor
 docker --context cengine info
 ```
 
+Each Docker network is backed by a separate dual-stack macOS vmnet network.
+Cengine allocates IPv4 `/24`s from documented RFC 1918 pools and assigns every
+network an RFC 4193 ULA `/64`. Override the IPv4 pools with
+`~/Library/Application Support/cengine/config.json`:
+
+```json
+{
+  "network": {
+    "ipv4Pools": ["192.168.224.0/20", "172.29.0.0/16", "10.240.0.0/16"]
+  }
+}
+```
+
+Pool entries must be unique RFC 1918 ranges containing complete `/24`s. Cengine
+asks vmnet to reserve each candidate directly; it does not pre-screen the host
+routing table. Networks are always dual-stack because vmnet supplies IPv6 even
+when Docker clients send `EnableIPv6: false`. Cengine persists vmnet's opaque
+network serialization so an abruptly restarted daemon can reclaim the same
+reservation before falling back to subnet remapping.
+
 ## Usage
 
 Run Docker commands against `cengine` by selecting its context:

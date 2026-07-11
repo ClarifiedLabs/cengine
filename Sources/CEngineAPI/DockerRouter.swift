@@ -28,6 +28,10 @@ public struct DockerRouter: Sendable {
     private let runtime: EngineRuntime
     private let root: URL
     private let decoder = JSONDecoder()
+
+    private func nonEmpty(_ value: String?) -> String? {
+        value.flatMap { $0.isEmpty ? nil : $0 }
+    }
     private let encoder = JSONEncoder()
 
     public init(runtime: EngineRuntime, root: URL) { self.runtime = runtime; self.root = root }
@@ -119,10 +123,12 @@ public struct DockerRouter: Sendable {
             record.ports = ports(from: input)
             for (networkName, endpoint) in input.NetworkingConfig?.EndpointsConfig ?? [:] {
                 let network = try await runtime.network(networkName)
+                let requestedIPv4 = nonEmpty(endpoint?.IPAMConfig?.IPv4Address) ?? nonEmpty(endpoint?.IPAddress)
+                let requestedIPv6 = nonEmpty(endpoint?.IPAMConfig?.IPv6Address) ?? nonEmpty(endpoint?.GlobalIPv6Address)
                 record.networks.append(.init(
                     networkID: network.id, aliases: endpoint?.Aliases ?? [],
-                    ipv4Address: endpoint?.IPAMConfig?.IPv4Address ?? endpoint?.IPAddress,
-                    ipv6Address: endpoint?.IPAMConfig?.IPv6Address ?? endpoint?.GlobalIPv6Address
+                    ipv4Address: requestedIPv4, ipv6Address: requestedIPv6,
+                    ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil
                 ))
             }
             if let networkMode = input.HostConfig?.NetworkMode,
@@ -267,15 +273,24 @@ public struct DockerRouter: Sendable {
             return json(status: .ok, DockerNetworkResponse(try await runtime.network(String(value.dropFirst("/networks/".count)))))
         case (.POST, "/networks/create"):
             let input = try decoder.decode(NetworkCreateRequest.self, from: request.body)
-            let network = try await runtime.createNetwork(name: input.Name, labels: input.Labels ?? [:])
+            let configs = input.IPAM?.Config ?? []
+            let ipv4 = configs.first(where: { $0.Subnet?.contains(":") == false })
+            let ipv6 = configs.first(where: { $0.Subnet?.contains(":") == true })
+            let network = try await runtime.createNetwork(
+                name: input.Name,
+                subnet: ipv4?.Subnet, gateway: ipv4?.Gateway,
+                ipv6Subnet: ipv6?.Subnet, ipv6Gateway: ipv6?.Gateway,
+                internalNetwork: input.Internal ?? false,
+                labels: input.Labels ?? [:]
+            )
             return json(status: .created, NetworkCreateResponse(Id: network.id, Warning: ""))
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/connect"):
             let id = String(value.dropFirst("/networks/".count).dropLast("/connect".count))
             let input = try decoder.decode(NetworkConnectRequest.self, from: request.body)
             try await runtime.connectNetwork(
                 id, container: input.Container, aliases: input.EndpointConfig?.Aliases ?? [],
-                ipv4Address: input.EndpointConfig?.IPAMConfig?.IPv4Address ?? input.EndpointConfig?.IPAddress,
-                ipv6Address: input.EndpointConfig?.IPAMConfig?.IPv6Address ?? input.EndpointConfig?.GlobalIPv6Address
+                ipv4Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv4Address) ?? nonEmpty(input.EndpointConfig?.IPAddress),
+                ipv6Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv6Address) ?? nonEmpty(input.EndpointConfig?.GlobalIPv6Address)
             )
             return APIResponse(status: .ok)
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/disconnect"):
@@ -687,8 +702,11 @@ public struct ContainerInspectResponse: Codable, Sendable {
             result[name] = .init(
                 IPAMConfig: nil, Links: nil, Aliases: aliases, NetworkID: endpoint.networkID,
                 EndpointID: "\(record.id)-\(endpoint.networkID)", Gateway: network?.gateway ?? "",
-                IPAddress: endpoint.ipv4Address ?? "", IPPrefixLen: 24, IPv6Gateway: "",
-                GlobalIPv6Address: endpoint.ipv6Address ?? "", GlobalIPv6PrefixLen: 0,
+                IPAddress: endpoint.ipv4Address ?? "",
+                IPPrefixLen: network?.subnet.split(separator: "/").last.flatMap { Int($0) } ?? 0,
+                IPv6Gateway: network?.ipv6Gateway ?? "",
+                GlobalIPv6Address: endpoint.ipv6Address ?? "",
+                GlobalIPv6PrefixLen: network?.ipv6Subnet.split(separator: "/").last.flatMap { Int($0) } ?? 0,
                 MacAddress: "", DNSNames: dnsNames
             )
         }

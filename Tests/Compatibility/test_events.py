@@ -45,7 +45,7 @@ def test_filtered_container_events(client: docker.DockerClient):
     reader.join(timeout=10)
     stream.close()
     assert not reader.is_alive()
-    assert actions >= {"create", "start", "die", "destroy"}
+    assert actions >= {"create", "start", "die", "destroy"}, json.dumps(events, indent=2)
     assert all(event["Type"] == "container" for event in events)
 
 

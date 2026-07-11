@@ -94,8 +94,10 @@ private final class DaemonLock {
         do {
             try await server.wait()
             try await server.shutdown()
+            await runtime.shutdown()
         } catch {
             try? await server.shutdown()
+            await runtime.shutdown()
             throw error
         }
         if managed { try? SystemManager.writeState(.stopped, message: nil, paths: paths) }

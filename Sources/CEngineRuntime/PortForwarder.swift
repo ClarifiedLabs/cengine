@@ -10,11 +10,17 @@ final class PortForwarder: @unchecked Sendable {
     private let lock = NSLock()
     private var listeners: [String: [Channel]] = [:]
 
-    func start(containerID: String, guestAddress: String, bindings: [PortBinding]) async throws -> [PortBinding] {
+    func start(containerID: String, guestIPv4Address: String, guestIPv6Address: String?,
+               bindings: [PortBinding]) async throws -> [PortBinding] {
         var started: [Channel] = []
         var resolved: [PortBinding] = []
         do {
             for binding in bindings {
+                let wantsIPv6 = binding.hostIP.contains(":")
+                guard !wantsIPv6 || guestIPv6Address != nil else {
+                    throw EngineError(.unsupported, "IPv6 port publishing requires an IPv6 container endpoint")
+                }
+                let guestAddress = wantsIPv6 ? guestIPv6Address! : guestIPv4Address
                 if binding.proto.lowercased() == "udp" {
                     let guest = try SocketAddress(ipAddress: guestAddress, port: Int(binding.containerPort))
                     let channel = try await DatagramBootstrap(group: group)
@@ -62,6 +68,15 @@ final class PortForwarder: @unchecked Sendable {
 
     func stop(containerID: String) {
         let values = lock.withLock { listeners.removeValue(forKey: containerID) ?? [] }
+        values.forEach { $0.close(promise: nil) }
+    }
+
+    func stopAll() {
+        let values = lock.withLock {
+            let result = listeners.values.flatMap { $0 }
+            listeners.removeAll()
+            return result
+        }
         values.forEach { $0.close(promise: nil) }
     }
 }

@@ -36,10 +36,36 @@ public actor EngineRuntime {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
         self.backend = backend
         self.snapshot = try await store.load(default: EngineSnapshot())
+        let persistedNetworks = Dictionary(uniqueKeysWithValues: snapshot.networks.map { ($0.id, $0) })
+        self.snapshot.networks = try await backend.restoreNetworks(snapshot.networks)
+        let remappedNetworkIDs = Set(snapshot.networks.compactMap { network -> String? in
+            guard let old = persistedNetworks[network.id],
+                  old.subnet != network.subnet || old.ipv6Subnet != network.ipv6Subnet else { return nil }
+            return network.id
+        })
+        if !remappedNetworkIDs.isEmpty {
+            for container in snapshot.containers.indices {
+                for endpoint in snapshot.containers[container].networks.indices
+                    where remappedNetworkIDs.contains(snapshot.containers[container].networks[endpoint].networkID) {
+                    if !snapshot.containers[container].networks[endpoint].ipv4AddressIsStatic {
+                        snapshot.containers[container].networks[endpoint].ipv4Address = nil
+                    }
+                    if !snapshot.containers[container].networks[endpoint].ipv6AddressIsStatic {
+                        snapshot.containers[container].networks[endpoint].ipv6Address = nil
+                    }
+                }
+            }
+        }
         if !snapshot.networks.contains(where: { $0.name == "default" }) {
-            snapshot.networks.append(NetworkRecord(
-                id: "cengine-default-network", name: "default", subnet: "192.168.64.0/24", gateway: "192.168.64.1"
-            ))
+            snapshot.networks.append(try await backend.createNetwork(NetworkRecord(
+                id: "cengine-default-network", name: "default", subnet: "", gateway: ""
+            )))
+        }
+        let defaultNetworkID = snapshot.networks.first(where: { $0.name == "default" })?.id
+        if let defaultNetworkID {
+            for index in snapshot.containers.indices where snapshot.containers[index].networks.isEmpty {
+                snapshot.containers[index].networks = [.init(networkID: defaultNetworkID)]
+            }
         }
         try await backend.cleanupOrphans(keeping: Set(snapshot.containers.map(\.id)))
         var recovered: [(String, Date)] = []
@@ -56,6 +82,12 @@ public actor EngineRuntime {
                 try await backend.prepare(restarted)
                 restarted.ports = try await backend.start(restarted)
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
+                let addresses = await backend.endpointAddresses(for: restarted)
+                for endpoint in restarted.networks.indices {
+                    guard let address = addresses[restarted.networks[endpoint].networkID] else { continue }
+                    restarted.networks[endpoint].ipv4Address = address.ipv4Address
+                    restarted.networks[endpoint].ipv6Address = address.ipv6Address
+                }
                 let startedAt = Date(); restarted.startedAt = startedAt
                 snapshot.containers[index] = restarted
                 recovered.append((restarted.id, startedAt))
@@ -83,6 +115,12 @@ public actor EngineRuntime {
         }
     }
 
+    public func shutdown() async {
+        healthTasks.values.forEach { $0.cancel() }
+        healthTasks.removeAll()
+        await backend.shutdown()
+    }
+
     public func listContainers(all: Bool) -> [ContainerRecord] {
         snapshot.containers.filter { all || $0.phase == .running || $0.phase == .paused }
             .sorted { $0.createdAt > $1.createdAt }
@@ -99,11 +137,16 @@ public actor EngineRuntime {
     }
 
     @discardableResult
-    public func createContainer(_ record: ContainerRecord) async throws -> ContainerRecord {
+    public func createContainer(_ input: ContainerRecord) async throws -> ContainerRecord {
+        var record = input
         guard Identifier.validateName(record.name) else { throw EngineError(.badRequest, "invalid container name: \(record.name)") }
         guard !snapshot.containers.contains(where: { $0.name == record.name || $0.id == record.id }) else {
             throw EngineError(.conflict, "Conflict. The container name \"/\(record.name)\" is already in use.")
         }
+        if record.networks.isEmpty, let network = snapshot.networks.first(where: { $0.name == "default" }) {
+            record.networks = [.init(networkID: network.id)]
+        }
+        try validateEndpoints(record)
         try await backend.prepare(record)
         snapshot.containers.append(record)
         try await backend.updateNetworkRecords(snapshot.containers)
@@ -132,16 +175,11 @@ public actor EngineRuntime {
         snapshot.containers[current].startedAt = startedAt
         snapshot.containers[current].finishedAt = nil
         snapshot.containers[current].exitCode = nil
-        if let address = await backend.ipv4Address(for: record) {
-            if snapshot.containers[current].networks.isEmpty {
-                if let network = snapshot.networks.first(where: { $0.name == "default" }) {
-                    snapshot.containers[current].networks = [.init(networkID: network.id, ipv4Address: address)]
-                }
-            } else {
-                for endpoint in snapshot.containers[current].networks.indices {
-                    snapshot.containers[current].networks[endpoint].ipv4Address = address
-                }
-            }
+        let addresses = await backend.endpointAddresses(for: record)
+        for endpoint in snapshot.containers[current].networks.indices {
+            guard let address = addresses[snapshot.containers[current].networks[endpoint].networkID] else { continue }
+            snapshot.containers[current].networks[endpoint].ipv4Address = address.ipv4Address
+            snapshot.containers[current].networks[endpoint].ipv6Address = address.ipv6Address
         }
         try await persist()
         emit(containerEvent("start", snapshot.containers[current]))
@@ -186,6 +224,7 @@ public actor EngineRuntime {
             try await backend.delete(old)
             try await backend.prepare(updated)
             updated.ports = try await backend.start(updated)
+            updated = await applyingEndpointAddresses(to: updated)
             updated.phase = .running; updated.startedAt = Date(); updated.finishedAt = nil; updated.exitCode = nil
         }
         snapshot.containers[index] = updated
@@ -243,6 +282,7 @@ public actor EngineRuntime {
         snapshot.containers[current].finishedAt = nil
         snapshot.containers[current].exitCode = nil
         snapshot.containers[current].restartCount += 1
+        snapshot.containers[current] = await applyingEndpointAddresses(to: snapshot.containers[current])
         try await persist()
         emit(containerEvent("restart", snapshot.containers[current]))
         startHealthMonitor(record.id)
@@ -460,12 +500,23 @@ public actor EngineRuntime {
         )
     }
 
-    public func createNetwork(name: String, subnet: String = "172.30.0.0/24", gateway: String = "172.30.0.1", labels: [String: String] = [:]) async throws -> NetworkRecord {
+    public func createNetwork(name: String, subnet: String? = nil, gateway: String? = nil,
+                              ipv6Subnet: String? = nil, ipv6Gateway: String? = nil,
+                              internalNetwork: Bool = false, labels: [String: String] = [:]) async throws -> NetworkRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid network name: \(name)") }
         if let existing = snapshot.networks.first(where: { $0.name == name }) { return existing }
-        let record = NetworkRecord(id: Identifier.random(), name: name, createdAt: Date(), subnet: subnet, gateway: gateway, internalNetwork: false, labels: labels)
+        let requestedSubnet = subnet ?? ""
+        let requestedIPv6 = ipv6Subnet ?? ""
+        let requested = NetworkRecord(
+            id: Identifier.random(), name: name, createdAt: Date(), subnet: requestedSubnet, gateway: gateway ?? "",
+            ipv6Subnet: requestedIPv6, ipv6Gateway: ipv6Gateway ?? "",
+            allocationMode: subnet == nil && ipv6Subnet == nil ? .automatic : .explicit,
+            internalNetwork: internalNetwork, labels: labels
+        )
+        let record = try await backend.createNetwork(requested)
         snapshot.networks.append(record)
-        try await persist()
+        do { try await persist() }
+        catch { try? await backend.deleteNetwork(record); snapshot.networks.removeAll { $0.id == record.id }; throw error }
         return record
     }
 
@@ -479,7 +530,8 @@ public actor EngineRuntime {
         guard !snapshot.containers.contains(where: { container in container.networks.contains { $0.networkID == snapshot.networks[index].id } }) else {
             throw EngineError(.conflict, "network \(snapshot.networks[index].name) has active endpoints")
         }
-        snapshot.networks.remove(at: index)
+        let removed = snapshot.networks.remove(at: index)
+        try await backend.deleteNetwork(removed)
         try await persist()
     }
 
@@ -488,23 +540,39 @@ public actor EngineRuntime {
                                ipv6Address: String? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
+        guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
+            throw EngineError(.conflict, "cannot connect a network while container \(snapshot.containers[index].name) is running")
+        }
         guard !snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else { return }
+        guard (ipv4Address == nil && ipv6Address == nil) || network.allocationMode == .explicit else {
+            throw EngineError(.badRequest, "static endpoint addresses require an explicitly configured network subnet")
+        }
+        let previous = snapshot.containers[index]
         snapshot.containers[index].networks.append(.init(
-            networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address
+            networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
+            ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil
         ))
-        try await backend.updateNetworkRecords(snapshot.containers)
+        do {
+            try validateEndpoints(snapshot.containers[index])
+            try await backend.updateNetworkRecords(snapshot.containers)
+        } catch { snapshot.containers[index] = previous; try? await backend.updateNetworkRecords(snapshot.containers); throw error }
         try await persist()
     }
 
     public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
+        guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
+            throw EngineError(.conflict, "cannot disconnect a network while container \(snapshot.containers[index].name) is running")
+        }
         guard snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else {
             if force { return }
-            throw EngineError(.notFound, "container is not connected to network (network.name)")
+            throw EngineError(.notFound, "container is not connected to network \(network.name)")
         }
+        let previous = snapshot.containers[index]
         snapshot.containers[index].networks.removeAll { $0.networkID == network.id }
-        try await backend.updateNetworkRecords(snapshot.containers)
+        do { try await backend.updateNetworkRecords(snapshot.containers) }
+        catch { snapshot.containers[index] = previous; try? await backend.updateNetworkRecords(snapshot.containers); throw error }
         try await persist()
     }
 
@@ -512,6 +580,7 @@ public actor EngineRuntime {
         let used = Set(snapshot.containers.flatMap(\.networks).map(\.networkID))
         let removed = snapshot.networks.filter { $0.name != "default" && !used.contains($0.id) }
         snapshot.networks.removeAll { $0.name != "default" && !used.contains($0.id) }
+        for network in removed { try await backend.deleteNetwork(network) }
         try await persist()
         return removed.map(\.name)
     }
@@ -569,6 +638,38 @@ public actor EngineRuntime {
             throw EngineError(.notFound, indices.isEmpty ? "No such container: \(identifier)" : "container identifier is ambiguous: \(identifier)")
         }
         return index
+    }
+
+    private func validateEndpoints(_ record: ContainerRecord) throws {
+        for endpoint in record.networks {
+            guard let network = snapshot.networks.first(where: { $0.id == endpoint.networkID }) else {
+                throw EngineError(.notFound, "network \(endpoint.networkID) not found")
+            }
+            guard (!endpoint.ipv4AddressIsStatic && !endpoint.ipv6AddressIsStatic) || network.allocationMode == .explicit else {
+                throw EngineError(.badRequest, "static endpoint addresses require an explicitly configured network subnet")
+            }
+            for peer in snapshot.containers where peer.id != record.id {
+                for existing in peer.networks where existing.networkID == endpoint.networkID {
+                    if endpoint.ipv4AddressIsStatic, endpoint.ipv4Address == existing.ipv4Address {
+                        throw EngineError(.conflict, "IPv4 address \(endpoint.ipv4Address ?? "") is already allocated")
+                    }
+                    if endpoint.ipv6AddressIsStatic, endpoint.ipv6Address == existing.ipv6Address {
+                        throw EngineError(.conflict, "IPv6 address \(endpoint.ipv6Address ?? "") is already allocated")
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyingEndpointAddresses(to input: ContainerRecord) async -> ContainerRecord {
+        var record = input
+        let addresses = await backend.endpointAddresses(for: input)
+        for endpoint in record.networks.indices {
+            guard let address = addresses[record.networks[endpoint].networkID] else { continue }
+            record.networks[endpoint].ipv4Address = address.ipv4Address
+            record.networks[endpoint].ipv6Address = address.ipv6Address
+        }
+        return record
     }
 
     func persist() async throws { try await store.save(snapshot) }
@@ -687,6 +788,7 @@ public actor EngineRuntime {
                 var restarted = record; restarted.restartCount += 1
                 try await backend.delete(record); try await backend.prepare(restarted)
                 restarted.ports = try await backend.start(restarted)
+                restarted = await applyingEndpointAddresses(to: restarted)
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let restartedAt = Date(); restarted.startedAt = restartedAt
                 if let current = try? containerIndex(identifier) { snapshot.containers[current] = restarted }

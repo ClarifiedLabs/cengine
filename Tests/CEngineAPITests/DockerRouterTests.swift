@@ -1,6 +1,6 @@
-import CEngineAPI
+@testable import CEngineAPI
 import CEngineCore
-import CEngineRuntime
+@testable import CEngineRuntime
 import Foundation
 import NIOHTTP1
 import Testing
@@ -184,6 +184,15 @@ private actor AuthImageBackend: ContainerBackend {
         return (DockerRouter(runtime: try await EngineRuntime(root: root), root: root), root)
     }
 
+    @Test func eventFiltersDecodeFormEncodedDockerJSON() throws {
+        let target = try DockerRequestTarget.parse(
+            "/v1.55/events?filters=%7B%22type%22%3A+%5B%22container%22%5D%2C+%22container%22%3A+%5B%22sample%22%5D%2C+%22label%22%3A+%5B%22app%3Ddemo%22%5D%7D"
+        )
+        #expect(DockerHTTPHandler.eventFilters(target) == [
+            "type": ["container"], "container": ["sample"], "label": ["app=demo"],
+        ])
+    }
+
     @Test func pingAndVersionNegotiation() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -321,7 +330,11 @@ private actor AuthImageBackend: ContainerBackend {
         let network = try #require(JSONSerialization.jsonObject(with: networkInspect.body) as? [String: Any])
         #expect(network["Name"] as? String == "frontend")
         #expect(network["Driver"] as? String == "bridge")
-        #expect(network["IPAM"] is [String: Any])
+        #expect(network["EnableIPv6"] as? Bool == true)
+        let ipam = try #require(network["IPAM"] as? [String: Any])
+        let configs = try #require(ipam["Config"] as? [[String: Any]])
+        #expect(configs.count == 2)
+        #expect((configs[1]["Subnet"] as? String)?.contains(":") == true)
 
         let volumeCreate = await router.route(.init(method: .POST, uri: "/v1.44/volumes/create", body: Data(#"{"Name":"dbdata","Labels":{"app":"demo"}}"#.utf8)))
         #expect(volumeCreate.status == .created)
@@ -330,6 +343,58 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(createdVolume["Driver"] as? String == "local")
         let volumeInspect = await router.route(.init(method: .GET, uri: "/v1.44/volumes/dbdata", body: Data()))
         #expect(volumeInspect.status == .ok)
+    }
+
+    @Test func runningContainersRejectNetworkAttachmentChanges() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        #expect((await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/create", body: Data(#"{"Name":"late"}"#.utf8)
+        ))).status == .created)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=live", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        #expect((await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/start"))).status == .noContent)
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/late/connect",
+            body: Data("{\"Container\":\"\(id)\"}".utf8)
+        ))
+        #expect(connect.status == .conflict)
+    }
+
+    @Test func networkConnectTreatsDockerEmptyAddressesAsUnspecified() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        #expect((await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/create", body: Data(#"{"Name":"extra"}"#.utf8)
+        ))).status == .created)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=stopped", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.44/networks/extra/connect",
+            body: Data("{\"Container\":\"\(id)\",\"EndpointConfig\":{\"IPAMConfig\":{\"IPv4Address\":\"\",\"IPv6Address\":\"\"},\"IPAddress\":\"\",\"GlobalIPv6Address\":\"\"}}".utf8)
+        ))
+        #expect(connect.status == .ok)
+    }
+
+    @Test func networkPoolsExpandAndInterleaveConfiguredPrivateRanges() throws {
+        #expect(try AppleContainerBackend.expand(pool: "192.168.240.0/23") == [
+            "192.168.240.0/24", "192.168.241.0/24",
+        ])
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(#"{"network":{"ipv4Pools":["192.168.250.0/23","172.29.8.0/23","10.240.8.0/23"]}}"#.utf8)
+            .write(to: root.appending(path: "config.json"))
+        #expect(try AppleContainerBackend.loadSubnetCandidates(root: root) == [
+            "192.168.250.0/24", "172.29.8.0/24", "10.240.8.0/24",
+            "192.168.251.0/24", "172.29.9.0/24", "10.240.9.0/24",
+        ])
     }
 
     @Test func responseShapesFollowRequestedAPIVersion() async throws {
@@ -425,7 +490,8 @@ private actor AuthImageBackend: ContainerBackend {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let networkCreate = await router.route(.init(
-            method: .POST, uri: "/v1.44/networks/create", body: Data(#"{"Name":"project_default"}"#.utf8)
+            method: .POST, uri: "/v1.44/networks/create",
+            body: Data(#"{"Name":"project_default","IPAM":{"Config":[{"Subnet":"172.30.0.0/24"}]}}"#.utf8)
         ))
         #expect(networkCreate.status == .created)
         let create = await router.route(.init(

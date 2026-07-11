@@ -24,6 +24,17 @@ def test_network_list_filters_labels(client: docker.DockerClient):
     assert [network.id for network in found] == [matching.id]
 
 
+@pytest.mark.compat("NET-007")
+def test_sequential_network_deletion_releases_vmnet_reservations(client: docker.DockerClient):
+    subnets = []
+    for index in range(130):
+        network = client.networks.create(f"compat-release-{index}-{uuid.uuid4().hex[:8]}")
+        network.reload()
+        subnets.append(network.attrs["IPAM"]["Config"][0]["Subnet"])
+        network.remove()
+    assert len(set(subnets)) == 1
+
+
 @pytest.mark.compat("VOL-001")
 def test_volume_list_filters_labels(client: docker.DockerClient):
     project = f"project-{uuid.uuid4().hex[:8]}"

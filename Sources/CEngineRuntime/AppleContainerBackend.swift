@@ -6,8 +6,11 @@ import ContainerizationEXT4
 import ContainerizationExtras
 import ContainerizationOCI
 import ContainerizationOS
+import Darwin
 import Foundation
 import SystemPackage
+import Virtualization
+import vmnet
 
 /// Executes Linux containers with Apple's Virtualization.framework-backed runtime.
 /// The actor owns ContainerManager because its image/network bookkeeping is mutable.
@@ -16,8 +19,10 @@ public actor AppleContainerBackend: ContainerBackend {
 
     private var manager: ContainerManager
     private let vmm: VZVirtualMachineManager
-    private var network: VmnetNetwork
-    private var interfaces: [String: any Containerization.Interface] = [:]
+    private var networks: [String: ManagedVmnetNetwork] = [:]
+    private var networkRecords: [String: NetworkRecord] = [:]
+    private var interfaces: [String: [String: any Containerization.Interface]] = [:]
+    private let subnetCandidates: [String]
     private let portForwarder = PortForwarder()
     private var containers: [String: LinuxContainer] = [:]
     private var ioBridges: [String: ContainerIOBridge] = [:]
@@ -50,8 +55,7 @@ public actor AppleContainerBackend: ContainerBackend {
         try FileManager.default.createDirectory(at: volumeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
-        let network = try await Self.createNetwork()
-        self.network = network
+        self.subnetCandidates = try Self.loadSubnetCandidates(root: root)
         let imageStore = try ImageStore(path: runtimeRoot)
         let initPath = runtimeRoot.appending(path: "initfs.ext4")
         let initfs: Containerization.Mount
@@ -70,17 +74,168 @@ public actor AppleContainerBackend: ContainerBackend {
         )
     }
 
-    private static func createNetwork() async throws -> VmnetNetwork {
-        var lastError: Error?
-        for attempt in 0..<30 {
-            do { return try VmnetNetwork() }
-            catch {
-                lastError = error
-                guard attempt < 29 else { break }
-                try await Task.sleep(for: .seconds(1))
+    private struct ConfigurationFile: Decodable {
+        struct Network: Decodable { var ipv4Pools: [String]? }
+        var network: Network?
+    }
+
+    private static let defaultPools = ["192.168.224.0/20", "172.29.0.0/16", "10.240.0.0/16"]
+
+    static func loadSubnetCandidates(root: URL) throws -> [String] {
+        let url = root.appending(path: "config.json")
+        let pools: [String]
+        if FileManager.default.fileExists(atPath: url.path) {
+            do { pools = try JSONDecoder().decode(ConfigurationFile.self, from: Data(contentsOf: url)).network?.ipv4Pools ?? defaultPools }
+            catch { throw EngineError(.badRequest, "invalid cengine configuration at \(url.path): \(error.localizedDescription)") }
+        } else { pools = defaultPools }
+        guard !pools.isEmpty else { throw EngineError(.badRequest, "network.ipv4Pools must not be empty") }
+        var expanded: [[String]] = []
+        for pool in pools { expanded.append(try expand(pool: pool)) }
+        var result: [String] = []
+        for index in 0..<(expanded.map(\.count).max() ?? 0) {
+            for values in expanded where values.indices.contains(index) { result.append(values[index]) }
+        }
+        guard Set(result).count == result.count else { throw EngineError(.badRequest, "network.ipv4Pools contain overlapping /24 subnets") }
+        return result
+    }
+
+    static func expand(pool: String) throws -> [String] {
+        let components = pool.split(separator: "/")
+        guard components.count == 2, let prefix = Int(components[1]), prefix >= 8, prefix <= 24,
+              let value = ipv4Value(String(components[0])) else {
+            throw EngineError(.badRequest, "invalid IPv4 network pool: \(pool)")
+        }
+        let mask = prefix == 0 ? UInt32(0) : UInt32.max << UInt32(32 - prefix)
+        let lower = value & mask
+        let upper = lower | ~mask
+        guard isPrivate(lower), isPrivate(upper) else { throw EngineError(.badRequest, "network pool must be RFC1918: \(pool)") }
+        return stride(from: UInt64(lower), through: UInt64(upper), by: 256).map {
+            "\(($0 >> 24) & 255).\(($0 >> 16) & 255).\(($0 >> 8) & 255).0/24"
+        }
+    }
+
+    private static func ipv4Value(_ address: String) -> UInt32? {
+        let parts = address.split(separator: ".").compactMap { UInt32($0) }
+        guard parts.count == 4, parts.allSatisfy({ $0 <= 255 }) else { return nil }
+        return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+    }
+
+    private static func isPrivate(_ value: UInt32) -> Bool {
+        value >> 24 == 10 || value >> 20 == 0xAC1 || value >> 16 == 0xC0A8
+    }
+
+    private static func randomIPv6Prefix() -> String {
+        let hex = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return "fd\(hex.prefix(2)):\(hex.dropFirst(2).prefix(4)):\(hex.dropFirst(6).prefix(4))::/64"
+    }
+
+    public func restoreNetworks(_ records: [NetworkRecord]) async throws -> [NetworkRecord] {
+        var restored: [NetworkRecord] = []
+        for record in records {
+            var lastError: Error?
+            for attempt in 0..<5 {
+                do {
+                    restored.append(try allocateNetwork(
+                        record, restoring: true, allowAutomaticRemap: attempt == 4
+                    ))
+                    lastError = nil
+                    break
+                } catch {
+                    lastError = error
+                    guard attempt < 4 else { break }
+                    try await Task.sleep(for: .milliseconds(500 * (1 << attempt)))
+                }
+            }
+            if let lastError { throw lastError }
+        }
+        return restored
+    }
+
+    public func createNetwork(_ record: NetworkRecord) async throws -> NetworkRecord {
+        try allocateNetwork(record, restoring: false)
+    }
+
+    public func deleteNetwork(_ record: NetworkRecord) async throws {
+        networks.removeValue(forKey: record.id)
+        networkRecords.removeValue(forKey: record.id)
+    }
+
+    public func shutdown() async {
+        for task in waitTasks.values { task.cancel() }
+        waitTasks.removeAll()
+        for container in containers.values { try? await container.stop() }
+        containers.removeAll()
+        for bridge in ioBridges.values { bridge.finishOutput() }
+        ioBridges.removeAll()
+        portForwarder.stopAll()
+        interfaces.removeAll()
+        preparedRecords.removeAll()
+        preparedImages.removeAll()
+        networks.removeAll()
+        networkRecords.removeAll()
+    }
+
+    private func allocateNetwork(
+        _ requested: NetworkRecord, restoring: Bool, allowAutomaticRemap: Bool = true
+    ) throws -> NetworkRecord {
+        var attempts: [(String, String)] = []
+        if restoring, let serialization = requested.vmnetSerialization {
+            do {
+                let value = try ManagedVmnetNetwork(serialization: serialization)
+                var record = requested
+                record.subnet = value.subnet.description
+                record.gateway = value.ipv4Gateway.description
+                record.ipv6Subnet = value.prefixV6?.description ?? ""
+                record.ipv6Gateway = value.ipv6Gateway?.description ?? ""
+                record.vmnetSerialization = try value.serialization()
+                networks[record.id] = value
+                networkRecords[record.id] = record
+                return record
+            } catch {
+                attempts.append(("serialized reservation", error.localizedDescription))
             }
         }
-        throw lastError ?? EngineError(.internalError, "failed to create vmnet network")
+        let used = Set(networkRecords.values.map(\.subnet))
+        var candidates: [String] = []
+        if !requested.subnet.isEmpty { candidates.append(requested.subnet) }
+        if requested.allocationMode == .automatic, allowAutomaticRemap {
+            candidates.append(contentsOf: subnetCandidates.filter { !used.contains($0) && $0 != requested.subnet })
+        }
+        for subnet in candidates {
+            let ipv6 = requested.ipv6Subnet.isEmpty || (restoring && subnet != requested.subnet)
+                ? Self.randomIPv6Prefix() : requested.ipv6Subnet
+            do {
+                let ipv4CIDR = try CIDRv4(subnet)
+                let ipv6CIDR = try CIDRv6(ipv6)
+                guard ipv4CIDR.prefix.length == 24 else {
+                    throw EngineError(.badRequest, "cengine networks require an IPv4 /24 subnet: \(subnet)")
+                }
+                guard ipv6CIDR.prefix.length == 64, ipv6CIDR.lower.description.lowercased().hasPrefix("fd") else {
+                    throw EngineError(.badRequest, "cengine networks require an RFC 4193 ULA /64 prefix: \(ipv6)")
+                }
+                let mode: vmnet.operating_modes_t = requested.internalNetwork ? .VMNET_HOST_MODE : .VMNET_SHARED_MODE
+                let value = try ManagedVmnetNetwork(mode: mode, subnet: ipv4CIDR, prefixV6: ipv6CIDR)
+                let retainingRequestedSubnet = subnet == requested.subnet
+                if retainingRequestedSubnet, !requested.gateway.isEmpty,
+                   requested.gateway != value.ipv4Gateway.description {
+                    throw EngineError(.badRequest, "IPv4 gateway must be \(value.ipv4Gateway) for subnet \(subnet)")
+                }
+                if retainingRequestedSubnet, !requested.ipv6Gateway.isEmpty,
+                   requested.ipv6Gateway != value.ipv6Gateway?.description {
+                    throw EngineError(.badRequest, "IPv6 gateway must be \(value.ipv6Gateway?.description ?? "") for prefix \(ipv6)")
+                }
+                var record = requested
+                record.subnet = value.subnet.description
+                record.gateway = value.ipv4Gateway.description
+                record.ipv6Subnet = value.prefixV6?.description ?? ""
+                record.ipv6Gateway = value.ipv6Gateway?.description ?? ""
+                record.vmnetSerialization = try value.serialization()
+                networks[record.id] = value; networkRecords[record.id] = record
+                return record
+            } catch { attempts.append((subnet, error.localizedDescription)) }
+        }
+        let details = attempts.map { "\($0.0): \($0.1)" }.joined(separator: "; ")
+        throw EngineError(.internalError, "could not allocate network \(requested.name) (\(details))")
     }
 
     public func pullImage(_ reference: String, platform: String) async throws {
@@ -134,19 +289,42 @@ public actor AppleContainerBackend: ContainerBackend {
 
         let io = ContainerIOBridge(tty: record.tty, logURL: logRoot.appending(path: "\(record.id).log"))
         let image = try await image(reference: record.image, platform: record.platform, pull: true)
-        if interfaces[record.id] == nil {
-            interfaces[record.id] = try network.createInterface(record.id)
-        }
+        if interfaces[record.id] == nil { interfaces[record.id] = try allocateInterfaces(for: record) }
         preparedRecords[record.id] = record
         preparedImages[record.id] = image
         ioBridges[record.id] = io
+    }
+
+    private func allocateInterfaces(for record: ContainerRecord) throws -> [String: any Containerization.Interface] {
+        var result: [String: any Containerization.Interface] = [:]
+        for (index, endpoint) in record.networks.enumerated() {
+            guard var network = networks[endpoint.networkID], let networkRecord = networkRecords[endpoint.networkID] else {
+                throw EngineError(.notFound, "network \(endpoint.networkID) is unavailable")
+            }
+            let allocationID = "\(record.id)-\(endpoint.networkID)"
+            let requestedIPv4 = endpoint.ipv4AddressIsStatic
+                ? try CIDRv4(IPv4Address(endpoint.ipv4Address ?? ""), prefix: network.subnet.prefix) : nil
+            let requestedIPv6 = endpoint.ipv6AddressIsStatic
+                ? try CIDRv6(IPv6Address(endpoint.ipv6Address ?? ""), prefix: network.prefixV6?.prefix ?? .ipv6(64)!) : nil
+            do {
+                result[endpoint.networkID] = try network.createInterface(
+                    allocationID, withDefaultRoute: index == 0,
+                    requestedIPv4: requestedIPv4, requestedIPv6: requestedIPv6
+                )
+            } catch {
+                throw EngineError(.badRequest, "could not allocate endpoint on network \(networkRecord.name): \(error.localizedDescription)")
+            }
+            networks[endpoint.networkID] = network
+        }
+        return result
     }
 
     private func createPreparedContainer(_ record: ContainerRecord) async throws -> LinuxContainer {
         guard let io = ioBridges[record.id] else { throw EngineError(.notFound, "container I/O is unavailable") }
         let volumeRoot = self.volumeRoot
         let staged = stagedCopies[record.id] ?? []
-        guard let interface = interfaces[record.id] else { throw EngineError(.internalError, "container network is unavailable") }
+        guard let interfaceMap = interfaces[record.id], !interfaceMap.isEmpty else { throw EngineError(.internalError, "container network is unavailable") }
+        let configuredInterfaces = record.networks.compactMap { interfaceMap[$0.networkID] }
         let peerHosts = hostEntries(for: record, records: Array(preparedRecords.values))
         guard let image = preparedImages[record.id] else { throw EngineError(.notFound, "prepared image is unavailable") }
         let selectedPlatform = try Self.platform(record.platform)
@@ -167,8 +345,8 @@ public actor AppleContainerBackend: ContainerBackend {
             config.memoryInBytes = max(record.memoryBytes, 256 * 1_024 * 1_024)
             config.hostname = record.hostname
             config.useInit = record.useInit
-            config.interfaces = [interface]
-            if let gateway = interface.ipv4Gateway { config.dns = .init(nameservers: [gateway.description]) }
+            config.interfaces = configuredInterfaces
+            if let gateway = configuredInterfaces.first?.ipv4Gateway { config.dns = .init(nameservers: [gateway.description]) }
             config.hosts = Hosts(entries: Hosts.default.entries + peerHosts)
             config.bootLog = BootLog.file(path: containerPath.appending(path: "bootlog.log"))
             config.process.arguments = resolvedArguments
@@ -204,6 +382,7 @@ public actor AppleContainerBackend: ContainerBackend {
                     ))
                 case .volume:
                     let directory = volumeRoot.appending(path: mount.source, directoryHint: .isDirectory)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                     if record.privileged, mount.destination == "/var" {
                         config.mounts.append(.block(
                             format: "ext4", source: directory.appending(path: "volume.ext4").path,
@@ -431,10 +610,13 @@ public actor AppleContainerBackend: ContainerBackend {
         try await container.create()
         try await container.start()
         var resolvedPorts = record.ports
-        if !record.ports.isEmpty, let interface = interfaces[record.id] {
+        if !record.ports.isEmpty, let primaryID = record.networks.first?.networkID,
+           let interface = interfaces[record.id]?[primaryID] {
             do {
                 resolvedPorts = try await portForwarder.start(
-                    containerID: record.id, guestAddress: interface.ipv4Address.address.description,
+                    containerID: record.id,
+                    guestIPv4Address: interface.ipv4Address.address.description,
+                    guestIPv6Address: interface.ipv6Address?.address.description,
                     bindings: record.ports
                 )
             } catch {
@@ -469,18 +651,23 @@ public actor AppleContainerBackend: ContainerBackend {
     public func stop(_ record: ContainerRecord, timeoutSeconds: Int) async throws -> Int32 {
         guard let container = containers[record.id] else { return record.exitCode ?? 137 }
         let signal = try Signal(record.stopSignal)
-        try await container.kill(timeoutSeconds == 0 ? .kill : signal)
-
-        let status: ExitStatus
         do {
-            status = try await container.wait(timeoutInSeconds: Int64(max(timeoutSeconds, 1)))
+            try await container.kill(timeoutSeconds == 0 ? .kill : signal)
+            let status: ExitStatus
+            do {
+                status = try await container.wait(timeoutInSeconds: Int64(max(timeoutSeconds, 1)))
+            } catch {
+                try await container.kill(.kill)
+                status = try await container.wait(timeoutInSeconds: 5)
+            }
+            try await container.stop()
+            portForwarder.stop(containerID: record.id)
+            return status.exitCode
         } catch {
-            try await container.kill(.kill)
-            status = try await container.wait(timeoutInSeconds: 5)
+            try? await container.stop()
+            portForwarder.stop(containerID: record.id)
+            return record.exitCode ?? 137
         }
-        try await container.stop()
-        portForwarder.stop(containerID: record.id)
-        return status.exitCode
     }
 
     public func delete(_ record: ContainerRecord) async throws {
@@ -492,8 +679,12 @@ public actor AppleContainerBackend: ContainerBackend {
         ioBridges.removeValue(forKey: record.id)?.finishOutput()
         preparedRecords.removeValue(forKey: record.id)
         preparedImages.removeValue(forKey: record.id)
-        interfaces.removeValue(forKey: record.id)
-        try? network.releaseInterface(record.id)
+        let released = interfaces.removeValue(forKey: record.id) ?? [:]
+        for networkID in released.keys {
+            guard var network = networks[networkID] else { continue }
+                network.releaseInterface("\(record.id)-\(networkID)")
+            networks[networkID] = network
+        }
         stagedCopies.removeValue(forKey: record.id)
         try? FileManager.default.removeItem(at: stagingRoot.appending(path: record.id))
         try? manager.delete(record.id)
@@ -514,8 +705,13 @@ public actor AppleContainerBackend: ContainerBackend {
         try await container.resize(to: Terminal.Size(width: width, height: height))
     }
 
-    public func ipv4Address(for record: ContainerRecord) async -> String? {
-        interfaces[record.id]?.ipv4Address.address.description
+    public func endpointAddresses(for record: ContainerRecord) async -> [String: BackendEndpointAddress] {
+        (interfaces[record.id] ?? [:]).reduce(into: [:]) { result, pair in
+            result[pair.key] = .init(
+                ipv4Address: pair.value.ipv4Address.address.description,
+                ipv6Address: pair.value.ipv6Address?.address.description ?? ""
+            )
+        }
     }
 
     public func statistics(_ record: ContainerRecord) async throws -> BackendStatistics {
@@ -591,20 +787,40 @@ public actor AppleContainerBackend: ContainerBackend {
 
     public func updateNetworkRecords(_ records: [ContainerRecord]) async throws {
         let byID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
-        for id in Array(preparedRecords.keys) where byID[id] != nil { preparedRecords[id] = byID[id] }
+        for id in Array(preparedRecords.keys) {
+            guard let record = byID[id] else { continue }
+            preparedRecords[id] = record
+            guard containers[id] == nil else { continue }
+            let old = interfaces.removeValue(forKey: id) ?? [:]
+            for networkID in old.keys {
+                guard var network = networks[networkID] else { continue }
+                network.releaseInterface("\(id)-\(networkID)")
+                networks[networkID] = network
+            }
+            interfaces[id] = try allocateInterfaces(for: record)
+        }
         await synchronizeHosts()
     }
 
     private func hostEntries(for record: ContainerRecord, records: [ContainerRecord]) -> [Hosts.Entry] {
         let networkIDs = Set(record.networks.map(\.networkID))
-        return records.compactMap { peer in
-            guard let peerInterface = interfaces[peer.id] else { return nil }
-            guard peer.id == record.id || !networkIDs.isDisjoint(with: peer.networks.map(\.networkID)) else { return nil }
-            let names = Set([peer.name, peer.hostname] + peer.networks.flatMap(\.aliases)).filter {
-                !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" }
+        return records.flatMap { peer -> [Hosts.Entry] in
+            guard let peerInterfaces = interfaces[peer.id] else { return [] }
+            let shared = peer.id == record.id ? Set(peer.networks.map(\.networkID))
+                : networkIDs.intersection(peer.networks.map(\.networkID))
+            return shared.flatMap { networkID -> [Hosts.Entry] in
+                guard let peerInterface = peerInterfaces[networkID] else { return [] }
+                let aliases = peer.networks.first(where: { $0.networkID == networkID })?.aliases ?? []
+                let names = Set([peer.name, peer.hostname] + aliases).filter {
+                    !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" }
+                }.sorted()
+                guard !names.isEmpty else { return [] }
+                var entries = [Hosts.Entry(ipAddress: peerInterface.ipv4Address.address.description, hostnames: names)]
+                if let ipv6 = peerInterface.ipv6Address {
+                    entries.append(.init(ipAddress: ipv6.address.description, hostnames: names))
+                }
+                return entries
             }
-            guard !names.isEmpty else { return nil }
-            return Hosts.Entry(ipAddress: peerInterface.ipv4Address.address.description, hostnames: names.sorted())
         }
     }
 
