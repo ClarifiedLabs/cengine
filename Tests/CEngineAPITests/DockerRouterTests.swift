@@ -98,6 +98,26 @@ private actor BlockingStartBackend: ContainerBackend {
     func releaseStart() { continuation?.resume(); continuation = nil }
 }
 
+private actor ConcurrentDeleteBackend: ContainerBackend {
+    private var arrivals = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {
+        arrivals += 1
+        if arrivals == 2 {
+            let pending = waiters
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
 private actor ImageStoreBackend: ContainerBackend {
     private var references = ["docker.io/library/existing:latest"]
     private var deleted: [String] = []
@@ -351,7 +371,9 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((newSummary["Health"] as? [String: Any])?["Status"] as? String == "none")
 
         let image = ImageRecord(
-            id: "sha256:test", references: ["example:test"], createdAt: Date(), size: 1,
+            id: "sha256:test", references: [
+                "docker.io/library/example:test", "docker.io/library/example@sha256:digest",
+            ], createdAt: Date(), size: 1,
             architecture: "arm64", os: "linux"
         )
         let oldImage = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
@@ -362,6 +384,8 @@ private actor AuthImageBackend: ContainerBackend {
         )) as? [String: Any])
         #expect((oldImage["Config"] as? [String: Any])?["Env"] != nil)
         #expect((newImage["Config"] as? [String: Any])?["Env"] == nil)
+        #expect(newImage["RepoTags"] as? [String] == ["example:test"])
+        #expect(newImage["RepoDigests"] as? [String] == ["example@sha256:digest"])
 
         let summary = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
             ImageSummaryResponse(image, containers: 2)
@@ -571,7 +595,7 @@ private actor AuthImageBackend: ContainerBackend {
         let list = await router.route(.init(method: .GET, uri: "/v1.44/images/json", body: Data()))
         let images = try #require(JSONSerialization.jsonObject(with: list.body) as? [[String: Any]])
         #expect(images.count == 1)
-        #expect((images[0]["RepoTags"] as? [String]) == ["docker.io/library/alpine:latest"])
+        #expect((images[0]["RepoTags"] as? [String]) == ["alpine:latest"])
 
         let inspect = await router.route(.init(method: .GET, uri: "/v1.44/images/docker.io/library/alpine:latest/json", body: Data()))
         #expect(inspect.status == .ok)
@@ -721,6 +745,18 @@ private actor AuthImageBackend: ContainerBackend {
         } catch let error as EngineError {
             #expect(error.code == .conflict)
         }
+    }
+
+    @Test func concurrentContainerRemovalsDoNotUseStaleIndices() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: ConcurrentDeleteBackend())
+        let first = try await runtime.createContainer(ContainerRecord(name: "remove-first", image: "debian"))
+        let second = try await runtime.createContainer(ContainerRecord(name: "remove-second", image: "debian"))
+        async let removeFirst: Void = runtime.removeContainer(first.id, force: false)
+        async let removeSecond: Void = runtime.removeContainer(second.id, force: false)
+        _ = try await (removeFirst, removeSecond)
+        #expect(await runtime.listContainers(all: true).isEmpty)
     }
 
     @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {

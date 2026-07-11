@@ -19,7 +19,7 @@ XCODE_METADATA_FLAGS = CENGINE_GIT_COMMIT="$(CENGINE_GIT_COMMIT)" CENGINE_BUILD_
 
 export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME
 
-.PHONY: all build test test-compat dist-cli package release release-list test-release clean help
+.PHONY: all build test test-compat test-compat-soak test-compat-oracle dist-cli package release release-list test-release clean help
 
 all: dist-cli
 
@@ -29,6 +29,8 @@ help:
 		'make build         Build cengine in debug mode with xcodebuild' \
 		'make test          Run the Xcode test suite' \
 		'make test-compat  Run Docker API and Compose compatibility tests against an isolated daemon' \
+		'make test-compat-soak  Run the compatibility suite three times with shuffled ordering' \
+		'make test-compat-oracle  Compare deterministic contracts with DOCKER_REFERENCE_HOST' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
 		'make package       Build local unsigned PKG and DMG release artifacts' \
 		'make release       Create a GitHub release tag (VERSION=patch|minor|major|X.Y.Z)' \
@@ -47,6 +49,22 @@ test-compat: build
 	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
 	@CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine" \
 		.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility
+
+test-compat-soak: build
+	@python3 -m venv .build/compat-venv
+	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
+	@for seed in 101 202 303; do \
+		echo "Running compatibility soak seed $$seed"; \
+		CENGINE_TEST_SEED="$$seed" CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine" \
+			.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility || exit $$?; \
+	done
+
+test-compat-oracle: build
+	@test -n "$(DOCKER_REFERENCE_HOST)" || (echo 'DOCKER_REFERENCE_HOST is required' >&2; exit 2)
+	@python3 -m venv .build/compat-venv
+	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
+	@DOCKER_REFERENCE_HOST="$(DOCKER_REFERENCE_HOST)" CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine" \
+		.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini -m oracle Tests/Compatibility
 
 dist-cli: test
 	XCODE_DERIVED_DATA="$(XCODE_DERIVED_DATA)" XCODE_SOURCE_PACKAGES="$(XCODE_SOURCE_PACKAGES)" ./Scripts/build-release.sh

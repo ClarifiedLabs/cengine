@@ -47,6 +47,9 @@ docker --context cengine compose up
 docker buildx build --builder cengine-builder .
 ```
 
+Buildx is the intended build path, but non-scratch builds currently have a
+strict known compatibility failure; see `BLD-001` in the compatibility ledger.
+
 To make `cengine` the default engine for subsequent Docker commands, activate
 its Docker context:
 

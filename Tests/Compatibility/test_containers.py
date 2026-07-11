@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import tarfile
 import threading
 import time
+import urllib.request
 import uuid
 
 import docker
@@ -27,10 +29,12 @@ def test_create_container(client: docker.DockerClient, top):
 
 @pytest.mark.compat("CTR-002")
 def test_create_network(client: docker.DockerClient, top):
-    client.networks.create(
+    network = client.networks.create(
         f"compat-{uuid.uuid4().hex[:8]}", driver="bridge", labels={"dev.cengine.compat": "true"}
     )
-    client.containers.create(image=IMAGE, detach=True)
+    network.reload()
+    assert network.attrs["Driver"] == "bridge"
+    assert network.attrs["Labels"]["dev.cengine.compat"] == "true"
 
 
 @pytest.mark.compat("CTR-003")
@@ -42,10 +46,25 @@ def test_start_container(client: docker.DockerClient, top):
 
 @pytest.mark.compat("CTR-004")
 def test_start_container_with_random_port_bind(client: docker.DockerClient, top):
-    container = client.containers.create(image=IMAGE, ports={"1234/tcp": None})
+    container = client.containers.create(
+        image=IMAGE,
+        command=["sh", "-c", "while true; do { echo -e 'HTTP/1.1 200 OK\\r\\nContent-Length: 9\\r\\n\\r\\nreachable'; } | nc -l -p 1234; done"],
+        ports={"1234/tcp": ("127.0.0.1", None)},
+    )
     container.start(); container.reload()
     bindings = container.attrs["NetworkSettings"]["Ports"]["1234/tcp"]
     assert bindings and int(bindings[0]["HostPort"]) > 0
+    url = f"http://127.0.0.1:{bindings[0]['HostPort']}"
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                assert response.read() == b"reachable"
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
 
 
 @pytest.mark.compat("CTR-005")
@@ -186,6 +205,86 @@ def test_container_inspect_compatibility(client: docker.DockerClient, top):
     required_host_config = {"Binds", "Mounts", "PortBindings", "LogConfig", "NetworkMode"}
     assert required_host_config <= inspect["HostConfig"].keys()
     assert {"Id", "Name", "State", "Config", "HostConfig", "Mounts", "NetworkSettings"} <= inspect.keys()
+
+
+@pytest.mark.compat("CTR-024")
+def test_exec_attached_output_and_exit_code(client: docker.DockerClient, top):
+    result = top.exec_run(["sh", "-c", "printf stdout; printf stderr >&2; exit 23"], demux=True)
+    assert result.exit_code == 23
+    assert result.output == (b"stdout", b"stderr")
+
+
+@pytest.mark.compat("CTR-025")
+def test_copy_from_container_round_trip(client: docker.DockerClient, top):
+    top.exec_run(["sh", "-c", "printf archive-roundtrip >/tmp/from-container.txt"])
+    stream, stat = top.get_archive("/tmp/from-container.txt")
+    archive = io.BytesIO(b"".join(stream))
+    with tarfile.open(fileobj=archive, mode="r:") as value:
+        member = next(member for member in value.getmembers() if member.isfile())
+        extracted = value.extractfile(member)
+        assert extracted is not None and extracted.read() == b"archive-roundtrip"
+    assert stat["name"] == "from-container.txt"
+
+
+@pytest.mark.compat("CTR-026")
+def test_container_configuration_round_trip(client: docker.DockerClient):
+    container = client.containers.create(
+        IMAGE, command=["sh", "-c", "sleep 300"], environment={"COMPAT_VALUE": "roundtrip"},
+        working_dir="/tmp", user="0:0", read_only=True, labels={"dev.cengine.compat": "true"},
+        restart_policy={"Name": "on-failure", "MaximumRetryCount": 2},
+    )
+    inspect = client.api.inspect_container(container.id)
+    assert "COMPAT_VALUE=roundtrip" in inspect["Config"]["Env"]
+    assert inspect["Config"]["WorkingDir"] == "/tmp"
+    assert inspect["Config"]["User"] == "0:0"
+    assert inspect["HostConfig"]["ReadonlyRootfs"] is True
+    assert inspect["HostConfig"]["RestartPolicy"] == {"Name": "on-failure", "MaximumRetryCount": 2}
+
+
+@pytest.mark.compat("CTR-027")
+def test_container_stats_complete(daemon, top):
+    environment = os.environ.copy()
+    environment["DOCKER_HOST"] = f"unix://{daemon['socket']}"
+    result = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format", "{{.ID}}", top.id],
+        env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
+    )
+    assert result.returncode == 0 and result.stdout.strip() == top.id[:12]
+
+
+@pytest.mark.compat("CTR-028")
+def test_top_and_update(client: docker.DockerClient, top):
+    processes = top.top(ps_args="-ef")
+    assert processes["Titles"] and processes["Processes"]
+    warnings = top.update(mem_limit="64m", restart_policy={"Name": "always"})
+    assert warnings == {"Warnings": []} or warnings == []
+    top.reload()
+    assert top.attrs["HostConfig"]["Memory"] == 64 * 1024 * 1024
+    assert top.attrs["HostConfig"]["RestartPolicy"]["Name"] == "always"
+
+
+@pytest.mark.compat("NET-002")
+def test_network_connect_disconnect(client: docker.DockerClient):
+    first = client.networks.create(f"compat-{uuid.uuid4().hex[:8]}")
+    second = client.networks.create(f"compat-{uuid.uuid4().hex[:8]}")
+    container = client.containers.create(IMAGE, command="top")
+    first.connect(container, aliases=["primary-alias"])
+    second.connect(container, aliases=["secondary-alias"])
+    container.reload()
+    assert {first.name, second.name} <= set(container.attrs["NetworkSettings"]["Networks"])
+    second.disconnect(container)
+    container.reload()
+    assert first.name in container.attrs["NetworkSettings"]["Networks"]
+    assert second.name not in container.attrs["NetworkSettings"]["Networks"]
+
+
+@KNOWN_GAP(reason="NET-003: docker-py network= create requests with an empty endpoint object return HTTP 500")
+@pytest.mark.compat("NET-003")
+def test_create_container_on_network(client: docker.DockerClient):
+    network = client.networks.create(f"compat-{uuid.uuid4().hex[:8]}")
+    container = client.containers.create(IMAGE, command="top", network=network.name)
+    container.reload()
+    assert network.name in container.attrs["NetworkSettings"]["Networks"]
 
 
 @pytest.mark.compat("CTR-022")

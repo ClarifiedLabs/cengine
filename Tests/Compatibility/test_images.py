@@ -20,14 +20,15 @@ KNOWN_GAP = pytest.mark.xfail(strict=True)
 def test_tag_valid_image(client: docker.DockerClient):
     image = client.images.get(IMAGE)
     assert image.tag("demo", "alpine")
-    assert any("alpine" in tag for tag in client.images.get(IMAGE).tags)
+    assert "demo:alpine" in client.images.get(IMAGE).tags
 
 
 @pytest.mark.compat("IMG-002")
 def test_retag_valid_image(client: docker.DockerClient):
     image = client.images.get(IMAGE)
     assert image.tag("demo", "rename")
-    assert "demo:test" not in client.images.get(IMAGE).tags
+    assert "demo:rename" in client.images.get(IMAGE).tags
+    assert IMAGE in client.images.get("demo:rename").tags
 
 
 @pytest.mark.compat("IMG-003")

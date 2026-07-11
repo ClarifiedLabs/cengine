@@ -8,9 +8,30 @@ with assertions adapted to Docker Engine semantics where Podman tests its own
 quirks. The active suite uses docker-py 7.2.0, negotiates Docker API v1.55,
 and retains an explicit v1.44 minimum-version smoke test.
 
-Run the complete suite with `make test-compat`. Known failures
+Run the complete suite with `make test-compat`, repeat it across three isolated
+shuffled runs with `make test-compat-soak`, or compare deterministic behavior
+with `make test-compat-oracle DOCKER_REFERENCE_HOST=...`. Known failures
 are strict expected failures: a new failure or an unexpected pass fails the
 command until this ledger and the test disposition are updated.
+
+The VM-backed suite is a local gate today. GitHub-hosted runners do not provide
+the environment needed to run it; a self-hosted Apple-silicon gate remains a
+future task. Test output records the installed Docker CLI, Compose, and Buildx
+versions. Docker-py and Compose are pinned by the repository, BuildKit is pinned
+by the Buildx contract, and external Compose/Buildx fixture images use manifest
+digests.
+
+## Black-box coverage map
+
+| Exposed family | VM-backed coverage | Remaining black-box gaps |
+|---|---|---|
+| Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-014`, `CTR-019`–`CTR-024`, `CTR-026`, `CLI-002`–`CLI-004` | Event streaming, log following, TTY resize, and concurrent stress are not assessed. |
+| Archive, exec, observability, update | `CTR-015`, `CTR-025`, `CTR-027`, `CTR-028` | Streaming stats is not assessed. |
+| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `NET-001`–`NET-003`, `VOL-001`–`VOL-003`, `CLI-005` | Create-with-network is a strict known failure; UDP forwarding and port-collision error parity are not assessed. |
+| Images and build | `IMG-001`–`IMG-014`, `BLD-001` | Successful authenticated push and Buildx non-scratch builds remain gaps. |
+| Compose and recovery | `CMP-001`–`CMP-006`, `REC-001` | Health-conditioned dependencies and daemon recovery during active I/O are not assessed. |
+| Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
 
 ## API version envelope
 
@@ -80,6 +101,11 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-021` | `test_container_inspect_compatibility` | ✅ Pass | Support | Includes stable container, mount, network, logging, and host-config fields consumed by docker-py. |
 | `CTR-022` | `test_rename_container` | ✅ Pass | Support | **cengine-owned.** Rename is persisted and addressable by the new name. |
 | `CTR-023` | `test_rename_container_name_conflict` | ✅ Pass | Support | **cengine-owned.** Duplicate names return HTTP 409. |
+| `CTR-024` | `test_exec_attached_output_and_exit_code` | ✅ Pass | Support | **cengine-owned.** Attached exec preserves multiplexed stdout/stderr and exit status. |
+| `CTR-025` | `test_copy_from_container_round_trip` | ✅ Pass | Support | **cengine-owned.** Archive download returns file contents and path metadata. |
+| `CTR-026` | `test_container_configuration_round_trip` | ✅ Pass | Support | **cengine-owned.** Environment, user, workdir, read-only root, labels, and restart policy survive create/inspect. |
+| `CTR-027` | `test_container_stats_complete` | ✅ Pass | Support | **cengine-owned.** VM-backed `docker stats --no-stream` returns a container sample. |
+| `CTR-028` | `test_top_and_update` | ✅ Pass | Support | **cengine-owned.** Process listing and live resource-policy updates use Docker schemas. |
 
 ## Images
 
@@ -87,7 +113,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 |---|---|---|---|---|
 | `IMG-001` | `test_tag_valid_image` | ✅ Pass | Support | Image tagging persists through the backend store. |
 | `IMG-002` | `test_retag_valid_image` | ✅ Pass | Support | Additional tags resolve to the same image. |
-| `IMG-003` | `test_list_images` | ✅ Pass | Support | Reference, dangling, and Compose label filtering. |
+| `IMG-003` | `test_list_images` | ✅ Pass | Support | Reference filtering excludes nonmatching images. |
 | `IMG-004` | `test_search_image` | ❌ Known fail | Undecided | Registry search is not implemented; upstream currently skips this case. |
 | `IMG-005` | `test_search_bogus_image` | ✅ Pass | Support | Unsupported search is surfaced as an API error. |
 | `IMG-006` | `test_remove_image` | ✅ Pass | Support | Missing-image and successful removal behavior. |
@@ -113,6 +139,8 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
 | `NET-001` | `test_network_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
+| `NET-002` | `test_network_connect_disconnect` | ✅ Pass | Support | **cengine-owned.** Containers can be connected to and disconnected from additional networks. |
+| `NET-003` | `test_create_container_on_network` | ❌ Known fail | Support | **cengine-owned.** docker-py's `network=` create shape currently returns HTTP 500. |
 | `VOL-001` | `test_volume_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
 | `VOL-002` | `test_empty_named_volume_copies_image_directory` | ✅ Pass | Support | **cengine-owned.** Empty named volumes receive image directory contents. |
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |
@@ -121,9 +149,24 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
-| `CMP-001` | `test_compose_application_lifecycle` | ✅ Pass | Support | Pull, create, start, DNS, ports, list, logs, and teardown. |
+| `CMP-001` | `test_compose_application_lifecycle` | ✅ Pass | Support | Pull, create, start, DNS, exit status, published-port HTTP, list, and teardown. |
 | `CMP-002` | `test_compose_repeated_up_is_idempotent` | ✅ Pass | Support | Reconciliation preserves unchanged containers. |
 | `CMP-003` | `test_compose_force_recreate_renames_replacement` | ✅ Pass | Support | Replacement containers receive canonical Compose names. |
+| `CMP-004` | `test_compose_scale_and_reconcile` | ✅ Pass | Support | Scaling creates the requested replicas, preserves them on repeated up, and removes excess replicas. |
+| `CMP-005` | `test_compose_exec_stop_start_and_restart` | ✅ Pass | Support | Compose exec and service lifecycle commands work without replacing the container. |
+| `CMP-006` | `test_compose_named_volume_down_semantics` | ✅ Pass | Support | Named data survives ordinary down and is deleted by `down --volumes`. |
+
+## Docker Buildx 0.35
+
+| ID | Contract | Status | Intent | Notes |
+|---|---|---|---|---|
+| `BLD-001` | `test_buildx_load_run_cache_and_volume_copy` | ❌ Known fail | Support | A real pinned builder boots, but BuildKit `COPY` into an Alpine rootfs currently fails with a read-only-filesystem error. |
+
+## Daemon recovery
+
+| ID | Contract | Status | Intent | Notes |
+|---|---|---|---|---|
+| `REC-001` | `test_daemon_restart_recovers_resources_and_restart_policy` | ✅ Pass | Support | **cengine-owned.** An abrupt daemon restart preserves resources and restarts an `always` container. |
 
 ## Docker CLI
 
@@ -134,3 +177,9 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CLI-003` | `test_cli_run_attached_output` | ✅ Pass | Support | Attached `docker run` output and automatic removal. |
 | `CLI-004` | `test_cli_run_attached_stdin` | ✅ Pass | Support | Interactive stdin over the hijacked attach connection. |
 | `CLI-005` | `test_cli_network_and_volume_lifecycle` | ✅ Pass | Support | Network and volume create, list, and remove commands. |
+
+## Optional Docker differential oracle
+
+| ID | Contract | Status | Intent | Notes |
+|---|---|---|---|---|
+| `ORC-001` | `test_container_lifecycle_matches_reference_docker` | ✅ Pass | Support | With `DOCKER_REFERENCE_HOST`, compares normalized create/inspect/filter/conflict/stop behavior to a real Docker Engine. |

@@ -22,8 +22,16 @@ compatibility suites against a temporary root and Unix socket. The command uses
 the kernel installed by `cengine system install`; override it with
 `CENGINE_KERNEL`, or override the daemon and fixture image with
 `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`. The suite requires Docker Compose
-5.3.1; CI installs the checksum-pinned plugin with
-`Scripts/install-compose-compat.sh`.
+5.3.1; install the checksum-pinned plugin with
+`Scripts/install-compose-compat.sh`. GitHub-hosted runners cannot execute the
+VM-backed suite, so compatibility tests are currently a local gate rather than
+part of `.github/workflows/test.yml`.
+
+Use `make test-compat-soak` to run three fresh-daemon passes with shuffled test
+ordering. To compare normalized behavior with a real Docker Engine, run
+`make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/docker.sock`;
+the reference host is always explicit and is never inferred from the active
+Docker context.
 
 The CLI target is ad-hoc signed for local development with
 `Configuration/cengine.entitlements`. That file intentionally contains only
@@ -69,9 +77,10 @@ Implemented API groups include server ping/version/info and live events;
 authenticated, platform-aware image pull with live progress,
 import/list/inspect/history/delete and pruning; container lifecycle, health,
 stats, top, logs, attach, exec, archive copy, mounts, networking, ports, and
-pruning; and Docker-shaped network and volume lifecycle APIs. A managed Buildx
-container driver supports local, pushed, and Docker `--load` outputs. Direct
-`docker build` intentionally directs clients to Buildx.
+pruning; and Docker-shaped network and volume lifecycle APIs. Direct
+`docker build` intentionally directs clients to Buildx. The VM-backed Buildx
+contract is tracked in the compatibility ledger and currently records a strict
+known failure while copying into a non-scratch image.
 
 See [`docker-compatibility.md`](docker-compatibility.md) for the detailed
 compatibility ledger and test provenance.

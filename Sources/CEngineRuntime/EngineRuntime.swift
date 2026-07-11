@@ -323,15 +323,17 @@ public actor EngineRuntime {
 
     public func removeContainer(_ identifier: String, force: Bool, removeVolumes: Bool = false) async throws {
         let index = try containerIndex(identifier)
-        if snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused {
-            guard force else { throw EngineError(.conflict, "You cannot remove a running container. Stop the container before attempting removal or force remove.") }
-            _ = try await backend.stop(snapshot.containers[index], timeoutSeconds: 0)
-        }
         let removed = snapshot.containers[index]
+        if removed.phase == .running || removed.phase == .paused {
+            guard force else { throw EngineError(.conflict, "You cannot remove a running container. Stop the container before attempting removal or force remove.") }
+            _ = try await backend.stop(removed, timeoutSeconds: 0)
+        }
+        guard (try? containerIndex(removed.id)) != nil else { return }
         resumeNextExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
-        snapshot.containers.remove(at: index)
+        guard let current = try? containerIndex(removed.id) else { return }
+        snapshot.containers.remove(at: current)
         if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
         try await persist()
         emit(containerEvent("destroy", removed))

@@ -336,7 +336,9 @@ public struct ImageSummaryResponse: Encodable, Sendable {
     public let Created: Int64; public let Size: Int64; public let SharedSize: Int64
     public let Labels: [String: String]
     public init(_ image: ImageRecord, containers: Int = -1) {
-        Id = image.id; RepoTags = image.references; RepoDigests = []
+        Id = image.id
+        RepoTags = image.references.filter { !$0.contains("@") }.map(dockerDisplayReference)
+        RepoDigests = image.references.filter { $0.contains("@") }.map(dockerDisplayReference)
         ParentId = ""; Containers = containers
         Created = Int64(image.createdAt.timeIntervalSince1970); Size = image.size; SharedSize = 0; Labels = [:]
     }
@@ -368,10 +370,19 @@ public struct ImageInspectResponse: Encodable, Sendable {
     public struct RootFSResponse: Encodable, Sendable { public let `Type` = "layers"; public let Layers: [String] = [] }
     public struct EmptyObject: Encodable, Sendable {}
     public init(_ image: ImageRecord, version: DockerAPIVersion = .maximum) {
-        Id = image.id; RepoTags = image.references; RepoDigests = []; Created = ISO8601DateFormatter().string(from: image.createdAt)
+        Id = image.id
+        RepoTags = image.references.filter { !$0.contains("@") }.map(dockerDisplayReference)
+        RepoDigests = image.references.filter { $0.contains("@") }.map(dockerDisplayReference)
+        Created = ISO8601DateFormatter().string(from: image.createdAt)
         Architecture = image.architecture; Os = image.os; Size = image.size
         Config = .init(omitEmpty: version >= .init(major: 1, minor: 52)); RootFS = .init()
     }
+}
+
+private func dockerDisplayReference(_ value: String) -> String {
+    if value.hasPrefix("docker.io/library/") { return String(value.dropFirst("docker.io/library/".count)) }
+    if value.hasPrefix("docker.io/") { return String(value.dropFirst("docker.io/".count)) }
+    return value
 }
 
 public struct ImageDeleteResponse: Encodable, Sendable { public let Deleted: String }
