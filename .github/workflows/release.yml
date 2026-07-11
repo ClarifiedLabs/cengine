@@ -205,6 +205,27 @@ jobs:
           XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
           XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
           ./Scripts/package-release.sh
+      - name: Verify Homebrew formula installation
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          brew tap-new --no-git clarifiedlabs/cengine-ci
+          tap="$(brew --repository clarifiedlabs/cengine-ci)"
+          dmg="$PWD/dist/cengine-${VERSION}.dmg"
+          TAG="v${VERSION}" TAP_DIR="$tap" DMG_URL="file://${dmg}" \
+            DMG_SHA256="$(shasum -a 256 "$dmg" | awk '{print $1}')" \
+            ./Scripts/homebrew-formula.sh
+          brew install clarifiedlabs/cengine-ci/cengine
+          installed="$(brew --prefix cengine)/bin/cengine"
+          codesign --verify --strict --verbose=2 "$installed"
+          codesign --verify -R=notarized --check-notarization --verbose=2 "$installed"
+          codesign -d --entitlements :- "$installed" 2>&1 | grep -q com.apple.security.virtualization
+          ! otool -l "$installed" | grep -q PackageFrameworks
+          "$installed" version | grep -q "cengine ${VERSION}"
+          brew services info cengine
+          brew uninstall cengine
+          brew untap clarifiedlabs/cengine-ci
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -235,7 +256,7 @@ jobs:
           rm -rf "$HOME/.appstoreconnect"
 
   homebrew-publish:
-    name: Publish Homebrew cask
+    name: Publish Homebrew formula
     runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -272,7 +293,7 @@ jobs:
           TAP_DIR: ${{ github.workspace }}/homebrew-tap
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          DMG_SHA256="$(sha256sum "package/cengine-${VERSION}.dmg" | awk '{print $1}')" source/Scripts/homebrew-cask.sh
+          DMG_SHA256="$(sha256sum "package/cengine-${VERSION}.dmg" | awk '{print $1}')" source/Scripts/homebrew-formula.sh
       - name: Commit tap update
         env:
           TAG: ${{ github.ref_name }}
@@ -280,7 +301,7 @@ jobs:
           cd homebrew-tap
           git config user.name "${{ steps.tap-token.outputs.app-slug }}[bot]"
           git config user.email "${{ steps.tap-token.outputs.app-slug }}[bot]@users.noreply.github.com"
-          git add Casks/cengine.rb
+          git add -A -- Formula/cengine.rb Casks/cengine.rb
           if ! git diff --cached --quiet; then
             git commit -m "chore: update cengine ${TAG}"
             git push

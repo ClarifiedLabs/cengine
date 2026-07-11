@@ -13,6 +13,8 @@ def main() -> None:
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
         "Upload release artifacts", ".pkg", ".dmg", "DMG_SHA256",
+        "Verify Homebrew formula installation", "brew services info cengine",
+        "--check-notarization", "com.apple.security.virtualization",
     ):
         require_contains(release, needle, "release.yml")
     for forbidden in ("draft: true", "--draft", "TestFlight"):

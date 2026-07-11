@@ -92,7 +92,7 @@ release:
 test-release:
 	@python3 tools/tests/test-release.py
 	@python3 tools/tests/test-workflows.py
-	@python3 tools/tests/test-homebrew-cask.py
+	@python3 tools/tests/test-homebrew-formula.py
 	@python3 tools/tests/test-package.py
 
 clean:

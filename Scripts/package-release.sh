@@ -25,6 +25,15 @@ enabled() {
   esac
 }
 
+remove_build_rpaths() {
+  local binary="$1"
+  local rpath
+  while IFS= read -r rpath; do
+    [[ "$rpath" == *PackageFrameworks* ]] || continue
+    install_name_tool -delete_rpath "$rpath" "$binary"
+  done < <(otool -l "$binary" | awk '/cmd LC_RPATH/ { found=1; next } found && /path / { print $2; found=0 }')
+}
+
 project_marketing_version() {
   sed -nE 's/.*MARKETING_VERSION = ([0-9]+[.][0-9]+[.][0-9]+);.*/\1/p' \
     "$PROJECT_PATH/project.pbxproj" | head -n 1
@@ -88,6 +97,7 @@ PKG_PATH="$OUTPUT_DIR/cengine-$VERSION.pkg"
 DMG_PATH="$OUTPUT_DIR/cengine-$VERSION.dmg"
 ditto --norsrc --noextattr "$PRODUCT" "$CLI_PATH"
 xattr -cr "$PAYLOAD_ROOT"
+remove_build_rpaths "$CLI_PATH"
 
 if enabled "$SIGN_RELEASE"; then
   developer_id_application="${CENGINE_DEVELOPER_ID_APPLICATION:-${DEVELOPER_ID_APPLICATION:-}}"
@@ -103,6 +113,7 @@ if enabled "$SIGN_RELEASE"; then
     "$CLI_PATH"
 else
   echo "Skipping Developer ID signing. Set CENGINE_SIGN_RELEASE=1 for public release packages."
+  codesign --force --entitlements "$ENTITLEMENTS_PATH" --sign - "$CLI_PATH"
 fi
 
 "$ROOT_DIR/Scripts/verify-entitlements.sh" "$CLI_PATH"

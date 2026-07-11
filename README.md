@@ -17,14 +17,18 @@ Note: this project was created as part of testing out gpt-5.6-sol for the first 
 Install `cengine` with Homebrew:
 
 ```sh
-brew install --cask clarifiedlabs/tap/cengine
+brew install clarifiedlabs/tap/cengine
 ```
 
-Then install the per-user service, Linux kernel, Docker context, and Buildx
-builder:
+If upgrading from the former cask package, first run
+`brew uninstall --cask cengine`.
+
+Start the per-user service. On its first start, cengine downloads and verifies
+the Linux kernel, initializes its runtime, and configures the Docker context and
+Buildx builder when the Docker CLI is available:
 
 ```sh
-cengine system install
+brew services start cengine
 ```
 
 Check that the engine is ready:
@@ -64,12 +68,22 @@ Switch back to Docker's standard context with:
 docker context use default
 ```
 
-To remove the service and Docker context while preserving images and container
-data:
+To stop the service and remove the Homebrew package while preserving images,
+container data, the kernel, and Docker integration:
 
 ```sh
-cengine system uninstall
+brew services stop cengine
+brew uninstall cengine
 ```
+
+Run `cengine system uninstall` before `brew uninstall cengine` if the Docker
+context and Buildx builder should also be removed.
+
+The initial service start can take several minutes while the Kata kernel and
+Apple `vminit` image are downloaded. Inspect progress in
+`$(brew --prefix)/var/log/cengine.log`. Transient provisioning failures are
+retried twice; after three failed attempts, correct the reported problem and
+run `brew services restart cengine`.
 
 For architecture, development, testing, and implementation details, see
 [`docs/development.md`](docs/development.md). Docker API and Compose support is

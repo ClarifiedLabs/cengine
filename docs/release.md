@@ -2,7 +2,8 @@
 
 cengine releases include signed, notarized `.pkg` installers for direct
 downloads and `.dmg` images used by Homebrew. Both are published to GitHub
-Releases; the DMG is also referenced by `ClarifiedLabs/homebrew-tap`.
+Releases; the signed binary in the notarized DMG is installed by the formula in
+`ClarifiedLabs/homebrew-tap`.
 
 ## Workflows
 
@@ -12,7 +13,7 @@ for a successful test run for the same commit before packaging.
 
 `release-ci` exercises the full signing and notarization paths and uploads both
 artifacts to Actions. It does not create a GitHub Release or update Homebrew.
-Tag runs publish both artifacts and update the Homebrew cask to use the DMG.
+Tag runs publish both artifacts and update the Homebrew formula to use the DMG.
 
 ## Required Secrets
 
@@ -61,9 +62,11 @@ pkgutil --payload-files dist/cengine-0.0.1.pkg
 hdiutil verify dist/cengine-0.0.1.dmg
 ```
 
-After installation, each user runs `cengine system install` to install their
-LaunchAgent, kernel, Docker context, and Buildx builder.
+Homebrew users run `brew services start cengine`; its managed entrypoint
+provisions the kernel, runtime, Docker context, and Buildx builder. PKG users
+run `cengine system install` to install the equivalent cengine-owned
+LaunchAgent.
 
 The PKG installs directly into `/usr/local/bin` and therefore requests
-administrator authorization. Homebrew stages the executable from the DMG in
-its Caskroom and links it into the Homebrew prefix without administrator access.
+administrator authorization. Homebrew installs the executable from the DMG in
+its Cellar and links it into the Homebrew prefix without administrator access.

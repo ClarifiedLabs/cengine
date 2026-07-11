@@ -16,6 +16,7 @@ def main() -> None:
         "sed -nE 's/.*MARKETING_VERSION", 'xattr -cr "$PAYLOAD_ROOT"',
         'DMG_PATH="$OUTPUT_DIR/cengine-$VERSION.dmg"', 'hdiutil create',
         'hdiutil verify', 'spctl --assess --type open',
+        'install_name_tool -delete_rpath', 'PackageFrameworks',
     ):
         require_contains(script, needle, "package-release.sh")
     require_contains(entitlements, "com.apple.security.virtualization", "cengine.entitlements")
@@ -27,6 +28,7 @@ def main() -> None:
     require_contains(info_plist, "$(CENGINE_GIT_COMMIT)", "cengine-Info.plist")
     require_contains(info_plist, "$(CENGINE_BUILD_TIME)", "cengine-Info.plist")
     require_contains(project, 'INFOPLIST_FILE = "Configuration/cengine-Info.plist"', "project.pbxproj")
+    require_contains(project, 'LD_RUNPATH_SEARCH_PATHS = ""', "project.pbxproj")
     if project.count("CREATE_INFOPLIST_SECTION_IN_BINARY = YES") != 2:
         raise AssertionError("cengine Debug and Release builds must embed version metadata")
 

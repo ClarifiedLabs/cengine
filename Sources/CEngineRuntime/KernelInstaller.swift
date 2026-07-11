@@ -8,6 +8,12 @@ public enum KernelInstaller {
     public static let archiveURL = URL(string: "https://github.com/kata-containers/kata-containers/releases/download/3.28.0/kata-static-3.28.0-arm64.tar.zst")!
     public static let archiveSHA256 = "f63d54507d1f18635d94475077e4c2330de4d8e05cedf25f7c38f063b0e66a91"
     public static let archiveMember = "opt/kata/share/kata-containers/vmlinux-6.18.15-186"
+    public static let kernelSHA256 = "2fe4a58d2885d623bcb4d705900ac8c1d4f02371152da8126b3b00c8c47fc3a1"
+
+    public static func isInstalled(at destination: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: destination.path) else { return false }
+        return (try? sha256(of: destination)) == kernelSHA256
+    }
 
     public static func install(to destination: URL) async throws {
         let (temporaryArchive, response) = try await URLSession.shared.download(from: archiveURL)
@@ -54,7 +60,7 @@ public enum KernelInstaller {
         try FileManager.default.moveItem(at: temporaryKernel, to: destination)
     }
 
-    private static func sha256(of url: URL) throws -> String {
+    static func sha256(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hash = SHA256()

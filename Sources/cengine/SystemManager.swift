@@ -6,14 +6,17 @@ import Foundation
 enum SystemManager {
     static let label = "dev.cengine.engine"
 
+    enum ServicePhase: String, Codable { case starting, running, failed, stopped }
+
+    struct ServiceState: Codable {
+        let phase: ServicePhase
+        let message: String?
+        let updatedAt: Date
+    }
+
     static func install(paths: EnginePaths) async throws {
-        try paths.createDirectories()
-        if !FileManager.default.fileExists(atPath: paths.kernel.path) {
-            print("Installing Kata Linux kernel \(KernelInstaller.version)…")
-            try await KernelInstaller.install(to: paths.kernel)
-        }
+        try await prepare(paths: paths)
         try installLaunchAgent(paths: paths)
-        try configureDocker(paths: paths)
         print("cengine is installed; use `docker --context cengine info`")
     }
 
@@ -21,8 +24,49 @@ enum SystemManager {
         let domain = "gui/\(getuid())"
         _ = try? run("/bin/launchctl", ["bootout", domain + "/" + label])
         try? FileManager.default.removeItem(at: launchAgentURL)
+        _ = try? runDocker(["buildx", "rm", "--force", "cengine-builder"])
         _ = try? runDocker(["context", "rm", "-f", "cengine"])
-        print("cengine service and Docker context removed; data was preserved at \(paths.data.path)")
+        try? writeState(.stopped, message: nil, paths: paths)
+        print("cengine service and Docker integration removed; data was preserved at \(paths.data.path)")
+    }
+
+    static func prepare(paths: EnginePaths) async throws {
+        try paths.createDirectories()
+        if !KernelInstaller.isInstalled(at: paths.kernel) {
+            print("Installing Kata Linux kernel \(KernelInstaller.version)…")
+            try await KernelInstaller.install(to: paths.kernel)
+        }
+        configureDockerContext(paths: paths)
+    }
+
+    static func configureBuildx() {
+        guard executable(named: "docker") != nil else { return }
+        guard (try? runDocker(["buildx", "version"])) != nil else {
+            warn("Docker Buildx is not installed; container builds will be unavailable")
+            return
+        }
+        if (try? runDocker(["buildx", "inspect", "cengine-builder"])) == nil {
+            do {
+                try runDocker([
+                    "buildx", "create", "--name", "cengine-builder", "--driver", "docker-container",
+                    "--driver-opt", "image=moby/buildkit:v0.27.1",
+                    "--buildkitd-flags", "--oci-worker-snapshotter=native", "cengine",
+                ])
+            } catch {
+                warn("could not configure Buildx: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    static func writeState(_ phase: ServicePhase, message: String?, paths: EnginePaths) throws {
+        try paths.createDirectories()
+        let state = ServiceState(phase: phase, message: message, updatedAt: Date())
+        try JSONEncoder().encode(state).write(to: paths.serviceState, options: .atomic)
+    }
+
+    static func readState(paths: EnginePaths) -> ServiceState? {
+        guard let data = try? Data(contentsOf: paths.serviceState) else { return nil }
+        return try? JSONDecoder().decode(ServiceState.self, from: data)
     }
 
     private static var launchAgentURL: URL {
@@ -36,9 +80,10 @@ enum SystemManager {
         }
         let plist: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [executable.path, "daemon"],
+            "ProgramArguments": [executable.path, "service", "run"],
             "RunAtLoad": true,
-            "KeepAlive": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "ThrottleInterval": 60,
             "ProcessType": "Interactive",
             "StandardOutPath": paths.logs.appending(path: "daemon.log").path,
             "StandardErrorPath": paths.logs.appending(path: "daemon.log").path,
@@ -55,32 +100,28 @@ enum SystemManager {
         do {
             try run("/bin/launchctl", ["bootstrap", domain, launchAgentURL.path])
         } catch {
-            // launchd can report EIO when a bootout/bootstrap pair races even
-            // though the new job was loaded. Verify state before failing.
             if (try? run("/bin/launchctl", ["print", domain + "/" + label])) == nil { throw error }
         }
     }
 
-    private static func configureDocker(paths: EnginePaths) throws {
+    private static func configureDockerContext(paths: EnginePaths) {
         guard executable(named: "docker") != nil else {
             print("Docker CLI not found; skipping context and Buildx configuration")
             return
         }
-        _ = try? runDocker(["context", "rm", "-f", "cengine"])
-        try runDocker(["context", "create", "cengine", "--docker", "host=unix://\(paths.socket.path)", "--description", "cengine (Apple Containerization)"])
-        guard (try? runDocker(["buildx", "version"])) != nil else {
-            print("Docker Buildx not found; container builds will be unavailable")
-            return
+        let expected = "unix://\(paths.socket.path)"
+        if let current = try? runDocker(["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"]),
+           current.trimmingCharacters(in: .whitespacesAndNewlines) == expected { return }
+        do {
+            _ = try? runDocker(["context", "rm", "-f", "cengine"])
+            try runDocker(["context", "create", "cengine", "--docker", "host=\(expected)", "--description", "cengine (Apple Containerization)"])
+        } catch {
+            warn("could not configure Docker context: \(error.localizedDescription)")
         }
-        // BuildKit's overlayfs snapshotter cannot use a VirtioFS-backed named
-        // volume as its upper/work filesystem. The native snapshotter retains
-        // the managed builder's state on that volume without nested overlayfs.
-        _ = try? runDocker(["buildx", "rm", "--force", "cengine-builder"])
-        try runDocker([
-            "buildx", "create", "--name", "cengine-builder", "--driver", "docker-container",
-            "--driver-opt", "image=moby/buildkit:v0.27.1",
-            "--buildkitd-flags", "--oci-worker-snapshotter=native", "cengine",
-        ])
+    }
+
+    private static func warn(_ message: String) {
+        FileHandle.standardError.write(Data("cengine: warning: \(message)\n".utf8))
     }
 
     @discardableResult private static func runDocker(_ arguments: [String]) throws -> String {
@@ -89,7 +130,8 @@ enum SystemManager {
     }
 
     private static func executable(named name: String) -> String? {
-        for directory in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") {
+        let path = (ProcessInfo.processInfo.environment["PATH"] ?? "") + ":/opt/homebrew/bin:/usr/local/bin"
+        for directory in path.split(separator: ":") {
             let candidate = URL(filePath: String(directory)).appending(path: name).path
             if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
         }

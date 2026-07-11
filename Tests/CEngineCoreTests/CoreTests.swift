@@ -39,6 +39,16 @@ private final class DataBox: @unchecked Sendable {
     @Test func kataKernelUsesPublishedZstdAsset() {
         #expect(KernelInstaller.archiveURL.lastPathComponent == "kata-static-3.28.0-arm64.tar.zst")
         #expect(KernelInstaller.archiveSHA256.count == 64)
+        #expect(KernelInstaller.kernelSHA256.count == 64)
+    }
+
+    @Test func invalidKernelIsNotAcceptedAsInstalled() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let kernel = root.appending(path: "vmlinux")
+        try Data("not a kernel".utf8).write(to: kernel)
+        #expect(!KernelInstaller.isInstalled(at: kernel))
     }
 
     @Test func identifiersAreDockerCompatible() {
@@ -104,6 +114,8 @@ private final class DataBox: @unchecked Sendable {
         let home = URL(filePath: "/tmp/example-home", directoryHint: .isDirectory)
         let paths = EnginePaths(home: home)
         #expect(paths.socket.path == "/tmp/example-home/.cengine/run/docker.sock")
+        #expect(paths.lock.path == "/tmp/example-home/.cengine/run/docker.sock.lock")
+        #expect(paths.serviceState.path == "/tmp/example-home/.cengine/run/service-state.json")
         #expect(paths.data.path.contains("Application Support/cengine"))
     }
 }

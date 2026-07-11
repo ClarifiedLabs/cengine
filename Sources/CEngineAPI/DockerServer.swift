@@ -290,7 +290,14 @@ public final class DockerServer: @unchecked Sendable {
     }
 
     public func wait() async throws { try await channel?.closeFuture.get() }
-    public func shutdown() async throws { try await channel?.close().get(); try await group.shutdownGracefully() }
+    public func stop() async throws {
+        if let channel, channel.isActive { try await channel.close().get() }
+    }
+    public func shutdown() async throws {
+        try await stop()
+        try await group.shutdownGracefully()
+        try? FileManager.default.removeItem(atPath: socketPath)
+    }
 }
 
 private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {

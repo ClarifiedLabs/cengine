@@ -19,7 +19,7 @@ make package
 `make test-compat` builds the debug daemon, creates a cached Python virtual
 environment under `.build`, and runs the Docker API and Docker Compose 5.3.1
 compatibility suites against a temporary root and Unix socket. The command uses
-the kernel installed by `cengine system install`; override it with
+the kernel installed by the managed service or `cengine system install`; override it with
 `CENGINE_KERNEL`, or override the daemon and fixture image with
 `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`. The suite requires Docker Compose
 5.3.1; install the checksum-pinned plugin with
@@ -87,10 +87,12 @@ compatibility ledger and test provenance.
 
 ## Local installation and metadata-only development
 
-`cengine system install` downloads the pinned Kata kernel and verifies its
-SHA-256 digest, installs the `dev.cengine.engine` LaunchAgent, creates the
-`cengine` Docker context, and creates the pinned `cengine-builder` Buildx
-builder when Buildx is installed. It does not change the active Docker context.
+The Homebrew service runs `cengine service run`, which downloads the pinned
+Kata kernel and verifies its SHA-256 digest, creates the `cengine` Docker
+context, starts the daemon, and creates the pinned `cengine-builder` Buildx
+builder when Buildx is installed. The signed PKG retains `cengine system
+install` for its `dev.cengine.engine` LaunchAgent. Both service paths use a
+shared socket lock and do not change the active Docker context.
 
 To develop without downloading a kernel or starting VMs:
 
