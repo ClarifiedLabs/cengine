@@ -169,12 +169,32 @@ private actor AuthImageBackend: ContainerBackend {
         let ping = await router.route(.init(method: .GET, uri: "/_ping", headers: [:], body: Data()))
         #expect(ping.status == .ok)
         #expect(String(decoding: ping.body, as: UTF8.self) == "OK")
-        #expect(ping.headers["Api-Version"].first == "1.44")
+        #expect(ping.headers["Api-Version"].first == "1.55")
 
         let version = await router.route(.init(method: .GET, uri: "/v1.44/version", headers: [:], body: Data()))
         #expect(version.status == .ok)
         let json = try #require(JSONSerialization.jsonObject(with: version.body) as? [String: Any])
-        #expect(json["ApiVersion"] as? String == "1.44")
+        #expect(json["ApiVersion"] as? String == "1.55")
+        #expect(json["MinAPIVersion"] as? String == "1.44")
+
+        for minor in 44...55 {
+            #expect((await router.route(.init(method: .GET, uri: "/v1.\(minor)/info"))).status == .ok)
+        }
+    }
+
+    @Test func rejectsRequestsOutsideNegotiatedAPIRange() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for uri in ["/v1.43/info", "/v1.56/info", "/v1.x/info", "/info"] {
+            let response = await router.route(.init(method: .GET, uri: uri))
+            #expect(response.status == .badRequest)
+            let json = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: String])
+            #expect(json["message"]?.isEmpty == false)
+        }
+
+        #expect((await router.route(.init(method: .GET, uri: "/version"))).status == .ok)
+        #expect((await router.route(.init(method: .GET, uri: "/_ping"))).status == .ok)
     }
 
     @Test func versionIncludesBuildMetadataInEngineDetails() throws {
@@ -184,12 +204,14 @@ private actor AuthImageBackend: ContainerBackend {
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(json["GitCommit"] as? String == "abcdef0")
         #expect(json["BuildTime"] as? String == "2026-02-02T17:16:40Z")
+        #expect(json["ApiVersion"] as? String == "1.55")
         #expect(json["MinAPIVersion"] as? String == "1.44")
         let components = try #require(json["Components"] as? [[String: Any]])
         let engine = try #require(components.first)
         let details = try #require(engine["Details"] as? [String: String])
         #expect(details["GitCommit"] == "abcdef0")
         #expect(details["BuildTime"] == "Mon Feb  2 17:16:40 2026")
+        #expect(details["ApiVersion"] == "1.55")
         #expect(details["MinAPIVersion"] == "1.44")
     }
 
@@ -287,6 +309,78 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(createdVolume["Driver"] as? String == "local")
         let volumeInspect = await router.route(.init(method: .GET, uri: "/v1.44/volumes/dbdata", body: Data()))
         #expect(volumeInspect.status == .ok)
+    }
+
+    @Test func responseShapesFollowRequestedAPIVersion() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        _ = await router.route(.init(method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"versioned"}"#.utf8)))
+        let create = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/containers/create?name=shape-version",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"versioned":{"Aliases":["web"]}}}}"#.utf8)
+        ))
+        let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+
+        let oldInspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let oldJSON = try #require(JSONSerialization.jsonObject(with: oldInspect.body) as? [String: Any])
+        let oldSettings = try #require(oldJSON["NetworkSettings"] as? [String: Any])
+        let oldNetworks = try #require(oldSettings["Networks"] as? [String: Any])
+        let oldEndpoint = try #require(oldNetworks["versioned"] as? [String: Any])
+        let oldAliases = try #require(oldEndpoint["Aliases"] as? [String])
+        #expect(oldAliases.contains("web"))
+        #expect(oldAliases.contains(String(id.prefix(12))))
+        #expect(oldSettings["Bridge"] != nil)
+
+        let newInspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/\(id)/json"))
+        let newJSON = try #require(JSONSerialization.jsonObject(with: newInspect.body) as? [String: Any])
+        let newSettings = try #require(newJSON["NetworkSettings"] as? [String: Any])
+        let newNetworks = try #require(newSettings["Networks"] as? [String: Any])
+        let newEndpoint = try #require(newNetworks["versioned"] as? [String: Any])
+        #expect(newEndpoint["Aliases"] as? [String] == ["web"])
+        #expect(newSettings["Bridge"] == nil)
+        #expect(newSettings["HairpinMode"] == nil)
+
+        let oldList = await router.route(.init(method: .GET, uri: "/v1.44/containers/json?all=1"))
+        let oldSummary = try #require((JSONSerialization.jsonObject(with: oldList.body) as? [[String: Any]])?.first)
+        #expect(oldSummary["Health"] == nil)
+        let newList = await router.route(.init(method: .GET, uri: "/v1.55/containers/json?all=1"))
+        let newSummary = try #require((JSONSerialization.jsonObject(with: newList.body) as? [[String: Any]])?.first)
+        #expect((newSummary["Health"] as? [String: Any])?["Status"] as? String == "none")
+
+        let image = ImageRecord(
+            id: "sha256:test", references: ["example:test"], createdAt: Date(), size: 1,
+            architecture: "arm64", os: "linux"
+        )
+        let oldImage = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            ImageInspectResponse(image, version: .init(major: 1, minor: 51))
+        )) as? [String: Any])
+        let newImage = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            ImageInspectResponse(image, version: .init(major: 1, minor: 52))
+        )) as? [String: Any])
+        #expect((oldImage["Config"] as? [String: Any])?["Env"] != nil)
+        #expect((newImage["Config"] as? [String: Any])?["Env"] == nil)
+
+        let summary = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            ImageSummaryResponse(image, containers: 2)
+        )) as? [String: Any])
+        #expect(summary["ParentId"] as? String == "")
+        #expect(summary["Containers"] as? Int == 2)
+        #expect(summary["VirtualSize"] == nil)
+
+        let event = RuntimeEvent(type: "container", action: "start", id: id, attributes: [:])
+        let oldEvent = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            DockerEventResponse(event, version: .init(major: 1, minor: 51))
+        )) as? [String: Any])
+        let newEvent = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            DockerEventResponse(event, version: .init(major: 1, minor: 52))
+        )) as? [String: Any])
+        #expect(oldEvent["status"] as? String == "start")
+        #expect(oldEvent["id"] as? String == id)
+        #expect(newEvent["status"] == nil)
+        #expect(newEvent["id"] == nil)
     }
 
     @Test func defaultNetworkIsAlwaysPresentAndCannotBeRemoved() async throws {

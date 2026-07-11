@@ -38,7 +38,7 @@ when dependency versions change.
 ```text
 docker / compose / buildx
           |
-          | HTTP v1.44 over ~/.cengine/run/docker.sock
+          | negotiated HTTP v1.44-v1.55 over ~/.cengine/run/docker.sock
           v
   SwiftNIO API router
           |

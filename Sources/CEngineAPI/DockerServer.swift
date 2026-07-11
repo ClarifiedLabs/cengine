@@ -34,20 +34,29 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             body.writeBuffer(&chunk)
         case .end:
             guard let head else { return }
-            if Self.isImagePull(head) {
+            let target: DockerRequestTarget
+            do { target = try DockerRequestTarget.parse(head.uri) }
+            catch let error as EngineError {
+                Self.write(channel: context.channel, response: dockerErrorResponse(error), keepAlive: head.isKeepAlive)
+                return
+            } catch {
+                Self.write(channel: context.channel, response: .init(status: .badRequest), keepAlive: head.isKeepAlive)
+                return
+            }
+            if Self.isImagePull(head, target: target) {
                 startImagePull(request: .init(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView)), channel: context.channel)
                 return
             }
-            if Self.isStreamingStats(head.uri), let id = Self.statsContainerID(head.uri) {
-                startStats(identifier: id, channel: context.channel)
+            if Self.isStreamingStats(target), let id = Self.statsContainerID(target) {
+                startStats(identifier: id, version: target.version, channel: context.channel)
                 return
             }
-            if Self.isEvents(head.uri) {
-                startEvents(channel: context.channel)
+            if target.path == "/events" {
+                startEvents(version: target.version, channel: context.channel)
                 return
             }
-            if Self.isFollowingLogs(head.uri) {
-                startFollowingLogs(head: head, channel: context.channel)
+            if Self.isFollowingLogs(target), let id = Self.logContainerID(target) {
+                startFollowingLogs(identifier: id, channel: context.channel)
                 return
             }
             let request = APIRequest(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView))
@@ -68,8 +77,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         context.fireChannelInactive()
     }
 
-    private func startFollowingLogs(head: HTTPRequestHead, channel: Channel) {
-        guard let id = Self.logContainerID(head.uri) else { return }
+    private func startFollowingLogs(identifier id: String, channel: Channel) {
         Task { [router] in
             do {
                 let initial = try await router.containerLogs(id)
@@ -103,19 +111,18 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         }
     }
 
-    private static func isFollowingLogs(_ uri: String) -> Bool {
-        guard let components = URLComponents(string: uri), components.path.hasSuffix("/logs") else { return false }
-        return components.queryItems?.contains { $0.name == "follow" && ($0.value == "1" || $0.value == "true") } == true
+    private static func isFollowingLogs(_ target: DockerRequestTarget) -> Bool {
+        guard target.path.hasSuffix("/logs") else { return false }
+        return target.components.queryItems?.contains { $0.name == "follow" && ($0.value == "1" || $0.value == "true") } == true
     }
 
-    private static func logContainerID(_ uri: String) -> String? {
-        guard let components = URLComponents(string: uri) else { return nil }
-        let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
+    private static func logContainerID(_ target: DockerRequestTarget) -> String? {
+        let path = target.path
         guard path.hasPrefix("/containers/"), path.hasSuffix("/logs") else { return nil }
         return String(path.dropFirst("/containers/".count).dropLast("/logs".count))
     }
 
-    private func startEvents(channel: Channel) {
+    private func startEvents(version: DockerAPIVersion, channel: Channel) {
         eventTask = Task { [router] in
             let stream = await router.events()
             channel.eventLoop.execute {
@@ -127,7 +134,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             let encoder = JSONEncoder()
             for await event in stream {
                 guard !Task.isCancelled else { break }
-                guard var data = try? encoder.encode(DockerEventResponse(event)) else { continue }
+                guard var data = try? encoder.encode(DockerEventResponse(event, version: version)) else { continue }
                 data.append(0x0a)
                 let payload = data
                 channel.eventLoop.execute {
@@ -138,12 +145,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         }
     }
 
-    private static func isEvents(_ uri: String) -> Bool {
-        guard let components = URLComponents(string: uri) else { return false }
-        return components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression) == "/events"
-    }
-
-    private func startStats(identifier: String, channel: Channel) {
+    private func startStats(identifier: String, version: DockerAPIVersion, channel: Channel) {
         statsTask = Task { [router] in
             channel.eventLoop.execute {
                 var headers = HTTPHeaders(); headers.add(name: "Content-Type", value: "application/json")
@@ -153,7 +155,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             let encoder = JSONEncoder()
             while !Task.isCancelled {
                 do {
-                    var encoded = try encoder.encode(await router.statistics(identifier)); encoded.append(0x0a)
+                    var encoded = try encoder.encode(await router.statistics(identifier, version: version)); encoded.append(0x0a)
                     let payload = encoded
                     channel.eventLoop.execute {
                         var buffer = channel.allocator.buffer(capacity: payload.count); buffer.writeBytes(payload)
@@ -166,14 +168,13 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         }
     }
 
-    private static func isStreamingStats(_ uri: String) -> Bool {
-        guard let components = URLComponents(string: uri), components.path.hasSuffix("/stats") else { return false }
-        return !((components.queryItems ?? []).contains { $0.name == "stream" && ($0.value == "0" || $0.value == "false") })
+    private static func isStreamingStats(_ target: DockerRequestTarget) -> Bool {
+        guard target.path.hasSuffix("/stats") else { return false }
+        return !((target.components.queryItems ?? []).contains { $0.name == "stream" && ($0.value == "0" || $0.value == "false") })
     }
 
-    private static func statsContainerID(_ uri: String) -> String? {
-        guard let components = URLComponents(string: uri) else { return nil }
-        let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
+    private static func statsContainerID(_ target: DockerRequestTarget) -> String? {
+        let path = target.path
         guard path.hasPrefix("/containers/"), path.hasSuffix("/stats") else { return nil }
         return String(path.dropFirst("/containers/".count).dropLast("/stats".count))
     }
@@ -207,9 +208,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         }
     }
 
-    private static func isImagePull(_ head: HTTPRequestHead) -> Bool {
-        guard head.method == .POST, let components = URLComponents(string: head.uri) else { return false }
-        return components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression) == "/images/create"
+    private static func isImagePull(_ head: HTTPRequestHead, target: DockerRequestTarget) -> Bool {
+        head.method == .POST && target.path == "/images/create"
     }
 
     private static func write(channel: Channel, response: APIResponse, keepAlive: Bool) {
@@ -320,8 +320,8 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
 
     private enum UpgradeTarget: Sendable { case container(String), exec(String) }
     private static func upgradeTarget(from uri: String) -> UpgradeTarget? {
-        guard let components = URLComponents(string: uri) else { return nil }
-        let path = components.path.replacingOccurrences(of: #"^/v[0-9.]+"#, with: "", options: .regularExpression)
+        guard let target = try? DockerRequestTarget.parse(uri) else { return nil }
+        let path = target.path
         if path.hasPrefix("/containers/"), path.hasSuffix("/attach") {
             return .container(String(path.dropFirst("/containers/".count).dropLast("/attach".count)))
         }

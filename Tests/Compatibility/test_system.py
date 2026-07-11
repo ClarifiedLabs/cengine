@@ -28,7 +28,18 @@ def test_info_container_details(client: docker.DockerClient, top):
 
 
 @pytest.mark.compat("SYS-003")
-def test_version(client: docker.DockerClient):
+def test_version(client: docker.DockerClient, daemon):
     version = client.version()
     assert version["Platform"]["Name"] == "cengine"
-    assert version["ApiVersion"] == "1.44"
+    assert version["ApiVersion"] == "1.55"
+    assert version["MinAPIVersion"] == "1.44"
+
+    minimum = docker.DockerClient(
+        base_url=f"unix://{daemon['socket']}", timeout=180, version="1.44"
+    )
+    try:
+        assert minimum.ping()
+        assert minimum.info()["Name"]
+        assert minimum.containers.list(all=True) is not None
+    finally:
+        minimum.close()

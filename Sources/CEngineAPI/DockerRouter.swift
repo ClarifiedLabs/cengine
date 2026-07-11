@@ -34,18 +34,20 @@ public struct DockerRouter: Sendable {
 
     public func route(_ request: APIRequest) async -> APIResponse {
         do { return try await handle(request) }
-        catch let error as EngineError { return errorResponse(error) }
+        catch let error as EngineError { return dockerErrorResponse(error) }
         catch { return json(status: .internalServerError, DockerErrorBody(message: error.localizedDescription)) }
     }
 
     private func handle(_ request: APIRequest) async throws -> APIResponse {
-        let components = try parsedComponents(request.uri)
-        let path = components.path.replacingOccurrences(of: #"^/v1\.44"#, with: "", options: .regularExpression)
+        let target = try DockerRequestTarget.parse(request.uri)
+        let components = target.components
+        let path = target.path
+        let version = target.version
         let query = queryItems(components)
 
         switch (request.method, path) {
         case (.GET, "/_ping"), (.HEAD, "/_ping"):
-            return APIResponse(status: .ok, headers: ["Api-Version": "1.44", "Docker-Experimental": "true"], body: request.method == .HEAD ? Data() : Data("OK".utf8))
+            return APIResponse(status: .ok, headers: ["Api-Version": DockerAPIVersion.maximum.description, "Docker-Experimental": "true"], body: request.method == .HEAD ? Data() : Data("OK".utf8))
         case (.GET, "/version"):
             return json(status: .ok, DockerVersionResponse())
         case (.GET, "/info"):
@@ -61,7 +63,9 @@ public struct DockerRouter: Sendable {
             let all = parseBool(query["all"]) ?? false
             let containers = filteredContainers(await runtime.listContainers(all: all), filters: query["filters"])
             let networks = await runtime.listNetworks()
-            return json(status: .ok, containers.map { ContainerSummaryResponse($0, networks: networks) })
+            return json(status: .ok, containers.map {
+                ContainerSummaryResponse($0, networks: networks, version: version)
+            })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
@@ -112,7 +116,7 @@ public struct DockerRouter: Sendable {
             return json(status: .created, ContainerCreateResponse(Id: created.id, Warnings: []))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/json".count))
-            return json(status: .ok, try await inspectContainer(id))
+            return json(status: .ok, try await inspectContainer(id, version: version))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/logs"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/logs".count))
             _ = try await runtime.container(id)
@@ -127,7 +131,7 @@ public struct DockerRouter: Sendable {
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/stats"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/stats".count))
             let record = try await runtime.container(id)
-            return json(status: .ok, ContainerStatsResponse(try await runtime.containerStatistics(id), container: record))
+            return json(status: .ok, ContainerStatsResponse(try await runtime.containerStatistics(id), container: record, version: version))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/top"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/top".count))
             let result = try await runtime.containerTop(id, arguments: (query["ps_args"] ?? "-ef").split(whereSeparator: \.isWhitespace).map(String.init))
@@ -280,7 +284,15 @@ public struct DockerRouter: Sendable {
         case (.DELETE, let value) where value.hasPrefix("/volumes/"):
             try await runtime.removeVolume(String(value.dropFirst("/volumes/".count)), force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
         case (.GET, "/images/json"):
-            return json(status: .ok, filteredImages(await runtime.listImages(), filters: query["filters"]).map(ImageSummaryResponse.init))
+            let allContainers = await runtime.listContainers(all: true)
+            return json(status: .ok, filteredImages(await runtime.listImages(), filters: query["filters"]).map { image in
+                ImageSummaryResponse(
+                    image,
+                    containers: version >= .init(major: 1, minor: 51)
+                        ? allContainers.filter { $0.image == image.id || image.references.contains($0.image) }.count
+                        : -1
+                )
+            })
         case (.POST, "/images/create"):
             let collector = PullProgressCollector()
             let image = try await pullImage(request, progress: { await collector.append($0) })
@@ -295,7 +307,7 @@ public struct DockerRouter: Sendable {
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/images/".count).dropLast("/json".count)).removingPercentEncoding ?? value
-            return json(status: .ok, ImageInspectResponse(try await runtime.image(id)))
+            return json(status: .ok, ImageInspectResponse(try await runtime.image(id), version: version))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/history"):
             let id = String(value.dropFirst("/images/".count).dropLast("/history".count)).removingPercentEncoding ?? value
             let (image, history) = try await runtime.imageHistory(id)
@@ -343,18 +355,6 @@ public struct DockerRouter: Sendable {
     private func json<T: Encodable>(status: HTTPResponseStatus, _ value: T) -> APIResponse {
         do { return APIResponse(status: status, headers: ["Content-Type": "application/json"], body: try encoder.encode(value)) }
         catch { return APIResponse(status: .internalServerError, body: Data(#"{"message":"encoding error"}"#.utf8)) }
-    }
-
-    private func errorResponse(_ error: EngineError) -> APIResponse {
-        let status: HTTPResponseStatus = switch error.code {
-        case .badRequest: .badRequest
-        case .unauthorized: .unauthorized
-        case .notFound: .notFound
-        case .conflict: .conflict
-        case .unsupported: .notImplemented
-        case .internalError: .internalServerError
-        }
-        return json(status: status, DockerErrorBody(message: error.message))
     }
 
     private func parsedComponents(_ uri: String) throws -> URLComponents {
@@ -436,8 +436,8 @@ public struct DockerRouter: Sendable {
         }
     }
 
-    private func inspectContainer(_ identifier: String) async throws -> ContainerInspectResponse {
-        .init(try await runtime.container(identifier), networks: await runtime.listNetworks())
+    private func inspectContainer(_ identifier: String, version: DockerAPIVersion) async throws -> ContainerInspectResponse {
+        .init(try await runtime.container(identifier), networks: await runtime.listNetworks(), version: version)
     }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
@@ -446,9 +446,9 @@ public struct DockerRouter: Sendable {
 
     public func containerLogs(_ identifier: String) async throws -> Data { try await runtime.containerLogs(identifier) }
     public func events() async -> AsyncStream<RuntimeEvent> { await runtime.events() }
-    public func statistics(_ identifier: String) async throws -> ContainerStatsResponse {
+    public func statistics(_ identifier: String, version: DockerAPIVersion = .maximum) async throws -> ContainerStatsResponse {
         let record = try await runtime.container(identifier)
-        return ContainerStatsResponse(try await runtime.containerStatistics(identifier), container: record)
+        return ContainerStatsResponse(try await runtime.containerStatistics(identifier), container: record, version: version)
     }
     public func pullImage(_ request: APIRequest, progress: @escaping ImagePullProgressHandler) async throws -> ImageRecord {
         let components = try parsedComponents(request.uri)
@@ -553,7 +553,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Driver: String; let Mode: String; let RW: Bool; let Propagation: String
     }
     public struct NetworkSettingsResponse: Codable, Sendable {
-        let Bridge: String; let SandboxID: String; let HairpinMode: Bool
+        let Bridge: String?; let SandboxID: String; let HairpinMode: Bool?
         let Ports: [String: [PortBindingResponse]?]
         let Networks: [String: EndpointResponse]
     }
@@ -566,7 +566,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let DNSNames: [String]
     }
 
-    init(_ record: ContainerRecord, networks: [NetworkRecord] = []) {
+    init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
         let formatter = ISO8601DateFormatter()
         Id = record.id; Name = "/\(record.name)"; Created = formatter.string(from: record.createdAt)
         Path = record.processArguments.first ?? ""; Args = Array(record.processArguments.dropFirst()); Image = record.image
@@ -599,18 +599,29 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let endpoints = record.networks.reduce(into: [String: EndpointResponse]()) { result, endpoint in
             let network = networkByID[endpoint.networkID]
             let name = network?.name ?? endpoint.networkID
-            let aliases = Array(Set([record.name, record.hostname] + endpoint.aliases)).sorted()
+            let shortID = String(record.id.prefix(12))
+            let aliases = version < .init(major: 1, minor: 45)
+                ? Array(Set(endpoint.aliases + [shortID])).sorted()
+                : endpoint.aliases
+            let dnsNames = Array(Set([record.name, record.hostname, shortID] + endpoint.aliases)).sorted()
             result[name] = .init(
                 IPAMConfig: nil, Links: nil, Aliases: aliases, NetworkID: endpoint.networkID,
                 EndpointID: "\(record.id)-\(endpoint.networkID)", Gateway: network?.gateway ?? "",
                 IPAddress: endpoint.ipv4Address ?? "", IPPrefixLen: 24, IPv6Gateway: "",
                 GlobalIPv6Address: endpoint.ipv6Address ?? "", GlobalIPv6PrefixLen: 0,
-                MacAddress: "", DNSNames: aliases
+                MacAddress: "", DNSNames: dnsNames
             )
         }
         let ports = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {
             Optional($0.map { PortBindingResponse(HostIp: $0.hostIP, HostPort: String($0.hostPort)) })
         }
-        NetworkSettings = .init(Bridge: "", SandboxID: record.id, HairpinMode: false, Ports: ports, Networks: endpoints)
+        let includeLegacyNetworkSettings = version < .init(major: 1, minor: 52)
+        NetworkSettings = .init(
+            Bridge: includeLegacyNetworkSettings ? "" : nil,
+            SandboxID: record.id,
+            HairpinMode: includeLegacyNetworkSettings ? false : nil,
+            Ports: ports,
+            Networks: endpoints
+        )
     }
 }

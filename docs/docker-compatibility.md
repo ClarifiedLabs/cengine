@@ -5,11 +5,46 @@ lifecycle tests. Its seed inventory came from the docker-py compatibility tests
 maintained by Podman, pinned to commit
 [`ac46410007edf94c9c5482c5d83c1471cfd23b00`](https://github.com/containers/podman/tree/ac46410007edf94c9c5482c5d83c1471cfd23b00/test/python/docker/compat),
 with assertions adapted to Docker Engine semantics where Podman tests its own
-quirks. The active suite uses docker-py 7.2.0 and Docker API v1.44.
+quirks. The active suite uses docker-py 7.2.0, negotiates Docker API v1.55,
+and retains an explicit v1.44 minimum-version smoke test.
 
 Run the complete suite with `make test-compat`. Known failures
 are strict expected failures: a new failure or an unexpected pass fails the
 command until this ledger and the test disposition are updated.
+
+## API version envelope
+
+Cengine advertises API v1.55 and accepts versioned operational requests from
+v1.44 through v1.55. Unversioned requests are limited to `/_ping` and
+`/version`. Supporting this negotiation envelope does not imply that cengine
+implements every endpoint in Docker's API; the tables below remain the source
+of truth for its focused runtime surface.
+
+The following assessment tracks changes from Docker's
+[API version history](https://docs.docker.com/reference/api/engine/version-history/)
+that affect endpoint families cengine exposes. **Supported** means the versioned
+behavior is implemented and tested, **Partial** means the base operation works
+but the newer option does not, and **Gap** identifies future work. This table is
+an assessment backlog rather than part of the pytest compatibility-ID inventory.
+
+| API | Change affecting cengine's surface | Status | Notes |
+|---|---|---|---|
+| 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
+| 1.45 | Named-volume mount `VolumeOptions.Subpath` | Gap | The field is not persisted or applied by the runtime. |
+| 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
+| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Gap | The base info, create, push, and event operations remain available without these additions. |
+| 1.47 | Image-list manifest summaries | Gap | The `manifests` option and `Manifests` response are not implemented. |
+| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Gap | These optional parameters and response fields are not implemented. |
+| 1.49 | Platform-specific image inspect and firewall backend info | Gap | Image inspect uses the stored image platform; `FirewallBackend` is absent. |
+| 1.50 | Platform-selective image deletion and discovered-device info | Gap | Deletion applies to the stored image and `DiscoveredDevices` is absent. |
+| 1.50 | Removal of deprecated image-config fields | Supported | Cengine's image configuration already omits the removed runtime-only fields. |
+| 1.51 | Image summary container usage count | Supported | v1.44-v1.50 report `-1`; v1.51+ calculate the number of containers using each image. |
+| 1.52 | Event legacy-field removal and container/image response omissions | Supported | Responses branch at v1.52 while older API requests retain their legacy shape. |
+| 1.52 | Container summary health and stats OS type | Supported | v1.52+ responses include `Health` and `os_type`. |
+| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Gap | The existing single-platform and JSON event behavior remains. `/system/df` is not implemented. |
+| 1.53 | NRI info, JSONL event negotiation, and image identity | Gap | `NRI`, `application/jsonl`, and image `Identity` are not implemented. |
+| 1.54 | Image-list identity and endpoint MAC application | Gap | The `identity` option and endpoint `MacAddress` are ignored. |
+| 1.55 | Image attestations and per-device blkio updates | Gap | `GET /images/{name}/attestations` and the five blkio device arrays are not implemented. |
 
 Status values are **✅ Pass**, **❌ Known fail**, and **⬜ Not assessed**. Intent
 values are **Support**, **Intentional gap**, and **Undecided**.

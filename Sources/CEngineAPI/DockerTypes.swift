@@ -4,24 +4,24 @@ import Foundation
 
 public struct DockerErrorBody: Codable, Sendable { public let message: String }
 public struct DockerEventResponse: Encodable, Sendable {
-    public let status: String; public let id: String; public let `Type`: String; public let Action: String
+    public let status: String?; public let id: String?; public let `Type`: String; public let Action: String
     public let Actor: ActorResponse; public let time: Int64; public let timeNano: Int64
     public struct ActorResponse: Encodable, Sendable { public let ID: String; public let Attributes: [String: String] }
-    public init(_ event: RuntimeEvent) {
-        status = event.action; id = event.id; Type = event.type; Action = event.action
+    public init(_ event: RuntimeEvent, version: DockerAPIVersion = .maximum) {
+        status = version < .init(major: 1, minor: 52) ? event.action : nil
+        id = version < .init(major: 1, minor: 52) ? event.id : nil
+        Type = event.type; Action = event.action
         Actor = .init(ID: event.id, Attributes: event.attributes)
         time = Int64(event.date.timeIntervalSince1970); timeNano = Int64(event.date.timeIntervalSince1970 * 1_000_000_000)
     }
 }
 
 public struct DockerVersionResponse: Encodable, Sendable {
-    private static let apiVersion = "1.44"
-
     public let Platform: PlatformInfo
     public let Components: [Component]
     public let Version: String
-    public let ApiVersion = apiVersion
-    public let MinAPIVersion = apiVersion
+    public let ApiVersion = DockerAPIVersion.maximum.description
+    public let MinAPIVersion = DockerAPIVersion.minimum.description
     public let GitCommit: String
     public let GoVersion = ""
     public let Os = "linux"
@@ -39,8 +39,8 @@ public struct DockerVersionResponse: Encodable, Sendable {
         BuildTime = CEngineVersion.buildTime(bundle: bundle)
         Platform = .init(Name: "cengine")
         Components = [.init(Name: "Engine", Version: Version, Details: [
-            "ApiVersion": Self.apiVersion,
-            "MinAPIVersion": Self.apiVersion,
+            "ApiVersion": DockerAPIVersion.maximum.description,
+            "MinAPIVersion": DockerAPIVersion.minimum.description,
             "Arch": "arm64",
             "Os": "linux",
             "GitCommit": GitCommit,
@@ -162,6 +162,7 @@ public struct ContainerUpdateResponse: Encodable, Sendable { public let Warnings
 public struct ContainerTopResponse: Encodable, Sendable { public let Titles: [String]; public let Processes: [[String]] }
 public struct ContainerStatsResponse: Encodable, Sendable {
     public let id: String; public let name: String
+    public let os_type: String?
     public let read: String; public let preread: String; public let pids_stats: Pids
     public let blkio_stats: BlockIO; public let num_procs: UInt64
     public let cpu_stats: CPU; public let precpu_stats: CPU; public let memory_stats: Memory
@@ -181,8 +182,9 @@ public struct ContainerStatsResponse: Encodable, Sendable {
         let rx_bytes: UInt64; let rx_packets: UInt64; let rx_errors: UInt64; let rx_dropped: UInt64 = 0
         let tx_bytes: UInt64; let tx_packets: UInt64; let tx_errors: UInt64; let tx_dropped: UInt64 = 0
     }
-    public init(_ value: BackendStatistics, container: ContainerRecord) {
+    public init(_ value: BackendStatistics, container: ContainerRecord, version: DockerAPIVersion = .maximum) {
         id = container.id; name = container.name
+        os_type = version >= .init(major: 1, minor: 52) ? "linux" : nil
         let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         read = formatter.string(from: value.read); preread = formatter.string(from: value.read.addingTimeInterval(-1))
         pids_stats = .init(current: value.pids, limit: UInt64.max); num_procs = value.pids
@@ -245,14 +247,18 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Ports: [Port]
     public let Labels: [String: String]
     public let NetworkSettings: NetworkSettingsSummary
+    public let Health: HealthSummary?
 
-    public init(_ record: ContainerRecord, networks: [NetworkRecord] = []) {
+    public init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
         Id = record.id; Names = ["/\(record.name)"]; Image = record.image; ImageID = ""
         Command = record.processArguments.joined(separator: " "); Created = Int64(record.createdAt.timeIntervalSince1970)
         State = record.phase.rawValue
         Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
         Ports = record.ports.map { .init(IP: $0.hostIP, PrivatePort: $0.containerPort, PublicPort: $0.hostPort, Type: $0.proto) }
         Labels = record.labels
+        Health = version >= .init(major: 1, minor: 52)
+            ? .init(Status: record.healthStatus ?? "none", FailingStreak: record.healthFailingStreak ?? 0)
+            : nil
         NetworkSettings = .init(Networks: Dictionary(uniqueKeysWithValues: record.networks.compactMap { endpoint in
             guard let network = networks.first(where: { $0.id == endpoint.networkID }) else { return nil }
             return (network.name, EndpointSummary(NetworkID: network.id))
@@ -261,6 +267,7 @@ public struct ContainerSummaryResponse: Codable, Sendable {
 
     public struct NetworkSettingsSummary: Codable, Sendable { public let Networks: [String: EndpointSummary] }
     public struct EndpointSummary: Codable, Sendable { public let NetworkID: String }
+    public struct HealthSummary: Codable, Sendable { public let Status: String; public let FailingStreak: Int }
 
     public struct Port: Codable, Sendable {
         public let IP: String; public let PrivatePort: UInt16; public let PublicPort: UInt16; public let `Type`: String
@@ -325,11 +332,13 @@ public struct DockerNetworkResponse: Encodable, Sendable {
 
 public struct ImageSummaryResponse: Encodable, Sendable {
     public let Id: String; public let RepoTags: [String]; public let RepoDigests: [String]
-    public let Created: Int64; public let Size: Int64; public let SharedSize: Int64; public let VirtualSize: Int64
+    public let ParentId: String; public let Containers: Int
+    public let Created: Int64; public let Size: Int64; public let SharedSize: Int64
     public let Labels: [String: String]
-    public init(_ image: ImageRecord) {
+    public init(_ image: ImageRecord, containers: Int = -1) {
         Id = image.id; RepoTags = image.references; RepoDigests = []
-        Created = Int64(image.createdAt.timeIntervalSince1970); Size = image.size; SharedSize = 0; VirtualSize = image.size; Labels = [:]
+        ParentId = ""; Containers = containers
+        Created = Int64(image.createdAt.timeIntervalSince1970); Size = image.size; SharedSize = 0; Labels = [:]
     }
 }
 
@@ -339,21 +348,29 @@ public struct ImageInspectResponse: Encodable, Sendable {
     public let Config: ConfigResponse
     public let RootFS: RootFSResponse
     public struct ConfigResponse: Encodable, Sendable {
-        public let Env: [String] = []
+        public let Env: [String]?
         public let Cmd: [String]? = nil
         public let Entrypoint: [String]? = nil
-        public let WorkingDir = ""
-        public let User = ""
-        public let Labels: [String: String] = [:]
-        public let ExposedPorts: [String: EmptyObject] = [:]
-        public let Volumes: [String: EmptyObject] = [:]
+        public let WorkingDir: String?
+        public let User: String?
+        public let Labels: [String: String]?
+        public let ExposedPorts: [String: EmptyObject]?
+        public let Volumes: [String: EmptyObject]?
+        init(omitEmpty: Bool) {
+            Env = omitEmpty ? nil : []
+            WorkingDir = omitEmpty ? nil : ""
+            User = omitEmpty ? nil : ""
+            Labels = omitEmpty ? nil : [:]
+            ExposedPorts = omitEmpty ? nil : [:]
+            Volumes = omitEmpty ? nil : [:]
+        }
     }
     public struct RootFSResponse: Encodable, Sendable { public let `Type` = "layers"; public let Layers: [String] = [] }
     public struct EmptyObject: Encodable, Sendable {}
-    public init(_ image: ImageRecord) {
+    public init(_ image: ImageRecord, version: DockerAPIVersion = .maximum) {
         Id = image.id; RepoTags = image.references; RepoDigests = []; Created = ISO8601DateFormatter().string(from: image.createdAt)
         Architecture = image.architecture; Os = image.os; Size = image.size
-        Config = .init(); RootFS = .init()
+        Config = .init(omitEmpty: version >= .init(major: 1, minor: 52)); RootFS = .init()
     }
 }
 
