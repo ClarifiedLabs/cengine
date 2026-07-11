@@ -59,7 +59,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 |---|---|---|---|---|
 | `CTR-001` | `test_create_container` | ✅ Pass | Support | Create and list through docker-py. |
 | `CTR-002` | `test_create_network` | ✅ Pass | Support | Bridge network creation. |
-| `CTR-003` | `test_start_container` | ✅ Pass | Support | Created-container accounting. |
+| `CTR-003` | `test_start_container` | ✅ Pass | Support | Start through docker-py and verify running state. |
 | `CTR-004` | `test_start_container_with_random_port_bind` | ✅ Pass | Support | Strengthened to require a nonzero assigned host port after start. |
 | `CTR-005` | `test_stop_container` | ✅ Pass | Support | State becomes exited. |
 | `CTR-006` | `test_kill_container` | ✅ Pass | Support | SIGKILL is reconciled before the response completes. |
@@ -124,3 +124,13 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CMP-001` | `test_compose_application_lifecycle` | ✅ Pass | Support | Pull, create, start, DNS, ports, list, logs, and teardown. |
 | `CMP-002` | `test_compose_repeated_up_is_idempotent` | ✅ Pass | Support | Reconciliation preserves unchanged containers. |
 | `CMP-003` | `test_compose_force_recreate_renames_replacement` | ✅ Pass | Support | Replacement containers receive canonical Compose names. |
+
+## Docker CLI
+
+| ID | Contract | Status | Intent | Notes |
+|---|---|---|---|---|
+| `CLI-001` | `test_cli_system_and_image_commands` | ✅ Pass | Support | Version, info, pull, and image listing through the Docker CLI. |
+| `CLI-002` | `test_cli_container_lifecycle` | ✅ Pass | Support | Create, start, inspect, list, stop, and remove through the Docker CLI. |
+| `CLI-003` | `test_cli_run_attached_output` | ✅ Pass | Support | Attached `docker run` output and automatic removal. |
+| `CLI-004` | `test_cli_run_attached_stdin` | ✅ Pass | Support | Interactive stdin over the hijacked attach connection. |
+| `CLI-005` | `test_cli_network_and_volume_lifecycle` | ✅ Pass | Support | Network and volume create, list, and remove commands. |

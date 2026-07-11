@@ -35,8 +35,9 @@ def test_create_network(client: docker.DockerClient, top):
 
 @pytest.mark.compat("CTR-003")
 def test_start_container(client: docker.DockerClient, top):
-    client.containers.create(image=IMAGE, name=f"container-{uuid.uuid4().hex[:8]}")
-    assert len(client.containers.list(all=True)) == 2
+    container = client.containers.create(image=IMAGE, command="top", name=f"container-{uuid.uuid4().hex[:8]}")
+    container.start(); container.reload()
+    assert container.status == "running"
 
 
 @pytest.mark.compat("CTR-004")
