@@ -2,6 +2,7 @@ import Foundation
 import NIOCore
 import ServiceManagement
 import Testing
+import CEngineCore
 @testable import CEngineApp
 
 @Suite struct ServiceRegistrationTests {
@@ -20,6 +21,26 @@ import Testing
 }
 
 @Suite struct EngineAvailabilityTests {
+    @MainActor @Test func loadsSharedBuilderSettings() throws {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let paths = EnginePaths(home: home)
+        try BuilderSettings(cpus: 2, memoryGiB: 1).save(to: paths.builderSettings)
+        try ContainerSettings(cpus: 2, memoryGiB: 1).save(to: paths.containerSettings)
+
+        let model = AppModel(home: home)
+
+        #expect(model.builderCPUs == 2)
+        #expect(model.builderMemoryGiB == 1)
+        #expect(model.containerCPUs == 2)
+        #expect(model.containerMemoryGiB == 1)
+
+        model.containerCPUs = 1
+        model.applyContainerSettings()
+        #expect(try ContainerSettings.load(from: paths.containerSettings).cpus == 1)
+        #expect(model.containerSettingsStatus == "Saved; applies to new containers")
+    }
+
     @Test func missingSocketMeansEngineIsStillStarting() {
         let path = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString).path
         #expect(AppModel.isEngineUnavailable(DashboardError("connect failed"), socketPath: path))

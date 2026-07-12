@@ -103,7 +103,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-023` | `test_rename_container_name_conflict` | ✅ Pass | Support | **cengine-owned.** Duplicate names return HTTP 409. |
 | `CTR-024` | `test_exec_attached_output_and_exit_code` | ✅ Pass | Support | **cengine-owned.** Attached exec preserves multiplexed stdout/stderr and exit status. |
 | `CTR-025` | `test_copy_from_container_round_trip` | ✅ Pass | Support | **cengine-owned.** Archive download returns file contents and path metadata. |
-| `CTR-026` | `test_container_configuration_round_trip` | ✅ Pass | Support | **cengine-owned.** Environment, user, workdir, read-only root, labels, and restart policy survive create/inspect. |
+| `CTR-026` | `test_container_configuration_round_trip` | ✅ Pass | Support | **cengine-owned.** Environment, user, workdir, read-only root, labels, restart policy, and default resources survive create/inspect. |
 | `CTR-027` | `test_container_stats_complete` | ✅ Pass | Support | **cengine-owned.** VM-backed `docker stats --no-stream` returns a container sample. |
 | `CTR-028` | `test_top_and_update` | ✅ Pass | Support | **cengine-owned.** Process listing and live resource-policy updates use Docker schemas. |
 | `CTR-029` | `test_follow_logs_streams_output_and_closes` | ✅ Pass | Support | **cengine-owned.** Follow mode streams multiplexed output and closes at container exit. |

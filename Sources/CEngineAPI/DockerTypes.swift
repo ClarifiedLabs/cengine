@@ -156,6 +156,8 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Init: Bool?
         public var Memory: Int64?
         public var NanoCpus: Int64?
+        public var CpuPeriod: Int64?
+        public var CpuQuota: Int64?
         public var RestartPolicy: RestartPolicy?
         public var NetworkMode: String?
         public var Binds: [String]?

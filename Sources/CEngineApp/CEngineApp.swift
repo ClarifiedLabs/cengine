@@ -125,6 +125,39 @@ private struct SettingsView: View {
     @State private var deleteData = false
     var body: some View {
         Form {
+            Section("Container Defaults") {
+                Stepper("CPUs: \(model.containerCPUs)", value: $model.containerCPUs, in: 1...model.maximumCPUs)
+                Stepper(
+                    "Memory: \(model.containerMemoryGiB) GiB",
+                    value: $model.containerMemoryGiB,
+                    in: 1...model.maximumMemoryGiB
+                )
+                Text("Used for new containers when Docker or Compose does not specify resource limits.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Save Container Defaults") { model.applyContainerSettings() }
+                    if let status = model.containerSettingsStatus {
+                        Text(status).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Section("Builder Resources") {
+                Stepper("CPUs: \(model.builderCPUs)", value: $model.builderCPUs, in: 1...model.maximumCPUs)
+                Stepper(
+                    "Memory: \(model.builderMemoryGiB) GiB",
+                    value: $model.builderMemoryGiB,
+                    in: 1...model.maximumMemoryGiB
+                )
+                Text("Changing resources recreates the managed builder VM while preserving its build cache.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Apply Builder Resources") { Task { await model.applyBuilderSettings() } }
+                    if let status = model.builderSettingsStatus {
+                        Text(status).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Divider()
             Toggle("Privileged Ports", isOn: Binding(
                 get: { model.helperEnabled },
                 set: { value in Task { await model.setHelperEnabled(value) } }

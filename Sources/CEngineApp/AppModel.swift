@@ -21,17 +21,37 @@ struct ResourceItem: Identifiable, Hashable {
     @Published var networks: [ResourceItem] = []
     @Published var volumes: [ResourceItem] = []
     @Published var helperEnabled = false
+    @Published var builderCPUs: Int
+    @Published var builderMemoryGiB: Int
+    @Published var builderSettingsStatus: String?
+    @Published var containerCPUs: Int
+    @Published var containerMemoryGiB: Int
+    @Published var containerSettingsStatus: String?
     @Published var showOnboarding: Bool
+
+    let maximumCPUs = ProcessInfo.processInfo.activeProcessorCount
+    let maximumMemoryGiB = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
 
     private let agent = SMAppService.agent(plistName: CEngineServices.agentPlist)
     private let helper = SMAppService.daemon(plistName: CEngineServices.helperPlist)
     private let client: DockerSocketClient
     private let socketPath: String
+    private let builderSettingsURL: URL
+    private let containerSettingsURL: URL
     private var refreshTask: Task<Void, Never>?
 
-    init() {
-        socketPath = EnginePaths().socket.path
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        let paths = EnginePaths(home: home)
+        socketPath = paths.socket.path
+        builderSettingsURL = paths.builderSettings
+        containerSettingsURL = paths.containerSettings
         client = DockerSocketClient(socketPath: socketPath)
+        let builderSettings = (try? BuilderSettings.load(from: builderSettingsURL)) ?? .default
+        builderCPUs = builderSettings.cpus
+        builderMemoryGiB = builderSettings.memoryGiB
+        let containerSettings = (try? ContainerSettings.load(from: containerSettingsURL)) ?? .default
+        containerCPUs = containerSettings.cpus
+        containerMemoryGiB = containerSettings.memoryGiB
         showOnboarding = !UserDefaults.standard.bool(forKey: "completedOnboarding")
     }
 
@@ -82,6 +102,42 @@ struct ResourceItem: Identifiable, Hashable {
             self.error = "Could not update privileged-port support: \(error.localizedDescription)"
         }
         updateServiceStatus()
+    }
+
+    func applyBuilderSettings() async {
+        let settings = BuilderSettings(cpus: builderCPUs, memoryGiB: builderMemoryGiB)
+        builderSettingsStatus = "Applying…"
+        do {
+            try settings.save(to: builderSettingsURL)
+        } catch {
+            builderSettingsStatus = "Could not save"
+            self.error = "Builder resources could not be saved: \(error.localizedDescription)"
+            return
+        }
+        guard FileManager.default.fileExists(atPath: socketPath) else {
+            builderSettingsStatus = "Saved; applies when cengine starts"
+            return
+        }
+        do {
+            try await Task.detached {
+                try DockerIntegration.configureBuilder(settings)
+            }.value
+            builderSettingsStatus = "Applied"
+        } catch {
+            builderSettingsStatus = "Saved; applies when cengine restarts"
+            self.error = "Builder resources could not be applied now: \(error.localizedDescription)"
+        }
+    }
+
+    func applyContainerSettings() {
+        let settings = ContainerSettings(cpus: containerCPUs, memoryGiB: containerMemoryGiB)
+        do {
+            try settings.save(to: containerSettingsURL)
+            containerSettingsStatus = "Saved; applies to new containers"
+        } catch {
+            containerSettingsStatus = "Could not save"
+            self.error = "Container defaults could not be saved: \(error.localizedDescription)"
+        }
     }
 
     func refresh() async {

@@ -83,6 +83,9 @@ public struct DockerRouter: Sendable {
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
+            let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
+            record.memoryBytes = defaults.memoryBytes
+            record.cpus = defaults.cpus
             record.platform = query["platform"] ?? "linux/arm64"
             record.entrypoint = input.Entrypoint
             record.command = input.Cmd
@@ -98,7 +101,12 @@ public struct DockerRouter: Sendable {
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.useInit = input.HostConfig?.Init ?? false
             if let memory = input.HostConfig?.Memory, memory > 0 { record.memoryBytes = UInt64(memory) }
-            if let nano = input.HostConfig?.NanoCpus, nano > 0 { record.cpus = max(1, Int((nano + 999_999_999) / 1_000_000_000)) }
+            if let nano = input.HostConfig?.NanoCpus, nano > 0 {
+                record.cpus = max(1, Int((nano + 999_999_999) / 1_000_000_000))
+            } else if let quota = input.HostConfig?.CpuQuota, quota > 0 {
+                let period = max(input.HostConfig?.CpuPeriod ?? 100_000, 1)
+                record.cpus = max(1, Int((quota + period - 1) / period))
+            }
             record.stopSignal = input.StopSignal ?? "SIGTERM"
             record.stopTimeoutSeconds = input.StopTimeout ?? 10
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)

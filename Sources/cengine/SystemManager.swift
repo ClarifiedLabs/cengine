@@ -40,20 +40,11 @@ enum SystemManager {
 
     static func configureBuildx() {
         guard DockerIntegration.executable(named: "docker") != nil else { return }
-        guard (try? DockerIntegration.runDocker(["buildx", "version"])) != nil else {
-            warn("Docker Buildx is not installed; container builds will be unavailable")
-            return
-        }
-        if (try? DockerIntegration.runDocker(["buildx", "inspect", "cengine-builder"])) == nil {
-            do {
-                try DockerIntegration.runDocker([
-                    "buildx", "create", "--name", "cengine-builder", "--driver", "docker-container",
-                    "--driver-opt", "image=moby/buildkit:v0.27.1",
-                    "--buildkitd-flags", "--oci-worker-snapshotter=native", "cengine",
-                ])
-            } catch {
-                warn("could not configure Buildx: \(error.localizedDescription)")
-            }
+        do {
+            let paths = EnginePaths()
+            try DockerIntegration.configureBuilder(BuilderSettings.load(from: paths.builderSettings))
+        } catch {
+            warn("could not configure Buildx: \(error.localizedDescription)")
         }
     }
 

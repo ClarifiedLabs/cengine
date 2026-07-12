@@ -343,6 +343,55 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
     }
 
+    @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=quota-limited",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Memory":4294967296,"CpuPeriod":100000,"CpuQuota":400000}}"#.utf8)
+        ))
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+
+        #expect(host["Memory"] as? Int == 4 * 1_024 * 1_024 * 1_024)
+        #expect(host["NanoCpus"] as? Int == 4_000_000_000)
+    }
+
+    @Test func createUsesConfiguredContainerDefaultsUnlessResourcesAreExplicit() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try ContainerSettings(cpus: 2, memoryGiB: 3).save(
+            to: root.appending(path: ContainerSettings.fileName)
+        )
+
+        let defaultCreate = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=configured-defaults",
+            body: Data(#"{"Image":"alpine"}"#.utf8)
+        ))
+        let defaultBody = try #require(JSONSerialization.jsonObject(with: defaultCreate.body) as? [String: Any])
+        let defaultID = try #require(defaultBody["Id"] as? String)
+        let defaultInspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(defaultID)/json"))
+        let defaultObject = try #require(JSONSerialization.jsonObject(with: defaultInspect.body) as? [String: Any])
+        let defaultHost = try #require(defaultObject["HostConfig"] as? [String: Any])
+        #expect(defaultHost["Memory"] as? Int == 3 * 1_024 * 1_024 * 1_024)
+        #expect(defaultHost["NanoCpus"] as? Int == 2_000_000_000)
+
+        let explicitCreate = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=explicit-resources",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Memory":1073741824,"NanoCpus":1000000000}}"#.utf8)
+        ))
+        let explicitBody = try #require(JSONSerialization.jsonObject(with: explicitCreate.body) as? [String: Any])
+        let explicitID = try #require(explicitBody["Id"] as? String)
+        let explicitInspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(explicitID)/json"))
+        let explicitObject = try #require(JSONSerialization.jsonObject(with: explicitInspect.body) as? [String: Any])
+        let explicitHost = try #require(explicitObject["HostConfig"] as? [String: Any])
+        #expect(explicitHost["Memory"] as? Int == 1_073_741_824)
+        #expect(explicitHost["NanoCpus"] as? Int == 1_000_000_000)
+    }
+
     @Test func networkAndVolumeResponsesUseDockerSchema() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

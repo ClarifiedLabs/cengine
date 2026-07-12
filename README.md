@@ -71,7 +71,30 @@ docker --context cengine buildx build --builder cengine-builder --load .
 ```
 
 Buildx is the intended build path. The managed `cengine-builder` uses BuildKit's
-native snapshotter so non-scratch builds work with cengine-backed volumes.
+native snapshotter so non-scratch builds work with cengine-backed volumes. Its
+builder VM defaults to 4 CPUs, 4 GiB of memory, and a 16 GiB root filesystem.
+View or change the CPU and memory settings from the app's Settings window or
+with the CLI:
+
+```sh
+cengine builder resources
+cengine builder resources --cpus 6 --memory 8g
+```
+
+Applying new resources recreates the managed builder while preserving its
+BuildKit cache.
+
+Ordinary containers default to 4 CPUs and 1 GiB of memory. Change those defaults
+for newly created containers from **Container Defaults** in the app's Settings
+window or with the CLI:
+
+```sh
+cengine container resources
+cengine container resources --cpus 2 --memory 2g
+```
+
+Explicit Docker or Compose CPU and memory limits take precedence over these
+defaults. Existing containers are not changed.
 
 To make `cengine` the default engine for subsequent Docker commands, activate
 its Docker context:

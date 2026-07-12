@@ -240,6 +240,8 @@ def test_container_configuration_round_trip(client: docker.DockerClient):
     assert inspect["Config"]["User"] == "0:0"
     assert inspect["HostConfig"]["ReadonlyRootfs"] is True
     assert inspect["HostConfig"]["RestartPolicy"] == {"Name": "on-failure", "MaximumRetryCount": 2}
+    assert inspect["HostConfig"]["Memory"] == 1_073_741_824
+    assert inspect["HostConfig"]["NanoCpus"] == 4_000_000_000
 
 
 @pytest.mark.compat("CTR-027")

@@ -38,6 +38,9 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
         buildx(
             "create", "--name", builder, "--driver", "docker-container",
             "--driver-opt", f"image={BUILDKIT_IMAGE}",
+            "--driver-opt", "memory=4294967296",
+            "--driver-opt", "cpu-period=100000",
+            "--driver-opt", "cpu-quota=400000",
             "--buildkitd-flags", "--oci-worker-snapshotter=native",
             docker_host, docker_host=docker_host,
         )
@@ -46,6 +49,9 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
             docker_host=docker_host,
         )
         assert "ERROR" not in first.stdout
+        builder_container = client.containers.get(f"buildx_buildkit_{builder}0")
+        assert builder_container.attrs["HostConfig"]["Memory"] == 4_294_967_296
+        assert builder_container.attrs["HostConfig"]["NanoCpus"] == 4_000_000_000
         image = client.images.get(tag)
         assert tag in image.tags
         assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"

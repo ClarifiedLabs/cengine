@@ -144,8 +144,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.readOnlyRootfs = false
         self.autoRemove = false
         self.useInit = false
-        self.memoryBytes = 1_073_741_824
-        self.cpus = 4
+        self.memoryBytes = ContainerSettings.default.memoryBytes
+        self.cpus = ContainerSettings.default.cpus
         self.stopSignal = "SIGTERM"
         self.stopTimeoutSeconds = 10
         self.restartPolicy = .init()

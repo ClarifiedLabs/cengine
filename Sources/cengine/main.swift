@@ -37,6 +37,8 @@ private final class DaemonLock {
             switch command {
             case "daemon": try await daemon(arguments, managed: false)
             case "service": try await service(arguments)
+            case "builder": try await builder(arguments)
+            case "container": try container(arguments)
             case "version", "--version": print("cengine \(CEngineVersion.shortVersion())")
             case "system": try await system(arguments)
             case "help", "--help", "-h": usage()
@@ -192,6 +194,90 @@ private final class DaemonLock {
         }
     }
 
+    private static func builder(_ arguments: [String]) async throws {
+        guard arguments.first ?? "resources" == "resources" else {
+            throw EngineError(.badRequest, "builder command is not implemented")
+        }
+        let values = Array(arguments.dropFirst())
+        let paths = EnginePaths()
+        var settings = try BuilderSettings.load(from: paths.builderSettings)
+        guard !values.isEmpty else {
+            print("CPUs: \(settings.cpus)")
+            print("Memory: \(settings.memoryGiB) GiB")
+            return
+        }
+
+        try parseResources(values, cpus: &settings.cpus, memory: &settings.memoryGiB, subject: "builder")
+
+        try settings.save(to: paths.builderSettings)
+        if await socketIsReachable(paths.socket.path) {
+            do {
+                try DockerIntegration.configureBuilder(settings)
+                print("Builder resources updated to \(settings.cpus) CPUs and \(settings.memoryGiB) GiB memory.")
+            } catch {
+                throw EngineError(
+                    .internalError,
+                    "builder resources were saved but could not be applied now: \(error.localizedDescription)"
+                )
+            }
+        } else {
+            print("Builder resources saved; they will apply when cengine next starts.")
+        }
+    }
+
+    private static func container(_ arguments: [String]) throws {
+        guard arguments.first ?? "resources" == "resources" else {
+            throw EngineError(.badRequest, "container command is not implemented")
+        }
+        let values = Array(arguments.dropFirst())
+        let paths = EnginePaths()
+        var settings = try ContainerSettings.load(from: paths.containerSettings)
+        guard !values.isEmpty else {
+            print("CPUs: \(settings.cpus)")
+            print("Memory: \(settings.memoryGiB) GiB")
+            return
+        }
+
+        try parseResources(values, cpus: &settings.cpus, memory: &settings.memoryGiB, subject: "container")
+        try settings.save(to: paths.containerSettings)
+        print("Default container resources updated to \(settings.cpus) CPUs and \(settings.memoryGiB) GiB memory.")
+    }
+
+    private static func parseResources(
+        _ values: [String], cpus: inout Int, memory: inout Int, subject: String
+    ) throws {
+        var index = 0
+        while index < values.count {
+            let name = values[index]
+            guard values.indices.contains(index + 1) else {
+                throw EngineError(.badRequest, "\(name) requires a value")
+            }
+            let value = values[index + 1]
+            switch name {
+            case "--cpus":
+                guard let parsed = Int(value) else { throw EngineError(.badRequest, "invalid CPU count: \(value)") }
+                cpus = parsed
+            case "--memory":
+                memory = try memoryGiB(value)
+            default:
+                throw EngineError(.badRequest, "unknown \(subject) resource option: \(name)")
+            }
+            index += 2
+        }
+    }
+
+    private static func memoryGiB(_ value: String) throws -> Int {
+        let normalized = value.lowercased()
+        let suffixes = ["gib", "gb", "g"]
+        let numeric = suffixes.first(where: normalized.hasSuffix).map {
+            String(normalized.dropLast($0.count))
+        } ?? normalized
+        guard let memory = Int(numeric), memory > 0 else {
+            throw EngineError(.badRequest, "invalid memory: \(value); use whole GiB such as 4g")
+        }
+        return memory
+    }
+
     private static func option(_ name: String, in arguments: [String]) -> String? {
         guard let index = arguments.firstIndex(of: name), arguments.indices.contains(index + 1) else { return nil }
         return arguments[index + 1]
@@ -209,6 +295,8 @@ private final class DaemonLock {
     private static func usage() {
         print("""
         Usage: cengine <command>
+          builder resources [--cpus COUNT] [--memory GiB]
+          container resources [--cpus COUNT] [--memory GiB]
           daemon [--socket PATH] [--root PATH] [--kernel PATH] [--metadata-only]
           service run
           system status|doctor|install|uninstall

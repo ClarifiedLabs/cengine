@@ -7,6 +7,8 @@ public struct EnginePaths: Sendable {
     public let socket: URL
     public let lock: URL
     public let serviceState: URL
+    public let builderSettings: URL
+    public let containerSettings: URL
     public let logs: URL
     public let kernel: URL
 
@@ -17,6 +19,8 @@ public struct EnginePaths: Sendable {
         self.socket = runtime.appending(path: "docker.sock", directoryHint: .notDirectory)
         self.lock = runtime.appending(path: "docker.sock.lock", directoryHint: .notDirectory)
         self.serviceState = runtime.appending(path: "service-state.json", directoryHint: .notDirectory)
+        self.builderSettings = data.appending(path: "builder-settings.json", directoryHint: .notDirectory)
+        self.containerSettings = data.appending(path: ContainerSettings.fileName, directoryHint: .notDirectory)
         self.logs = home.appending(path: "Library/Logs/cengine", directoryHint: .isDirectory)
         self.kernel = data.appending(path: "assets/vmlinux", directoryHint: .notDirectory)
     }
