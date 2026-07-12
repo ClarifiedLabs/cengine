@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import plistlib
+
 from _checks import REPO_ROOT, read, require_absent, require_contains
 
 
@@ -10,6 +12,7 @@ def main() -> None:
     project = read(REPO_ROOT / "cengine.xcodeproj/project.pbxproj")
     build_script = read(REPO_ROOT / "Scripts/build-release.sh")
     makefile = read(REPO_ROOT / "Makefile")
+    component_plist_path = REPO_ROOT / "Configuration/cengine-component.plist"
     for needle in (
         'PAYLOAD_ROOT/Applications', 'PAYLOAD_ROOT/usr/local/bin', 'dev.cengine.app.pkg',
         'Contents/Helpers/cengine', 'Contents/Helpers/cengine-network-helper',
@@ -19,6 +22,7 @@ def main() -> None:
         'stapler staple', 'spctl --assess --type install', 'verify-entitlements.sh',
         "sed -nE 's/.*MARKETING_VERSION", 'xattr -cr "$PAYLOAD_ROOT"',
         'install_name_tool -delete_rpath', 'PackageFrameworks',
+        '--component-plist "$COMPONENT_PLIST"',
     ):
         require_contains(script, needle, "package-release.sh")
     require_contains(entitlements, "com.apple.security.virtualization", "cengine.entitlements")
@@ -37,6 +41,15 @@ def main() -> None:
     require_contains(project, 'LD_RUNPATH_SEARCH_PATHS = ""', "project.pbxproj")
     if project.count("CREATE_INFOPLIST_SECTION_IN_BINARY = YES") != 4:
         raise AssertionError("engine and network helper builds must embed metadata")
+
+    with component_plist_path.open("rb") as component_plist_file:
+        components = plistlib.load(component_plist_file)
+    app_component = next(
+        component for component in components
+        if component.get("RootRelativeBundlePath") == "Applications/cengine.app"
+    )
+    if app_component.get("BundleIsRelocatable") is not False:
+        raise AssertionError("cengine.app must not be relocated away from /Applications")
 
 
 if __name__ == "__main__":

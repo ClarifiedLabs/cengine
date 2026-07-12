@@ -64,4 +64,7 @@ Users open `cengine.app`; it registers the bundled engine LaunchAgent and offers
 the optional privileged networking helper during onboarding.
 
 The PKG installs `/Applications/cengine.app` and `/usr/local/bin/cengine` and
-therefore requests administrator authorization. Homebrew installs the same PKG.
+therefore requests administrator authorization. Homebrew installs the same PKG
+with its command-line installer, so `brew install` requests `sudo` rather than
+showing Installer.app's authorization dialog. The package marks the app bundle
+as non-relocatable so PackageKit always installs it at `/Applications/cengine.app`.

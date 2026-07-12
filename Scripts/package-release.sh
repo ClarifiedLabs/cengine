@@ -13,6 +13,7 @@ PKG_IDENTIFIER="dev.cengine.app.pkg"
 UNINSTALLER_IDENTIFIER="dev.cengine.uninstaller.pkg"
 ENGINE_ENTITLEMENTS="$ROOT_DIR/Configuration/cengine.entitlements"
 APP_ENTITLEMENTS="$ROOT_DIR/Configuration/cengine-app.entitlements"
+COMPONENT_PLIST="$ROOT_DIR/Configuration/cengine-component.plist"
 export COPYFILE_DISABLE=1
 
 enabled() { case "${1:-0}" in 1|true|TRUE|yes|YES) return 0;; *) return 1;; esac; }
@@ -46,6 +47,7 @@ enabled "$NOTARIZE_RELEASE" && SIGN_RELEASE=1
 [[ "$BUILD_NUMBER" =~ '^[0-9]+$' ]] || { echo "Invalid build number '$BUILD_NUMBER'" >&2; exit 2; }
 require_file "$ENGINE_ENTITLEMENTS" "engine entitlements"
 require_file "$APP_ENTITLEMENTS" "app entitlements"
+require_file "$COMPONENT_PLIST" "package component plist"
 require_file "$ROOT_DIR/Configuration/dev.cengine.engine.plist" "engine launch agent plist"
 require_file "$ROOT_DIR/Configuration/dev.cengine.network-helper.plist" "network helper launch daemon plist"
 
@@ -121,7 +123,7 @@ component_pkg="$BUILD_DIR/cengine-component.pkg"
 unsigned_pkg="$BUILD_DIR/cengine-$VERSION.unsigned.pkg"
 PKG_PATH="$OUTPUT_DIR/cengine-$VERSION.pkg"
 pkgbuild --root "$PAYLOAD_ROOT" --identifier "$PKG_IDENTIFIER" --version "$VERSION" \
-  --install-location / --ownership recommended "$component_pkg"
+  --install-location / --ownership recommended --component-plist "$COMPONENT_PLIST" "$component_pkg"
 productbuild --package "$component_pkg" "$unsigned_pkg"
 if enabled "$SIGN_RELEASE"; then
   productsign --sign "$installer_identity" "$unsigned_pkg" "$PKG_PATH"
