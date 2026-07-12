@@ -4,7 +4,7 @@
 Apple silicon. It runs Linux containers as lightweight virtual machines using
 Apple's [Containerization](https://github.com/apple/containerization) package.
 
-Note: this project was created as part of testing out gpt-5.6-sol for the first time. As of commit 224624b705e9a94428316c9c33a96b70d77f08b1 all planning used `xhigh` effort and implementation used `low`.
+Note: this project was created as an experiment when testing out gpt-5.6-sol for the first time. As of commit 224624b705e9a94428316c9c33a96b70d77f08b1 all planning used `xhigh` effort and implementation used `low`.
 
 ## Requirements
 

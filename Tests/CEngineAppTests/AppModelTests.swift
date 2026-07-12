@@ -27,3 +27,14 @@ import Testing
         #expect(!AppModel.isEngineUnavailable(IOError(errnoCode: EPIPE, reason: "write"), socketPath: url.path))
     }
 }
+
+@MainActor @Suite struct OnboardingViewTests {
+    @Test func enablingPrivilegedPortsCompletesOnboardingWithHelperEnabled() async {
+        var requestedHelperState: Bool?
+        let view = OnboardingView { requestedHelperState = $0 }
+
+        await view.complete(enableHelper: true)
+
+        #expect(requestedHelperState == true)
+    }
+}

@@ -10,7 +10,11 @@ struct CEngineApplication: App {
                 .environmentObject(model)
                 .frame(minWidth: 760, minHeight: 500)
                 .task { model.start() }
-                .sheet(isPresented: $model.showOnboarding) { OnboardingView() }
+                .sheet(isPresented: $model.showOnboarding) {
+                    OnboardingView { enableHelper in
+                        await model.completeOnboarding(enableHelper: enableHelper)
+                    }
+                }
         }
         .onChange(of: scenePhase) { _, phase in model.setActive(phase == .active) }
         Settings { SettingsView().environmentObject(model).frame(width: 480) }
@@ -93,8 +97,9 @@ private struct ResourceList: View {
     }
 }
 
-private struct OnboardingView: View {
-    @EnvironmentObject private var model: AppModel
+struct OnboardingView: View {
+    let onComplete: @MainActor (Bool) async -> Void
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Welcome to cengine").font(.largeTitle.bold())
@@ -102,11 +107,15 @@ private struct OnboardingView: View {
             Text("You can enable it later in Settings.").foregroundStyle(.secondary)
             HStack {
                 Spacer()
-                Button("Not Now") { Task { await model.completeOnboarding(enableHelper: false) } }
+                Button("Not Now") { Task { await complete(enableHelper: false) } }
                     .keyboardShortcut(.defaultAction)
-                Button("Enable Privileged Ports") { Task { await model.completeOnboarding(enableHelper: true) } }
+                Button("Enable Privileged Ports") { Task { await complete(enableHelper: true) } }
             }
         }.padding(28).frame(width: 520)
+    }
+
+    func complete(enableHelper: Bool) async {
+        await onComplete(enableHelper)
     }
 }
 
