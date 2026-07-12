@@ -22,7 +22,7 @@ cask "cengine" do
   homepage "https://github.com/ClarifiedLabs/cengine"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :tahoe"
+  depends_on macos: :tahoe
 
   pkg "cengine-${version}.pkg"
 
