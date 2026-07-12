@@ -9,6 +9,13 @@ enum CEngineServices {
     static let agentPlist = "dev.cengine.engine.plist"
     static let helperPlist = "dev.cengine.network-helper.plist"
 
+    /// A newly installed bundled service can be absent from Background Task
+    /// Management's database and report `.notFound` until its first registration.
+    /// Register both absent and explicitly unregistered services.
+    static func needsRegistration(_ status: SMAppService.Status) -> Bool {
+        status == .notRegistered || status == .notFound
+    }
+
     /// Unregisters the network-helper daemon and then the engine agent,
     /// tolerating already-removed services so repeated teardowns stay idempotent.
     static func teardownServices() async {

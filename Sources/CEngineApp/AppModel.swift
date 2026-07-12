@@ -37,7 +37,7 @@ struct ResourceItem: Identifiable, Hashable {
 
     func start() {
         do {
-            if agent.status == .notRegistered { try agent.register() }
+            if CEngineServices.needsRegistration(agent.status) { try agent.register() }
         } catch {
             self.error = "Could not enable the cengine background service: \(error.localizedDescription)"
         }
@@ -73,7 +73,7 @@ struct ResourceItem: Identifiable, Hashable {
     func setHelperEnabled(_ enabled: Bool) async {
         do {
             if enabled {
-                if helper.status == .notRegistered { try helper.register() }
+                if CEngineServices.needsRegistration(helper.status) { try helper.register() }
                 if helper.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
             } else if helper.status != .notRegistered && helper.status != .notFound {
                 try await helper.unregister()

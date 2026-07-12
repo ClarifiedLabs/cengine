@@ -1,7 +1,23 @@
 import Foundation
 import NIOCore
+import ServiceManagement
 import Testing
 @testable import CEngineApp
+
+@Suite struct ServiceRegistrationTests {
+    @Test func registersServicesMissingFromBackgroundTaskManagement() {
+        #expect(CEngineServices.needsRegistration(.notFound))
+    }
+
+    @Test func registersExplicitlyUnregisteredServices() {
+        #expect(CEngineServices.needsRegistration(.notRegistered))
+    }
+
+    @Test func doesNotReregisterKnownServices() {
+        #expect(!CEngineServices.needsRegistration(.enabled))
+        #expect(!CEngineServices.needsRegistration(.requiresApproval))
+    }
+}
 
 @Suite struct EngineAvailabilityTests {
     @Test func missingSocketMeansEngineIsStillStarting() {
