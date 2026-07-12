@@ -7,6 +7,7 @@ import NIOPosix
 
 final class PortForwarder: @unchecked Sendable {
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    private let privilegedPorts = PrivilegedPortClient()
     private let lock = NSLock()
     private var listeners: [String: [Channel]] = [:]
 
@@ -23,11 +24,19 @@ final class PortForwarder: @unchecked Sendable {
                 let guestAddress = wantsIPv6 ? guestIPv6Address! : guestIPv4Address
                 if binding.proto.lowercased() == "udp" {
                     let guest = try SocketAddress(ipAddress: guestAddress, port: Int(binding.containerPort))
-                    let channel = try await DatagramBootstrap(group: group)
+                    let bootstrap = DatagramBootstrap(group: group)
                         .channelInitializer { channel in
                             channel.pipeline.addHandler(UDPInboundHandler(guest: guest, listener: channel))
                         }
-                        .bind(host: binding.hostIP.isEmpty ? "0.0.0.0" : binding.hostIP, port: Int(binding.hostPort)).get()
+                    let channel: Channel
+                    do {
+                        channel = try await bootstrap
+                            .bind(host: binding.hostIP.isEmpty ? "0.0.0.0" : binding.hostIP, port: Int(binding.hostPort)).get()
+                    } catch let error as IOError {
+                        channel = try await helperBoundChannel(binding: binding, transport: .udp, ioError: error) {
+                            try await bootstrap.withBoundSocket($0).get()
+                        }
+                    }
                     started.append(channel)
                     var value = binding
                     value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
@@ -49,10 +58,17 @@ final class PortForwarder: @unchecked Sendable {
                                 }
                             }
                     }
-                let channel = try await bootstrap.bind(
-                    host: binding.hostIP.isEmpty ? "0.0.0.0" : binding.hostIP,
-                    port: Int(binding.hostPort)
-                ).get()
+                let channel: Channel
+                do {
+                    channel = try await bootstrap.bind(
+                        host: binding.hostIP.isEmpty ? "0.0.0.0" : binding.hostIP,
+                        port: Int(binding.hostPort)
+                    ).get()
+                } catch let error as IOError {
+                    channel = try await helperBoundChannel(binding: binding, transport: .tcp, ioError: error) {
+                        try await bootstrap.withBoundSocket($0).get()
+                    }
+                }
                 started.append(channel)
                 var value = binding
                 value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
@@ -64,6 +80,25 @@ final class PortForwarder: @unchecked Sendable {
             started.forEach { $0.close(promise: nil) }
             throw error
         }
+    }
+
+    // Falls back to the privileged helper when a low-port bind was denied. NIO adopts
+    // the helper's descriptor inside makeChannel and closes it on its own failure
+    // paths, so the descriptor must never be closed here — the number may already
+    // have been reused by another thread.
+    func helperBoundChannel(
+        binding: PortBinding, transport: PrivilegedPortRequest.Transport, ioError: IOError,
+        bind: ((PrivilegedPortRequest) async throws -> CInt)? = nil,
+        makeChannel: (CInt) async throws -> Channel
+    ) async throws -> Channel {
+        guard PrivilegedPortRequest.shouldUseHelper(
+            errnoCode: ioError.errnoCode, address: binding.hostIP, port: binding.hostPort
+        ) else { throw ioError }
+        let request = try PrivilegedPortRequest(
+            address: binding.hostIP, port: binding.hostPort, transport: transport
+        )
+        let descriptor = try await (bind ?? privilegedPorts.bind)(request)
+        return try await makeChannel(descriptor)
     }
 
     func stop(containerID: String) {

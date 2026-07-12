@@ -112,7 +112,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 }
             } catch {
                 channel.eventLoop.execute {
-                    Self.write(channel: channel, response: dockerErrorResponse(EngineError(.internalError, error.localizedDescription)), keepAlive: keepAlive)
+                    Self.write(channel: channel, response: dockerErrorResponse(EngineError(.internalError, EngineError.message(for: error))), keepAlive: keepAlive)
                 }
             }
         }

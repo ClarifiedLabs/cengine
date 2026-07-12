@@ -14,6 +14,15 @@
 		CE00000000000000000000B5 /* libCEngineCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000020 /* libCEngineCore.a */; };
 		CE00000000000000000000B6 /* libCEngineRuntime.a in Frameworks */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000021 /* libCEngineRuntime.a */; };
 		CE00000000000000000000B7 /* libCEngineAPI.a in Frameworks */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000022 /* libCEngineAPI.a */; };
+		CE00000000000000000000B8 /* libCEngineCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000020 /* libCEngineCore.a */; };
+		CE00000000000000000000B9 /* libCEngineCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = CE0000000000000000000020 /* libCEngineCore.a */; };
+		CE00000000000000000000F6 /* NIOCore in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D7 /* NIOCore */; };
+		CE00000000000000000000F7 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D8 /* NIOPosix */; };
+		CE00000000000000000000F8 /* NIOHTTP1 in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D9 /* NIOHTTP1 */; };
+		CE00000000000000000000F9 /* NIOEmbedded in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000DA /* NIOEmbedded */; };
+		CE00000000000000000000F3 /* NIOCore in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D7 /* NIOCore */; };
+		CE00000000000000000000F4 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D8 /* NIOPosix */; };
+		CE00000000000000000000F5 /* NIOHTTP1 in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D9 /* NIOHTTP1 */; };
 		CE00000000000000000000C0 /* Containerization in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D0 /* Containerization */; };
 		CE00000000000000000000C1 /* ContainerizationArchive in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D1 /* ContainerizationArchive */; };
 		CE00000000000000000000C2 /* ContainerizationEXT4 in Frameworks */ = {isa = PBXBuildFile; productRef = CE00000000000000000000D2 /* ContainerizationEXT4 */; };
@@ -65,6 +74,9 @@
 		CE0000000000000000000068 = {isa = PBXContainerItemProxy; containerPortal = CE0000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = CE0000000000000000000030; remoteInfo = CEngineCore; };
 		CE0000000000000000000069 = {isa = PBXContainerItemProxy; containerPortal = CE0000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = CE0000000000000000000031; remoteInfo = CEngineRuntime; };
 		CE000000000000000000006A = {isa = PBXContainerItemProxy; containerPortal = CE0000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = CE0000000000000000000032; remoteInfo = CEngineAPI; };
+		CE000000000000000000006B = {isa = PBXContainerItemProxy; containerPortal = CE0000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = CE0000000000000000000030; remoteInfo = CEngineCore; };
+		CE000000000000000000006C = {isa = PBXContainerItemProxy; containerPortal = CE0000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = CE0000000000000000000030; remoteInfo = CEngineCore; };
+		CE000000000000000000006D = {isa = PBXContainerItemProxy; containerPortal = CE0000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = CE0000000000000000000036; remoteInfo = CEngineApp; };
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
@@ -74,6 +86,9 @@
 		CE0000000000000000000023 /* cengine */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = cengine; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE0000000000000000000024 /* CEngineCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CEngineCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE0000000000000000000025 /* CEngineAPITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CEngineAPITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		CE0000000000000000000026 /* cengine.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = cengine.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CE0000000000000000000027 /* cengine-network-helper */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = cengine-network-helper; sourceTree = BUILT_PRODUCTS_DIR; };
+		CE0000000000000000000028 /* CEngineAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CEngineAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CE0000000000000000000080 /* Makefile */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.make; path = Makefile; sourceTree = "<group>"; };
 		CE0000000000000000000081 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		CE0000000000000000000082 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
@@ -87,6 +102,9 @@
 		CE0000000000000000000014 = {isa = PBXFileSystemSynchronizedRootGroup; path = Tests/CEngineCoreTests; sourceTree = "<group>"; };
 		CE0000000000000000000015 = {isa = PBXFileSystemSynchronizedRootGroup; path = Tests/CEngineAPITests; sourceTree = "<group>"; };
 		CE0000000000000000000016 = {isa = PBXFileSystemSynchronizedRootGroup; path = Configuration; sourceTree = "<group>"; };
+		CE0000000000000000000017 = {isa = PBXFileSystemSynchronizedRootGroup; path = Sources/CEngineApp; sourceTree = "<group>"; };
+		CE0000000000000000000018 = {isa = PBXFileSystemSynchronizedRootGroup; path = Sources/CEngineNetworkHelper; sourceTree = "<group>"; };
+		CE0000000000000000000019 = {isa = PBXFileSystemSynchronizedRootGroup; path = Tests/CEngineAppTests; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -96,13 +114,16 @@
 		CE0000000000000000000043 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (CE00000000000000000000B0, CE00000000000000000000B1, CE00000000000000000000B2, CE00000000000000000000CA, CE00000000000000000000CB, CE00000000000000000000CC, CE00000000000000000000CD, CE00000000000000000000CE, CE00000000000000000000CF, CE00000000000000000000E0, CE00000000000000000000E1, CE00000000000000000000E2, CE00000000000000000000E3,); runOnlyForDeploymentPostprocessing = 0; };
 		CE0000000000000000000044 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (CE00000000000000000000B3, CE00000000000000000000B4, CE00000000000000000000E4, CE00000000000000000000E5, CE00000000000000000000E6, CE00000000000000000000E7, CE00000000000000000000E8, CE00000000000000000000E9, CE00000000000000000000EA, CE00000000000000000000EB, CE00000000000000000000EC,); runOnlyForDeploymentPostprocessing = 0; };
 		CE0000000000000000000045 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (CE00000000000000000000B5, CE00000000000000000000B6, CE00000000000000000000B7, CE00000000000000000000ED, CE00000000000000000000E4, CE00000000000000000000E5, CE00000000000000000000E6, CE00000000000000000000E7, CE00000000000000000000E8, CE00000000000000000000E9, CE00000000000000000000EA, CE00000000000000000000EB, CE00000000000000000000EC,); runOnlyForDeploymentPostprocessing = 0; };
+		CE0000000000000000000046 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (CE00000000000000000000B9, CE00000000000000000000F3, CE00000000000000000000F4, CE00000000000000000000F5,); runOnlyForDeploymentPostprocessing = 0; };
+		CE0000000000000000000047 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (CE00000000000000000000B8,); runOnlyForDeploymentPostprocessing = 0; };
+		CE0000000000000000000048 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (CE00000000000000000000F6, CE00000000000000000000F7, CE00000000000000000000F8, CE00000000000000000000F9,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		CE0000000000000000000002 = {isa = PBXGroup; children = (CE0000000000000000000090 /* Sources */, CE0000000000000000000091 /* Tests */, CE0000000000000000000016 /* Configuration */, CE0000000000000000000003 /* Products */, CE0000000000000000000080 /* Makefile */, CE0000000000000000000081 /* README.md */, CE0000000000000000000082 /* LICENSE */,); sourceTree = "<group>"; };
-		CE0000000000000000000003 /* Products */ = {isa = PBXGroup; children = (CE0000000000000000000020, CE0000000000000000000021, CE0000000000000000000022, CE0000000000000000000023, CE0000000000000000000024, CE0000000000000000000025,); name = Products; sourceTree = "<group>"; };
-		CE0000000000000000000090 /* Sources */ = {isa = PBXGroup; children = (CE0000000000000000000010, CE0000000000000000000011, CE0000000000000000000012, CE0000000000000000000013,); name = Sources; sourceTree = "<group>"; };
-		CE0000000000000000000091 /* Tests */ = {isa = PBXGroup; children = (CE0000000000000000000014, CE0000000000000000000015,); name = Tests; sourceTree = "<group>"; };
+		CE0000000000000000000003 /* Products */ = {isa = PBXGroup; children = (CE0000000000000000000020, CE0000000000000000000021, CE0000000000000000000022, CE0000000000000000000023, CE0000000000000000000026, CE0000000000000000000027, CE0000000000000000000024, CE0000000000000000000025, CE0000000000000000000028,); name = Products; sourceTree = "<group>"; };
+		CE0000000000000000000090 /* Sources */ = {isa = PBXGroup; children = (CE0000000000000000000010, CE0000000000000000000011, CE0000000000000000000012, CE0000000000000000000013, CE0000000000000000000017, CE0000000000000000000018,); name = Sources; sourceTree = "<group>"; };
+		CE0000000000000000000091 /* Tests */ = {isa = PBXGroup; children = (CE0000000000000000000014, CE0000000000000000000015, CE0000000000000000000019,); name = Tests; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -112,10 +133,13 @@
 		CE0000000000000000000033 /* cengine */ = {isa = PBXNativeTarget; buildConfigurationList = CE0000000000000000000133; buildPhases = (CE0000000000000000000053, CE0000000000000000000043,); buildRules = (); dependencies = (CE0000000000000000000073, CE0000000000000000000074, CE0000000000000000000075,); fileSystemSynchronizedGroups = (CE0000000000000000000013,); name = cengine; packageProductDependencies = (CE00000000000000000000D0, CE00000000000000000000D1, CE00000000000000000000D2, CE00000000000000000000D3, CE00000000000000000000D4, CE00000000000000000000D5, CE00000000000000000000D6, CE00000000000000000000D7, CE00000000000000000000D8, CE00000000000000000000D9,); productName = cengine; productReference = CE0000000000000000000023; productType = "com.apple.product-type.tool"; };
 		CE0000000000000000000034 /* CEngineCoreTests */ = {isa = PBXNativeTarget; buildConfigurationList = CE0000000000000000000134; buildPhases = (CE0000000000000000000054, CE0000000000000000000044,); buildRules = (); dependencies = (CE0000000000000000000076, CE0000000000000000000077,); fileSystemSynchronizedGroups = (CE0000000000000000000014,); name = CEngineCoreTests; packageProductDependencies = (CE00000000000000000000D0, CE00000000000000000000D1, CE00000000000000000000D2, CE00000000000000000000D3, CE00000000000000000000D4, CE00000000000000000000D5, CE00000000000000000000D6, CE00000000000000000000D7, CE00000000000000000000D8,); productName = CEngineCoreTests; productReference = CE0000000000000000000024; productType = "com.apple.product-type.bundle.unit-test"; };
 		CE0000000000000000000035 /* CEngineAPITests */ = {isa = PBXNativeTarget; buildConfigurationList = CE0000000000000000000135; buildPhases = (CE0000000000000000000055, CE0000000000000000000045,); buildRules = (); dependencies = (CE0000000000000000000078, CE0000000000000000000079, CE000000000000000000007A,); fileSystemSynchronizedGroups = (CE0000000000000000000015,); name = CEngineAPITests; packageProductDependencies = (CE00000000000000000000D0, CE00000000000000000000D1, CE00000000000000000000D2, CE00000000000000000000D3, CE00000000000000000000D4, CE00000000000000000000D5, CE00000000000000000000D6, CE00000000000000000000D7, CE00000000000000000000D8, CE00000000000000000000D9,); productName = CEngineAPITests; productReference = CE0000000000000000000025; productType = "com.apple.product-type.bundle.unit-test"; };
+		CE0000000000000000000036 /* CEngineApp */ = {isa = PBXNativeTarget; buildConfigurationList = CE0000000000000000000136; buildPhases = (CE0000000000000000000056, CE0000000000000000000046,); buildRules = (); dependencies = (CE000000000000000000007C,); fileSystemSynchronizedGroups = (CE0000000000000000000017,); name = CEngineApp; packageProductDependencies = (CE00000000000000000000D7, CE00000000000000000000D8, CE00000000000000000000D9,); productName = cengine; productReference = CE0000000000000000000026; productType = "com.apple.product-type.application"; };
+		CE0000000000000000000037 /* CEngineNetworkHelper */ = {isa = PBXNativeTarget; buildConfigurationList = CE0000000000000000000137; buildPhases = (CE0000000000000000000057, CE0000000000000000000047,); buildRules = (); dependencies = (CE000000000000000000007B,); fileSystemSynchronizedGroups = (CE0000000000000000000018,); name = CEngineNetworkHelper; productName = cengine-network-helper; productReference = CE0000000000000000000027; productType = "com.apple.product-type.tool"; };
+		CE0000000000000000000038 /* CEngineAppTests */ = {isa = PBXNativeTarget; buildConfigurationList = CE0000000000000000000138; buildPhases = (CE0000000000000000000058, CE0000000000000000000048,); buildRules = (); dependencies = (CE000000000000000000007D,); fileSystemSynchronizedGroups = (CE0000000000000000000019,); name = CEngineAppTests; packageProductDependencies = (CE00000000000000000000D7, CE00000000000000000000D8, CE00000000000000000000D9, CE00000000000000000000DA,); productName = CEngineAppTests; productReference = CE0000000000000000000028; productType = "com.apple.product-type.bundle.unit-test"; };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		CE0000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {CE0000000000000000000030 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000031 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000032 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000033 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000034 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000035 = {CreatedOnToolsVersion = 26.6;};};}; buildConfigurationList = CE0000000000000000000101; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = CE0000000000000000000002; minimizedProjectReferenceProxies = 1; packageReferences = (CE00000000000000000000F0, CE00000000000000000000F1, CE00000000000000000000F2,); preferredProjectObjectVersion = 77; productRefGroup = CE0000000000000000000003; projectDirPath = ""; projectRoot = ""; targets = (CE0000000000000000000030, CE0000000000000000000031, CE0000000000000000000032, CE0000000000000000000033, CE0000000000000000000034, CE0000000000000000000035,); };
+		CE0000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {CE0000000000000000000030 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000031 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000032 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000033 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000034 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000035 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000036 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000037 = {CreatedOnToolsVersion = 26.6;}; CE0000000000000000000038 = {CreatedOnToolsVersion = 26.6; TestTargetID = CE0000000000000000000036;};};}; buildConfigurationList = CE0000000000000000000101; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = CE0000000000000000000002; minimizedProjectReferenceProxies = 1; packageReferences = (CE00000000000000000000F0, CE00000000000000000000F1, CE00000000000000000000F2,); preferredProjectObjectVersion = 77; productRefGroup = CE0000000000000000000003; projectDirPath = ""; projectRoot = ""; targets = (CE0000000000000000000030, CE0000000000000000000031, CE0000000000000000000032, CE0000000000000000000033, CE0000000000000000000036, CE0000000000000000000037, CE0000000000000000000034, CE0000000000000000000035, CE0000000000000000000038,); };
 /* End PBXProject section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -125,6 +149,9 @@
 		CE0000000000000000000053 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		CE0000000000000000000054 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		CE0000000000000000000055 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CE0000000000000000000056 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CE0000000000000000000057 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		CE0000000000000000000058 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -139,6 +166,9 @@
 		CE0000000000000000000078 = {isa = PBXTargetDependency; target = CE0000000000000000000030; targetProxy = CE0000000000000000000068; };
 		CE0000000000000000000079 = {isa = PBXTargetDependency; target = CE0000000000000000000031; targetProxy = CE0000000000000000000069; };
 		CE000000000000000000007A = {isa = PBXTargetDependency; target = CE0000000000000000000032; targetProxy = CE000000000000000000006A; };
+		CE000000000000000000007B = {isa = PBXTargetDependency; target = CE0000000000000000000030; targetProxy = CE000000000000000000006B; };
+		CE000000000000000000007C = {isa = PBXTargetDependency; target = CE0000000000000000000030; targetProxy = CE000000000000000000006C; };
+		CE000000000000000000007D = {isa = PBXTargetDependency; target = CE0000000000000000000036; targetProxy = CE000000000000000000006D; };
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -156,6 +186,12 @@
 		CE0000000000000000000219 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.core-tests; PRODUCT_NAME = "$(TARGET_NAME)";}; name = Release; };
 		CE000000000000000000021A = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.api-tests; PRODUCT_NAME = "$(TARGET_NAME)";}; name = Debug; };
 		CE000000000000000000021B = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.api-tests; PRODUCT_NAME = "$(TARGET_NAME)";}; name = Release; };
+		CE000000000000000000021C = {isa = XCBuildConfiguration; buildSettings = {CENGINE_TEAM_IDENTIFIER = ""; CODE_SIGN_ENTITLEMENTS = Configuration/cengine-app.entitlements; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Configuration/cengine-app-Info.plist; MARKETING_VERSION = 0.0.9; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.app; PRODUCT_MODULE_NAME = CEngineApp; PRODUCT_NAME = cengine;}; name = Debug; };
+		CE000000000000000000021D = {isa = XCBuildConfiguration; buildSettings = {CENGINE_TEAM_IDENTIFIER = "$(DEVELOPMENT_TEAM)"; CODE_SIGN_ENTITLEMENTS = Configuration/cengine-app.entitlements; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; CURRENT_PROJECT_VERSION = 1; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Configuration/cengine-app-Info.plist; MARKETING_VERSION = 0.0.9; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.app; PRODUCT_MODULE_NAME = CEngineApp; PRODUCT_NAME = cengine;}; name = Release; };
+		CE000000000000000000021E = {isa = XCBuildConfiguration; buildSettings = {CENGINE_TEAM_IDENTIFIER = ""; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; CREATE_INFOPLIST_SECTION_IN_BINARY = YES; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Configuration/network-helper-Info.plist; MARKETING_VERSION = 0.0.9; OTHER_SWIFT_FLAGS = "$(inherited) -parse-as-library"; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.network-helper; PRODUCT_NAME = cengine-network-helper;}; name = Debug; };
+		CE000000000000000000021F = {isa = XCBuildConfiguration; buildSettings = {CENGINE_TEAM_IDENTIFIER = "$(DEVELOPMENT_TEAM)"; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; CREATE_INFOPLIST_SECTION_IN_BINARY = YES; CURRENT_PROJECT_VERSION = 1; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Configuration/network-helper-Info.plist; MARKETING_VERSION = 0.0.9; OTHER_SWIFT_FLAGS = "$(inherited) -parse-as-library"; PRODUCT_BUNDLE_IDENTIFIER = dev.cengine.network-helper; PRODUCT_NAME = cengine-network-helper;}; name = Release; };
+		CE0000000000000000000220 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "dev.cengine.app-tests"; PRODUCT_NAME = "$(TARGET_NAME)"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/cengine.app/Contents/MacOS/cengine";}; name = Debug; };
+		CE0000000000000000000221 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "dev.cengine.app-tests"; PRODUCT_NAME = "$(TARGET_NAME)"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/cengine.app/Contents/MacOS/cengine";}; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -166,6 +202,9 @@
 		CE0000000000000000000133 = {isa = XCConfigurationList; buildConfigurations = (CE0000000000000000000216, CE0000000000000000000217,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		CE0000000000000000000134 = {isa = XCConfigurationList; buildConfigurations = (CE0000000000000000000218, CE0000000000000000000219,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		CE0000000000000000000135 = {isa = XCConfigurationList; buildConfigurations = (CE000000000000000000021A, CE000000000000000000021B,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		CE0000000000000000000136 = {isa = XCConfigurationList; buildConfigurations = (CE000000000000000000021C, CE000000000000000000021D,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		CE0000000000000000000137 = {isa = XCConfigurationList; buildConfigurations = (CE000000000000000000021E, CE000000000000000000021F,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		CE0000000000000000000138 = {isa = XCConfigurationList; buildConfigurations = (CE0000000000000000000220, CE0000000000000000000221,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -185,6 +224,7 @@
 		CE00000000000000000000D7 = {isa = XCSwiftPackageProductDependency; package = CE00000000000000000000F1; productName = NIOCore; };
 		CE00000000000000000000D8 = {isa = XCSwiftPackageProductDependency; package = CE00000000000000000000F1; productName = NIOPosix; };
 		CE00000000000000000000D9 = {isa = XCSwiftPackageProductDependency; package = CE00000000000000000000F1; productName = NIOHTTP1; };
+		CE00000000000000000000DA = {isa = XCSwiftPackageProductDependency; package = CE00000000000000000000F1; productName = NIOEmbedded; };
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = CE0000000000000000000001 /* Project object */;

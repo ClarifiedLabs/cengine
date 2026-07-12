@@ -1,9 +1,7 @@
 # Release Process
 
-cengine releases include signed, notarized `.pkg` installers for direct
-downloads and `.dmg` images used by Homebrew. Both are published to GitHub
-Releases; the signed binary in the notarized DMG is installed by the formula in
-`ClarifiedLabs/homebrew-tap`.
+cengine releases use one signed, notarized `.pkg` for direct downloads and the
+Homebrew Cask in `ClarifiedLabs/homebrew-tap`.
 
 ## Workflows
 
@@ -13,7 +11,7 @@ for a successful test run for the same commit before packaging.
 
 `release-ci` exercises the full signing and notarization paths and uploads both
 artifacts to Actions. It does not create a GitHub Release or update Homebrew.
-Tag runs publish both artifacts and update the Homebrew formula to use the DMG.
+Tag runs publish the package and update the Homebrew Cask to use it.
 
 ## Required Secrets
 
@@ -36,8 +34,8 @@ The Homebrew GitHub App must have Contents read/write access to
 git push origin HEAD:release-ci
 ```
 
-The resulting `cengine-<version>.pkg` and `cengine-<version>.dmg` artifacts must
-pass signature inspection, stapler validation, and Gatekeeper assessment.
+The resulting `cengine-<version>.pkg` must pass nested signature inspection,
+stapler validation, and Gatekeeper assessment.
 
 ## Create a Release
 
@@ -59,14 +57,11 @@ For a local payload-only package:
 ```bash
 make package
 pkgutil --payload-files dist/cengine-0.0.1.pkg
-hdiutil verify dist/cengine-0.0.1.dmg
+pkgutil --check-signature dist/cengine-0.0.1.pkg
 ```
 
-Homebrew users run `brew services start cengine`; its managed entrypoint
-provisions the kernel, runtime, Docker context, and Buildx builder. PKG users
-run `cengine system install` to install the equivalent cengine-owned
-LaunchAgent.
+Users open `cengine.app`; it registers the bundled engine LaunchAgent and offers
+the optional privileged networking helper during onboarding.
 
-The PKG installs directly into `/usr/local/bin` and therefore requests
-administrator authorization. Homebrew installs the executable from the DMG in
-its Cellar and links it into the Homebrew prefix without administrator access.
+The PKG installs `/Applications/cengine.app` and `/usr/local/bin/cengine` and
+therefore requests administrator authorization. Homebrew installs the same PKG.

@@ -13,8 +13,7 @@ make package
 
 `make test` runs `CEngineCoreTests` and `CEngineAPITests` through the shared
 `cengine` scheme. `make dist-cli` runs the tests and stages `dist/cengine`.
-`make package` creates `dist/cengine-0.0.1.pkg` and
-`dist/cengine-0.0.1.dmg` for local release-artifact testing.
+`make package` creates `dist/cengine-0.0.1.pkg` for local release-artifact testing.
 
 `make test-compat` builds the debug daemon, creates a cached Python virtual
 environment under `.build`, and runs the Docker API and Docker Compose 5.3.1
@@ -87,12 +86,11 @@ compatibility ledger and test provenance.
 
 ## Local installation and metadata-only development
 
-The Homebrew service runs `cengine service run`, which downloads the pinned
-Kata kernel and verifies its SHA-256 digest, creates the `cengine` Docker
-context, starts the daemon, and creates the pinned `cengine-builder` Buildx
-builder when Buildx is installed. The signed PKG retains `cengine system
-install` for its `dev.cengine.engine` LaunchAgent. Both service paths use a
-shared socket lock and do not change the active Docker context.
+The signed app registers its bundled `dev.cengine.engine` LaunchAgent with
+`SMAppService`. The agent downloads the pinned Kata kernel, creates the cengine
+Docker context, starts the daemon, and configures the Buildx builder. The
+optional `dev.cengine.network-helper` LaunchDaemon binds exact specific-IP
+ports below 1024 and returns descriptors to the engine over authenticated XPC.
 
 To develop without downloading a kernel or starting VMs:
 
@@ -103,10 +101,8 @@ DOCKER_HOST=unix://$HOME/.cengine/run/docker.sock docker info
 
 ## Releases
 
-Public releases include Developer ID signed, notarized, stapled `.pkg`
-installers for direct download and `.dmg` images used by Homebrew without
-administrator access. They are published through GitHub Releases and
-`ClarifiedLabs/homebrew-tap`. See
+Public releases use one Developer ID signed, notarized, stapled `.pkg` for
+direct download and the Homebrew Cask. See
 [`release.md`](release.md) for the release process.
 
 Note: this project was created as part of testing gpt-5.6-sol. Planning used

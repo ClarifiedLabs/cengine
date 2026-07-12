@@ -24,8 +24,7 @@ enum SystemManager {
         let domain = "gui/\(getuid())"
         _ = try? run("/bin/launchctl", ["bootout", domain + "/" + label])
         try? FileManager.default.removeItem(at: launchAgentURL)
-        _ = try? runDocker(["buildx", "rm", "--force", "cengine-builder"])
-        _ = try? runDocker(["context", "rm", "-f", "cengine"])
+        DockerIntegration.remove()
         try? writeState(.stopped, message: nil, paths: paths)
         print("cengine service and Docker integration removed; data was preserved at \(paths.data.path)")
     }
@@ -40,14 +39,14 @@ enum SystemManager {
     }
 
     static func configureBuildx() {
-        guard executable(named: "docker") != nil else { return }
-        guard (try? runDocker(["buildx", "version"])) != nil else {
+        guard DockerIntegration.executable(named: "docker") != nil else { return }
+        guard (try? DockerIntegration.runDocker(["buildx", "version"])) != nil else {
             warn("Docker Buildx is not installed; container builds will be unavailable")
             return
         }
-        if (try? runDocker(["buildx", "inspect", "cengine-builder"])) == nil {
+        if (try? DockerIntegration.runDocker(["buildx", "inspect", "cengine-builder"])) == nil {
             do {
-                try runDocker([
+                try DockerIntegration.runDocker([
                     "buildx", "create", "--name", "cengine-builder", "--driver", "docker-container",
                     "--driver-opt", "image=moby/buildkit:v0.27.1",
                     "--buildkitd-flags", "--oci-worker-snapshotter=native", "cengine",
@@ -105,16 +104,16 @@ enum SystemManager {
     }
 
     private static func configureDockerContext(paths: EnginePaths) {
-        guard executable(named: "docker") != nil else {
+        guard DockerIntegration.executable(named: "docker") != nil else {
             print("Docker CLI not found; skipping context and Buildx configuration")
             return
         }
         let expected = "unix://\(paths.socket.path)"
-        if let current = try? runDocker(["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"]),
+        if let current = try? DockerIntegration.runDocker(["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"]),
            current.trimmingCharacters(in: .whitespacesAndNewlines) == expected { return }
         do {
-            _ = try? runDocker(["context", "rm", "-f", "cengine"])
-            try runDocker(["context", "create", "cengine", "--docker", "host=\(expected)", "--description", "cengine (Apple Containerization)"])
+            _ = try? DockerIntegration.runDocker(["context", "rm", "-f", "cengine"])
+            try DockerIntegration.runDocker(["context", "create", "cengine", "--docker", "host=\(expected)", "--description", "cengine (Apple Containerization)"])
         } catch {
             warn("could not configure Docker context: \(error.localizedDescription)")
         }
@@ -122,20 +121,6 @@ enum SystemManager {
 
     private static func warn(_ message: String) {
         FileHandle.standardError.write(Data("cengine: warning: \(message)\n".utf8))
-    }
-
-    @discardableResult private static func runDocker(_ arguments: [String]) throws -> String {
-        guard let docker = executable(named: "docker") else { throw EngineError(.notFound, "docker CLI not found") }
-        return try run(docker, arguments)
-    }
-
-    private static func executable(named name: String) -> String? {
-        let path = (ProcessInfo.processInfo.environment["PATH"] ?? "") + ":/opt/homebrew/bin:/usr/local/bin"
-        for directory in path.split(separator: ":") {
-            let candidate = URL(filePath: String(directory)).appending(path: name).path
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
-        }
-        return nil
     }
 
     @discardableResult private static func run(_ executable: String, _ arguments: [String]) throws -> String {

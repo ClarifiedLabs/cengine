@@ -12,8 +12,8 @@ def main() -> None:
         "- release-ci", "v*.*.*", "require-tests:", "needs: require-tests",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
-        "Upload release artifacts", ".pkg", ".dmg", "DMG_SHA256",
-        "Verify Homebrew formula installation", "brew services info cengine",
+        "Upload release artifacts", ".pkg", "PKG_SHA256",
+        "Verify Homebrew Cask installation",
         "--check-notarization", "com.apple.security.virtualization",
     ):
         require_contains(release, needle, "release.yml")

@@ -22,6 +22,8 @@
 	<string>$(CENGINE_BUILD_TIME)</string>
 	<key>CEngineGitCommit</key>
 	<string>$(CENGINE_GIT_COMMIT)</string>
+	<key>CEngineTeamIdentifier</key>
+	<string>$(CENGINE_TEAM_IDENTIFIER)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 </dict>

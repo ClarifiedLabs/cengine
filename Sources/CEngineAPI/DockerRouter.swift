@@ -42,7 +42,7 @@ public struct DockerRouter: Sendable {
         catch let error as DecodingError {
             return dockerErrorResponse(EngineError(.badRequest, "invalid request body: \(error.localizedDescription)"))
         }
-        catch { return json(status: .internalServerError, DockerErrorBody(message: error.localizedDescription)) }
+        catch { return json(status: .internalServerError, DockerErrorBody(message: EngineError.message(for: error))) }
     }
 
     private func handle(_ request: APIRequest) async throws -> APIResponse {

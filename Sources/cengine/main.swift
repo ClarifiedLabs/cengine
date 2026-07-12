@@ -112,6 +112,11 @@ private final class DaemonLock {
             return
         }
         let paths = EnginePaths()
+        do {
+            try DaemonLog.redirectStandardStreams(to: paths.logs.appending(path: "daemon.log"))
+        } catch {
+            FileHandle.standardError.write(Data("cengine: could not open daemon log: \(error.localizedDescription)\n".utf8))
+        }
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
         let runner = Task { try await runManagedService(paths: paths) }
@@ -143,7 +148,7 @@ private final class DaemonLock {
                 let permanent = isPermanentProvisioningError(error)
                 if permanent || attempt == retryDelays.count {
                     try? SystemManager.writeState(.failed, message: message, paths: paths)
-                    FileHandle.standardError.write(Data("cengine: service provisioning failed: \(message)\nRun `brew services restart cengine` after correcting the problem.\n".utf8))
+                    FileHandle.standardError.write(Data("cengine: service provisioning failed: \(message)\nRelaunch the cengine app after correcting the problem.\n".utf8))
                     return
                 }
                 let delay = retryDelays[attempt]

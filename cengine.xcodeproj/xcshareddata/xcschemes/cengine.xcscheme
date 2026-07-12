@@ -21,6 +21,34 @@
                ReferencedContainer = "container:cengine.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "CE0000000000000000000036"
+               BuildableName = "cengine.app"
+               BlueprintName = "CEngineApp"
+               ReferencedContainer = "container:cengine.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "CE0000000000000000000037"
+               BuildableName = "cengine-network-helper"
+               BlueprintName = "CEngineNetworkHelper"
+               ReferencedContainer = "container:cengine.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -45,6 +73,15 @@
                BlueprintIdentifier = "CE0000000000000000000035"
                BuildableName = "CEngineAPITests.xctest"
                BlueprintName = "CEngineAPITests"
+               ReferencedContainer = "container:cengine.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference skipped = "NO" parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "CE0000000000000000000038"
+               BuildableName = "CEngineAppTests.xctest"
+               BlueprintName = "CEngineAppTests"
                ReferencedContainer = "container:cengine.xcodeproj">
             </BuildableReference>
          </TestableReference>

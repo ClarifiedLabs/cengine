@@ -14,21 +14,20 @@ Note: this project was created as part of testing out gpt-5.6-sol for the first 
 
 ## Install
 
-Install `cengine` with Homebrew:
+Install the signed cengine app and CLI with Homebrew:
 
 ```sh
-brew install clarifiedlabs/tap/cengine
+brew install --cask clarifiedlabs/tap/cengine
 ```
 
-If upgrading from the former cask package, first run
-`brew uninstall --cask cengine`.
-
-Start the per-user service. On its first start, cengine downloads and verifies
-the Linux kernel, initializes its runtime, and configures the Docker context and
-Buildx builder when the Docker CLI is available:
+Open `/Applications/cengine.app`. On first launch, cengine enables its per-user
+engine service, downloads and verifies the Linux kernel, initializes its runtime,
+and configures the Docker context and Buildx builder when Docker CLI is available.
+The optional Privileged Ports helper is disabled by default and can be enabled
+during onboarding or later in Settings.
 
 ```sh
-brew services start cengine
+open /Applications/cengine.app
 ```
 
 Check that the engine is ready:
@@ -88,22 +87,24 @@ Switch back to Docker's standard context with:
 docker context use default
 ```
 
-To stop the service and remove the Homebrew package while preserving images,
-container data, the kernel, and Docker integration:
+Use **Uninstall cengine…** in the app to remove services, Docker integration,
+the app, and CLI while preserving images and container data by default. Homebrew
+users can instead run:
 
 ```sh
-brew services stop cengine
-brew uninstall cengine
+brew uninstall --cask cengine
 ```
 
-Run `cengine system uninstall` before `brew uninstall cengine` if the Docker
-context and Buildx builder should also be removed.
+which also unregisters the background services and removes the `cengine` Docker
+context and `cengine-builder` Buildx builder. Add `--zap` to delete images,
+containers, and logs as well. Dragging only the app to Trash is not a complete
+uninstall because macOS does not invoke package or `SMAppService` cleanup hooks
+for ordinary app bundles.
 
 The initial service start can take several minutes while the Kata kernel and
-Apple `vminit` image are downloaded. Inspect progress in
-`$(brew --prefix)/var/log/cengine.log`. Transient provisioning failures are
-retried twice; after three failed attempts, correct the reported problem and
-run `brew services restart cengine`.
+Apple `vminit` image are downloaded. The app reports service state and daemon
+errors; transient provisioning failures are retried twice. The daemon logs to
+`~/Library/Logs/cengine/daemon.log`.
 
 For architecture, development, testing, and implementation details, see
 [`docs/development.md`](docs/development.md). Docker API and Compose support is
