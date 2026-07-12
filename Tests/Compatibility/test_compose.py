@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import pathlib
 import json
 import subprocess
@@ -12,6 +11,8 @@ import uuid
 
 import pytest
 from docker import errors
+
+from harness import docker_environment
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -23,18 +24,18 @@ COMPOSE_VERSION = "5.3.1"
 
 def compose(daemon, project: str, *arguments: str, compose_file=COMPOSE_FILE) -> subprocess.CompletedProcess[str]:
     socket = daemon["socket"]
-    environment = os.environ.copy()
-    environment["DOCKER_HOST"] = f"unix://{socket}"
-    return subprocess.run(
+    result = subprocess.run(
         ["docker", "compose", "-f", str(compose_file), "--project-name", project, *arguments],
         cwd=REPO_ROOT,
-        env=environment,
+        env=docker_environment(socket),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=300,
-        check=True,
     )
+    if result.returncode != 0:
+        pytest.fail(f"Docker Compose {' '.join(arguments)} failed:\n{result.stdout}")
+    return result
 
 
 def compose_json(daemon, project: str, *arguments: str) -> list[dict]:
@@ -57,14 +58,11 @@ def require_compose_version():
 def compose_project(daemon):
     project = f"cenginecompat{uuid.uuid4().hex[:8]}"
     yield project
-    try:
-        compose(daemon, project, "down", "--volumes", "--remove-orphans")
-        compose(
-            daemon, project, "down", "--volumes", "--remove-orphans",
-            compose_file=COMPOSE_VOLUMES_FILE,
-        )
-    except subprocess.CalledProcessError as error:
-        pytest.fail(f"Compose cleanup failed:\n{error.stdout}")
+    compose(daemon, project, "down", "--volumes", "--remove-orphans")
+    compose(
+        daemon, project, "down", "--volumes", "--remove-orphans",
+        compose_file=COMPOSE_VOLUMES_FILE,
+    )
 
 
 @pytest.mark.compat("CMP-001")

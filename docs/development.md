@@ -11,8 +11,9 @@ make dist-cli
 make package
 ```
 
-`make test` runs `CEngineCoreTests` and `CEngineAPITests` through the shared
-`cengine` scheme. `make dist-cli` runs the tests and stages `dist/cengine`.
+`make test` first checks compatibility-harness environment isolation, then runs
+`CEngineCoreTests` and `CEngineAPITests` through the shared `cengine` scheme.
+`make dist-cli` runs the tests and stages `dist/cengine`.
 `make package` creates `dist/cengine-0.0.1.pkg` for local release-artifact testing.
 
 `make test-compat` builds the debug daemon, creates a cached Python virtual
@@ -25,6 +26,11 @@ the kernel installed by the managed service or `cengine system install`; overrid
 Compose plugin with `Scripts/install-compose-compat.sh`. GitHub-hosted runners
 cannot execute the VM-backed suite, so compatibility tests are currently a
 local gate rather than part of `.github/workflows/test.yml`.
+
+The harness removes ambient Docker endpoint overrides from every subprocess,
+checks that the daemon reports the expected Git commit, and verifies Docker CLI
+access to a sentinel resource on the isolated socket before running scenarios.
+Set `CENGINE_EXPECTED_GIT_COMMIT` when testing a custom `CENGINE_BINARY`.
 
 Use `make test-compat-soak` to run three fresh-daemon passes with shuffled test
 ordering. To compare normalized behavior with a real Docker Engine, run

@@ -9,6 +9,8 @@ import uuid
 
 import pytest
 
+from harness import docker_environment
+
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 
@@ -16,10 +18,8 @@ IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 def docker(daemon, *arguments: str, input: str | None = None) -> subprocess.CompletedProcess[str]:
     socket = daemon["socket"]
     assert isinstance(socket, pathlib.Path)
-    environment = os.environ.copy()
-    environment["DOCKER_HOST"] = f"unix://{socket}"
     result = subprocess.run(
-        ["docker", *arguments], env=environment, input=input, text=True,
+        ["docker", *arguments], env=docker_environment(socket), input=input, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
     )
     assert result.returncode == 0, f"docker {' '.join(arguments)} failed:\n{result.stdout}"

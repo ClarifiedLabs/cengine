@@ -17,6 +17,8 @@ import pytest
 from docker import errors
 from docker.types import Mount
 
+from harness import docker_environment
+
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 KNOWN_GAP = pytest.mark.xfail(strict=True)
@@ -309,11 +311,10 @@ def test_container_configuration_round_trip(client: docker.DockerClient):
 
 @pytest.mark.compat("CTR-027")
 def test_container_stats_complete(daemon, top):
-    environment = os.environ.copy()
-    environment["DOCKER_HOST"] = f"unix://{daemon['socket']}"
     result = subprocess.run(
         ["docker", "stats", "--no-stream", "--format", "{{.ID}}", top.id],
-        env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
+        env=docker_environment(daemon["socket"]), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
     )
     assert result.returncode == 0 and result.stdout.strip() == top.id[:12]
 

@@ -213,7 +213,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
-| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster reaches readiness and is deleted through the isolated cengine daemon. |
+| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster creates a fresh dedicated network, reaches readiness, and is deleted through the isolated cengine daemon. |
 
 ## Optional Docker differential oracle
 

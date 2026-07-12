@@ -14,11 +14,33 @@ from dataclasses import dataclass, field
 import docker
 import pytest
 
+from harness import docker_environment
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_BINARY = REPO_ROOT / ".build/xcode-derived/Build/Products/Debug/cengine"
 DEFAULT_KERNEL = pathlib.Path.home() / "Library/Application Support/cengine/assets/vmlinux"
 DEFAULT_IMAGE = "alpine:latest"
+
+
+def expected_git_commit(binary: pathlib.Path) -> str:
+    configured = (
+        os.environ.get("CENGINE_EXPECTED_GIT_COMMIT")
+        or os.environ.get("CENGINE_GIT_COMMIT")
+    )
+    if configured:
+        return configured
+    if binary.resolve() != DEFAULT_BINARY.resolve():
+        pytest.fail(
+            "CENGINE_EXPECTED_GIT_COMMIT is required when CENGINE_BINARY selects a custom binary"
+        )
+    result = subprocess.run(
+        ["git", "rev-parse", "--short=7", "HEAD"], cwd=REPO_ROOT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"could not determine expected cengine commit: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 @dataclass
@@ -167,9 +189,38 @@ def client(daemon: Daemon) -> docker.DockerClient:
     assert isinstance(socket, pathlib.Path)
     value = docker.DockerClient(base_url=f"unix://{socket}", timeout=180, version="auto")
     value.ping()
+    expected = expected_git_commit(daemon.binary)
+    actual = value.version().get("GitCommit")
+    if actual != expected:
+        pytest.fail(
+            f"cengine binary identity mismatch: expected GitCommit {expected}, daemon reports {actual} "
+            f"(binary: {daemon.binary}, socket: {socket})"
+        )
     value.images.pull(os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE))
     yield value
     value.close()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def verify_docker_cli_target(daemon: Daemon, client: docker.DockerClient):
+    name = f"compat-target-{uuid.uuid4().hex[:8]}"
+    network = client.networks.create(name, labels={"dev.cengine.compat": "true"})
+    try:
+        result = subprocess.run(
+            ["docker", "network", "inspect", name, "--format", "{{.Name}}"],
+            env=docker_environment(daemon.socket), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+        )
+        if result.returncode != 0 or result.stdout.strip() != name:
+            pytest.fail(
+                "Docker CLI did not reach the isolated cengine daemon "
+                f"(binary: {daemon.binary}, socket: {daemon.socket}):\n{result.stdout}"
+            )
+    finally:
+        try:
+            network.remove()
+        except docker.errors.NotFound:
+            pass
 
 
 @pytest.fixture(autouse=True)

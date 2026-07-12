@@ -507,7 +507,7 @@ public actor EngineRuntime {
                               driver: String? = nil, internalNetwork: Bool = false,
                               labels: [String: String] = [:], options: [String: String] = [:]) async throws -> NetworkRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid network name: \(name)") }
-        let selectedDriver = driver ?? "bridge"
+        let selectedDriver = driver.flatMap { $0.isEmpty ? nil : $0 } ?? "bridge"
         guard selectedDriver == "bridge" || selectedDriver == "default" else {
             throw EngineError(.unsupported, "network driver \(selectedDriver) is not supported")
         }

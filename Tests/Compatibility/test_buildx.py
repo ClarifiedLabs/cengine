@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import pathlib
 import subprocess
 import time
@@ -12,6 +11,8 @@ import docker
 import pytest
 from docker.types import Mount
 
+from harness import docker_environment
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BUILD_CONTEXT = REPO_ROOT / "Tests/Fixtures/buildx"
@@ -19,10 +20,9 @@ BUILDKIT_IMAGE = "moby/buildkit:v0.27.1"
 
 
 def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    environment["DOCKER_HOST"] = docker_host
     result = subprocess.run(
-        ["docker", "buildx", *arguments], cwd=REPO_ROOT, env=environment, text=True,
+        ["docker", "buildx", *arguments], cwd=REPO_ROOT,
+        env=docker_environment(docker_host), text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
     )
     assert result.returncode == 0, f"docker buildx {' '.join(arguments)} failed:\n{result.stdout}"
@@ -73,11 +73,10 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
         )
         assert "ERROR" not in second.stdout
     finally:
-        environment = os.environ.copy()
-        environment["DOCKER_HOST"] = docker_host
         subprocess.run(
             ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
-            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+            env=docker_environment(docker_host), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=60,
         )
 
 
@@ -115,9 +114,8 @@ def test_buildx_pull_succeeds_after_daemon_restart(daemon, client: docker.Docker
         assert "ERROR" not in result.stdout
         assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"
     finally:
-        environment = os.environ.copy()
-        environment["DOCKER_HOST"] = docker_host
         subprocess.run(
             ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
-            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+            env=docker_environment(docker_host), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=60,
         )

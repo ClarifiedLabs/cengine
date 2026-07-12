@@ -481,6 +481,21 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(connect.status == .ok)
     }
 
+    @Test func composeEmptyNetworkDriverUsesDefaultBridge() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"compose-default","Driver":""}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/networks/compose-default"
+        ))
+        let json = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(json["Driver"] as? String == "bridge")
+    }
+
     @Test func networkPoolsExpandAndInterleaveConfiguredPrivateRanges() throws {
         #expect(try AppleContainerBackend.expand(pool: "192.168.240.0/23") == [
             "192.168.240.0/24", "192.168.241.0/24",
