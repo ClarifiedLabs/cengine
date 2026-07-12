@@ -27,8 +27,19 @@ private struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(AppSection.allCases, selection: $selection) { section in
-                Label(section.title, systemImage: section.icon).tag(section)
+            VStack(spacing: 0) {
+                List(AppSection.allCases, selection: $selection) { section in
+                    Label(section.title, systemImage: section.icon).tag(section)
+                }
+                Divider()
+                SettingsLink {
+                    Label("Settings", systemImage: "gearshape")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             }
             .navigationSplitViewColumnWidth(min: 150, ideal: 180)
         } detail: {
@@ -74,6 +85,26 @@ private struct DashboardView: View {
                 row("Privileged ports", model.helperStatus)
                 row("Version", model.version)
                 row("Resources", model.diskUsage)
+            }
+            if model.helperNeedsApproval {
+                GroupBox {
+                    HStack(alignment: .center, spacing: 16) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Privileged Ports needs administrator approval")
+                                .font(.headline)
+                            Text("Allow cengine in Login Items & Extensions before privileged host ports can be used.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Open Login Items & Extensions…") {
+                            model.openPrivilegedPortApproval()
+                        }
+                    }
+                    .padding(4)
+                }
             }
             Button("Refresh") { Task { await model.refresh() } }
             Spacer()
@@ -163,6 +194,13 @@ private struct SettingsView: View {
                 set: { value in Task { await model.setHelperEnabled(value) } }
             ))
             Text("Allows exact specific-IP bindings for host ports below 1024.").font(.caption).foregroundStyle(.secondary)
+            if model.helperNeedsApproval {
+                HStack {
+                    Text("Administrator approval is required.").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Open Login Items & Extensions…") { model.openPrivilegedPortApproval() }
+                }
+            }
             Divider()
             Button("Uninstall cengine…", role: .destructive) { showingUninstall = true }
         }.padding()

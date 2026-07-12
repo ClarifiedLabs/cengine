@@ -10,6 +10,14 @@ struct ResourceItem: Identifiable, Hashable {
     let detail: String
 }
 
+@MainActor protocol AppService {
+    var status: SMAppService.Status { get }
+    func register() throws
+    func unregister() async throws
+}
+
+extension SMAppService: AppService {}
+
 @MainActor final class AppModel: ObservableObject {
     @Published var engineStatus = "Starting…"
     @Published var helperStatus = "Disabled"
@@ -21,6 +29,7 @@ struct ResourceItem: Identifiable, Hashable {
     @Published var networks: [ResourceItem] = []
     @Published var volumes: [ResourceItem] = []
     @Published var helperEnabled = false
+    @Published var helperNeedsApproval = false
     @Published var builderCPUs: Int
     @Published var builderMemoryGiB: Int
     @Published var builderSettingsStatus: String?
@@ -33,14 +42,21 @@ struct ResourceItem: Identifiable, Hashable {
     let maximumMemoryGiB = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
 
     private let agent = SMAppService.agent(plistName: CEngineServices.agentPlist)
-    private let helper = SMAppService.daemon(plistName: CEngineServices.helperPlist)
+    private let helper: any AppService
+    private let openLoginItemsSettings: () -> Void
     private let client: DockerSocketClient
     private let socketPath: String
     private let builderSettingsURL: URL
     private let containerSettingsURL: URL
     private var refreshTask: Task<Void, Never>?
 
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    init(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        helper: any AppService = SMAppService.daemon(plistName: CEngineServices.helperPlist),
+        openLoginItemsSettings: @escaping () -> Void = { SMAppService.openSystemSettingsLoginItems() }
+    ) {
+        self.helper = helper
+        self.openLoginItemsSettings = openLoginItemsSettings
         let paths = EnginePaths(home: home)
         socketPath = paths.socket.path
         builderSettingsURL = paths.builderSettings
@@ -93,15 +109,34 @@ struct ResourceItem: Identifiable, Hashable {
     func setHelperEnabled(_ enabled: Bool) async {
         do {
             if enabled {
-                if CEngineServices.needsRegistration(helper.status) { try helper.register() }
-                if helper.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+                var registrationError: Error?
+                if CEngineServices.needsRegistration(helper.status) {
+                    do {
+                        try helper.register()
+                    } catch {
+                        registrationError = error
+                    }
+                }
+                if helper.status == .requiresApproval {
+                    // LaunchDaemon registration intentionally returns launch-denied until
+                    // an administrator approves it. The service is registered at this point,
+                    // so guide the user to approval instead of reporting a fatal failure.
+                    openLoginItemsSettings()
+                } else if let registrationError {
+                    throw registrationError
+                }
             } else if helper.status != .notRegistered && helper.status != .notFound {
                 try await helper.unregister()
             }
+            error = nil
         } catch {
             self.error = "Could not update privileged-port support: \(error.localizedDescription)"
         }
         updateServiceStatus()
+    }
+
+    func openPrivilegedPortApproval() {
+        openLoginItemsSettings()
     }
 
     func applyBuilderSettings() async {
@@ -209,6 +244,7 @@ struct ResourceItem: Identifiable, Hashable {
         engineStatus = Self.label(agent.status)
         helperStatus = Self.label(helper.status)
         helperEnabled = helper.status == .enabled || helper.status == .requiresApproval
+        helperNeedsApproval = helper.status == .requiresApproval
     }
 
     private static func label(_ status: SMAppService.Status) -> String {

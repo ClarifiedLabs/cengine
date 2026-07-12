@@ -18,6 +18,66 @@ import CEngineCore
         #expect(!CEngineServices.needsRegistration(.enabled))
         #expect(!CEngineServices.needsRegistration(.requiresApproval))
     }
+
+    @MainActor @Test func launchDeniedRegistrationOpensApprovalSettingsWithoutAnError() async {
+        let helper = MockAppService(
+            status: .notFound,
+            statusAfterRegistration: .requiresApproval,
+            registrationError: NSError(domain: SMAppServiceErrorDomain, code: 1)
+        )
+        var settingsOpenCount = 0
+        let model = AppModel(helper: helper) { settingsOpenCount += 1 }
+
+        await model.setHelperEnabled(true)
+
+        #expect(helper.registerCount == 1)
+        #expect(settingsOpenCount == 1)
+        #expect(model.error == nil)
+        #expect(model.helperNeedsApproval)
+        #expect(model.helperStatus == "Needs approval")
+    }
+
+    @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() async {
+        let helper = MockAppService(
+            status: .notFound,
+            statusAfterRegistration: .notFound,
+            registrationError: NSError(domain: SMAppServiceErrorDomain, code: 1)
+        )
+        var settingsOpenCount = 0
+        let model = AppModel(helper: helper) { settingsOpenCount += 1 }
+
+        await model.setHelperEnabled(true)
+
+        #expect(settingsOpenCount == 0)
+        #expect(model.error?.contains("Could not update privileged-port support") == true)
+    }
+}
+
+@MainActor private final class MockAppService: AppService {
+    var status: SMAppService.Status
+    let statusAfterRegistration: SMAppService.Status
+    let registrationError: Error?
+    var registerCount = 0
+
+    init(
+        status: SMAppService.Status,
+        statusAfterRegistration: SMAppService.Status,
+        registrationError: Error? = nil
+    ) {
+        self.status = status
+        self.statusAfterRegistration = statusAfterRegistration
+        self.registrationError = registrationError
+    }
+
+    func register() throws {
+        registerCount += 1
+        status = statusAfterRegistration
+        if let registrationError { throw registrationError }
+    }
+
+    func unregister() async throws {
+        status = .notRegistered
+    }
 }
 
 @Suite struct EngineAvailabilityTests {
