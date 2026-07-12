@@ -27,8 +27,13 @@ cask "cengine" do
   pkg "cengine-${version}.pkg"
 
   uninstall early_script: {
-              executable: "/Applications/cengine.app/Contents/MacOS/cengine",
-              args: ["--uninstall-support"],
+              executable: "/bin/sh",
+              args: [
+                "-c",
+                'if [ -x "\$1" ]; then "\$1" --uninstall-support; fi',
+                "--",
+                "/Applications/cengine.app/Contents/MacOS/cengine",
+              ],
               must_succeed: false,
             },
             launchctl: ["dev.cengine.engine", "dev.cengine.network-helper"],

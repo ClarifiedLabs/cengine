@@ -29,8 +29,9 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertNotIn('depends_on macos: ">= :tahoe"', cask)
             self.assertIn('pkg "cengine-1.2.3.pkg"', cask)
             self.assertIn("early_script:", cask)
+            self.assertIn('executable: "/bin/sh"', cask)
+            self.assertIn('if [ -x "$1" ]; then "$1" --uninstall-support; fi', cask)
             self.assertIn('"/Applications/cengine.app/Contents/MacOS/cengine"', cask)
-            self.assertIn('"--uninstall-support"', cask)
             self.assertIn("must_succeed: false", cask)
             self.assertIn("launchctl:", cask)
             self.assertIn('"dev.cengine.engine"', cask)
@@ -40,6 +41,19 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn('"/Applications/cengine.app"', cask)
             self.assertIn('"/usr/local/bin/cengine"', cask)
             self.assertFalse((root / "Formula/cengine.rb").exists())
+
+    def test_uninstall_script_skips_missing_app_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([SCRIPT], check=True, env=os.environ | {
+                "TAG": "v1.2.3", "PKG_SHA256": "a" * 64, "TAP_DIR": directory,
+            })
+            cask = (pathlib.Path(directory) / "Casks/cengine.rb").read_text()
+            self.assertIn('executable: "/bin/sh"', cask)
+            self.assertIn('if [ -x "$1" ]; then "$1" --uninstall-support; fi', cask)
+            self.assertNotIn(
+                'executable: "/Applications/cengine.app/Contents/MacOS/cengine"',
+                cask,
+            )
 
     def test_rejects_invalid_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
