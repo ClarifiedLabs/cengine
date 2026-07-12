@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
+import time
 import uuid
 
 import docker
@@ -71,6 +72,48 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
             docker_host=docker_host,
         )
         assert "ERROR" not in second.stdout
+    finally:
+        environment = os.environ.copy()
+        environment["DOCKER_HOST"] = docker_host
+        subprocess.run(
+            ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+        )
+
+
+@pytest.mark.compat("BLD-002")
+def test_buildx_pull_succeeds_after_daemon_restart(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    builder = f"compat-recovery-builder-{suffix}"
+    tag = f"compat-recovery-buildx:{suffix}"
+    docker_host = f"unix://{daemon.socket}"
+    try:
+        buildx(
+            "create", "--name", builder, "--driver", "docker-container",
+            "--driver-opt", f"image={BUILDKIT_IMAGE}",
+            "--driver-opt", "memory=4294967296",
+            "--buildkitd-flags", "--oci-worker-snapshotter=native",
+            docker_host, docker_host=docker_host,
+        )
+        buildx("inspect", "--builder", builder, "--bootstrap", docker_host=docker_host)
+        daemon.restart(kill=True)
+
+        deadline = time.monotonic() + 30
+        while True:
+            buildkit = client.containers.get(f"buildx_buildkit_{builder}0")
+            buildkit.reload()
+            if buildkit.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"buildkit did not recover after daemon restart: {buildkit.attrs['State']}")
+            time.sleep(0.2)
+
+        result = buildx(
+            "build", "--builder", builder, "--pull", "--no-cache", "--load",
+            "--tag", tag, str(BUILD_CONTEXT), docker_host=docker_host,
+        )
+        assert "ERROR" not in result.stdout
+        assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"
     finally:
         environment = os.environ.copy()
         environment["DOCKER_HOST"] = docker_host

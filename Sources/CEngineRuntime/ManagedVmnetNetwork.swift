@@ -4,13 +4,13 @@ import Containerization
 import ContainerizationExtras
 import CoreFoundation
 import Darwin
+import Synchronization
 import Virtualization
 import vmnet
-import XPC
 
 /// Owns a vmnet reservation explicitly. Containerization's value-type
 /// `VmnetNetwork` does not provide a place to release the retained C handle.
-private final class ManagedVmnetHandle: @unchecked Sendable {
+fileprivate final class ManagedVmnetHandle: @unchecked Sendable {
     let reference: vmnet_network_ref
 
     init(_ reference: vmnet_network_ref) {
@@ -22,9 +22,21 @@ private final class ManagedVmnetHandle: @unchecked Sendable {
     }
 }
 
-struct ManagedVmnetNetwork {
+final class ManagedVmnetNetwork: @unchecked Sendable {
+    private struct AllocationState: ~Copyable {
+        var allocations: [String: (ipv4: UInt32, ipv6: UInt128?)] = [:]
+        var nextIPv4Offset: UInt32 = 2
+        var nextIPv6Offset: UInt32 = 2
+    }
+
     struct Interface: Containerization.Interface, VZInterface, Sendable {
+        fileprivate enum Attachment: Sendable {
+            case direct(ManagedVmnetHandle)
+            case filtered(FilteredVmnetEndpoint)
+        }
+
         fileprivate let handle: ManagedVmnetHandle
+        fileprivate let attachment: Attachment
         let ipv4Address: CIDRv4
         let ipv4Gateway: IPv4Address?
         let ipv6Address: CIDRv6?
@@ -33,16 +45,23 @@ struct ManagedVmnetNetwork {
         let mtu: UInt32 = 1500
 
         func device() throws -> VZVirtioNetworkDeviceConfiguration {
-            let configuration = VZVirtioNetworkDeviceConfiguration()
-            configuration.attachment = VZVmnetNetworkDeviceAttachment(network: handle.reference)
-            return configuration
+            switch attachment {
+            case .direct(let handle):
+                let configuration = VZVirtioNetworkDeviceConfiguration()
+                configuration.attachment = VZVmnetNetworkDeviceAttachment(network: handle.reference)
+                return configuration
+            case .filtered(let endpoint):
+                return try endpoint.device(mtu: mtu, macAddress: macAddress)
+            }
+        }
+
+        func stop() {
+            if case .filtered(let endpoint) = attachment { endpoint.stop() }
         }
     }
 
     private let handle: ManagedVmnetHandle
-    private var allocations: [String: (ipv4: UInt32, ipv6: UInt128?)] = [:]
-    private var nextIPv4Offset: UInt32 = 2
-    private var nextIPv6Offset: UInt32 = 2
+    private let allocationState = Mutex(AllocationState())
     let subnet: CIDRv4
     let prefixV6: CIDRv6?
 
@@ -66,79 +85,85 @@ struct ManagedVmnetNetwork {
         self.prefixV6 = Self.readIPv6(reference)
     }
 
-    init(serialization: Data) throws {
-        let object = try XPCArchive.decode(serialization)
-        var status: vmnet_return_t = .VMNET_FAILURE
-        guard let reference = vmnet_network_create_with_serialization(object, &status), status == .VMNET_SUCCESS else {
-            throw EngineError(.internalError, "failed to restore serialized vmnet network with status \(status)")
-        }
-        self.handle = ManagedVmnetHandle(reference)
-        self.subnet = try Self.readIPv4(reference)
-        self.prefixV6 = Self.readIPv6(reference)
-    }
-
-    func serialization() throws -> Data {
-        var status: vmnet_return_t = .VMNET_FAILURE
-        guard let object = vmnet_network_copy_serialization(handle.reference, &status), status == .VMNET_SUCCESS else {
-            throw EngineError(.internalError, "failed to serialize vmnet network with status \(status)")
-        }
-        return try XPCArchive.encode(object)
-    }
-
-    mutating func createInterface(
-        _ id: String, withDefaultRoute: Bool, requestedIPv4: CIDRv4? = nil, requestedIPv6: CIDRv6? = nil
-    ) throws -> Interface {
-        guard allocations[id] == nil else {
-            throw EngineError(.conflict, "network allocation already exists for \(id)")
-        }
-        let ipv4Value: UInt32
-        if let requestedIPv4 {
-            guard subnet.contains(requestedIPv4.address), !allocations.values.contains(where: { $0.ipv4 == requestedIPv4.address.value }) else {
-                throw EngineError(.conflict, "requested IPv4 address is unavailable")
+    func createInterface(
+        _ id: String, withDefaultRoute: Bool, requestedIPv4: CIDRv4? = nil, requestedIPv6: CIDRv6? = nil,
+        isolateIPv4: Bool = false, isolateIPv6: Bool = false
+    ) async throws -> Interface {
+        let (ipv4Value, ipv6Value) = try allocationState.withLock { state -> (UInt32, UInt128?) in
+            guard state.allocations[id] == nil else {
+                throw EngineError(.conflict, "network allocation already exists for \(id)")
             }
-            ipv4Value = requestedIPv4.address.value
-        } else {
-            let used = Set(allocations.values.map(\.ipv4))
-            guard let offset = Self.availableOffset(startingAt: nextIPv4Offset, where: { !used.contains(subnet.lower.value + $0) }) else {
-                throw EngineError(.conflict, "network has no available IPv4 addresses")
+            let ipv4Value: UInt32
+            if let requestedIPv4 {
+                guard subnet.contains(requestedIPv4.address),
+                      !state.allocations.values.contains(where: { $0.ipv4 == requestedIPv4.address.value }) else {
+                    throw EngineError(.conflict, "requested IPv4 address is unavailable")
+                }
+                ipv4Value = requestedIPv4.address.value
+            } else {
+                let used = Set(state.allocations.values.map(\.ipv4))
+                guard let offset = Self.availableOffset(
+                    startingAt: state.nextIPv4Offset,
+                    where: { !used.contains(subnet.lower.value + $0) }
+                ) else {
+                    throw EngineError(.conflict, "network has no available IPv4 addresses")
+                }
+                state.nextIPv4Offset = Self.nextOffset(after: offset)
+                ipv4Value = subnet.lower.value + offset
             }
-            nextIPv4Offset = Self.nextOffset(after: offset)
-            ipv4Value = subnet.lower.value + offset
+            let ipv6Value: UInt128?
+            if let requestedIPv6 {
+                guard prefixV6?.contains(requestedIPv6.address) == true,
+                      !state.allocations.values.contains(where: { $0.ipv6 == requestedIPv6.address.value }) else {
+                    throw EngineError(.conflict, "requested IPv6 address is unavailable")
+                }
+                ipv6Value = requestedIPv6.address.value
+            } else if let prefixV6 {
+                let used = Set(state.allocations.values.compactMap(\.ipv6))
+                let base = prefixV6.address.value & prefixV6.prefix.prefixMask128
+                guard let offset = Self.availableOffset(
+                    startingAt: state.nextIPv6Offset,
+                    where: { !used.contains(base | UInt128($0)) }
+                ) else {
+                    throw EngineError(.conflict, "network has no available IPv6 addresses")
+                }
+                state.nextIPv6Offset = Self.nextOffset(after: offset)
+                ipv6Value = base | UInt128(offset)
+            } else {
+                ipv6Value = nil
+            }
+            state.allocations[id] = (ipv4Value, ipv6Value)
+            return (ipv4Value, ipv6Value)
         }
-        let ipv6Value: UInt128?
-        if let requestedIPv6 {
-            guard prefixV6?.contains(requestedIPv6.address) == true,
-                  !allocations.values.contains(where: { $0.ipv6 == requestedIPv6.address.value }) else {
-                throw EngineError(.conflict, "requested IPv6 address is unavailable")
-            }
-            ipv6Value = requestedIPv6.address.value
-        } else if let prefixV6 {
-            let used = Set(allocations.values.compactMap(\.ipv6))
-            let base = prefixV6.address.value & prefixV6.prefix.prefixMask128
-            guard let offset = Self.availableOffset(startingAt: nextIPv6Offset, where: { !used.contains(base | UInt128($0)) }) else {
-                throw EngineError(.conflict, "network has no available IPv6 addresses")
-            }
-            nextIPv6Offset = Self.nextOffset(after: offset)
-            ipv6Value = base | UInt128(offset)
-        } else {
-            ipv6Value = nil
-        }
-        allocations[id] = (ipv4Value, ipv6Value)
         let ipv4 = try CIDRv4(IPv4Address(ipv4Value), prefix: subnet.prefix)
         let ipv6 = try ipv6Value.flatMap { value in
             try prefixV6.map { try CIDRv6(IPv6Address(value), prefix: $0.prefix) }
         }
+        let attachment: Interface.Attachment
+        if isolateIPv4 || isolateIPv6 {
+            do {
+                attachment = .filtered(try await FilteredVmnetEndpoint.start(
+                    network: handle.reference, subnet: subnet, prefixV6: prefixV6,
+                    isolateIPv4: isolateIPv4, isolateIPv6: isolateIPv6
+                ))
+            } catch {
+                allocationState.withLock { _ = $0.allocations.removeValue(forKey: id) }
+                throw error
+            }
+        } else {
+            attachment = .direct(handle)
+        }
         return Interface(
-            handle: handle,
+            handle: handle, attachment: attachment,
             ipv4Address: ipv4,
-            ipv4Gateway: withDefaultRoute ? ipv4Gateway : nil,
+            ipv4Gateway: withDefaultRoute && !isolateIPv4 ? ipv4Gateway : nil,
             ipv6Address: ipv6,
-            ipv6Gateway: withDefaultRoute ? ipv6Gateway : nil
+            ipv6Gateway: withDefaultRoute && !isolateIPv6 ? ipv6Gateway : nil
         )
     }
 
-    mutating func releaseInterface(_ id: String) {
-        allocations.removeValue(forKey: id)
+    func releaseInterface(_ id: String) {
+        allocationState.withLock { _ = $0.allocations.removeValue(forKey: id) }
     }
 
     private static func availableOffset(startingAt start: UInt32, where available: (UInt32) -> Bool) -> UInt32? {

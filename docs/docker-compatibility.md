@@ -26,11 +26,11 @@ digests.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-014`, `CTR-019`–`CTR-024`, `CTR-026`, `CTR-029`, `CTR-031`–`CTR-033`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-014`, `CTR-019`–`CTR-024`, `CTR-026`, `CTR-029`, `CTR-031`–`CTR-034`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-025`, `CTR-027`, `CTR-028`, `CTR-030`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
-| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `NET-001`–`NET-006`, `VOL-001`–`VOL-005`, `CLI-005` | SCTP is not assessed. |
-| Images and build | `IMG-001`–`IMG-015`, `BLD-001` | Authenticated push and pull-back use a pinned local registry. |
-| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-002` | Recovery is covered during log following and stats streaming. |
+| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `NET-001`–`NET-012`, `VOL-001`–`VOL-005`, `CLI-005` | SCTP is not assessed. |
+| Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-002` | Authenticated push and pull-back use a pinned local registry. |
+| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-003` | Recovery is covered during log following, stats streaming, and active network use. |
 | Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
 
 ## API version envelope
@@ -111,6 +111,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-031` | `test_container_and_exec_tty_resize` | ✅ Pass | Support | **cengine-owned.** Running container and exec terminals accept resize requests. |
 | `CTR-032` | `test_log_time_tail_stream_and_timestamp_filters` | ✅ Pass | Support | **cengine-owned.** Snapshot and follow logs honor stream, time, tail, and timestamp options. |
 | `CTR-033` | `test_multiple_containers_stream_stats_concurrently` | ✅ Pass | Support | **cengine-owned.** Multiple simultaneous stats streams produce independent samples. |
+| `CTR-034` | `test_network_none_has_only_loopback` | ✅ Pass | Support | **cengine-owned.** Network mode `none` persists across inspect and exposes only loopback in the guest. |
 
 ## Images
 
@@ -158,6 +159,11 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `NET-005` | `test_occupied_host_port_returns_server_error` | ✅ Pass | Support | **cengine-owned.** Occupied host ports fail container start without stealing the listener. |
 | `NET-006` | `test_concurrent_random_port_allocation_is_unique` | ✅ Pass | Support | **cengine-owned.** Concurrent ephemeral TCP bindings remain unique. |
 | `NET-007` | `test_sequential_network_deletion_releases_vmnet_reservations` | ✅ Pass | Support | **cengine-owned.** More than 119 sequential networks reuse a released vmnet reservation instead of exhausting host resources. |
+| `NET-008` | `test_bridge_network_allows_peers_host_and_internet` | ✅ Pass | Support | **cengine-owned.** A normal bridge reaches peers, macOS host services, and the internet. |
+| `NET-009` | `test_internal_network_allows_peers_and_host_but_not_internet` | ✅ Pass | Support | **cengine-owned.** Docker internal mode retains peer and host access while removing external connectivity. |
+| `NET-010` | `test_isolated_gateway_allows_only_network_peers` | ✅ Pass | Support | **cengine-owned.** Isolated gateway mode permits peer traffic and blocks host and internet traffic. |
+| `NET-011` | `test_isolated_gateway_options_round_trip_and_require_internal` | ✅ Pass | Support | **cengine-owned.** Docker bridge gateway options round-trip and isolated mode requires an internal network. |
+| `NET-012` | `test_isolated_gateway_filter_cannot_be_bypassed_by_adding_a_route` | ✅ Pass | Support | **cengine-owned.** The external frame filter remains effective when a privileged guest adds a default route. |
 | `VOL-001` | `test_volume_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
 | `VOL-002` | `test_empty_named_volume_copies_image_directory` | ✅ Pass | Support | **cengine-owned.** Empty named volumes receive image directory contents. |
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |
@@ -181,6 +187,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
 | `BLD-001` | `test_buildx_load_run_cache_and_volume_copy` | ✅ Pass | Support | The managed native-snapshotter builder supports non-scratch `COPY`, `RUN`, load, cache reuse, and volume initialization. |
+| `BLD-002` | `test_buildx_pull_succeeds_after_daemon_restart` | ✅ Pass | Support | **cengine-owned.** A recovered BuildKit VM regains carrier, DNS, and registry access for a fresh pull. |
 
 ## Daemon recovery
 
@@ -188,6 +195,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 |---|---|---|---|---|
 | `REC-001` | `test_daemon_restart_recovers_resources_and_restart_policy` | ✅ Pass | Support | **cengine-owned.** An abrupt daemon restart preserves resources and restarts an `always` container. |
 | `REC-002` | `test_daemon_restart_during_active_io_and_stats` | ✅ Pass | Support | **cengine-owned.** Recovery remains correct while log and stats streams are active. |
+| `REC-003` | `test_daemon_restart_recreates_usable_network_interfaces` | ✅ Pass | Support | **cengine-owned.** Logical vmnet restoration recreates a carrier-up interface with working DNS and internet access. |
 
 ## Docker CLI
 

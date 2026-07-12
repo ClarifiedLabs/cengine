@@ -112,3 +112,41 @@ def test_daemon_restart_during_active_io_and_stats(daemon, client: docker.Docker
         assert sample["read"] and "cpu_stats" in sample
     finally:
         recovered.close()
+
+
+@pytest.mark.compat("REC-003")
+def test_daemon_restart_recreates_usable_network_interfaces(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    network = client.networks.create(f"compat-network-recovery-{suffix}")
+    container = client.containers.create(
+        IMAGE, command="top", name=f"network-recovery-{suffix}", network=network.name,
+        restart_policy={"Name": "always"},
+    )
+    container.start(); container.reload()
+    code, carrier = container.exec_run(["cat", "/sys/class/net/eth0/carrier"])
+    assert (code, carrier.strip()) == (0, b"1")
+    code, _ = container.exec_run(["sh", "-c", "nslookup registry-1.docker.io >/dev/null && nc -z -w 5 1.1.1.1 443"])
+    assert code == 0
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(container.name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"networked container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        recovered_address = value.attrs["NetworkSettings"]["Networks"][network.name]["IPAddress"]
+        assert recovered_address
+        code, carrier = value.exec_run(["cat", "/sys/class/net/eth0/carrier"])
+        assert (code, carrier.strip()) == (0, b"1")
+        code, output = value.exec_run([
+            "sh", "-c", "nslookup registry-1.docker.io && nc -z -w 5 1.1.1.1 443"
+        ])
+        assert code == 0, output.decode(errors="replace")
+    finally:
+        recovered.close()

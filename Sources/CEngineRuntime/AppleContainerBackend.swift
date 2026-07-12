@@ -168,6 +168,7 @@ public actor AppleContainerBackend: ContainerBackend {
         for bridge in ioBridges.values { bridge.finishOutput() }
         ioBridges.removeAll()
         portForwarder.stopAll()
+        for values in interfaces.values { Self.stopFilteredInterfaces(values) }
         interfaces.removeAll()
         preparedRecords.removeAll()
         preparedImages.removeAll()
@@ -179,22 +180,6 @@ public actor AppleContainerBackend: ContainerBackend {
         _ requested: NetworkRecord, restoring: Bool, allowAutomaticRemap: Bool = true
     ) throws -> NetworkRecord {
         var attempts: [(String, String)] = []
-        if restoring, let serialization = requested.vmnetSerialization {
-            do {
-                let value = try ManagedVmnetNetwork(serialization: serialization)
-                var record = requested
-                record.subnet = value.subnet.description
-                record.gateway = value.ipv4Gateway.description
-                record.ipv6Subnet = value.prefixV6?.description ?? ""
-                record.ipv6Gateway = value.ipv6Gateway?.description ?? ""
-                record.vmnetSerialization = try value.serialization()
-                networks[record.id] = value
-                networkRecords[record.id] = record
-                return record
-            } catch {
-                attempts.append(("serialized reservation", error.localizedDescription))
-            }
-        }
         let used = Set(networkRecords.values.map(\.subnet))
         var candidates: [String] = []
         if !requested.subnet.isEmpty { candidates.append(requested.subnet) }
@@ -237,7 +222,6 @@ public actor AppleContainerBackend: ContainerBackend {
                 record.gateway = value.ipv4Gateway.description
                 record.ipv6Subnet = value.prefixV6?.description ?? ""
                 record.ipv6Gateway = value.ipv6Gateway?.description ?? ""
-                record.vmnetSerialization = try value.serialization()
                 networks[record.id] = value; networkRecords[record.id] = record
                 return record
             } catch { attempts.append((subnet, error.localizedDescription)) }
@@ -301,16 +285,16 @@ public actor AppleContainerBackend: ContainerBackend {
 
         let io = ContainerIOBridge(tty: record.tty, logURL: logRoot.appending(path: "\(record.id).log"))
         let image = try await image(reference: record.image, platform: record.platform, pull: true)
-        if interfaces[record.id] == nil { interfaces[record.id] = try allocateInterfaces(for: record) }
+        if interfaces[record.id] == nil { interfaces[record.id] = try await allocateInterfaces(for: record) }
         preparedRecords[record.id] = record
         preparedImages[record.id] = image
         ioBridges[record.id] = io
     }
 
-    private func allocateInterfaces(for record: ContainerRecord) throws -> [String: any Containerization.Interface] {
+    private func allocateInterfaces(for record: ContainerRecord) async throws -> [String: any Containerization.Interface] {
         var result: [String: any Containerization.Interface] = [:]
         for (index, endpoint) in record.networks.enumerated() {
-            guard var network = networks[endpoint.networkID], let networkRecord = networkRecords[endpoint.networkID] else {
+            guard let network = networks[endpoint.networkID], let networkRecord = networkRecords[endpoint.networkID] else {
                 throw EngineError(.notFound, "network \(endpoint.networkID) is unavailable")
             }
             let allocationID = "\(record.id)-\(endpoint.networkID)"
@@ -319,14 +303,15 @@ public actor AppleContainerBackend: ContainerBackend {
             let requestedIPv6 = endpoint.ipv6AddressIsStatic
                 ? try CIDRv6(IPv6Address(endpoint.ipv6Address ?? ""), prefix: network.prefixV6?.prefix ?? .ipv6(64)!) : nil
             do {
-                result[endpoint.networkID] = try network.createInterface(
+                result[endpoint.networkID] = try await network.createInterface(
                     allocationID, withDefaultRoute: index == 0,
-                    requestedIPv4: requestedIPv4, requestedIPv6: requestedIPv6
+                    requestedIPv4: requestedIPv4, requestedIPv6: requestedIPv6,
+                    isolateIPv4: networkRecord.ipv4GatewayMode == .isolated,
+                    isolateIPv6: networkRecord.ipv6GatewayMode == .isolated
                 )
             } catch {
                 throw EngineError(.badRequest, "could not allocate endpoint on network \(networkRecord.name): \(error.localizedDescription)")
             }
-            networks[endpoint.networkID] = network
         }
         return result
     }
@@ -335,7 +320,7 @@ public actor AppleContainerBackend: ContainerBackend {
         guard let io = ioBridges[record.id] else { throw EngineError(.notFound, "container I/O is unavailable") }
         let volumeRoot = self.volumeRoot
         let staged = stagedCopies[record.id] ?? []
-        guard let interfaceMap = interfaces[record.id], !interfaceMap.isEmpty else { throw EngineError(.internalError, "container network is unavailable") }
+        guard let interfaceMap = interfaces[record.id] else { throw EngineError(.internalError, "container network is unavailable") }
         let configuredInterfaces = record.networks.compactMap { interfaceMap[$0.networkID] }
         let peerHosts = hostEntries(for: record, records: Array(preparedRecords.values))
         guard let image = preparedImages[record.id] else { throw EngineError(.notFound, "prepared image is unavailable") }
@@ -692,10 +677,10 @@ public actor AppleContainerBackend: ContainerBackend {
         preparedRecords.removeValue(forKey: record.id)
         preparedImages.removeValue(forKey: record.id)
         let released = interfaces.removeValue(forKey: record.id) ?? [:]
+        Self.stopFilteredInterfaces(released)
         for networkID in released.keys {
-            guard var network = networks[networkID] else { continue }
-                network.releaseInterface("\(record.id)-\(networkID)")
-            networks[networkID] = network
+            guard let network = networks[networkID] else { continue }
+            network.releaseInterface("\(record.id)-\(networkID)")
         }
         stagedCopies.removeValue(forKey: record.id)
         try? FileManager.default.removeItem(at: stagingRoot.appending(path: record.id))
@@ -804,14 +789,20 @@ public actor AppleContainerBackend: ContainerBackend {
             preparedRecords[id] = record
             guard containers[id] == nil else { continue }
             let old = interfaces.removeValue(forKey: id) ?? [:]
+            Self.stopFilteredInterfaces(old)
             for networkID in old.keys {
-                guard var network = networks[networkID] else { continue }
+                guard let network = networks[networkID] else { continue }
                 network.releaseInterface("\(id)-\(networkID)")
-                networks[networkID] = network
             }
-            interfaces[id] = try allocateInterfaces(for: record)
+            interfaces[id] = try await allocateInterfaces(for: record)
         }
         await synchronizeHosts()
+    }
+
+    private static func stopFilteredInterfaces(_ values: [String: any Containerization.Interface]) {
+        for value in values.values {
+            (value as? ManagedVmnetNetwork.Interface)?.stop()
+        }
     }
 
     private func hostEntries(for record: ContainerRecord, records: [ContainerRecord]) -> [Hosts.Entry] {

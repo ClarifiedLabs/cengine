@@ -129,6 +129,7 @@ public struct DockerRouter: Sendable {
                 record.mounts[index].source = name
             }
             record.ports = ports(from: input)
+            record.networkDisabled = input.HostConfig?.NetworkMode == "none"
             for (networkName, endpoint) in input.NetworkingConfig?.EndpointsConfig ?? [:] {
                 let network = try await runtime.network(networkName)
                 let requestedIPv4 = nonEmpty(endpoint?.IPAMConfig?.IPv4Address) ?? nonEmpty(endpoint?.IPAddress)
@@ -138,6 +139,12 @@ public struct DockerRouter: Sendable {
                     ipv4Address: requestedIPv4, ipv6Address: requestedIPv6,
                     ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil
                 ))
+            }
+            if record.networkDisabled == true, !record.networks.isEmpty {
+                throw EngineError(.badRequest, "network mode none cannot be combined with another network")
+            }
+            if record.networkDisabled == true, !record.ports.isEmpty {
+                throw EngineError(.badRequest, "network mode none cannot be combined with published ports")
             }
             if let networkMode = input.HostConfig?.NetworkMode,
                !networkMode.isEmpty, networkMode != "default", networkMode != "bridge", networkMode != "none" {
@@ -288,8 +295,9 @@ public struct DockerRouter: Sendable {
                 name: input.Name,
                 subnet: ipv4?.Subnet, gateway: ipv4?.Gateway,
                 ipv6Subnet: ipv6?.Subnet, ipv6Gateway: ipv6?.Gateway,
+                driver: input.Driver,
                 internalNetwork: input.Internal ?? false,
-                labels: input.Labels ?? [:]
+                labels: input.Labels ?? [:], options: input.Options ?? [:]
             )
             return json(status: .created, NetworkCreateResponse(Id: network.id, Warning: ""))
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/connect"):
@@ -686,7 +694,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
             $0.map { PortBindingResponse(HostIp: $0.hostIP, HostPort: String($0.hostPort)) }
         }
         let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
-        let networkMode = record.networks.first.flatMap { networkByID[$0.networkID]?.name } ?? "default"
+        let networkMode = record.networkDisabled == true
+            ? "none"
+            : record.networks.first.flatMap { networkByID[$0.networkID]?.name } ?? "default"
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             AutoRemove: record.autoRemove, Privileged: record.privileged,

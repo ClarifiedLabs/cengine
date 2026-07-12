@@ -296,9 +296,11 @@ public struct ContainerSummaryResponse: Codable, Sendable {
 
 public struct NetworkCreateRequest: Decodable, Sendable {
     public let Name: String
+    public var Driver: String?
     public var Internal: Bool?
     public var EnableIPv6: Bool?
     public var Labels: [String: String]?
+    public var Options: [String: String]?
     public var IPAM: IPAMRequest?
     public struct IPAMRequest: Decodable, Sendable { public var Config: [ConfigRequest]? }
     public struct ConfigRequest: Decodable, Sendable { public var Subnet: String?; public var Gateway: String? }
@@ -387,7 +389,7 @@ public struct DockerNetworkResponse: Encodable, Sendable {
     public let Scope = "local"; public let Driver = "bridge"; public let EnableIPv6 = true
     public let IPAM: IPAMResponse; public let Internal: Bool; public let Attachable = false; public let Ingress = false
     public let ConfigFrom: [String: String] = [:]; public let ConfigOnly = false
-    public let Containers: [String: String] = [:]; public let Options: [String: String] = [:]; public let Labels: [String: String]
+    public let Containers: [String: String] = [:]; public let Options: [String: String]; public let Labels: [String: String]
     public struct IPAMResponse: Encodable, Sendable {
         public let Driver = "default"; public let Options: [String: String]? = nil; public let Config: [ConfigResponse]
     }
@@ -398,7 +400,7 @@ public struct DockerNetworkResponse: Encodable, Sendable {
             .init(Subnet: network.subnet, Gateway: network.gateway),
             .init(Subnet: network.ipv6Subnet, Gateway: network.ipv6Gateway),
         ])
-        Internal = network.internalNetwork; Labels = network.labels
+        Internal = network.internalNetwork; Labels = network.labels; Options = network.options ?? [:]
     }
 }
 

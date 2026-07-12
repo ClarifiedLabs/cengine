@@ -54,9 +54,25 @@ network an RFC 4193 ULA `/64`. Override the IPv4 pools with
 Pool entries must be unique RFC 1918 ranges containing complete `/24`s. Cengine
 asks vmnet to reserve each candidate directly; it does not pre-screen the host
 routing table. Networks are always dual-stack because vmnet supplies IPv6 even
-when Docker clients send `EnableIPv6: false`. Cengine persists vmnet's opaque
-network serialization so an abruptly restarted daemon can reclaim the same
-reservation before falling back to subnet remapping.
+when Docker clients send `EnableIPv6: false`. Cengine persists logical network
+configuration and recreates vmnet reservations after daemon restart, remapping
+only automatically allocated subnets when the previous range is unavailable.
+
+Network access follows Docker's bridge modes:
+
+| Configuration | Network peers | macOS host services | Internet |
+|---|---:|---:|---:|
+| Default bridge | Yes | Yes | Yes |
+| `docker network create --internal` | Yes | Yes | No |
+| Internal bridge with gateway mode `isolated` | Yes | No | No |
+| `docker run --network none` | No (loopback only) | No | No |
+
+Use `--internal` with
+`com.docker.network.bridge.gateway_mode_ipv4=isolated` and/or
+`com.docker.network.bridge.gateway_mode_ipv6=isolated` when containers must not
+reach macOS host services. Isolated traffic is enforced outside the guest by a
+frame-filtered vmnet data path, so a privileged container cannot bypass it by
+adding its own route. Ordinary bridge networks retain vmnet's direct attachment.
 
 ## Usage
 

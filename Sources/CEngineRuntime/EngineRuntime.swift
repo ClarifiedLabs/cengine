@@ -63,7 +63,8 @@ public actor EngineRuntime {
         }
         let defaultNetworkID = snapshot.networks.first(where: { $0.name == "default" })?.id
         if let defaultNetworkID {
-            for index in snapshot.containers.indices where snapshot.containers[index].networks.isEmpty {
+            for index in snapshot.containers.indices
+                where snapshot.containers[index].networks.isEmpty && snapshot.containers[index].networkDisabled != true {
                 snapshot.containers[index].networks = [.init(networkID: defaultNetworkID)]
             }
         }
@@ -143,7 +144,8 @@ public actor EngineRuntime {
         guard !snapshot.containers.contains(where: { $0.name == record.name || $0.id == record.id }) else {
             throw EngineError(.conflict, "Conflict. The container name \"/\(record.name)\" is already in use.")
         }
-        if record.networks.isEmpty, let network = snapshot.networks.first(where: { $0.name == "default" }) {
+        if record.networks.isEmpty, record.networkDisabled != true,
+           let network = snapshot.networks.first(where: { $0.name == "default" }) {
             record.networks = [.init(networkID: network.id)]
         }
         try validateEndpoints(record)
@@ -502,8 +504,26 @@ public actor EngineRuntime {
 
     public func createNetwork(name: String, subnet: String? = nil, gateway: String? = nil,
                               ipv6Subnet: String? = nil, ipv6Gateway: String? = nil,
-                              internalNetwork: Bool = false, labels: [String: String] = [:]) async throws -> NetworkRecord {
+                              driver: String? = nil, internalNetwork: Bool = false,
+                              labels: [String: String] = [:], options: [String: String] = [:]) async throws -> NetworkRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid network name: \(name)") }
+        let selectedDriver = driver ?? "bridge"
+        guard selectedDriver == "bridge" || selectedDriver == "default" else {
+            throw EngineError(.unsupported, "network driver \(selectedDriver) is not supported")
+        }
+        let supportedOptions = Set([NetworkRecord.gatewayModeIPv4Option, NetworkRecord.gatewayModeIPv6Option])
+        if let option = options.keys.first(where: { !supportedOptions.contains($0) }) {
+            throw EngineError(.unsupported, "bridge network option \(option) is not supported")
+        }
+        for key in supportedOptions {
+            guard let raw = options[key] else { continue }
+            guard let mode = NetworkGatewayMode(rawValue: raw) else {
+                throw EngineError(.badRequest, "invalid bridge gateway mode \(raw) for \(key)")
+            }
+            if mode == .isolated && !internalNetwork {
+                throw EngineError(.badRequest, "bridge gateway mode isolated requires an internal network")
+            }
+        }
         if let existing = snapshot.networks.first(where: { $0.name == name }) { return existing }
         let requestedSubnet = subnet ?? ""
         let requestedIPv6 = ipv6Subnet ?? ""
@@ -512,7 +532,7 @@ public actor EngineRuntime {
             ipv6Subnet: requestedIPv6, ipv6Gateway: ipv6Gateway ?? "",
             ipv4AllocationMode: subnet == nil ? .automatic : .explicit,
             ipv6AllocationMode: ipv6Subnet == nil ? .automatic : .explicit,
-            internalNetwork: internalNetwork, labels: labels
+            internalNetwork: internalNetwork, labels: labels, options: options
         )
         let record = try await backend.createNetwork(requested)
         snapshot.networks.append(record)

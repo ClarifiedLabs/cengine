@@ -6,6 +6,34 @@ import Foundation
 import NIOHTTP1
 import Testing
 
+private func ethernetFrame(etherType: UInt16, payload: [UInt8]) -> [UInt8] {
+    [UInt8](repeating: 0, count: 12) + [UInt8(etherType >> 8), UInt8(etherType & 0xff)] + payload
+}
+
+private func ipv4Frame(source: [UInt8], destination: [UInt8]) -> [UInt8] {
+    var header = [UInt8](repeating: 0, count: 20)
+    header[0] = 0x45
+    header.replaceSubrange(12..<16, with: source)
+    header.replaceSubrange(16..<20, with: destination)
+    return ethernetFrame(etherType: 0x0800, payload: header)
+}
+
+private func arpFrame(source: [UInt8], target: [UInt8]) -> [UInt8] {
+    var payload = [UInt8](repeating: 0, count: 28)
+    payload[1] = 1; payload[2] = 0x08; payload[4] = 6; payload[5] = 4; payload[7] = 1
+    payload.replaceSubrange(14..<18, with: source)
+    payload.replaceSubrange(24..<28, with: target)
+    return ethernetFrame(etherType: 0x0806, payload: payload)
+}
+
+private func ipv6Frame(source: [UInt8], destination: [UInt8], nextHeader: UInt8 = 58, type: UInt8 = 135) -> [UInt8] {
+    var header = [UInt8](repeating: 0, count: 40)
+    header[0] = 0x60; header[6] = nextHeader
+    header.replaceSubrange(8..<24, with: source)
+    header.replaceSubrange(24..<40, with: destination)
+    return ethernetFrame(etherType: 0x86dd, payload: header + [type])
+}
+
 private func versionMetadataBundle() throws -> (Bundle, URL) {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     let bundleURL = root.appending(path: "VersionFixture.bundle", directoryHint: .isDirectory)
@@ -493,6 +521,124 @@ private actor AuthImageBackend: ContainerBackend {
         let dual = try #require(await backend.request(named: "dual"))
         #expect(dual.ipv4AllocationMode == .explicit)
         #expect(dual.ipv6AllocationMode == .explicit)
+    }
+
+    @Test func isolatedGatewayOptionsRoundTripAndRequireInternalNetwork() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let router = DockerRouter(runtime: try await EngineRuntime(root: root, backend: backend), root: root)
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"invalid-isolated","Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
+
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"isolated","Internal":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated","com.docker.network.bridge.gateway_mode_ipv6":"isolated"}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let request = try #require(await backend.request(named: "isolated"))
+        #expect(request.internalNetwork)
+        #expect(request.ipv4GatewayMode == .isolated)
+        #expect(request.ipv6GatewayMode == .isolated)
+
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/networks/isolated"))
+        let json = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let options = try #require(json["Options"] as? [String: String])
+        #expect(options[NetworkRecord.gatewayModeIPv4Option] == "isolated")
+        #expect(options[NetworkRecord.gatewayModeIPv6Option] == "isolated")
+    }
+
+    @Test func networkNonePersistsWithoutAnImplicitDefaultInterface() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var router = DockerRouter(runtime: try await EngineRuntime(root: root), root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=no-network",
+            body: Data(#"{"Image":"alpine","HostConfig":{"NetworkMode":"none"}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        router = DockerRouter(runtime: try await EngineRuntime(root: root), root: root)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/no-network/json"))
+        let json = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(json["HostConfig"] as? [String: Any])
+        let settings = try #require(json["NetworkSettings"] as? [String: Any])
+        #expect(host["NetworkMode"] as? String == "none")
+        #expect((settings["Networks"] as? [String: Any])?.isEmpty == true)
+    }
+
+    @Test func networkNoneRejectsOtherNetworksAndPublishedPorts() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let endpointConflict = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=endpoint-conflict",
+            body: Data(#"{"Image":"alpine","HostConfig":{"NetworkMode":"none"},"NetworkingConfig":{"EndpointsConfig":{"default":{}}}}"#.utf8)
+        ))
+        #expect(endpointConflict.status == .badRequest)
+        let portConflict = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=port-conflict",
+            body: Data(#"{"Image":"alpine","HostConfig":{"NetworkMode":"none","PortBindings":{"80/tcp":[{"HostPort":"8080"}]}}}"#.utf8)
+        ))
+        #expect(portConflict.status == .badRequest)
+    }
+
+    @Test func isolatedGatewayPacketFilterCannotBeBypassedWithAGuestRoute() throws {
+        let filter = IsolatedGatewayPacketFilter(
+            subnet: try CIDRv4("192.168.224.0/24"), prefixV6: nil,
+            isolateIPv4: true, isolateIPv6: false
+        )
+        let peer = ipv4Frame(source: [192, 168, 224, 2], destination: [192, 168, 224, 3])
+        #expect(filter.allows(peer, direction: .guestToNetwork))
+        #expect(filter.allows(peer, direction: .networkToGuest))
+        #expect(!filter.allows(
+            ipv4Frame(source: [192, 168, 224, 2], destination: [192, 168, 224, 1]),
+            direction: .guestToNetwork
+        ))
+        #expect(!filter.allows(
+            ipv4Frame(source: [192, 168, 224, 2], destination: [8, 8, 8, 8]),
+            direction: .guestToNetwork
+        ))
+        #expect(!filter.allows(
+            arpFrame(source: [192, 168, 224, 2], target: [192, 168, 224, 1]),
+            direction: .guestToNetwork
+        ))
+        #expect(filter.allows(
+            arpFrame(source: [192, 168, 224, 2], target: [192, 168, 224, 3]),
+            direction: .guestToNetwork
+        ))
+    }
+
+    @Test func isolatedGatewayPacketFilterAppliesModesPerAddressFamily() throws {
+        let local2 = [UInt8](repeating: 0, count: 15) + [2]
+        let local3 = [UInt8](repeating: 0, count: 15) + [3]
+        let external = [UInt8](repeating: 0x20, count: 16)
+        let filter = IsolatedGatewayPacketFilter(
+            subnet: try CIDRv4("192.168.224.0/24"), prefixV6: try CIDRv6("::/64"),
+            isolateIPv4: true, isolateIPv6: false
+        )
+        #expect(!filter.allows(
+            ipv4Frame(source: [192, 168, 224, 2], destination: [8, 8, 8, 8]),
+            direction: .guestToNetwork
+        ))
+        #expect(filter.allows(ipv6Frame(source: local2, destination: local3), direction: .guestToNetwork))
+        #expect(filter.allows(ipv6Frame(source: local2, destination: external), direction: .guestToNetwork))
+    }
+
+    @Test func isolatedGatewayPacketFilterAllowsDiscoveryButNotHostMulticastServices() throws {
+        let local = [0xfd] + [UInt8](repeating: 0, count: 14) + [2]
+        let multicast = [0xff, 0x02] + [UInt8](repeating: 0, count: 13) + [1]
+        let filter = IsolatedGatewayPacketFilter(
+            subnet: try CIDRv4("192.168.224.0/24"), prefixV6: try CIDRv6("fd00::/64"),
+            isolateIPv4: false, isolateIPv6: true
+        )
+        #expect(filter.allows(
+            ipv6Frame(source: local, destination: multicast), direction: .guestToNetwork
+        ))
+        #expect(!filter.allows(
+            ipv6Frame(source: local, destination: multicast, nextHeader: 17), direction: .guestToNetwork
+        ))
     }
 
     @Test func kindIPv6OnlyNetworkRequestAllocatesIPv4AndAllowsOnlyStaticIPv6() async throws {

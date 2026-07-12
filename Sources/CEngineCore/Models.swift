@@ -119,6 +119,7 @@ public struct ContainerRecord: Codable, Sendable {
     public var ports: [PortBinding]
     public var networks: [NetworkEndpointRecord]
     public var restartCount: Int
+    public var networkDisabled: Bool?
 
     public init(
         id: String = Identifier.random(), name: String, image: String,
@@ -155,12 +156,21 @@ public struct ContainerRecord: Codable, Sendable {
         self.ports = []
         self.networks = []
         self.restartCount = 0
+        self.networkDisabled = false
     }
 }
 
 public enum NetworkAllocationMode: String, Codable, Sendable { case automatic, explicit }
 
+public enum NetworkGatewayMode: String, Codable, Sendable {
+    case nat
+    case isolated
+}
+
 public struct NetworkRecord: Codable, Sendable {
+    public static let gatewayModeIPv4Option = "com.docker.network.bridge.gateway_mode_ipv4"
+    public static let gatewayModeIPv6Option = "com.docker.network.bridge.gateway_mode_ipv6"
+
     public var id: String
     public var name: String
     public var createdAt: Date
@@ -170,21 +180,31 @@ public struct NetworkRecord: Codable, Sendable {
     public var ipv6Gateway: String
     public var ipv4AllocationMode: NetworkAllocationMode
     public var ipv6AllocationMode: NetworkAllocationMode
-    public var vmnetSerialization: Data?
     public var internalNetwork: Bool
     public var labels: [String: String]
+    public var options: [String: String]?
 
     public init(id: String, name: String, createdAt: Date = Date(), subnet: String, gateway: String,
                 ipv6Subnet: String = "", ipv6Gateway: String = "",
                 ipv4AllocationMode: NetworkAllocationMode = .automatic,
-                ipv6AllocationMode: NetworkAllocationMode = .automatic, vmnetSerialization: Data? = nil,
-                internalNetwork: Bool = false, labels: [String: String] = [:]) {
+                ipv6AllocationMode: NetworkAllocationMode = .automatic,
+                internalNetwork: Bool = false, labels: [String: String] = [:],
+                options: [String: String] = [:]) {
         self.id = id; self.name = name; self.createdAt = createdAt; self.subnet = subnet; self.gateway = gateway
         self.ipv6Subnet = ipv6Subnet; self.ipv6Gateway = ipv6Gateway
         self.ipv4AllocationMode = ipv4AllocationMode; self.ipv6AllocationMode = ipv6AllocationMode
-        self.vmnetSerialization = vmnetSerialization
         self.internalNetwork = internalNetwork; self.labels = labels
+        self.options = options
     }
+
+    public var ipv4GatewayMode: NetworkGatewayMode {
+        NetworkGatewayMode(rawValue: options?[Self.gatewayModeIPv4Option] ?? "nat") ?? .nat
+    }
+
+    public var ipv6GatewayMode: NetworkGatewayMode {
+        NetworkGatewayMode(rawValue: options?[Self.gatewayModeIPv6Option] ?? "nat") ?? .nat
+    }
+
 }
 
 public struct VolumeRecord: Codable, Sendable {

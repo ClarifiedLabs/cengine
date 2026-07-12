@@ -20,6 +20,69 @@ from docker.types import Mount
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 KNOWN_GAP = pytest.mark.xfail(strict=True)
+GATEWAY_MODE_IPV4 = "com.docker.network.bridge.gateway_mode_ipv4"
+GATEWAY_MODE_IPV6 = "com.docker.network.bridge.gateway_mode_ipv6"
+
+
+def _network_container(client: docker.DockerClient, network, *, command="top"):
+    container = client.containers.create(IMAGE, command=command, network=network.name)
+    container.start()
+    return container
+
+
+def _gateway(network) -> str:
+    network.reload()
+    return next(config["Gateway"] for config in network.attrs["IPAM"]["Config"] if ":" not in config["Gateway"])
+
+
+def _assert_peer_reachable(client: docker.DockerClient, network) -> None:
+    server = _network_container(
+        client, network,
+        command=[
+            "sh", "-c",
+            "while true; do { printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 7\\r\\n\\r\\npeer-ok'; } | nc -l -p 8080; done",
+        ],
+    )
+    server.reload()
+    address = server.attrs["NetworkSettings"]["Networks"][network.name]["IPAddress"]
+    peer = _network_container(client, network)
+    code, output = peer.exec_run([
+        "sh", "-c",
+        f"for i in 1 2 3 4 5; do wget -qO- -T 2 http://{address}:8080 && exit 0; sleep 1; done; exit 1",
+    ])
+    assert (code, output) == (0, b"peer-ok")
+
+
+def _host_http_request(container, gateway: str) -> tuple[int, bytes, bool]:
+    accepted = threading.Event()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", 0)); listener.listen(); listener.settimeout(4)
+        port = listener.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                connection, _ = listener.accept()
+                accepted.set()
+                with connection:
+                    connection.recv(4096)
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nhost-ok")
+            except TimeoutError:
+                pass
+
+        server = threading.Thread(target=serve)
+        server.start()
+        code, output = container.exec_run([
+            "sh", "-c", f"wget -qO- -T 2 http://{gateway}:{port}"
+        ])
+        server.join(timeout=5)
+        assert not server.is_alive()
+        return code, output, accepted.is_set()
+
+
+def _can_reach_internet(container) -> bool:
+    code, _ = container.exec_run(["sh", "-c", "nc -z -w 5 1.1.1.1 443"])
+    return code == 0
 
 
 @pytest.mark.compat("CTR-001")
@@ -430,6 +493,84 @@ def test_concurrent_random_port_allocation_is_unique(client: docker.DockerClient
         container.reload()
     ports = [container.attrs["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"] for container in containers]
     assert len(set(ports)) == len(containers)
+
+
+@pytest.mark.compat("NET-008")
+def test_bridge_network_allows_peers_host_and_internet(client: docker.DockerClient):
+    network = client.networks.create(f"compat-normal-{uuid.uuid4().hex[:8]}")
+    _assert_peer_reachable(client, network)
+    container = _network_container(client, network)
+    assert _host_http_request(container, _gateway(network)) == (0, b"host-ok", True)
+    assert _can_reach_internet(container)
+
+
+@pytest.mark.compat("NET-009")
+def test_internal_network_allows_peers_and_host_but_not_internet(client: docker.DockerClient):
+    network = client.networks.create(f"compat-internal-{uuid.uuid4().hex[:8]}", internal=True)
+    _assert_peer_reachable(client, network)
+    container = _network_container(client, network)
+    assert _host_http_request(container, _gateway(network)) == (0, b"host-ok", True)
+    assert not _can_reach_internet(container)
+
+
+@pytest.mark.compat("NET-010")
+def test_isolated_gateway_allows_only_network_peers(client: docker.DockerClient):
+    network = client.networks.create(
+        f"compat-isolated-{uuid.uuid4().hex[:8]}", internal=True,
+        options={GATEWAY_MODE_IPV4: "isolated", GATEWAY_MODE_IPV6: "isolated"},
+    )
+    _assert_peer_reachable(client, network)
+    container = _network_container(client, network)
+    code, _, accepted = _host_http_request(container, _gateway(network))
+    assert code != 0 and not accepted
+    assert not _can_reach_internet(container)
+
+
+@pytest.mark.compat("NET-011")
+def test_isolated_gateway_options_round_trip_and_require_internal(client: docker.DockerClient):
+    with pytest.raises(errors.APIError) as caught:
+        client.networks.create(
+            f"compat-invalid-isolated-{uuid.uuid4().hex[:8]}",
+            options={GATEWAY_MODE_IPV4: "isolated"},
+        )
+    assert caught.value.response.status_code == 400
+    network = client.networks.create(
+        f"compat-isolated-options-{uuid.uuid4().hex[:8]}", internal=True,
+        options={GATEWAY_MODE_IPV4: "isolated"},
+    )
+    network.reload()
+    assert network.attrs["Internal"] is True
+    assert network.attrs["Options"][GATEWAY_MODE_IPV4] == "isolated"
+
+
+@pytest.mark.compat("NET-012")
+def test_isolated_gateway_filter_cannot_be_bypassed_by_adding_a_route(client: docker.DockerClient):
+    network = client.networks.create(
+        f"compat-isolated-route-{uuid.uuid4().hex[:8]}", internal=True,
+        options={GATEWAY_MODE_IPV4: "isolated"},
+    )
+    container = client.containers.create(IMAGE, command="top", network=network.name, privileged=True)
+    container.start()
+    gateway = _gateway(network)
+    code, output = container.exec_run(
+        ["sh", "-c", f"ip route add default via {gateway}; ip route"], privileged=True
+    )
+    assert code == 0 and gateway.encode() in output
+    code, _, accepted = _host_http_request(container, gateway)
+    assert code != 0 and not accepted
+    assert not _can_reach_internet(container)
+
+
+@pytest.mark.compat("CTR-034")
+def test_network_none_has_only_loopback(client: docker.DockerClient):
+    container = client.containers.create(IMAGE, command="top", network_mode="none")
+    container.start(); container.reload()
+    code, links = container.exec_run(["sh", "-c", "ls /sys/class/net"])
+    assert code == 0 and links.split() == [b"lo"]
+    code, routes = container.exec_run(["sh", "-c", "ip route show"])
+    assert code == 0 and routes.strip() == b""
+    assert container.attrs["HostConfig"]["NetworkMode"] == "none"
+    assert container.attrs["NetworkSettings"]["Networks"] == {}
 
 
 @pytest.mark.compat("CTR-022")
