@@ -168,6 +168,7 @@ public enum NetworkGatewayMode: String, Codable, Sendable {
 }
 
 public struct NetworkRecord: Codable, Sendable {
+    public static let enableIPMasqueradeOption = "com.docker.network.bridge.enable_ip_masquerade"
     public static let gatewayModeIPv4Option = "com.docker.network.bridge.gateway_mode_ipv4"
     public static let gatewayModeIPv6Option = "com.docker.network.bridge.gateway_mode_ipv6"
 

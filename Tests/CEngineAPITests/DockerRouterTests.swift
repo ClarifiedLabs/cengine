@@ -648,7 +648,7 @@ private actor AuthImageBackend: ContainerBackend {
         let router = DockerRouter(runtime: try await EngineRuntime(root: root, backend: backend), root: root)
         let create = await router.route(.init(
             method: .POST, uri: "/v1.55/networks/create",
-            body: Data(#"{"Name":"kind","EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fc00:f853:ccd:e793::/64"}]}}"#.utf8)
+            body: Data(#"{"Name":"kind","Driver":"bridge","EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fc00:f853:ccd:e793::/64"}]},"Options":{"com.docker.network.bridge.enable_ip_masquerade":"true"}}"#.utf8)
         ))
         #expect(create.status == .created)
         let request = try #require(await backend.request(named: "kind"))
@@ -656,6 +656,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(request.ipv4AllocationMode == .automatic)
         #expect(request.ipv6Subnet == "fc00:f853:ccd:e793::/64")
         #expect(request.ipv6AllocationMode == .explicit)
+        #expect(request.options?[NetworkRecord.enableIPMasqueradeOption] == "true")
 
         let staticIPv6 = await router.route(.init(
             method: .POST, uri: "/v1.55/containers/create?name=static-v6",

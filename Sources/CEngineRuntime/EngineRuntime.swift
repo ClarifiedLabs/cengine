@@ -511,11 +511,22 @@ public actor EngineRuntime {
         guard selectedDriver == "bridge" || selectedDriver == "default" else {
             throw EngineError(.unsupported, "network driver \(selectedDriver) is not supported")
         }
-        let supportedOptions = Set([NetworkRecord.gatewayModeIPv4Option, NetworkRecord.gatewayModeIPv6Option])
+        let gatewayModeOptions = [
+            NetworkRecord.gatewayModeIPv4Option,
+            NetworkRecord.gatewayModeIPv6Option,
+        ]
+        let supportedOptions = Set(gatewayModeOptions + [NetworkRecord.enableIPMasqueradeOption])
         if let option = options.keys.first(where: { !supportedOptions.contains($0) }) {
             throw EngineError(.unsupported, "bridge network option \(option) is not supported")
         }
-        for key in supportedOptions {
+        // Non-internal vmnet shared networks already provide Docker's requested masqueraded egress.
+        if let value = options[NetworkRecord.enableIPMasqueradeOption], value != "true" {
+            throw EngineError(
+                .unsupported,
+                "bridge network option \(NetworkRecord.enableIPMasqueradeOption)=\(value) is not supported"
+            )
+        }
+        for key in gatewayModeOptions {
             guard let raw = options[key] else { continue }
             guard let mode = NetworkGatewayMode(rawValue: raw) else {
                 throw EngineError(.badRequest, "invalid bridge gateway mode \(raw) for \(key)")
