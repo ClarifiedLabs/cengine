@@ -38,14 +38,24 @@ public enum DockerIntegration {
         guard executable(named: "docker") != nil else {
             throw EngineError(.notFound, "docker CLI not found")
         }
-        _ = try runDocker(["buildx", "version"])
+        try configureBuilder(settings, runDocker: runDocker)
+    }
 
+    static func configureBuilder(
+        _ settings: BuilderSettings,
+        runDocker: ([String]) throws -> String
+    ) throws {
+        _ = try runDocker(["buildx", "version"])
         let inspected = try? runDocker(["buildx", "inspect", builderName])
         if let inspected {
-            guard !builder(inspected, matches: settings) else { return }
-            _ = try runDocker(["buildx", "rm", "--force", "--keep-state", builderName])
+            if !builder(inspected, matches: settings) {
+                _ = try runDocker(["buildx", "rm", "--force", "--keep-state", builderName])
+                _ = try runDocker(createBuilderArguments(settings))
+            }
+        } else {
+            _ = try runDocker(createBuilderArguments(settings))
         }
-        _ = try runDocker(createBuilderArguments(settings))
+        _ = try runDocker(["buildx", "use", builderName])
     }
 
     public static func createBuilderArguments(_ settings: BuilderSettings) -> [String] {

@@ -41,6 +41,22 @@ import Testing
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 6, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 8)))
     }
+
+    @Test func configuringMatchingBuilderSelectsIt() throws {
+        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000""#
+        var commands: [[String]] = []
+
+        try DockerIntegration.configureBuilder(.default) { arguments in
+            commands.append(arguments)
+            return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
+        }
+
+        #expect(commands == [
+            ["buildx", "version"],
+            ["buildx", "inspect", DockerIntegration.builderName],
+            ["buildx", "use", DockerIntegration.builderName],
+        ])
+    }
 }
 
 @Suite struct BuilderSettingsTests {
