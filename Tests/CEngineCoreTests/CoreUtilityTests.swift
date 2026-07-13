@@ -54,7 +54,10 @@ import Testing
         #expect(commands == [
             ["buildx", "version"],
             ["buildx", "inspect", DockerIntegration.builderName],
-            ["buildx", "use", DockerIntegration.builderName],
+            [
+                "--context", DockerIntegration.contextName,
+                "buildx", "use", "--default", DockerIntegration.builderName,
+            ],
         ])
     }
 }

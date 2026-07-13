@@ -55,7 +55,9 @@ public enum DockerIntegration {
         } else {
             _ = try runDocker(createBuilderArguments(settings))
         }
-        _ = try runDocker(["buildx", "use", builderName])
+        _ = try runDocker([
+            "--context", contextName, "buildx", "use", "--default", builderName,
+        ])
     }
 
     public static func createBuilderArguments(_ settings: BuilderSettings) -> [String] {
