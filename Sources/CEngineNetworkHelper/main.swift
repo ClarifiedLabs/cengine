@@ -1,9 +1,18 @@
 import CEngineCore
 import Darwin
 import Foundation
+import vmnet
 @preconcurrency import XPC
 
+private final class SendableXPCObject: @unchecked Sendable {
+    let value: xpc_object_t
+    init(_ value: xpc_object_t) { self.value = value }
+}
+
 @main enum CEngineNetworkHelper {
+    private static let uplinkLock = NSLock()
+    nonisolated(unsafe) private static var uplinks: [String: HelperVMNetUplink] = [:]
+
     static func main() {
         guard geteuid() == 0 else {
             FileHandle.standardError.write(Data("cengine-network-helper must run as root\n".utf8))
@@ -16,15 +25,10 @@ import Foundation
             guard xpc_get_type(event) == XPC_TYPE_CONNECTION else { return }
             let peer: xpc_connection_t = event
             let team = Bundle.main.object(forInfoDictionaryKey: "CEngineTeamIdentifier") as? String ?? ""
-            let requirement: String
-            if team.isEmpty {
-                requirement = "identifier \"\(PrivilegedPortProtocol.engineIdentifier)\""
-            } else {
-                requirement = "anchor apple generic and identifier \"\(PrivilegedPortProtocol.engineIdentifier)\" and certificate leaf[subject.OU] = \"\(team)\""
-            }
-            let status = requirement.withCString {
-                xpc_connection_set_peer_code_signing_requirement(peer, $0)
-            }
+            let requirement = team.isEmpty
+                ? "identifier \"\(PrivilegedPortProtocol.engineIdentifier)\""
+                : "anchor apple generic and identifier \"\(PrivilegedPortProtocol.engineIdentifier)\" and certificate leaf[subject.OU] = \"\(team)\""
+            let status = requirement.withCString { xpc_connection_set_peer_code_signing_requirement(peer, $0) }
             guard status == 0 else { xpc_connection_cancel(peer); return }
             xpc_connection_set_event_handler(peer) { message in handle(message, peer: peer) }
             xpc_connection_activate(peer)
@@ -40,30 +44,96 @@ import Foundation
             guard xpc_dictionary_get_int64(message, "version") == PrivilegedPortProtocol.version else {
                 throw EngineError(.unsupported, "incompatible privileged networking helper protocol")
             }
-            guard xpc_dictionary_get_string(message, "operation").map({ String(cString: $0) }) == "bind" else {
-                throw EngineError(.unsupported, "privileged networking helper only supports bind")
+            guard let operationValue = xpc_dictionary_get_string(message, "operation") else {
+                throw EngineError(.badRequest, "privileged networking helper request has no operation")
             }
-            guard let addressValue = xpc_dictionary_get_string(message, "address"),
-                  let transportValue = xpc_dictionary_get_string(message, "transport"),
-                  let port = UInt16(exactly: xpc_dictionary_get_uint64(message, "port")),
-                  let transport = PrivilegedPortRequest.Transport(rawValue: String(cString: transportValue)) else {
-                throw EngineError(.badRequest, "malformed privileged bind request")
+            switch String(cString: operationValue) {
+            case "bind":
+                let descriptor = try boundSocket(for: try bindRequest(message))
+                xpc_dictionary_set_bool(reply, "ok", true)
+                xpc_dictionary_set_fd(reply, "socket", descriptor)
+                close(descriptor)
+            case "start-vmnet":
+                var length = 0
+                guard let bytes = xpc_dictionary_get_data(message, "request", &length), length > 0 else {
+                    throw EngineError(.badRequest, "vmnet request has no payload")
+                }
+                let request = try JSONDecoder().decode(
+                    PrivilegedVMNetRequest.self,
+                    from: Data(bytes: bytes, count: length)
+                )
+                try validate(request)
+                let replyBox = SendableXPCObject(reply)
+                let peerBox = SendableXPCObject(peer)
+                Task {
+                    do {
+                        let previous = uplinkLock.withLock { uplinks.removeValue(forKey: request.id) }
+                        await previous?.stop()
+                        let (uplink, clientDescriptor) = try await HelperVMNetUplink.start(request: request)
+                        uplinkLock.withLock { uplinks[request.id] = uplink }
+                        xpc_dictionary_set_bool(replyBox.value, "ok", true)
+                        xpc_dictionary_set_fd(replyBox.value, "packet-socket", clientDescriptor)
+                        close(clientDescriptor)
+                    } catch {
+                        setError(error, reply: replyBox.value)
+                    }
+                    xpc_connection_send_message(peerBox.value, replyBox.value)
+                }
+                return
+            case "stop-vmnet":
+                guard let value = xpc_dictionary_get_string(message, "network-id") else {
+                    throw EngineError(.badRequest, "vmnet stop request has no network id")
+                }
+                let id = String(cString: value)
+                let replyBox = SendableXPCObject(reply)
+                let peerBox = SendableXPCObject(peer)
+                Task {
+                    let uplink = uplinkLock.withLock { uplinks.removeValue(forKey: id) }
+                    await uplink?.stop()
+                    xpc_dictionary_set_bool(replyBox.value, "ok", true)
+                    xpc_connection_send_message(peerBox.value, replyBox.value)
+                }
+                return
+            default:
+                throw EngineError(.unsupported, "unsupported privileged networking helper operation")
             }
-            let request = try PrivilegedPortRequest(
-                address: String(cString: addressValue), port: port, transport: transport
-            )
-            let descriptor = try boundSocket(for: request)
-            xpc_dictionary_set_bool(reply, "ok", true)
-            xpc_dictionary_set_fd(reply, "socket", descriptor)
-            close(descriptor)
-        } catch let error as EngineError {
-            xpc_dictionary_set_bool(reply, "ok", false)
-            error.message.withCString { xpc_dictionary_set_string(reply, "error", $0) }
         } catch {
-            xpc_dictionary_set_bool(reply, "ok", false)
-            String(describing: error).withCString { xpc_dictionary_set_string(reply, "error", $0) }
+            setError(error, reply: reply)
         }
         xpc_connection_send_message(peer, reply)
+    }
+
+    private static func bindRequest(_ message: xpc_object_t) throws -> PrivilegedPortRequest {
+        guard let addressValue = xpc_dictionary_get_string(message, "address"),
+              let transportValue = xpc_dictionary_get_string(message, "transport"),
+              let port = UInt16(exactly: xpc_dictionary_get_uint64(message, "port")),
+              let transport = PrivilegedPortRequest.Transport(rawValue: String(cString: transportValue)) else {
+            throw EngineError(.badRequest, "malformed privileged bind request")
+        }
+        return try PrivilegedPortRequest(address: String(cString: addressValue), port: port, transport: transport)
+    }
+
+    private static func validate(_ request: PrivilegedVMNetRequest) throws {
+        guard !request.id.isEmpty, request.id.utf8.count <= 128 else {
+            throw EngineError(.badRequest, "invalid vmnet network id")
+        }
+        guard (1...4094).contains(request.vlan) else { throw EngineError(.badRequest, "invalid vmnet VLAN") }
+        _ = try HelperVMNetUplink.ipv4Subnet(request.subnet)
+        if !request.ipv6Subnet.isEmpty { _ = try HelperVMNetUplink.ipv6Prefix(request.ipv6Subnet) }
+        for port in request.ports {
+            var address = in_addr()
+            guard inet_pton(AF_INET, port.internalAddress, &address) == 1,
+                  port.externalPort > 0, port.internalPort > 0,
+                  port.proto.lowercased() == "tcp" || port.proto.lowercased() == "udp" else {
+                throw EngineError(.badRequest, "invalid vmnet port-forwarding rule")
+            }
+        }
+    }
+
+    private static func setError(_ error: Error, reply: xpc_object_t) {
+        xpc_dictionary_set_bool(reply, "ok", false)
+        let message = (error as? EngineError)?.message ?? String(describing: error)
+        message.withCString { xpc_dictionary_set_string(reply, "error", $0) }
     }
 
     private static func boundSocket(for request: PrivilegedPortRequest) throws -> CInt {
@@ -131,5 +201,232 @@ import Foundation
             .internalError,
             "\(operation) \(address):\(port) failed: \(String(cString: strerror(code))) (errno \(code))"
         )
+    }
+}
+
+private final class HelperVMNetUplink: @unchecked Sendable {
+    private let network: RetainedOpaquePointer
+    private let interface: interface_ref
+    private let queue: DispatchQueue
+    private let vlan: UInt16
+    private let packets: FileHandle
+    private let lock = NSLock()
+    private var stopTask: Task<Void, Never>?
+
+    static func start(request: PrivilegedVMNetRequest) async throws -> (HelperVMNetUplink, CInt) {
+        var status = vmnet_return_t.VMNET_SUCCESS
+        let mode = request.internalNetwork ? vmnet_mode_t.VMNET_HOST_MODE : vmnet_mode_t.VMNET_SHARED_MODE
+        guard let configuration = vmnet_network_configuration_create(mode, &status), status == .VMNET_SUCCESS else {
+            throw failure("create vmnet configuration", status)
+        }
+        let configurationOwner = RetainedOpaquePointer(configuration, release: releaseCFObject)
+        defer { withExtendedLifetime(configurationOwner) {} }
+        if !request.dhcpEnabled {
+            vmnet_network_configuration_disable_dhcp(configuration)
+        }
+        let (subnet, mask) = try ipv4Subnet(request.subnet)
+        var subnetValue = subnet
+        var maskValue = mask
+        guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
+            throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
+        }
+        if !request.ipv6Subnet.isEmpty {
+            let (prefix, prefixLength) = try ipv6Prefix(request.ipv6Subnet)
+            var prefixValue = prefix
+            guard vmnet_network_configuration_set_ipv6_prefix(configuration, &prefixValue, prefixLength) == .VMNET_SUCCESS else {
+                throw EngineError(.badRequest, "vmnet rejected IPv6 prefix \(request.ipv6Subnet)")
+            }
+        }
+        for port in request.internalNetwork ? [] : request.ports {
+            var address = in_addr()
+            guard inet_pton(AF_INET, port.internalAddress, &address) == 1 else {
+                throw EngineError(.badRequest, "invalid port-forward address \(port.internalAddress)")
+            }
+            let proto = port.proto.lowercased() == "udp" ? UInt8(IPPROTO_UDP) : UInt8(IPPROTO_TCP)
+            let result = withUnsafePointer(to: &address) {
+                vmnet_network_configuration_add_port_forwarding_rule(
+                    configuration, proto, sa_family_t(AF_INET),
+                    port.internalPort, port.externalPort, $0
+                )
+            }
+            guard result == .VMNET_SUCCESS else { throw failure("configure vmnet port forwarding", result) }
+        }
+        guard let networkObject = vmnet_network_create(configuration, &status), status == .VMNET_SUCCESS else {
+            throw failure("reserve vmnet network", status)
+        }
+        let networkOwner = RetainedOpaquePointer(networkObject, release: releaseCFObject)
+        let descriptor = xpc_dictionary_create(nil, nil, 0)
+        let queue = DispatchQueue(label: "dev.cengine.vmnet.\(request.id)")
+        var reference: interface_ref?
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                reference = vmnet_interface_start_with_network(networkObject, descriptor, queue) { status, _ in
+                    if status == .VMNET_SUCCESS { continuation.resume() }
+                    else { continuation.resume(throwing: failure("start vmnet interface", status)) }
+                }
+                if reference == nil {
+                    continuation.resume(throwing: EngineError(.internalError, "vmnet did not create an interface"))
+                }
+            }
+        } catch {
+            if let reference {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    let status = vmnet_stop_interface(reference, queue) { _ in continuation.resume() }
+                    if status != .VMNET_SUCCESS { continuation.resume() }
+                }
+            }
+            throw error
+        }
+        guard let reference else { throw EngineError(.internalError, "vmnet interface is unavailable") }
+        var sockets: [CInt] = [-1, -1]
+        guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &sockets) == 0 else {
+            await stopInterface(reference, queue: queue)
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let value = HelperVMNetUplink(
+            network: networkOwner,
+            interface: reference,
+            queue: queue,
+            vlan: request.vlan,
+            packets: FileHandle(fileDescriptor: sockets[0], closeOnDealloc: true)
+        )
+        value.startReading()
+        return (value, sockets[1])
+    }
+
+    private init(
+        network: RetainedOpaquePointer,
+        interface: interface_ref,
+        queue: DispatchQueue,
+        vlan: UInt16,
+        packets: FileHandle
+    ) {
+        self.network = network
+        self.interface = interface
+        self.queue = queue
+        self.vlan = vlan
+        self.packets = packets
+        packets.readabilityHandler = { [weak self] handle in self?.writeTagged(handle.availableData) }
+    }
+
+    func stop() async {
+        let task = lock.withLock { () -> Task<Void, Never> in
+            if let stopTask { return stopTask }
+            let task = Task { [self] in await performStop() }
+            stopTask = task
+            return task
+        }
+        await task.value
+    }
+
+    private func performStop() async {
+        packets.readabilityHandler = nil
+        try? packets.close()
+        _ = vmnet_interface_set_event_callback(interface, .VMNET_INTERFACE_PACKETS_AVAILABLE, nil, nil)
+        await Self.stopInterface(interface, queue: queue)
+        network.release()
+    }
+
+    private func startReading() {
+        let result = vmnet_interface_set_event_callback(interface, .VMNET_INTERFACE_PACKETS_AVAILABLE, queue) {
+            [weak self] _, _ in self?.readAvailable()
+        }
+        if result != .VMNET_SUCCESS { Task { await stop() } }
+    }
+
+    private static func stopInterface(_ interface: interface_ref, queue: DispatchQueue) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let status = vmnet_stop_interface(interface, queue) { _ in continuation.resume() }
+            if status != .VMNET_SUCCESS { continuation.resume() }
+        }
+    }
+
+    private static func releaseCFObject(_ pointer: OpaquePointer) {
+        Unmanaged<AnyObject>.fromOpaque(UnsafeRawPointer(pointer)).release()
+    }
+
+    private func readAvailable() {
+        while true {
+            var storage = [UInt8](repeating: 0, count: 65_535)
+            let received: Data? = storage.withUnsafeMutableBytes { bytes in
+                var vector = iovec(iov_base: bytes.baseAddress, iov_len: bytes.count)
+                return withUnsafeMutablePointer(to: &vector) { vectorPointer in
+                    var packet = vmpktdesc(
+                        vm_pkt_size: bytes.count, vm_pkt_iov: vectorPointer,
+                        vm_pkt_iovcnt: 1, vm_flags: 0
+                    )
+                    var count: Int32 = 1
+                    let result = vmnet_read(interface, &packet, &count)
+                    guard result == .VMNET_SUCCESS, count == 1, packet.vm_pkt_size > 0 else { return nil }
+                    return Data(bytes: bytes.baseAddress!, count: packet.vm_pkt_size)
+                }
+            }
+            guard let received else { return }
+            try? packets.write(contentsOf: Self.tag(received, vlan: vlan))
+        }
+    }
+
+    private func writeTagged(_ packet: Data) {
+        guard let untagged = Self.untag(packet, vlan: vlan) else { return }
+        untagged.withUnsafeBytes { bytes in
+            var vector = iovec(
+                iov_base: UnsafeMutableRawPointer(mutating: bytes.baseAddress),
+                iov_len: bytes.count
+            )
+            withUnsafeMutablePointer(to: &vector) { vectorPointer in
+                var descriptor = vmpktdesc(
+                    vm_pkt_size: bytes.count, vm_pkt_iov: vectorPointer,
+                    vm_pkt_iovcnt: 1, vm_flags: 0
+                )
+                var count: Int32 = 1
+                _ = vmnet_write(interface, &descriptor, &count)
+            }
+        }
+    }
+
+    private static func tag(_ frame: Data, vlan: UInt16) -> Data {
+        guard frame.count >= 14 else { return frame }
+        var output = Data(frame.prefix(12))
+        output.append(contentsOf: [0x81, 0x00, UInt8((vlan >> 8) & 0x0f), UInt8(vlan & 0xff)])
+        output.append(frame.dropFirst(12))
+        return output
+    }
+
+    private static func untag(_ frame: Data, vlan: UInt16) -> Data? {
+        guard frame.count >= 18, frame[12] == 0x81, frame[13] == 0x00 else { return nil }
+        let value = (UInt16(frame[14] & 0x0f) << 8) | UInt16(frame[15])
+        guard value == vlan else { return nil }
+        var output = Data(frame.prefix(12))
+        output.append(frame.dropFirst(16))
+        return output
+    }
+
+    static func ipv4Subnet(_ value: String) throws -> (in_addr, in_addr) {
+        let parts = value.split(separator: "/")
+        guard parts.count == 2, let prefix = Int(parts[1]), (0...32).contains(prefix) else {
+            throw EngineError(.badRequest, "invalid IPv4 subnet \(value)")
+        }
+        var subnet = in_addr()
+        guard inet_pton(AF_INET, String(parts[0]), &subnet) == 1 else {
+            throw EngineError(.badRequest, "invalid IPv4 subnet \(value)")
+        }
+        let bits: UInt32 = prefix == 0 ? 0 : UInt32.max << UInt32(32 - prefix)
+        return (subnet, in_addr(s_addr: bits.bigEndian))
+    }
+
+    static func ipv6Prefix(_ value: String) throws -> (in6_addr, UInt8) {
+        let parts = value.split(separator: "/")
+        guard parts.count == 2, let length = UInt8(parts[1]), length <= 128 else {
+            throw EngineError(.badRequest, "invalid IPv6 prefix \(value)")
+        }
+        var prefix = in6_addr()
+        guard inet_pton(AF_INET6, String(parts[0]), &prefix) == 1 else {
+            throw EngineError(.badRequest, "invalid IPv6 prefix \(value)")
+        }
+        return (prefix, length)
+    }
+
+    private static func failure(_ operation: String, _ status: vmnet_return_t) -> EngineError {
+        EngineError(.internalError, "\(operation) failed with vmnet status \(status.rawValue)")
     }
 }

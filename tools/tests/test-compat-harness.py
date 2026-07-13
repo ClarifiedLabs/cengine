@@ -27,6 +27,12 @@ def main() -> None:
     explicit = docker_environment("tcp://127.0.0.1:2375", base={})
     assert explicit == {"DOCKER_HOST": "tcp://127.0.0.1:2375"}
 
+    makefile = (REPO_ROOT / "Makefile").read_text()
+    assert 'CENGINE_KERNEL="$(CENGINE_GUEST_OUTPUT)/vmlinux"' in makefile
+    assert 'CENGINE_CONTAINER_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/container-initramfs.cpio.gz"' in makefile
+    assert 'CENGINE_STORAGE_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/storage-initramfs.cpio.gz"' in makefile
+    assert makefile.count("$(CENGINE_COMPAT_ENV)") == 3
+
     compatibility_root = REPO_ROOT / "Tests" / "Compatibility"
     for path in compatibility_root.glob("*.py"):
         if path.name == "harness.py":

@@ -8,6 +8,7 @@ def main() -> None:
     script = read(REPO_ROOT / "Scripts/package-release.sh")
     entitlements = read(REPO_ROOT / "Configuration/cengine.entitlements")
     app_entitlements = read(REPO_ROOT / "Configuration/cengine-app.entitlements")
+    component_plist = read(REPO_ROOT / "Configuration/cengine-component.plist")
     info_plist = read(REPO_ROOT / "Configuration/cengine-Info.plist")
     project = read(REPO_ROOT / "cengine.xcodeproj/project.pbxproj")
     build_script = read(REPO_ROOT / "Scripts/build-release.sh")
@@ -15,9 +16,9 @@ def main() -> None:
     component_plist_path = REPO_ROOT / "Configuration/cengine-component.plist"
     for needle in (
         'PAYLOAD_ROOT/Applications', 'PAYLOAD_ROOT/usr/local/bin', 'dev.cengine.app.pkg',
-        'Contents/Helpers/cengine', 'Contents/Helpers/cengine-network-helper',
+        'Contents/MacOS/cengine-engine', 'Contents/MacOS/cengine-network-helper',
         'Contents/Library/LaunchAgents', 'Contents/Library/LaunchDaemons',
-        'cengine-uninstall.pkg', 'codesign --force',
+        'cengine-uninstall.pkg', 'Contents/Resources/guest', 'codesign --force',
         '--options runtime', 'productsign --sign', 'notarytool submit',
         'stapler staple', 'spctl --assess --type install', 'verify-entitlements.sh',
         "sed -nE 's/.*MARKETING_VERSION", 'xattr -cr "$PAYLOAD_ROOT"',
@@ -26,9 +27,14 @@ def main() -> None:
     ):
         require_contains(script, needle, "package-release.sh")
     require_contains(entitlements, "com.apple.security.virtualization", "cengine.entitlements")
-    require_absent(entitlements, "com.apple.developer.networking.vmnet", "cengine.entitlements")
     require_absent(entitlements, "com.apple.vm.networking", "cengine.entitlements")
+    require_absent(entitlements, "com.apple.developer.networking.vmnet", "cengine.entitlements")
+    if (REPO_ROOT / "Configuration/cengine-network-helper.entitlements").exists():
+        raise AssertionError("the root network helper must not claim restricted vmnet entitlements")
+    require_absent(script, "NETWORK_HELPER_ENTITLEMENTS", "package-release.sh")
+    require_contains(script, 'verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-network-helper" --forbid com.apple.vm.networking', "package-release.sh")
     require_absent(app_entitlements, "com.apple.security.virtualization", "cengine-app.entitlements")
+    require_contains(component_plist, "<key>BundleIsVersionChecked</key>\n\t\t<false/>", "cengine-component.plist")
     for contents, label in ((script, "package-release.sh"), (build_script, "build-release.sh"), (makefile, "Makefile")):
         require_contains(contents, "CENGINE_GIT_COMMIT", label)
         require_contains(contents, "CENGINE_BUILD_TIME", label)

@@ -39,6 +39,7 @@ private final class DaemonLock {
             case "service": try await service(arguments)
             case "builder": try await builder(arguments)
             case "container": try container(arguments)
+            case "vm-shim": try await vmShim(arguments)
             case "version", "--version": print("cengine \(CEngineVersion.shortVersion())")
             case "system": try await system(arguments)
             case "help", "--help", "-h": usage()
@@ -63,10 +64,21 @@ private final class DaemonLock {
             backend = MetadataOnlyBackend()
         } else {
             let kernel = option("--kernel", in: arguments).map { URL(filePath: $0) } ?? paths.kernel
+            let containerInitialRamdisk = option("--container-initramfs", in: arguments).map { URL(filePath: $0) } ?? paths.containerInitialRamdisk
+            let storageInitialRamdisk = option("--storage-initramfs", in: arguments).map { URL(filePath: $0) } ?? paths.storageInitialRamdisk
             guard FileManager.default.fileExists(atPath: kernel.path) else {
                 throw EngineError(.notFound, "Linux kernel not found at \(kernel.path); run `cengine system install`")
             }
-            backend = try await AppleContainerBackend(root: root, kernel: kernel)
+            guard FileManager.default.fileExists(atPath: containerInitialRamdisk.path),
+                  FileManager.default.fileExists(atPath: storageInitialRamdisk.path) else {
+                throw EngineError(.notFound, "cengine guest initramfs assets are not installed; run `cengine system install`")
+            }
+            backend = try await RawVirtualizationBackend(
+                root: root,
+                kernel: kernel,
+                containerInitialRamdisk: containerInitialRamdisk,
+                storageInitialRamdisk: storageInitialRamdisk
+            )
         }
         let runtime = try await EngineRuntime(root: root, backend: backend)
         let server = DockerServer(socketPath: socket, router: DockerRouter(runtime: runtime, root: root))
@@ -103,6 +115,11 @@ private final class DaemonLock {
             throw error
         }
         if managed { try? SystemManager.writeState(.stopped, message: nil, paths: paths) }
+    }
+
+    private static func vmShim(_ arguments: [String]) async throws -> Never {
+        guard let path = option("--spec", in: arguments) else { throw EngineError(.badRequest, "vm-shim requires --spec") }
+        return try await VMShimServer.run(specificationURL: URL(filePath: path))
     }
 
     private static func service(_ arguments: [String]) async throws {
@@ -297,7 +314,7 @@ private final class DaemonLock {
         Usage: cengine <command>
           builder resources [--cpus COUNT] [--memory GiB]
           container resources [--cpus COUNT] [--memory GiB]
-          daemon [--socket PATH] [--root PATH] [--kernel PATH] [--metadata-only]
+          daemon [--socket PATH] [--root PATH] [--kernel PATH] [--container-initramfs PATH] [--storage-initramfs PATH] [--metadata-only]
           service run
           system status|doctor|install|uninstall
           version

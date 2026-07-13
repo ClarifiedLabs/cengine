@@ -11,8 +11,8 @@ struct CEngineApplication: App {
                 .frame(minWidth: 760, minHeight: 500)
                 .task { model.start() }
                 .sheet(isPresented: $model.showOnboarding) {
-                    OnboardingView { enableHelper in
-                        await model.completeOnboarding(enableHelper: enableHelper)
+                    OnboardingView {
+                        await model.completeOnboarding()
                     }
                 }
         }
@@ -82,7 +82,7 @@ private struct DashboardView: View {
             Text("cengine").font(.largeTitle.bold())
             Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 10) {
                 row("Engine", model.engineStatus)
-                row("Privileged ports", model.helperStatus)
+                row("VM networking", model.helperStatus)
                 row("Version", model.version)
                 row("Resources", model.diskUsage)
             }
@@ -92,15 +92,15 @@ private struct DashboardView: View {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Privileged Ports needs administrator approval")
+                            Text("VM networking needs administrator approval")
                                 .font(.headline)
-                            Text("Allow cengine in Login Items & Extensions before privileged host ports can be used.")
+                            Text("Allow cengine in Login Items & Extensions before the engine can start container networks.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
                         Button("Open Login Items & Extensions…") {
-                            model.openPrivilegedPortApproval()
+                            model.openNetworkingApproval()
                         }
                     }
                     .padding(4)
@@ -129,24 +129,23 @@ private struct ResourceList: View {
 }
 
 struct OnboardingView: View {
-    let onComplete: @MainActor (Bool) async -> Void
+    let onComplete: @MainActor () async -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Welcome to cengine").font(.largeTitle.bold())
-            Text("The cengine background service has been enabled. Privileged Ports allows exact host-IP bindings below port 1024 and requires administrator approval.")
-            Text("You can enable it later in Settings.").foregroundStyle(.secondary)
+            Text("cengine uses a privileged networking service to connect each container VM to macOS through vmnet.")
+            Text("macOS requires administrator approval before the engine can start.").foregroundStyle(.secondary)
             HStack {
                 Spacer()
-                Button("Not Now") { Task { await complete(enableHelper: false) } }
+                Button("Enable VM Networking") { Task { await complete() } }
                     .keyboardShortcut(.defaultAction)
-                Button("Enable Privileged Ports") { Task { await complete(enableHelper: true) } }
             }
         }.padding(28).frame(width: 520)
     }
 
-    func complete(enableHelper: Bool) async {
-        await onComplete(enableHelper)
+    func complete() async {
+        await onComplete()
     }
 }
 
@@ -189,16 +188,13 @@ private struct SettingsView: View {
                 }
             }
             Divider()
-            Toggle("Privileged Ports", isOn: Binding(
-                get: { model.helperEnabled },
-                set: { value in Task { await model.setHelperEnabled(value) } }
-            ))
-            Text("Allows exact specific-IP bindings for host ports below 1024.").font(.caption).foregroundStyle(.secondary)
+            LabeledContent("VM Networking", value: model.helperStatus)
+            Text("Required for vmnet NAT, DNS, host access, and published ports.").font(.caption).foregroundStyle(.secondary)
             if model.helperNeedsApproval {
                 HStack {
                     Text("Administrator approval is required.").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Open Login Items & Extensions…") { model.openPrivilegedPortApproval() }
+                    Button("Open Login Items & Extensions…") { model.openNetworkingApproval() }
                 }
             }
             Divider()

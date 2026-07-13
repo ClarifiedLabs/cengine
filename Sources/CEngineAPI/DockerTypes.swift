@@ -71,7 +71,7 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let ContainersPaused: Int
     public let ContainersStopped: Int
     public let Images = 0
-    public let Driver = "apple-containerization"
+    public let Driver = "cengine-raw-vm"
     public let DriverStatus = [[String]]()
     public let DockerRootDir: String
     public let Name = Host.current().localizedName ?? "mac"

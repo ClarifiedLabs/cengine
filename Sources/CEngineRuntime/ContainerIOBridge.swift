@@ -1,4 +1,3 @@
-import Containerization
 import Foundation
 
 public struct DockerLogOptions: Sendable {
@@ -11,7 +10,12 @@ public struct DockerLogOptions: Sendable {
     }
 }
 
-public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
+public protocol CEngineWriter: Sendable {
+    func write(_ data: Data) throws
+    func close() throws
+}
+
+public final class ContainerIOBridge: @unchecked Sendable {
     public enum OutputStream: UInt8, Sendable { case stdout = 1, stderr = 2 }
 
     private let lock = NSLock()
@@ -49,7 +53,7 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
     public func sendInput(_ data: Data) { inputContinuation.yield(data) }
     public func finishInput() { inputContinuation.finish() }
 
-    public func writer(_ stream: OutputStream) -> any Writer { OutputWriter(bridge: self, stream: stream) }
+    public func writer(_ stream: OutputStream) -> any CEngineWriter { OutputWriter(bridge: self, stream: stream) }
 
     @discardableResult
     public func attach(
@@ -190,7 +194,7 @@ public final class ContainerIOBridge: ReaderStream, @unchecked Sendable {
     }
 }
 
-private final class OutputWriter: Writer, @unchecked Sendable {
+private final class OutputWriter: CEngineWriter, @unchecked Sendable {
     private let bridge: ContainerIOBridge
     private let stream: ContainerIOBridge.OutputStream
     init(bridge: ContainerIOBridge, stream: ContainerIOBridge.OutputStream) { self.bridge = bridge; self.stream = stream }

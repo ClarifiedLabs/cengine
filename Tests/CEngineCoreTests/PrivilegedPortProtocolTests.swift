@@ -1,8 +1,45 @@
 import CEngineCore
 import Darwin
+import Foundation
 import Testing
 
 @Suite struct PrivilegedPortProtocolTests {
+    @Test func retainedOpaquePointerReleasesOwnedValueExactlyOnce() {
+        let state = ReleaseState()
+        do {
+            let pointer = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1)
+            let owner = RetainedOpaquePointer(OpaquePointer(pointer)) { value in
+                state.recordRelease()
+                UnsafeMutableRawPointer(value).deallocate()
+            }
+            #expect(owner.value == OpaquePointer(pointer))
+            #expect(state.releases == 0)
+            owner.release()
+            owner.release()
+            #expect(state.releases == 1)
+        }
+        #expect(state.releases == 1)
+    }
+
+    @Test func staticVMNetRequestDisablesDHCPAcrossProtocolEncoding() throws {
+        let request = PrivilegedVMNetRequest(
+            id: "bridge",
+            vlan: 1,
+            subnet: "10.240.1.0/24",
+            ipv6Subnet: "",
+            internalNetwork: false,
+            dhcpEnabled: false,
+            ports: []
+        )
+
+        let decoded = try JSONDecoder().decode(
+            PrivilegedVMNetRequest.self,
+            from: JSONEncoder().encode(request)
+        )
+        #expect(PrivilegedPortProtocol.version == 3)
+        #expect(decoded.dhcpEnabled == false)
+    }
+
     @Test func acceptsDistinctSpecificLowPortAddresses() throws {
         let first = try PrivilegedPortRequest(address: "127.0.0.1", port: 80, transport: .tcp)
         let second = try PrivilegedPortRequest(address: "127.0.0.2", port: 80, transport: .tcp)
@@ -64,4 +101,12 @@ import Testing
         #expect(!PrivilegedPortRequest.shouldUseHelper(errnoCode: EPERM, address: "0.0.0.0", port: 80))
         #expect(!PrivilegedPortRequest.shouldUseHelper(errnoCode: EPERM, address: "127.0.0.1", port: 1024))
     }
+}
+
+private final class ReleaseState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var releases: Int { lock.withLock { value } }
+    func recordRelease() { lock.withLock { value += 1 } }
 }

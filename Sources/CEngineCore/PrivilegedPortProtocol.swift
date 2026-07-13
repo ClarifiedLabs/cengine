@@ -3,9 +3,79 @@ import Darwin
 
 public enum PrivilegedPortProtocol {
     public static let serviceName = "dev.cengine.network-helper"
-    public static let version: Int64 = 1
+    public static let version: Int64 = 3
     public static let engineIdentifier = "dev.cengine.engine"
     public static let helperIdentifier = "dev.cengine.network-helper"
+}
+
+public final class RetainedOpaquePointer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var retainedValue: OpaquePointer?
+    private let releaseValue: (OpaquePointer) -> Void
+
+    public init(_ value: OpaquePointer, release: @escaping (OpaquePointer) -> Void) {
+        retainedValue = value
+        self.releaseValue = release
+    }
+
+    public var value: OpaquePointer {
+        lock.withLock {
+            guard let retainedValue else { preconditionFailure("retained pointer was already released") }
+            return retainedValue
+        }
+    }
+
+    public func release() {
+        let value = lock.withLock { () -> OpaquePointer? in
+            defer { retainedValue = nil }
+            return retainedValue
+        }
+        if let value { releaseValue(value) }
+    }
+
+    deinit { release() }
+}
+
+public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
+    public struct Port: Codable, Equatable, Sendable {
+        public let proto: String
+        public let externalPort: UInt16
+        public let internalAddress: String
+        public let internalPort: UInt16
+
+        public init(proto: String, externalPort: UInt16, internalAddress: String, internalPort: UInt16) {
+            self.proto = proto
+            self.externalPort = externalPort
+            self.internalAddress = internalAddress
+            self.internalPort = internalPort
+        }
+    }
+
+    public let id: String
+    public let vlan: UInt16
+    public let subnet: String
+    public let ipv6Subnet: String
+    public let internalNetwork: Bool
+    public let dhcpEnabled: Bool
+    public let ports: [Port]
+
+    public init(
+        id: String,
+        vlan: UInt16,
+        subnet: String,
+        ipv6Subnet: String,
+        internalNetwork: Bool,
+        dhcpEnabled: Bool,
+        ports: [Port]
+    ) {
+        self.id = id
+        self.vlan = vlan
+        self.subnet = subnet
+        self.ipv6Subnet = ipv6Subnet
+        self.internalNetwork = internalNetwork
+        self.dhcpEnabled = dhcpEnabled
+        self.ports = ports
+    }
 }
 
 public struct PrivilegedPortRequest: Equatable, Sendable {

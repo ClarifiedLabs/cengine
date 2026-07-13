@@ -28,7 +28,6 @@ extension SMAppService: AppService {}
     @Published var images: [ResourceItem] = []
     @Published var networks: [ResourceItem] = []
     @Published var volumes: [ResourceItem] = []
-    @Published var helperEnabled = false
     @Published var helperNeedsApproval = false
     @Published var builderCPUs: Int
     @Published var builderMemoryGiB: Int
@@ -41,7 +40,7 @@ extension SMAppService: AppService {}
     let maximumCPUs = ProcessInfo.processInfo.activeProcessorCount
     let maximumMemoryGiB = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
 
-    private let agent = SMAppService.agent(plistName: CEngineServices.agentPlist)
+    private let agent: any AppService
     private let helper: any AppService
     private let openLoginItemsSettings: () -> Void
     private let client: DockerSocketClient
@@ -52,9 +51,11 @@ extension SMAppService: AppService {}
 
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        agent: any AppService = SMAppService.agent(plistName: CEngineServices.agentPlist),
         helper: any AppService = SMAppService.daemon(plistName: CEngineServices.helperPlist),
         openLoginItemsSettings: @escaping () -> Void = { SMAppService.openSystemSettingsLoginItems() }
     ) {
+        self.agent = agent
         self.helper = helper
         self.openLoginItemsSettings = openLoginItemsSettings
         let paths = EnginePaths(home: home)
@@ -73,9 +74,10 @@ extension SMAppService: AppService {}
 
     func start() {
         do {
-            if CEngineServices.needsRegistration(agent.status) { try agent.register() }
+            try registerRequiredNetworking()
+            try registerEngineIfNetworkingIsReady()
         } catch {
-            self.error = "Could not enable the cengine background service: \(error.localizedDescription)"
+            self.error = "Could not enable required cengine services: \(error.localizedDescription)"
         }
         updateServiceStatus()
         startPolling()
@@ -100,42 +102,21 @@ extension SMAppService: AppService {}
         }
     }
 
-    func completeOnboarding(enableHelper: Bool) async {
+    func completeOnboarding() async {
         UserDefaults.standard.set(true, forKey: "completedOnboarding")
         showOnboarding = false
-        if enableHelper { await setHelperEnabled(true) }
-    }
-
-    func setHelperEnabled(_ enabled: Bool) async {
         do {
-            if enabled {
-                var registrationError: Error?
-                if CEngineServices.needsRegistration(helper.status) {
-                    do {
-                        try helper.register()
-                    } catch {
-                        registrationError = error
-                    }
-                }
-                if helper.status == .requiresApproval {
-                    // LaunchDaemon registration intentionally returns launch-denied until
-                    // an administrator approves it. The service is registered at this point,
-                    // so guide the user to approval instead of reporting a fatal failure.
-                    openLoginItemsSettings()
-                } else if let registrationError {
-                    throw registrationError
-                }
-            } else if helper.status != .notRegistered && helper.status != .notFound {
-                try await helper.unregister()
-            }
+            try registerRequiredNetworking()
+            try registerEngineIfNetworkingIsReady()
+            if helper.status == .requiresApproval { openLoginItemsSettings() }
             error = nil
         } catch {
-            self.error = "Could not update privileged-port support: \(error.localizedDescription)"
+            self.error = "Could not enable required networking: \(error.localizedDescription)"
         }
         updateServiceStatus()
     }
 
-    func openPrivilegedPortApproval() {
+    func openNetworkingApproval() {
         openLoginItemsSettings()
     }
 
@@ -176,6 +157,11 @@ extension SMAppService: AppService {}
     }
 
     func refresh() async {
+        do {
+            try registerEngineIfNetworkingIsReady()
+        } catch {
+            self.error = "Could not enable the cengine background service: \(error.localizedDescription)"
+        }
         updateServiceStatus()
         guard agent.status == .enabled else { return }
         do {
@@ -243,8 +229,23 @@ extension SMAppService: AppService {}
     private func updateServiceStatus() {
         engineStatus = Self.label(agent.status)
         helperStatus = Self.label(helper.status)
-        helperEnabled = helper.status == .enabled || helper.status == .requiresApproval
         helperNeedsApproval = helper.status == .requiresApproval
+    }
+
+    private func registerRequiredNetworking() throws {
+        guard CEngineServices.needsRegistration(helper.status) else { return }
+        do {
+            try helper.register()
+        } catch {
+            // Registering a LaunchDaemon reports launch-denied while approval is pending.
+            // The service is registered at that point, so only propagate actual failures.
+            if helper.status != .requiresApproval { throw error }
+        }
+    }
+
+    private func registerEngineIfNetworkingIsReady() throws {
+        guard helper.status == .enabled, CEngineServices.needsRegistration(agent.status) else { return }
+        try agent.register()
     }
 
     private static func label(_ status: SMAppService.Status) -> String {

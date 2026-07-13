@@ -20,6 +20,8 @@ from harness import docker_environment
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_BINARY = REPO_ROOT / ".build/xcode-derived/Build/Products/Debug/cengine"
 DEFAULT_KERNEL = pathlib.Path.home() / "Library/Application Support/cengine/assets/vmlinux"
+DEFAULT_CONTAINER_INITRAMFS = pathlib.Path.home() / "Library/Application Support/cengine/assets/container-initramfs.cpio.gz"
+DEFAULT_STORAGE_INITRAMFS = pathlib.Path.home() / "Library/Application Support/cengine/assets/storage-initramfs.cpio.gz"
 DEFAULT_IMAGE = "alpine:latest"
 
 
@@ -47,6 +49,8 @@ def expected_git_commit(binary: pathlib.Path) -> str:
 class Daemon:
     binary: pathlib.Path
     kernel: pathlib.Path
+    container_initramfs: pathlib.Path
+    storage_initramfs: pathlib.Path
     work: pathlib.Path
     root: pathlib.Path = field(init=False)
     runtime: pathlib.Path = field(init=False)
@@ -76,7 +80,8 @@ class Daemon:
         self._log = self.log_path.open("ab")
         self.process = subprocess.Popen(
             [str(self.binary), "daemon", "--root", str(self.root), "--socket", str(self.socket),
-             "--kernel", str(self.kernel)],
+             "--kernel", str(self.kernel), "--container-initramfs", str(self.container_initramfs),
+             "--storage-initramfs", str(self.storage_initramfs)],
             stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
         )
         deadline = time.monotonic() + 60
@@ -166,15 +171,21 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 def daemon() -> Daemon:
     binary = pathlib.Path(os.environ.get("CENGINE_BINARY", DEFAULT_BINARY))
     kernel = pathlib.Path(os.environ.get("CENGINE_KERNEL", DEFAULT_KERNEL))
+    container_initramfs = pathlib.Path(os.environ.get("CENGINE_CONTAINER_INITRAMFS", DEFAULT_CONTAINER_INITRAMFS))
+    storage_initramfs = pathlib.Path(os.environ.get("CENGINE_STORAGE_INITRAMFS", DEFAULT_STORAGE_INITRAMFS))
     if not binary.is_file():
         pytest.fail(f"cengine binary not found at {binary}; run make build or set CENGINE_BINARY")
     if not kernel.is_file():
         pytest.fail(
             f"Linux kernel not found at {kernel}; run cengine system install or set CENGINE_KERNEL"
         )
+    for name, asset in [("container initramfs", container_initramfs), ("storage initramfs", storage_initramfs)]:
+        if not asset.is_file():
+            pytest.fail(f"cengine {name} not found at {asset}; run make guest-assets or set its CENGINE_* path")
 
     work = pathlib.Path(tempfile.mkdtemp(prefix="cengine-compat-"))
-    value = Daemon(binary=binary, kernel=kernel, work=work)
+    value = Daemon(binary=binary, kernel=kernel, container_initramfs=container_initramfs,
+                   storage_initramfs=storage_initramfs, work=work)
     value.start()
     yield value
     value.stop()

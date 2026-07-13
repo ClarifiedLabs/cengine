@@ -14,7 +14,7 @@ IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 @pytest.mark.compat("SYS-001")
 def test_info(client: docker.DockerClient):
     info = client.info()
-    assert info["Driver"] == "apple-containerization"
+    assert info["Driver"] == "cengine-raw-vm"
     assert info["OSType"] == "linux"
     assert info["Architecture"] == "arm64"
     assert info["DockerRootDir"]

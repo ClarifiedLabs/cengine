@@ -1,4 +1,5 @@
 import CEngineCore
+import Darwin
 import Foundation
 
 public struct EngineSnapshot: Codable, Sendable {
@@ -148,6 +149,7 @@ public actor EngineRuntime {
            let network = snapshot.networks.first(where: { $0.name == "default" }) {
             record.networks = [.init(networkID: network.id)]
         }
+        record = try allocatingEndpointAddresses(to: record)
         try validateEndpoints(record)
         try await backend.prepare(record)
         snapshot.containers.append(record)
@@ -584,6 +586,7 @@ public actor EngineRuntime {
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
             ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil
         ))
+        snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
         do {
             try validateEndpoints(snapshot.containers[index])
             try await backend.updateNetworkRecords(snapshot.containers)
@@ -692,6 +695,84 @@ public actor EngineRuntime {
                     }
                 }
             }
+        }
+    }
+
+    private func allocatingEndpointAddresses(to input: ContainerRecord) throws -> ContainerRecord {
+        var record = input
+        for index in record.networks.indices {
+            guard let network = snapshot.networks.first(where: { $0.id == record.networks[index].networkID }) else {
+                throw EngineError(.notFound, "network \(record.networks[index].networkID) not found")
+            }
+            let peers = snapshot.containers
+                .filter { $0.id != record.id }
+                .flatMap(\.networks)
+                .filter { $0.networkID == network.id }
+            if record.networks[index].ipv4Address == nil, !network.subnet.isEmpty {
+                record.networks[index].ipv4Address = try Self.nextAddress(
+                    in: network.subnet,
+                    gateway: network.gateway,
+                    used: Set(peers.compactMap(\.ipv4Address) + record.networks.compactMap(\.ipv4Address))
+                )
+            }
+            if record.networks[index].ipv6Address == nil, !network.ipv6Subnet.isEmpty {
+                record.networks[index].ipv6Address = try Self.nextAddress(
+                    in: network.ipv6Subnet,
+                    gateway: network.ipv6Gateway,
+                    used: Set(peers.compactMap(\.ipv6Address) + record.networks.compactMap(\.ipv6Address))
+                )
+            }
+        }
+        return record
+    }
+
+    private static func nextAddress(in subnet: String, gateway: String, used: Set<String>) throws -> String {
+        let components = subnet.split(separator: "/", maxSplits: 1).map(String.init)
+        guard components.count == 2, let prefix = Int(components[1]) else {
+            throw EngineError(.badRequest, "invalid network subnet \(subnet)")
+        }
+        let family = components[0].contains(":") ? AF_INET6 : AF_INET
+        let byteCount = family == AF_INET6 ? 16 : 4
+        guard (0..<(byteCount * 8)).contains(prefix), var network = addressBytes(components[0], family: family) else {
+            throw EngineError(.badRequest, "invalid network subnet \(subnet)")
+        }
+        for index in network.indices {
+            let remaining = prefix - index * 8
+            if remaining >= 8 { continue }
+            network[index] &= remaining <= 0 ? 0 : UInt8(0xff << (8 - remaining))
+        }
+        let hostBits = byteCount * 8 - prefix
+        let lastOffset = hostBits >= 16 ? 65_535 : (1 << hostBits) - 1
+        let reserved = Set(used.map { $0.split(separator: "/", maxSplits: 1).first.map(String.init) ?? $0 } + [gateway])
+        guard lastOffset >= 1 else { throw EngineError(.conflict, "network \(subnet) has no allocatable addresses") }
+        for offset in 1...lastOffset {
+            if family == AF_INET, offset == lastOffset { continue }
+            var candidate = network
+            var carry = offset
+            for index in candidate.indices.reversed() where carry > 0 {
+                let value = Int(candidate[index]) + carry
+                candidate[index] = UInt8(value & 0xff)
+                carry = value >> 8
+            }
+            guard let value = addressString(candidate, family: family), !reserved.contains(value) else { continue }
+            return value
+        }
+        throw EngineError(.conflict, "network \(subnet) has no free addresses")
+    }
+
+    private static func addressBytes(_ value: String, family: Int32) -> [UInt8]? {
+        var bytes = [UInt8](repeating: 0, count: family == AF_INET6 ? 16 : 4)
+        let result = value.withCString { source in
+            bytes.withUnsafeMutableBytes { destination in inet_pton(family, source, destination.baseAddress) }
+        }
+        return result == 1 ? bytes : nil
+    }
+
+    private static func addressString(_ bytes: [UInt8], family: Int32) -> String? {
+        var source = bytes
+        var destination = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        return source.withUnsafeMutableBytes { source in
+            inet_ntop(family, source.baseAddress, &destination, socklen_t(destination.count)).map { _ in String(cString: destination) }
         }
     }
 

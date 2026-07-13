@@ -112,6 +112,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-032` | `test_log_time_tail_stream_and_timestamp_filters` | ✅ Pass | Support | **cengine-owned.** Snapshot and follow logs honor stream, time, tail, and timestamp options. |
 | `CTR-033` | `test_multiple_containers_stream_stats_concurrently` | ✅ Pass | Support | **cengine-owned.** Multiple simultaneous stats streams produce independent samples. |
 | `CTR-034` | `test_network_none_has_only_loopback` | ✅ Pass | Support | **cengine-owned.** Network mode `none` persists across inspect and exposes only loopback in the guest. |
+| `CTR-035` | `test_debian_package_install_uses_ext4_rootfs` | ✅ Pass | Support | **cengine-owned.** Debian package installation creates `/etc/ssl` on the guest ext4 root without host-filesystem permission failures. |
 
 ## Images
 
@@ -169,6 +170,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |
 | `VOL-004` | `test_volume_subpath_mounts_existing_directory` | ✅ Pass | Support | **cengine-owned.** Existing volume subdirectories mount safely and traversal is rejected. |
 | `VOL-005` | `test_tmpfs_size_and_mode_options` | ✅ Pass | Support | **cengine-owned.** Structured tmpfs size and mode options are applied in the guest. |
+| `VOL-006` | `test_volume_preserves_inodes_across_link_and_rename` | ✅ Pass | Support | **cengine-owned.** FUSE node handles preserve hard-link identity across directory rename. |
 
 ## Docker Compose 5.3.1
 
@@ -196,6 +198,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `REC-001` | `test_daemon_restart_recovers_resources_and_restart_policy` | ✅ Pass | Support | **cengine-owned.** An abrupt daemon restart preserves resources and restarts an `always` container. |
 | `REC-002` | `test_daemon_restart_during_active_io_and_stats` | ✅ Pass | Support | **cengine-owned.** Recovery remains correct while log and stats streams are active. |
 | `REC-003` | `test_daemon_restart_recreates_usable_network_interfaces` | ✅ Pass | Support | **cengine-owned.** Logical vmnet restoration recreates a carrier-up interface with working DNS and internet access. |
+| `REC-004` | `test_running_workload_survives_daemon_process_replacement` | ✅ Pass | Support | **cengine-owned.** A daemon process replacement reconnects to the existing VM shim without changing container start time. |
 
 ## Docker CLI
 

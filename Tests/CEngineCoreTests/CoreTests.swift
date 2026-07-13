@@ -36,21 +36,13 @@ private final class DataBox: @unchecked Sendable {
         #expect(CEngineVersion.buildTime(bundle: Bundle()) == "")
     }
 
-    @Test func kataKernelUsesPublishedZstdAsset() {
-        #expect(KernelInstaller.version == "3.32.0")
-        #expect(KernelInstaller.archiveURL.lastPathComponent == "kata-static-3.32.0-arm64.tar.zst")
-        #expect(KernelInstaller.archiveMember == "opt/kata/share/kata-containers/vmlinux-6.18.35-197")
-        #expect(KernelInstaller.archiveSHA256.count == 64)
-        #expect(KernelInstaller.kernelSHA256.count == 64)
-    }
-
-    @Test func invalidKernelIsNotAcceptedAsInstalled() throws {
+    @Test func incompleteGuestAssetsAreNotAcceptedAsInstalled() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let kernel = root.appending(path: "vmlinux")
         try Data("not a kernel".utf8).write(to: kernel)
-        #expect(!KernelInstaller.isInstalled(at: kernel))
+        #expect(!GuestAssetInstaller.isInstalled(paths: EnginePaths(home: root)))
     }
 
     @Test func identifiersAreDockerCompatible() {

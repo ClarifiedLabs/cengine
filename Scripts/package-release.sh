@@ -81,17 +81,22 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$OUTPUT_DIR" "$PAYLOAD_ROOT/Applications" "$PAYLOAD_ROOT/usr/local/bin"
 APP_PATH="$PAYLOAD_ROOT/Applications/cengine.app"
 ditto --norsrc --noextattr "$SOURCE_APP" "$APP_PATH"
-mkdir -p "$APP_PATH/Contents/Helpers" "$APP_PATH/Contents/Library/LaunchAgents" \
+mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Library/LaunchAgents" \
   "$APP_PATH/Contents/Library/LaunchDaemons" "$APP_PATH/Contents/Resources"
-ditto --norsrc --noextattr "$SOURCE_ENGINE" "$APP_PATH/Contents/Helpers/cengine"
-ditto --norsrc --noextattr "$SOURCE_HELPER" "$APP_PATH/Contents/Helpers/cengine-network-helper"
+ditto --norsrc --noextattr "$SOURCE_ENGINE" "$APP_PATH/Contents/MacOS/cengine-engine"
+ditto --norsrc --noextattr "$SOURCE_HELPER" "$APP_PATH/Contents/MacOS/cengine-network-helper"
 ditto "$ROOT_DIR/Configuration/dev.cengine.engine.plist" "$APP_PATH/Contents/Library/LaunchAgents/dev.cengine.engine.plist"
 ditto "$ROOT_DIR/Configuration/dev.cengine.network-helper.plist" "$APP_PATH/Contents/Library/LaunchDaemons/dev.cengine.network-helper.plist"
+mkdir -p "$APP_PATH/Contents/Resources/guest"
+ditto "$ROOT_DIR/.build/guest/vmlinux" "$APP_PATH/Contents/Resources/guest/vmlinux"
+ditto "$ROOT_DIR/.build/guest/container-initramfs.cpio.gz" "$APP_PATH/Contents/Resources/guest/container-initramfs.cpio.gz"
+ditto "$ROOT_DIR/.build/guest/storage-initramfs.cpio.gz" "$APP_PATH/Contents/Resources/guest/storage-initramfs.cpio.gz"
+ditto "$ROOT_DIR/.build/guest/SHA256SUMS" "$APP_PATH/Contents/Resources/guest/SHA256SUMS"
 remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine"
-remove_build_rpaths "$APP_PATH/Contents/Helpers/cengine"
-remove_build_rpaths "$APP_PATH/Contents/Helpers/cengine-network-helper"
+remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-engine"
+remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-network-helper"
 xattr -cr "$PAYLOAD_ROOT"
-ln -s /Applications/cengine.app/Contents/Helpers/cengine "$PAYLOAD_ROOT/usr/local/bin/cengine"
+ln -s /Applications/cengine.app/Contents/MacOS/cengine-engine "$PAYLOAD_ROOT/usr/local/bin/cengine"
 
 UNINSTALLER_PKG="$BUILD_DIR/cengine-uninstall.pkg"
 if enabled "$SIGN_RELEASE"; then
@@ -105,19 +110,20 @@ ditto "$UNINSTALLER_PKG" "$APP_PATH/Contents/Resources/cengine-uninstall.pkg"
 
 if enabled "$SIGN_RELEASE"; then
   codesign --force --timestamp --options runtime --identifier dev.cengine.engine \
-    --entitlements "$ENGINE_ENTITLEMENTS" --sign "$developer_id_application" "$APP_PATH/Contents/Helpers/cengine"
+    --entitlements "$ENGINE_ENTITLEMENTS" --sign "$developer_id_application" "$APP_PATH/Contents/MacOS/cengine-engine"
   codesign --force --timestamp --options runtime --identifier dev.cengine.network-helper \
-    --sign "$developer_id_application" "$APP_PATH/Contents/Helpers/cengine-network-helper"
+    --sign "$developer_id_application" "$APP_PATH/Contents/MacOS/cengine-network-helper"
   codesign --force --timestamp --options runtime --identifier dev.cengine.app \
     --entitlements "$APP_ENTITLEMENTS" --sign "$developer_id_application" "$APP_PATH"
 else
-  codesign --force --entitlements "$ENGINE_ENTITLEMENTS" --sign - "$APP_PATH/Contents/Helpers/cengine"
-  codesign --force --sign - "$APP_PATH/Contents/Helpers/cengine-network-helper"
+  codesign --force --entitlements "$ENGINE_ENTITLEMENTS" --sign - "$APP_PATH/Contents/MacOS/cengine-engine"
+  codesign --force --sign - "$APP_PATH/Contents/MacOS/cengine-network-helper"
   codesign --force --entitlements "$APP_ENTITLEMENTS" --sign - "$APP_PATH"
 fi
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-"$ROOT_DIR/Scripts/verify-entitlements.sh" "$APP_PATH/Contents/Helpers/cengine"
-[[ "$($APP_PATH/Contents/Helpers/cengine version)" == "cengine $VERSION" ]]
+"$ROOT_DIR/Scripts/verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-engine" --require com.apple.security.virtualization
+"$ROOT_DIR/Scripts/verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-network-helper" --forbid com.apple.vm.networking
+[[ "$($APP_PATH/Contents/MacOS/cengine-engine version)" == "cengine $VERSION" ]]
 
 component_pkg="$BUILD_DIR/cengine-component.pkg"
 unsigned_pkg="$BUILD_DIR/cengine-$VERSION.unsigned.pkg"

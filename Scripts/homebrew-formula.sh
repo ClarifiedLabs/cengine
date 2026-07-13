@@ -18,7 +18,7 @@ cask "cengine" do
 
   url "${pkg_url}"
   name "cengine"
-  desc "Docker Engine-compatible daemon using Apple Containerization"
+  desc "Docker Engine-compatible daemon using one raw Linux VM per container"
   homepage "https://github.com/ClarifiedLabs/cengine"
 
   depends_on arch: :arm64

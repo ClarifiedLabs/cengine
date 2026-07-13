@@ -2,7 +2,8 @@
 
 `cengine` is an experimental, lightweight Docker Engine-compatible daemon for
 Apple silicon. It runs Linux containers as lightweight virtual machines using
-Apple's [Containerization](https://github.com/apple/containerization) package.
+Virtualization.framework directly, with one independently supervised VM per
+container.
 
 Note: this project was created as an experiment when testing out gpt-5.6-sol for the first time. As of commit 224624b705e9a94428316c9c33a96b70d77f08b1 all planning used `xhigh` effort and implementation used `low`.
 
@@ -20,11 +21,11 @@ Install the signed cengine app and CLI with Homebrew:
 brew install --cask clarifiedlabs/tap/cengine
 ```
 
-Open `/Applications/cengine.app`. On first launch, cengine enables its per-user
-engine service, downloads and verifies the Linux kernel, initializes its runtime,
-and configures the Docker context and Buildx builder when Docker CLI is available.
-The optional Privileged Ports helper is disabled by default and can be enabled
-during onboarding or later in Settings.
+Open `/Applications/cengine.app`. On first launch, cengine registers its required
+VM networking service for administrator approval. Once approved, it enables the
+per-user engine service, installs the bundled cengine kernel and guest initramfs
+assets, initializes its runtime, and configures the Docker context and Buildx
+builder when Docker CLI is available.
 
 ```sh
 open /Applications/cengine.app
@@ -38,25 +39,10 @@ cengine system doctor
 docker --context cengine info
 ```
 
-Each Docker network is backed by a separate dual-stack macOS vmnet network.
-Cengine allocates IPv4 `/24`s from documented RFC 1918 pools and assigns every
-network an RFC 4193 ULA `/64`. Override the IPv4 pools with
-`~/Library/Application Support/cengine/config.json`:
-
-```json
-{
-  "network": {
-    "ipv4Pools": ["192.168.224.0/20", "172.29.0.0/16", "10.240.0.0/16"]
-  }
-}
-```
-
-Pool entries must be unique RFC 1918 ranges containing complete `/24`s. Cengine
-asks vmnet to reserve each candidate directly; it does not pre-screen the host
-routing table. Networks are always dual-stack because vmnet supplies IPv6 even
-when Docker clients send `EnableIPv6: false`. Cengine persists logical network
-configuration and recreates vmnet reservations after daemon restart, remapping
-only automatically allocated subnets when the previous range is unavailable.
+Every container VM has one 802.1Q trunk. Docker networks are persistent VLAN and
+IP assignments switched by the infrastructure shim. Normal bridge VLANs receive
+a raw vmnet shared-mode uplink for host access, DNS, NAT, and published ports;
+internal networks use host-only mode, and isolated networks have no uplink.
 
 Network access follows Docker's bridge modes:
 
@@ -70,9 +56,9 @@ Network access follows Docker's bridge modes:
 Use `--internal` with
 `com.docker.network.bridge.gateway_mode_ipv4=isolated` and/or
 `com.docker.network.bridge.gateway_mode_ipv6=isolated` when containers must not
-reach macOS host services. Isolated traffic is enforced outside the guest by a
-frame-filtered vmnet data path, so a privileged container cannot bypass it by
-adding its own route. Ordinary bridge networks retain vmnet's direct attachment.
+reach macOS host services. VLAN membership is enforced outside the workload VM,
+so a privileged container
+cannot bypass isolation by adding its own route or opening the trunk parent.
 
 ## Usage
 
@@ -140,9 +126,8 @@ containers, and logs as well. Dragging only the app to Trash is not a complete
 uninstall because macOS does not invoke package or `SMAppService` cleanup hooks
 for ordinary app bundles.
 
-The initial service start can take several minutes while the Kata kernel and
-Apple `vminit` image are downloaded. The app reports service state and daemon
-errors; transient provisioning failures are retried twice. The daemon logs to
+The app reports service state and daemon errors; transient provisioning failures
+are retried twice. The daemon logs to
 `~/Library/Logs/cengine/daemon.log`.
 
 For architecture, development, testing, and implementation details, see

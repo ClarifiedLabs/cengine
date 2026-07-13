@@ -21,8 +21,8 @@ class LaunchdPlistTests(unittest.TestCase):
     def test_engine_launch_agent(self) -> None:
         plist = plistlib.loads(ENGINE_PLIST.read_bytes())
         self.assertEqual(plist["Label"], "dev.cengine.engine")
-        self.assertEqual(plist["BundleProgram"], "Contents/Helpers/cengine")
-        self.assertEqual(plist["ProgramArguments"], ["cengine", "service", "run"])
+        self.assertEqual(plist["BundleProgram"], "Contents/MacOS/cengine-engine")
+        self.assertEqual(plist["ProgramArguments"], ["cengine-engine", "service", "run"])
         self.assertIs(plist["RunAtLoad"], True)
         self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
         self.assertEqual(plist["ThrottleInterval"], 60)
@@ -31,7 +31,7 @@ class LaunchdPlistTests(unittest.TestCase):
     def test_network_helper_launch_daemon(self) -> None:
         plist = plistlib.loads(HELPER_PLIST.read_bytes())
         self.assertEqual(plist["Label"], "dev.cengine.network-helper")
-        self.assertEqual(plist["BundleProgram"], "Contents/Helpers/cengine-network-helper")
+        self.assertEqual(plist["BundleProgram"], "Contents/MacOS/cengine-network-helper")
         self.assertEqual(plist["MachServices"], {"dev.cengine.network-helper": True})
         self.assertEqual(plist["ProcessType"], "Interactive")
 

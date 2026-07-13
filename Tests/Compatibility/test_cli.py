@@ -32,7 +32,7 @@ def docker(daemon, *arguments: str, input: str | None = None) -> subprocess.Comp
 @pytest.mark.compat("CLI-001")
 def test_cli_system_and_image_commands(daemon):
     assert "cengine" in docker(daemon, "version", "--format", "{{.Server.Platform.Name}}").stdout
-    assert docker(daemon, "info", "--format", "{{.Driver}}").stdout.strip() == "apple-containerization"
+    assert docker(daemon, "info", "--format", "{{.Driver}}").stdout.strip() == "cengine-raw-vm"
     assert docker(daemon, "info", "--format", "{{.CgroupVersion}}").stdout.strip() == "2"
     docker(daemon, "pull", IMAGE)
     assert IMAGE.split(":", 1)[0] in docker(daemon, "image", "ls", "--format", "{{.Repository}}").stdout

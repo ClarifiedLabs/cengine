@@ -19,37 +19,59 @@ import CEngineCore
         #expect(!CEngineServices.needsRegistration(.requiresApproval))
     }
 
-    @MainActor @Test func launchDeniedRegistrationOpensApprovalSettingsWithoutAnError() async {
+    @MainActor @Test func requiredNetworkingRegistersBeforeEngineAndOpensApprovalFromOnboarding() async {
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(
             status: .notFound,
             statusAfterRegistration: .requiresApproval,
             registrationError: NSError(domain: SMAppServiceErrorDomain, code: 1)
         )
         var settingsOpenCount = 0
-        let model = AppModel(helper: helper) { settingsOpenCount += 1 }
+        let model = AppModel(agent: agent, helper: helper) { settingsOpenCount += 1 }
+        defer { model.setActive(false) }
 
-        await model.setHelperEnabled(true)
+        model.start()
 
         #expect(helper.registerCount == 1)
-        #expect(settingsOpenCount == 1)
+        #expect(agent.registerCount == 0)
+        #expect(settingsOpenCount == 0)
         #expect(model.error == nil)
         #expect(model.helperNeedsApproval)
         #expect(model.helperStatus == "Needs approval")
+
+        await model.completeOnboarding()
+        #expect(settingsOpenCount == 1)
     }
 
-    @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() async {
+    @MainActor @Test func enabledNetworkingRegistersEngineService() {
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let model = AppModel(agent: agent, helper: helper)
+        defer { model.setActive(false) }
+
+        model.start()
+
+        #expect(helper.registerCount == 0)
+        #expect(agent.registerCount == 1)
+        #expect(model.engineStatus == "Running")
+    }
+
+    @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() {
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(
             status: .notFound,
             statusAfterRegistration: .notFound,
             registrationError: NSError(domain: SMAppServiceErrorDomain, code: 1)
         )
         var settingsOpenCount = 0
-        let model = AppModel(helper: helper) { settingsOpenCount += 1 }
+        let model = AppModel(agent: agent, helper: helper) { settingsOpenCount += 1 }
+        defer { model.setActive(false) }
 
-        await model.setHelperEnabled(true)
+        model.start()
 
         #expect(settingsOpenCount == 0)
-        #expect(model.error?.contains("Could not update privileged-port support") == true)
+        #expect(agent.registerCount == 0)
+        #expect(model.error?.contains("Could not enable required cengine services") == true)
     }
 }
 
@@ -126,12 +148,12 @@ import CEngineCore
 }
 
 @MainActor @Suite struct OnboardingViewTests {
-    @Test func enablingPrivilegedPortsCompletesOnboardingWithHelperEnabled() async {
-        var requestedHelperState: Bool?
-        let view = OnboardingView { requestedHelperState = $0 }
+    @Test func enablingVMNetworkingCompletesOnboarding() async {
+        var completed = false
+        let view = OnboardingView { completed = true }
 
-        await view.complete(enableHelper: true)
+        await view.complete()
 
-        #expect(requestedHelperState == true)
+        #expect(completed)
     }
 }

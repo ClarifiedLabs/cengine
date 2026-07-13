@@ -31,9 +31,9 @@ enum SystemManager {
 
     static func prepare(paths: EnginePaths) async throws {
         try paths.createDirectories()
-        if !KernelInstaller.isInstalled(at: paths.kernel) {
-            print("Installing Kata Linux kernel \(KernelInstaller.version)…")
-            try await KernelInstaller.install(to: paths.kernel)
+        if !GuestAssetInstaller.isInstalled(paths: paths) {
+            print("Installing cengine kernel and guest initramfs assets...")
+            try GuestAssetInstaller.install(paths: paths)
         }
         configureDockerContext(paths: paths)
     }
@@ -104,7 +104,7 @@ enum SystemManager {
            current.trimmingCharacters(in: .whitespacesAndNewlines) == expected { return }
         do {
             _ = try? DockerIntegration.runDocker(["context", "rm", "-f", "cengine"])
-            try DockerIntegration.runDocker(["context", "create", "cengine", "--docker", "host=\(expected)", "--description", "cengine (Apple Containerization)"])
+            try DockerIntegration.runDocker(["context", "create", "cengine", "--docker", "host=\(expected)", "--description", "cengine (one container per VM)"])
         } catch {
             warn("could not configure Docker context: \(error.localizedDescription)")
         }

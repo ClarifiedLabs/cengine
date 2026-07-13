@@ -38,5 +38,11 @@ ditto --norsrc --noextattr "$PRODUCTS_DIR/$PRODUCT_NAME" "$OUTPUT_DIR/$PRODUCT_N
 remove_build_rpaths "$OUTPUT_DIR/$PRODUCT_NAME"
 codesign --force --entitlements "$ROOT_DIR/Configuration/cengine.entitlements" --sign - "$OUTPUT_DIR/$PRODUCT_NAME"
 "$ROOT_DIR/Scripts/verify-entitlements.sh" "$OUTPUT_DIR/$PRODUCT_NAME"
+rm -rf "$OUTPUT_DIR/share/cengine"
+mkdir -p "$OUTPUT_DIR/share/cengine"
+ditto "$ROOT_DIR/.build/guest/vmlinux" "$OUTPUT_DIR/share/cengine/vmlinux"
+ditto "$ROOT_DIR/.build/guest/container-initramfs.cpio.gz" "$OUTPUT_DIR/share/cengine/container-initramfs.cpio.gz"
+ditto "$ROOT_DIR/.build/guest/storage-initramfs.cpio.gz" "$OUTPUT_DIR/share/cengine/storage-initramfs.cpio.gz"
+ditto "$ROOT_DIR/.build/guest/SHA256SUMS" "$OUTPUT_DIR/share/cengine/SHA256SUMS"
 
 echo "Built ad-hoc Xcode-signed $OUTPUT_DIR/$PRODUCT_NAME"

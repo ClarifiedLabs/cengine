@@ -1,38 +1,10 @@
 @testable import CEngineAPI
 import CEngineCore
 @testable import CEngineRuntime
-import ContainerizationExtras
 import Foundation
 import NIOHTTP1
 import Testing
-
-private func ethernetFrame(etherType: UInt16, payload: [UInt8]) -> [UInt8] {
-    [UInt8](repeating: 0, count: 12) + [UInt8(etherType >> 8), UInt8(etherType & 0xff)] + payload
-}
-
-private func ipv4Frame(source: [UInt8], destination: [UInt8]) -> [UInt8] {
-    var header = [UInt8](repeating: 0, count: 20)
-    header[0] = 0x45
-    header.replaceSubrange(12..<16, with: source)
-    header.replaceSubrange(16..<20, with: destination)
-    return ethernetFrame(etherType: 0x0800, payload: header)
-}
-
-private func arpFrame(source: [UInt8], target: [UInt8]) -> [UInt8] {
-    var payload = [UInt8](repeating: 0, count: 28)
-    payload[1] = 1; payload[2] = 0x08; payload[4] = 6; payload[5] = 4; payload[7] = 1
-    payload.replaceSubrange(14..<18, with: source)
-    payload.replaceSubrange(24..<28, with: target)
-    return ethernetFrame(etherType: 0x0806, payload: payload)
-}
-
-private func ipv6Frame(source: [UInt8], destination: [UInt8], nextHeader: UInt8 = 58, type: UInt8 = 135) -> [UInt8] {
-    var header = [UInt8](repeating: 0, count: 40)
-    header[0] = 0x60; header[6] = nextHeader
-    header.replaceSubrange(8..<24, with: source)
-    header.replaceSubrange(24..<40, with: destination)
-    return ethernetFrame(etherType: 0x86dd, payload: header + [type])
-}
+import Virtualization
 
 private func versionMetadataBundle() throws -> (Bundle, URL) {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -496,21 +468,6 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(json["Driver"] as? String == "bridge")
     }
 
-    @Test func networkPoolsExpandAndInterleaveConfiguredPrivateRanges() throws {
-        #expect(try AppleContainerBackend.expand(pool: "192.168.240.0/23") == [
-            "192.168.240.0/24", "192.168.241.0/24",
-        ])
-        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try Data(#"{"network":{"ipv4Pools":["192.168.250.0/23","172.29.8.0/23","10.240.8.0/23"]}}"#.utf8)
-            .write(to: root.appending(path: "config.json"))
-        #expect(try AppleContainerBackend.loadSubnetCandidates(root: root) == [
-            "192.168.250.0/24", "172.29.8.0/24", "10.240.8.0/24",
-            "192.168.251.0/24", "172.29.9.0/24", "10.240.9.0/24",
-        ])
-    }
-
     @Test func networkAllocationModesAreTrackedPerAddressFamily() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -599,63 +556,6 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(portConflict.status == .badRequest)
     }
 
-    @Test func isolatedGatewayPacketFilterCannotBeBypassedWithAGuestRoute() throws {
-        let filter = IsolatedGatewayPacketFilter(
-            subnet: try CIDRv4("192.168.224.0/24"), prefixV6: nil,
-            isolateIPv4: true, isolateIPv6: false
-        )
-        let peer = ipv4Frame(source: [192, 168, 224, 2], destination: [192, 168, 224, 3])
-        #expect(filter.allows(peer, direction: .guestToNetwork))
-        #expect(filter.allows(peer, direction: .networkToGuest))
-        #expect(!filter.allows(
-            ipv4Frame(source: [192, 168, 224, 2], destination: [192, 168, 224, 1]),
-            direction: .guestToNetwork
-        ))
-        #expect(!filter.allows(
-            ipv4Frame(source: [192, 168, 224, 2], destination: [8, 8, 8, 8]),
-            direction: .guestToNetwork
-        ))
-        #expect(!filter.allows(
-            arpFrame(source: [192, 168, 224, 2], target: [192, 168, 224, 1]),
-            direction: .guestToNetwork
-        ))
-        #expect(filter.allows(
-            arpFrame(source: [192, 168, 224, 2], target: [192, 168, 224, 3]),
-            direction: .guestToNetwork
-        ))
-    }
-
-    @Test func isolatedGatewayPacketFilterAppliesModesPerAddressFamily() throws {
-        let local2 = [UInt8](repeating: 0, count: 15) + [2]
-        let local3 = [UInt8](repeating: 0, count: 15) + [3]
-        let external = [UInt8](repeating: 0x20, count: 16)
-        let filter = IsolatedGatewayPacketFilter(
-            subnet: try CIDRv4("192.168.224.0/24"), prefixV6: try CIDRv6("::/64"),
-            isolateIPv4: true, isolateIPv6: false
-        )
-        #expect(!filter.allows(
-            ipv4Frame(source: [192, 168, 224, 2], destination: [8, 8, 8, 8]),
-            direction: .guestToNetwork
-        ))
-        #expect(filter.allows(ipv6Frame(source: local2, destination: local3), direction: .guestToNetwork))
-        #expect(filter.allows(ipv6Frame(source: local2, destination: external), direction: .guestToNetwork))
-    }
-
-    @Test func isolatedGatewayPacketFilterAllowsDiscoveryButNotHostMulticastServices() throws {
-        let local = [0xfd] + [UInt8](repeating: 0, count: 14) + [2]
-        let multicast = [0xff, 0x02] + [UInt8](repeating: 0, count: 13) + [1]
-        let filter = IsolatedGatewayPacketFilter(
-            subnet: try CIDRv4("192.168.224.0/24"), prefixV6: try CIDRv6("fd00::/64"),
-            isolateIPv4: false, isolateIPv6: true
-        )
-        #expect(filter.allows(
-            ipv6Frame(source: local, destination: multicast), direction: .guestToNetwork
-        ))
-        #expect(!filter.allows(
-            ipv6Frame(source: local, destination: multicast, nextHeader: 17), direction: .guestToNetwork
-        ))
-    }
-
     @Test func kindIPv6OnlyNetworkRequestAllocatesIPv4AndAllowsOnlyStaticIPv6() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -683,14 +583,6 @@ private actor AuthImageBackend: ContainerBackend {
             body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"kind":{"IPAMConfig":{"IPv4Address":"192.168.250.20"}}}}}"#.utf8)
         ))
         #expect(staticIPv4.status == .badRequest)
-    }
-
-    @Test func uniqueLocalIPv6ValidationAcceptsTheFullRFC4193Range() throws {
-        #expect(AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fc00::/64")))
-        #expect(AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fdff:ffff:ffff:ffff::/64")))
-        #expect(!AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fbff:ffff::/64")))
-        #expect(!AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fe00::/64")))
-        #expect(!AppleContainerBackend.isUniqueLocal(prefix: try CIDRv6("fc00::/48")))
     }
 
     @Test func responseShapesFollowRequestedAPIVersion() async throws {
@@ -1387,5 +1279,10 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(history.status == .ok)
         let entries = try #require(JSONSerialization.jsonObject(with: history.body) as? [[String: Any]])
         #expect(entries.first?["CreatedBy"] as? String == "RUN true")
+    }
+
+    @Test @MainActor func rawVMConsoleUsesReadableInputHandle() throws {
+        let attachment = try RawVirtualMachineConfiguration.makeConsoleAttachment()
+        withExtendedLifetime(attachment) {}
     }
 }

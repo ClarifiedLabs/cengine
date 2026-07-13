@@ -6,10 +6,12 @@ def main() -> None:
     test = read(REPO_ROOT / ".github/workflows/test.yml")
     release = read(REPO_ROOT / ".github/workflows/release.yml")
     makefile = read(REPO_ROOT / "Makefile")
+    engine_entitlements = read(REPO_ROOT / "Configuration/cengine.entitlements")
     for needle in ("- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: macos-26", "make test"):
         require_contains(test, needle, "test.yml")
     for needle in (
-        "- release-ci", "v*.*.*", "require-tests:", "needs: require-tests",
+        "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
+        "needs: [require-tests, guest-assets]",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
         "Upload release artifacts", ".pkg", "PKG_SHA256",
@@ -19,6 +21,11 @@ def main() -> None:
         require_contains(release, needle, "release.yml")
     for forbidden in ("draft: true", "--draft", "TestFlight"):
         require_absent(release, forbidden, "release.yml")
+    require_contains(engine_entitlements, "com.apple.security.virtualization", "cengine.entitlements")
+    require_absent(release, "com.apple.vm.networking", "release.yml")
+    require_absent(engine_entitlements, "com.apple.vm.networking", "cengine.entitlements")
+    if (REPO_ROOT / "Configuration/cengine-network-helper.entitlements").exists():
+        raise AssertionError("the root network helper must not claim restricted vmnet entitlements")
     for forbidden in (
         "brew install docker",
         "install-compose-compat.sh",
@@ -31,6 +38,25 @@ def main() -> None:
         'CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine"',
         "Makefile",
     )
+    if makefile.count("Scripts/sign-compat-binary.sh .build/xcode-derived/Build/Products/Debug/cengine") != 3:
+        raise AssertionError("all compatibility test targets must sign the daemon for helper authentication")
+    for target in ("test-compat", "test-compat-soak", "test-compat-oracle"):
+        require_contains(makefile, f"{target}: build guest-initramfs", "Makefile")
+    guest_builder = read(REPO_ROOT / "Scripts/build-guest-assets.sh")
+    require_absent(guest_builder, "docker buildx build", "build-guest-assets.sh")
+    for needle in ("CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64", "-buildvcs=false"):
+        require_contains(guest_builder, needle, "build-guest-assets.sh")
+    compat_sign = read(REPO_ROOT / "Scripts/sign-compat-binary.sh")
+    for needle in (
+        "/Applications/cengine.app/Contents/MacOS/cengine-network-helper",
+        "dev.cengine.engine",
+        "Configuration/cengine.entitlements",
+        "security find-identity -v -p codesigning",
+        "PackageFrameworks",
+        "-name '*.framework'",
+        "-name '*.dylib'",
+    ):
+        require_contains(compat_sign, needle, "sign-compat-binary.sh")
 
 
 if __name__ == "__main__":
