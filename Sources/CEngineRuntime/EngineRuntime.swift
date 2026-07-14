@@ -84,7 +84,6 @@ public actor EngineRuntime {
             case .exited(let code):
                 snapshot.containers[index].exitCode = code
             case .unavailable:
-                try? await backend.delete(stale)
                 snapshot.containers[index].exitCode = 137
             }
             snapshot.containers[index].phase = .exited
@@ -177,8 +176,8 @@ public actor EngineRuntime {
         let record = snapshot.containers[index]
         if record.phase == .dead {
             try await backend.delete(record)
-            try await backend.prepare(record)
         }
+        try await backend.prepare(record)
         let resolvedPorts = try await backend.start(record)
         guard let current = try? containerIndex(record.id) else {
             _ = try? await backend.stop(record, timeoutSeconds: 0)

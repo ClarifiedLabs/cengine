@@ -177,13 +177,25 @@ private actor RestartBackend: ContainerBackend {
     private var starts = 0
     private var prepares = 0
     private var deletes = 0
+    private var preparedContainers = Set<String>()
     init(exitCode: Int32? = nil) { self.exitCode = exitCode }
     func pullImage(_: String, platform _: String) async throws {}
-    func prepare(_: ContainerRecord) async throws { prepares += 1 }
-    func start(_ container: ContainerRecord) async throws -> [PortBinding] { starts += 1; return container.ports }
+    func prepare(_ container: ContainerRecord) async throws {
+        if preparedContainers.insert(container.id).inserted { prepares += 1 }
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        guard preparedContainers.contains(container.id) else {
+            throw EngineError(.notFound, "container VM shim is unavailable")
+        }
+        starts += 1
+        return container.ports
+    }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
-    func delete(_: ContainerRecord) async throws { deletes += 1 }
+    func delete(_ container: ContainerRecord) async throws {
+        preparedContainers.remove(container.id)
+        deletes += 1
+    }
     func completion(_: ContainerRecord) async -> Int32? { defer { exitCode = nil }; return exitCode }
     func startCount() -> Int { starts }
     func prepareCount() -> Int { prepares }
@@ -1032,6 +1044,25 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(await backend.deleteCount() == 0)
         #expect(await backend.startCount() == 2)
         #expect(try await runtime.container(record.id).phase == .running)
+    }
+
+    @Test func startingAnExitedContainerRestoresItsMissingBackendPreparation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstBackend = RestartBackend()
+        let first = try await EngineRuntime(root: root, backend: firstBackend)
+        let record = try await first.createContainer(ContainerRecord(name: "missing-shim", image: "debian"))
+        try await first.startContainer(record.id)
+        try await first.stopContainer(record.id, timeoutSeconds: 0)
+
+        let recoveredBackend = RestartBackend()
+        let recovered = try await EngineRuntime(root: root, backend: recoveredBackend)
+        try await recovered.startContainer(record.id)
+
+        #expect(await recoveredBackend.prepareCount() == 1)
+        #expect(await recoveredBackend.deleteCount() == 0)
+        #expect(await recoveredBackend.startCount() == 1)
+        #expect(try await recovered.container(record.id).phase == .running)
     }
 
     @Test func detachedExitIsReconciledAndLogsAreServed() async throws {

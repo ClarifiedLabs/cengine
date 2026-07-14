@@ -153,6 +153,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func prepare(_ container: ContainerRecord) async throws {
         if shims[container.id] != nil { return }
+        if try await relaunchPreparedShim(container) != nil { return }
         let image = try await resolvedImage(container.image, platform: container.platform)
         let directory = root.appending(path: "containers/\(container.id)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -166,29 +167,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let bindSources = try HostBindSourceResolver(root: root.appending(path: "bind-sources")).resolve(container.mounts)
         preparedBindSources[container.id] = bindSources
         try Self.createSparseFile(at: disk, size: Self.defaultRootDiskBytes)
-        let specification = VMShimProtocol.Specification(
-            containerID: container.id,
+        let specification = try containerShimSpecification(
+            container,
+            directory: directory,
+            bindSources: bindSources,
             generation: 1,
-            token: Self.randomToken(),
-            kernelPath: kernel.path,
-            initialRamdiskPath: containerInitialRamdisk.path,
-            rootDiskPath: disk.path,
-            volumeDisks: [],
-            cpus: max(container.cpus, 1),
-            memoryBytes: max(container.memoryBytes, 256 * 1_024 * 1_024),
-            macAddress: Self.macAddress(container.id),
-            bindShares: container.mounts.enumerated().compactMap { index, mount in
-                guard mount.kind == .bind, let source = bindSources[index] else { return nil }
-                return .init(tag: "bind-\(index)", source: source.shareRoot.path, readOnly: mount.readOnly)
-            } + [.init(tag: "cengine-io", source: ioDirectory.path, readOnly: false)],
-            socketPath: try Self.makeRuntimeSocketPath(),
-            logPath: directory.appending(path: "shim.log").path,
-            kernelArguments: [
-                "cengine.management_address=\(Self.managementAddress(for: container.id))",
-                "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
-            ],
-            networkSocketPath: infrastructure.specification.networkSocketPath,
-            vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN]
+            volumeDisks: []
         )
         let shim = try await VMShimClient.launch(specification: specification)
         do {
@@ -617,6 +601,71 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func pull(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws -> OCIStoredImage {
         try await store.pull(reference: reference, platform: platform, credentials: credentials, progress: progress)
+    }
+
+    private func relaunchPreparedShim(_ container: ContainerRecord) async throws -> VMShimClient? {
+        let directory = root.appending(path: "containers/\(container.id)", directoryHint: .isDirectory)
+        let specificationURL = directory.appending(path: "shim.json")
+        let disk = directory.appending(path: "root.ext4")
+        guard FileManager.default.fileExists(atPath: specificationURL.path),
+              FileManager.default.fileExists(atPath: disk.path) else { return nil }
+        let persisted = try JSONDecoder().decode(
+            VMShimProtocol.Specification.self,
+            from: Data(contentsOf: specificationURL)
+        )
+        guard persisted.kind == .container, persisted.containerID == container.id else {
+            throw EngineError(.conflict, "persisted VM shim does not belong to container \(container.id)")
+        }
+        let ioDirectory = directory.appending(path: "io", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: ioDirectory, withIntermediateDirectories: true)
+        let bindSources = try HostBindSourceResolver(
+            root: root.appending(path: "bind-sources")
+        ).resolve(container.mounts)
+        let specification = try containerShimSpecification(
+            container,
+            directory: directory,
+            bindSources: bindSources,
+            generation: persisted.generation + 1,
+            volumeDisks: persisted.volumeDisks
+        )
+        let shim = try await VMShimClient.launch(specification: specification)
+        preparedBindSources[container.id] = bindSources
+        shims[container.id] = shim
+        return shim
+    }
+
+    private func containerShimSpecification(
+        _ container: ContainerRecord,
+        directory: URL,
+        bindSources: [Int: PreparedBindSource],
+        generation: UInt64,
+        volumeDisks: [VMShimProtocol.VolumeDisk]
+    ) throws -> VMShimProtocol.Specification {
+        let ioDirectory = directory.appending(path: "io", directoryHint: .isDirectory)
+        return VMShimProtocol.Specification(
+            containerID: container.id,
+            generation: generation,
+            token: Self.randomToken(),
+            kernelPath: kernel.path,
+            initialRamdiskPath: containerInitialRamdisk.path,
+            rootDiskPath: directory.appending(path: "root.ext4").path,
+            volumeDisks: volumeDisks,
+            cpus: max(container.cpus, 1),
+            memoryBytes: max(container.memoryBytes, 256 * 1_024 * 1_024),
+            macAddress: Self.macAddress(container.id),
+            bindShares: container.mounts.enumerated().compactMap { index, mount in
+                guard mount.kind == .bind, let source = bindSources[index] else { return nil }
+                return .init(tag: "bind-\(index)", source: source.shareRoot.path, readOnly: mount.readOnly)
+            } + [.init(tag: "cengine-io", source: ioDirectory.path, readOnly: false)],
+            socketPath: try Self.makeRuntimeSocketPath(),
+            logPath: directory.appending(path: "shim.log").path,
+            kernelArguments: [
+                "cengine.management_address=\(Self.managementAddress(for: container.id))",
+                "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
+            ],
+            networkSocketPath: infrastructure.specification.networkSocketPath,
+            vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN]
+        )
     }
 
     private func workload(_ container: ContainerRecord, image: OCIStoredImage, volumeModes: [String: VolumeStorageMode]) async throws -> GuestProtocol.Workload {

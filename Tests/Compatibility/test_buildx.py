@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import pathlib
+import signal
 import subprocess
 import time
 import uuid
@@ -159,6 +162,73 @@ def test_buildx_overlay_worker_has_large_state_volume(daemon, client: docker.Doc
         assert disk.exit_code == 0, disk.output.decode(errors="replace")
         size_kib = int(disk.output.decode().splitlines()[-1].split()[1])
         assert size_kib >= 500_000_000, f"BuildKit state volume is only {size_kib} KiB"
+    finally:
+        subprocess.run(
+            ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
+            env=docker_environment(docker_host), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=60,
+        )
+
+
+@pytest.mark.compat("BLD-004")
+def test_buildx_relaunches_missing_stopped_container_shim(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    builder = f"compat-shim-recovery-builder-{suffix}"
+    tag = f"compat-shim-recovery-buildx:{suffix}"
+    docker_host = f"unix://{daemon.socket}"
+    try:
+        buildx(
+            "create", "--name", builder, "--driver", "docker-container",
+            "--driver-opt", f"image={BUILDKIT_IMAGE}",
+            "--buildkitd-config", str(BUILDKIT_CONFIG),
+            "--buildkitd-flags", "--oci-worker-snapshotter=overlayfs",
+            docker_host, docker_host=docker_host,
+        )
+        buildx("inspect", "--builder", builder, "--bootstrap", docker_host=docker_host)
+        buildkit = client.containers.get(f"buildx_buildkit_{builder}0")
+        marker = buildkit.exec_run(["sh", "-c", "printf retained >/shim-recovery-marker; sync"])
+        assert marker.exit_code == 0, marker.output.decode(errors="replace")
+
+        specification_path = daemon.root / "containers" / buildkit.id / "shim.json"
+        specification = json.loads(specification_path.read_text())
+        status = json.loads(pathlib.Path(specification["socketPath"] + ".status").read_text())
+        assert status["state"] == "running"
+        shim_pid = status["processIdentifier"]
+
+        daemon.stop(kill=True)
+        os.kill(shim_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(shim_pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"container VM shim {shim_pid} did not exit")
+            time.sleep(0.05)
+
+        state_path = daemon.root / "engine.json"
+        state = json.loads(state_path.read_text())
+        matches = [value for value in state["value"]["containers"] if value["id"] == buildkit.id]
+        assert len(matches) == 1
+        matches[0]["phase"] = "exited"
+        matches[0]["exitCode"] = 137
+        state_path.write_text(json.dumps(state, sort_keys=True))
+        daemon.start()
+
+        buildkit = client.containers.get(buildkit.id)
+        assert buildkit.status == "exited"
+
+        result = buildx(
+            "build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT),
+            docker_host=docker_host,
+        )
+        assert "ERROR" not in result.stdout
+        relaunched = json.loads(specification_path.read_text())
+        assert relaunched["generation"] == specification["generation"] + 1
+        buildkit = client.containers.get(f"buildx_buildkit_{builder}0")
+        marker = buildkit.exec_run(["cat", "/shim-recovery-marker"])
+        assert (marker.exit_code, marker.output) == (0, b"retained")
     finally:
         subprocess.run(
             ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
