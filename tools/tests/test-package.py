@@ -13,6 +13,9 @@ def main() -> None:
     project = read(REPO_ROOT / "cengine.xcodeproj/project.pbxproj")
     build_script = read(REPO_ROOT / "Scripts/build-release.sh")
     makefile = read(REPO_ROOT / "Makefile")
+    uninstall_distribution = read(REPO_ROOT / "Scripts/Uninstaller/Distribution.xml")
+    uninstall_welcome = read(REPO_ROOT / "Scripts/Uninstaller/Resources/welcome.html")
+    uninstall_conclusion = read(REPO_ROOT / "Scripts/Uninstaller/Resources/conclusion.html")
     component_plist_path = REPO_ROOT / "Configuration/cengine-component.plist"
     for needle in (
         'PAYLOAD_ROOT/Applications', 'PAYLOAD_ROOT/usr/local/bin', 'dev.cengine.app.pkg',
@@ -24,8 +27,21 @@ def main() -> None:
         "sed -nE 's/.*MARKETING_VERSION", 'xattr -cr "$PAYLOAD_ROOT"',
         'install_name_tool -delete_rpath', 'PackageFrameworks',
         '--component-plist "$COMPONENT_PLIST"',
+        'cengine-uninstall-component.pkg', '--distribution "$UNINSTALLER_DISTRIBUTION"',
+        '--resources "$ROOT_DIR/Scripts/Uninstaller/Resources"', '--package-path "$BUILD_DIR"',
     ):
         require_contains(script, needle, "package-release.sh")
+    for needle in (
+        "<title>Uninstall cengine</title>", '<welcome file="welcome.html"',
+        '<conclusion file="conclusion.html"', 'enable_localSystem="true"',
+        "cengine-uninstall-component.pkg",
+    ):
+        require_contains(uninstall_distribution, needle, "uninstaller Distribution.xml")
+    require_contains(uninstall_welcome, "Uninstall cengine", "uninstaller welcome")
+    require_contains(
+        uninstall_welcome, "does not install cengine or any other software", "uninstaller welcome"
+    )
+    require_contains(uninstall_conclusion, "cengine has been uninstalled", "uninstaller conclusion")
     require_contains(entitlements, "com.apple.security.virtualization", "cengine.entitlements")
     require_absent(entitlements, "com.apple.vm.networking", "cengine.entitlements")
     require_absent(entitlements, "com.apple.developer.networking.vmnet", "cengine.entitlements")

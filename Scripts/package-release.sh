@@ -98,14 +98,21 @@ remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-network-helper"
 xattr -cr "$PAYLOAD_ROOT"
 ln -s /Applications/cengine.app/Contents/MacOS/cengine-engine "$PAYLOAD_ROOT/usr/local/bin/cengine"
 
+UNINSTALLER_COMPONENT_PKG="$BUILD_DIR/cengine-uninstall-component.pkg"
+UNINSTALLER_DISTRIBUTION="$BUILD_DIR/cengine-uninstall.dist"
 UNINSTALLER_PKG="$BUILD_DIR/cengine-uninstall.pkg"
+pkgbuild --nopayload --scripts "$ROOT_DIR/Scripts/Uninstaller" --identifier "$UNINSTALLER_IDENTIFIER" \
+  --version "$VERSION" "$UNINSTALLER_COMPONENT_PKG"
+sed "s/@VERSION@/$VERSION/g" "$ROOT_DIR/Scripts/Uninstaller/Distribution.xml" > "$UNINSTALLER_DISTRIBUTION"
+uninstaller_product_args=(
+  --distribution "$UNINSTALLER_DISTRIBUTION"
+  --resources "$ROOT_DIR/Scripts/Uninstaller/Resources"
+  --package-path "$BUILD_DIR"
+)
 if enabled "$SIGN_RELEASE"; then
-  pkgbuild --nopayload --scripts "$ROOT_DIR/Scripts/Uninstaller" --identifier "$UNINSTALLER_IDENTIFIER" \
-    --version "$VERSION" --sign "$installer_identity" "$UNINSTALLER_PKG"
-else
-  pkgbuild --nopayload --scripts "$ROOT_DIR/Scripts/Uninstaller" --identifier "$UNINSTALLER_IDENTIFIER" \
-    --version "$VERSION" "$UNINSTALLER_PKG"
+  uninstaller_product_args+=(--sign "$installer_identity")
 fi
+productbuild "${uninstaller_product_args[@]}" "$UNINSTALLER_PKG"
 ditto "$UNINSTALLER_PKG" "$APP_PATH/Contents/Resources/cengine-uninstall.pkg"
 
 if enabled "$SIGN_RELEASE"; then
