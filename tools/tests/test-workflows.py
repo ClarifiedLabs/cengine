@@ -23,6 +23,12 @@ def main() -> None:
         require_contains(release, needle, "release.yml")
     for forbidden in ("draft: true", "--draft", "TestFlight"):
         require_absent(release, forbidden, "release.yml")
+    require_contains(
+        release,
+        'installed="/Applications/cengine.app/Contents/MacOS/cengine-engine"',
+        "release.yml",
+    )
+    require_absent(release, "Contents/Helpers/cengine", "release.yml")
     require_contains(engine_entitlements, "com.apple.security.virtualization", "cengine.entitlements")
     require_absent(release, "com.apple.vm.networking", "release.yml")
     require_absent(engine_entitlements, "com.apple.vm.networking", "cengine.entitlements")

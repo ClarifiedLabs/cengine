@@ -248,7 +248,7 @@ jobs:
             PKG_SHA256="$(shasum -a 256 "$pkg" | awk '{print $1}')" \
             ./Scripts/homebrew-formula.sh
           brew install --cask clarifiedlabs/cengine-ci/cengine
-          installed="/Applications/cengine.app/Contents/Helpers/cengine"
+          installed="/Applications/cengine.app/Contents/MacOS/cengine-engine"
           codesign --verify --strict --verbose=2 "$installed"
           codesign --verify -R=notarized --check-notarization --verbose=2 "$installed"
           codesign -d --entitlements :- "$installed" 2>&1 | grep -q com.apple.security.virtualization
