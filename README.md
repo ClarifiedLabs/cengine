@@ -5,13 +5,12 @@ Apple silicon. It runs Linux containers as lightweight virtual machines using
 Virtualization.framework directly, with one independently supervised VM per
 container.
 
-Note: this project was created as an experiment when testing out gpt-5.6-sol for the first time. As of commit 224624b705e9a94428316c9c33a96b70d77f08b1 all planning used `xhigh` effort and implementation used `low`.
-
 ## Requirements
 
 - Apple silicon
 - macOS 26 or newer
-- Docker CLI
+- Docker CLI with the Buildx plugin
+- Docker Compose plugin when using Compose
 
 ## Install
 
@@ -72,11 +71,12 @@ docker --context cengine compose up
 docker --context cengine buildx build --builder cengine-builder --load .
 ```
 
-Buildx is the intended build path. The managed `cengine-builder` uses BuildKit's
-native snapshotter so non-scratch builds work with cengine-backed volumes. Its
-builder VM defaults to 4 CPUs, 4 GiB of memory, and a 16 GiB root filesystem.
-View or change the CPU and memory settings from the app's Settings window or
-with the CLI:
+Builds are supported through cengine's managed Buildx builder. Use
+`docker buildx build`; cengine does not implement Docker Engine's legacy
+`/build` API. The managed `cengine-builder` uses BuildKit's native snapshotter
+so non-scratch builds work with cengine-backed volumes. Its builder VM defaults
+to 4 CPUs, 4 GiB of memory, and a 16 GiB root filesystem. View or change the CPU
+and memory settings from the app's Settings window or with the CLI:
 
 ```sh
 cengine builder resources
@@ -97,6 +97,24 @@ cengine container resources --cpus 2 --memory 2g
 
 Explicit Docker or Compose CPU and memory limits take precedence over these
 defaults. Existing containers are not changed.
+
+## Volumes
+
+cengine chooses a volume's storage mode from the container topology known
+before its first use:
+
+- A volume with one known consumer uses a directly attached ext4 block device.
+  This supports filesystem behavior required by workloads such as BuildKit and
+  kind.
+- A volume with multiple known consumers is exported over NFS by cengine's
+  storage VM so the containers can mount it concurrently.
+
+The selected mode is persistent. Once a block-backed volume has been used,
+cengine cannot later attach it to a second container as a shared volume. Declare
+the complete sharing topology before first use; Compose does this automatically
+because cengine receives the project topology before starting its containers.
+See [Raw runtime architecture](docs/raw-runtime.md) for the detailed storage
+design.
 
 To make `cengine` the default engine for subsequent Docker commands, activate
 its Docker context:
@@ -130,6 +148,7 @@ The app reports service state and daemon errors; transient provisioning failures
 are retried twice. The daemon logs to
 `~/Library/Logs/cengine/daemon.log`.
 
-For architecture, development, testing, and implementation details, see
-[`docs/development.md`](docs/development.md). Docker API and Compose support is
-tracked in [`docs/docker-compatibility.md`](docs/docker-compatibility.md).
+See [Development](docs/development.md) for build and test commands. Architecture
+and implementation details are documented in
+[Raw runtime architecture](docs/raw-runtime.md). Docker API and Compose support
+is tracked in [Docker compatibility](docs/docker-compatibility.md).
