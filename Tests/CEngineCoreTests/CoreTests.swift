@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 @testable import CEngineCore
-import CEngineRuntime
+@testable import CEngineRuntime
 
 private final class DataBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -59,6 +59,32 @@ private final class DataBox: @unchecked Sendable {
         #expect(ImageReference.normalized("registry.example/debian:bookworm") == "registry.example/debian:bookworm")
     }
 
+    @Test func bindSourceFallsBackToManagedStorageForUnwritableHostNamespace() throws {
+        let temporary = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let managed = temporary.appending(path: "managed")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        let requested = URL(filePath: "/lib/cengine-bind-source-\(UUID().uuidString)")
+        let mount = MountRecord(kind: .bind, source: requested.path, destination: "/data", createSourceIfMissing: true)
+        let source = try #require(HostBindSourceResolver(root: managed).resolve([mount])[0])
+        #expect(source.shareRoot.path.hasPrefix(managed.path + "/"))
+        #expect(source.subpath == nil)
+        #expect(FileManager.default.fileExists(atPath: source.shareRoot.path))
+    }
+
+    @Test func portForwarderResolvesEphemeralHostPort() async throws {
+        let forwarder = PortForwarder()
+        defer { forwarder.stopAll() }
+        let ports = try await forwarder.start(
+            containerID: UUID().uuidString,
+            guestIPv4Address: "127.0.0.1",
+            guestIPv6Address: nil,
+            bindings: [.init(hostIP: "127.0.0.1", hostPort: 0, containerPort: 9)]
+        )
+        #expect(ports.count == 1)
+        #expect(ports.first?.hostPort != 0)
+    }
+
     @Test func containerIOFramesNonTTYOutput() throws {
         let bridge = ContainerIOBridge(tty: false)
         let received = DataBox()
@@ -80,6 +106,16 @@ private final class DataBox: @unchecked Sendable {
         try bridge.writer(.stdout).write(Data("-second".utf8))
         #expect(first.value == Data("both".utf8))
         #expect(second.value == Data("both-second".utf8))
+    }
+
+    @Test func containerIOFinishesInputAfterBufferedData() async {
+        let bridge = ContainerIOBridge(tty: true)
+        bridge.sendInput(Data("stdin".utf8))
+        bridge.finishInput()
+
+        var received: [Data] = []
+        for await data in bridge.stream() { received.append(data) }
+        #expect(received == [Data("stdin".utf8)])
     }
 
     @Test func containerIOPersistsFramedLogs() throws {

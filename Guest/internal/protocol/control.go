@@ -9,12 +9,12 @@ import (
 )
 
 const (
-	Version          = 1
-	ControlPort      = 4100
-	FileSystemPort   = 4101
+	Version           = 1
+	ControlPort       = 4100
+	FileSystemPort    = 4101
 	RootFSContentPort = 4102
-	MaxControlFrame  = 16 << 20
-	MaxFileSystemIO  = 4 << 20
+	MaxControlFrame   = 16 << 20
+	MaxFileSystemIO   = 4 << 20
 )
 
 type Envelope struct {
@@ -41,6 +41,7 @@ type WorkloadSpec struct {
 	Terminal         bool              `json:"terminal"`
 	ReadOnlyRoot     bool              `json:"readOnlyRoot"`
 	StopSignal       string            `json:"stopSignal"`
+	VolumeServer     string            `json:"volumeServer,omitempty"`
 	Mounts           []Mount           `json:"mounts"`
 	Networks         []NetworkEndpoint `json:"networks"`
 	Hosts            map[string]string `json:"hosts,omitempty"`
@@ -58,12 +59,12 @@ type User struct {
 type Mount struct {
 	Kind        string   `json:"kind"`
 	Source      string   `json:"source"`
+	Device      string   `json:"device,omitempty"`
 	Destination string   `json:"destination"`
 	ReadOnly    bool     `json:"readOnly"`
 	Options     []string `json:"options,omitempty"`
-	Token       string   `json:"token,omitempty"`
 	Subpath     string   `json:"subpath,omitempty"`
-	NoCopy     bool     `json:"noCopy,omitempty"`
+	NoCopy      bool     `json:"noCopy,omitempty"`
 }
 
 type NetworkEndpoint struct {
@@ -100,12 +101,12 @@ type NetworkRequest struct {
 }
 
 type ExecSpec struct {
-	ID string `json:"id"`
-	Arguments []string `json:"arguments"`
-	Environment []string `json:"environment"`
-	WorkingDirectory string `json:"workingDirectory"`
-	User string `json:"user"`
-	Terminal bool `json:"terminal"`
+	ID               string   `json:"id"`
+	Arguments        []string `json:"arguments"`
+	Environment      []string `json:"environment"`
+	WorkingDirectory string   `json:"workingDirectory"`
+	User             string   `json:"user"`
+	Terminal         bool     `json:"terminal"`
 }
 
 type RootFSLayer struct {

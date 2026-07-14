@@ -14,3 +14,10 @@ func TestContainerNetworkHandlesOnlyRequestRouteNetlink(t *testing.T) {
 		t.Fatalf("unexpected netlink families %v", families)
 	}
 }
+
+func TestTemporaryLinkNameCannotCollideWithDockerInterface(t *testing.T) {
+	name := temporaryLinkName(4_194_304, 4094)
+	if name == trunkName || len(name) > 15 {
+		t.Fatalf("invalid temporary interface name %q", name)
+	}
+}

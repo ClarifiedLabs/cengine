@@ -20,6 +20,7 @@ import Foundation
             initialRamdisk: configuration.initialRamdisk,
             rootDisk: configuration.rootDisk,
             rootDiskReadOnly: configuration.rootDiskReadOnly,
+            additionalDisks: configuration.additionalDisks,
             cpus: configuration.cpus,
             memoryBytes: configuration.memoryBytes,
             networkFileHandle: trunk.virtualMachineFileHandle,

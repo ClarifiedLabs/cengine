@@ -22,22 +22,41 @@ The Linux toolchain runs through `CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default:
 `make dist-cli` runs the tests and stages `dist/cengine` plus `dist/share/cengine`.
 `make package` creates `dist/cengine-0.0.1.pkg` for local release-artifact testing.
 
-`make test-compat` builds the debug daemon, creates a cached Python virtual
-environment under `.build`, and runs the Docker API and Docker Compose 5.3.1
-compatibility suites against a temporary root and Unix socket. The command uses
+`make test-compat` builds and signs the debug daemon, terminates orphaned
+compatibility daemons and VM shims owned by this worktree, removes their
+`cengine-compat-*` temporary roots, creates a cached Python virtual environment
+under `.build`, and runs the Docker API and Docker Compose 5.3.1 compatibility
+suites. Every test gets a new daemon, temporary root, Unix socket, engine state,
+and VM set. Fixture images are fetched once into a versioned immutable seed
+content store under `.build` and APFS-cloned into each root, avoiding external registry state without
+sharing mutable engine metadata. Pytest stops all VM shims owned by that root before removing it,
+including when a test fails; it does not reuse a daemon or repair resources
+left by a preceding test. The command uses
 the guest assets installed by the managed service or `cengine system install`;
 override them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and
 `CENGINE_STORAGE_INITRAMFS`, or override the daemon and fixture image with
-`CENGINE_BINARY` and `CENGINE_TEST_IMAGE`. The suite requires Docker Compose
+`CENGINE_BINARY` and `CENGINE_TEST_IMAGE`.
+Set `CENGINE_TEST_IMAGE_SOURCE` when the fixture tag should be seeded from a
+private or internal mirror; the default `alpine:latest` fixture is seeded from
+`mirror.gcr.io/library/alpine:latest` to avoid Docker Hub's anonymous rate limit.
+The suite requires Docker Compose
 5.3.1 and kind (v0.32.0 is the reference version); install the checksum-pinned
 Compose plugin with `Scripts/install-compose-compat.sh`. GitHub-hosted runners
 cannot execute the VM-backed suite, so compatibility tests are currently a
 local gate rather than part of `.github/workflows/test.yml`.
 
 The harness removes ambient Docker endpoint overrides from every subprocess,
-checks that the daemon reports the expected Git commit, and verifies Docker CLI
-access to a sentinel resource on the isolated socket before running scenarios.
+checks that each daemon reports the expected Git commit, and verifies Docker CLI
+access to a sentinel resource on each isolated socket before running a scenario.
 Set `CENGINE_EXPECTED_GIT_COMMIT` when testing a custom `CENGINE_BINARY`.
+
+Use `make test-compat-reset` to perform the worktree-scoped cleanup without
+running the suite. It deliberately does not touch `/Applications/cengine.app`,
+the installed engine service, or processes from another checkout. If a network
+helper crash left an idle reservation inside macOS `NetworkSharing`, use
+`make test-compat-reset-system` once. That exceptional recovery command requests
+administrator authorization and restarts cengine's helper and the system
+NetworkSharing daemon; normal compatibility runs do not restart system services.
 
 Use `make test-compat-soak` to run three fresh-daemon passes with shuffled test
 ordering. To compare normalized behavior with a real Docker Engine, run

@@ -73,11 +73,23 @@ public actor EngineRuntime {
         var recovered: [(String, Date)] = []
         for index in snapshot.containers.indices where snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused {
             let stale = snapshot.containers[index]
-            try? await backend.delete(stale)
+            let recovery = (try? await backend.recover(stale)) ?? .unavailable
+            switch recovery {
+            case .running, .paused:
+                snapshot.containers[index].phase = recovery == .paused ? .paused : .running
+                let startedAt = snapshot.containers[index].startedAt ?? Date()
+                snapshot.containers[index].startedAt = startedAt
+                recovered.append((stale.id, startedAt))
+                continue
+            case .exited(let code):
+                snapshot.containers[index].exitCode = code
+            case .unavailable:
+                try? await backend.delete(stale)
+                snapshot.containers[index].exitCode = 137
+            }
             snapshot.containers[index].phase = .exited
-            snapshot.containers[index].exitCode = 137
             snapshot.containers[index].finishedAt = Date()
-            guard Self.shouldRestart(stale, exitCode: 137) else { continue }
+            guard Self.shouldRestart(stale, exitCode: snapshot.containers[index].exitCode ?? 137) else { continue }
             do {
                 var restarted = snapshot.containers[index]
                 restarted.restartCount += 1

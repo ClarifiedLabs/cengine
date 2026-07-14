@@ -16,6 +16,7 @@ from harness import docker_environment
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BUILD_CONTEXT = REPO_ROOT / "Tests/Fixtures/buildx"
+BUILDKIT_CONFIG = BUILD_CONTEXT / "buildkitd.toml"
 BUILDKIT_IMAGE = "moby/buildkit:v0.27.1"
 
 
@@ -42,6 +43,7 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
             "--driver-opt", "memory=4294967296",
             "--driver-opt", "cpu-period=100000",
             "--driver-opt", "cpu-quota=400000",
+            "--buildkitd-config", str(BUILDKIT_CONFIG),
             "--buildkitd-flags", "--oci-worker-snapshotter=native",
             docker_host, docker_host=docker_host,
         )
@@ -91,6 +93,7 @@ def test_buildx_pull_succeeds_after_daemon_restart(daemon, client: docker.Docker
             "create", "--name", builder, "--driver", "docker-container",
             "--driver-opt", f"image={BUILDKIT_IMAGE}",
             "--driver-opt", "memory=4294967296",
+            "--buildkitd-config", str(BUILDKIT_CONFIG),
             "--buildkitd-flags", "--oci-worker-snapshotter=native",
             docker_host, docker_host=docker_host,
         )

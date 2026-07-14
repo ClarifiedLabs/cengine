@@ -5,11 +5,13 @@ package main
 import (
 	"encoding/hex"
 	"log"
+	"net"
 	"os"
-	"strings"
+	"strconv"
 
 	"dev.cengine/guest/internal/boot"
 	"dev.cengine/guest/internal/disk"
+	guestnetwork "dev.cengine/guest/internal/network"
 	"dev.cengine/guest/internal/protocol"
 	"dev.cengine/guest/internal/storage"
 	"dev.cengine/guest/internal/vsock"
@@ -25,6 +27,30 @@ func main() {
 	if err := disk.EnsureExt4("/dev/vda", "/data", "cengine-volumes"); err != nil {
 		log.Fatalf("prepare volume disk: %v", err)
 	}
+	managementAddress, err := boot.KernelParameter("cengine.management_address")
+	if err != nil {
+		log.Fatal(err)
+	}
+	managementVLAN, err := boot.KernelParameter("cengine.management_vlan")
+	if err != nil {
+		log.Fatal(err)
+	}
+	vlan, err := strconv.ParseUint(managementVLAN, 10, 16)
+	if err != nil {
+		log.Fatalf("parse management VLAN: %v", err)
+	}
+	if err := guestnetwork.ConfigureManagement(managementAddress, uint16(vlan)); err != nil {
+		log.Fatalf("configure management network: %v", err)
+	}
+	managementIP, _, err := net.ParseCIDR(managementAddress)
+	if err != nil {
+		log.Fatalf("parse management address: %v", err)
+	}
+	go func() {
+		if err := storage.ServeNFS(net.JoinHostPort(managementIP.String(), "2049"), "/data/volumes"); err != nil {
+			log.Fatalf("serve NFS volume store: %v", err)
+		}
+	}()
 	cid, err := vsock.LocalCID()
 	if err != nil {
 		log.Fatalf("resolve local vsock CID: %v", err)
@@ -39,20 +65,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("load volume token secret: %v", err)
 	}
-	if err := storage.Serve(listener, "/data", secret); err != nil {
+	if err := storage.Serve(listener, "/data/volumes", secret); err != nil {
 		log.Fatalf("serve volume store: %v", err)
 	}
 }
 
 func volumeSecret() ([]byte, error) {
-	data, err := os.ReadFile("/proc/cmdline")
+	value, err := boot.KernelParameter("cengine.volume_secret")
 	if err != nil {
 		return nil, err
 	}
-	for _, value := range strings.Fields(string(data)) {
-		if strings.HasPrefix(value, "cengine.volume_secret=") {
-			return hex.DecodeString(strings.TrimPrefix(value, "cengine.volume_secret="))
-		}
-	}
-	return nil, os.ErrNotExist
+	return hex.DecodeString(value)
 }

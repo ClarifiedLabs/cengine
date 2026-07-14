@@ -8,8 +8,7 @@ final class VMNetUplink: @unchecked Sendable {
     let fabricFileHandle: FileHandle
 
     private let networkID: String
-    private let serviceName: String
-    private let teamIdentifier: String
+    private let connection: xpc_connection_t
     private let lock = NSLock()
     private var stopped = false
 
@@ -18,6 +17,7 @@ final class VMNetUplink: @unchecked Sendable {
             id: network.id,
             vlan: network.vlan,
             subnet: network.subnet,
+            gateway: network.gateway,
             ipv6Subnet: network.ipv6Subnet,
             internalNetwork: network.internalNetwork,
             dhcpEnabled: false,
@@ -32,43 +32,37 @@ final class VMNetUplink: @unchecked Sendable {
         )
         let serviceName = PrivilegedPortProtocol.serviceName
         let teamIdentifier = Bundle.main.object(forInfoDictionaryKey: "CEngineTeamIdentifier") as? String ?? ""
-        let descriptor = try await requestUplink(request, serviceName: serviceName, teamIdentifier: teamIdentifier)
+        let transport = try await requestUplink(request, serviceName: serviceName, teamIdentifier: teamIdentifier)
         return VMNetUplink(
             networkID: request.id,
-            descriptor: descriptor,
-            serviceName: serviceName,
-            teamIdentifier: teamIdentifier
+            descriptor: transport.descriptor,
+            connection: transport.connection
         )
     }
 
-    private init(networkID: String, descriptor: CInt, serviceName: String, teamIdentifier: String) {
+    private init(networkID: String, descriptor: CInt, connection: xpc_connection_t) {
         self.networkID = networkID
-        self.serviceName = serviceName
-        self.teamIdentifier = teamIdentifier
+        self.connection = connection
         fabricFileHandle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
-    func stop() {
-        lock.lock()
-        guard !stopped else { lock.unlock(); return }
-        stopped = true
-        lock.unlock()
+    func stop() async {
+        guard lock.withLock({
+            if stopped { return false }
+            stopped = true
+            return true
+        }) else { return }
         try? fabricFileHandle.close()
 
-        let connection = xpc_connection_create_mach_service(serviceName, nil, 0)
-        let requirement = Self.signingRequirement(identifier: PrivilegedPortProtocol.helperIdentifier, teamIdentifier: teamIdentifier)
-        guard requirement.withCString({ xpc_connection_set_peer_code_signing_requirement(connection, $0) }) == 0 else {
-            xpc_connection_cancel(connection)
-            return
-        }
-        xpc_connection_set_event_handler(connection) { _ in }
-        xpc_connection_activate(connection)
         let message = xpc_dictionary_create(nil, nil, 0)
         xpc_dictionary_set_int64(message, "version", PrivilegedPortProtocol.version)
         xpc_dictionary_set_string(message, "operation", "stop-vmnet")
         networkID.withCString { xpc_dictionary_set_string(message, "network-id", $0) }
-        xpc_connection_send_message_with_reply(connection, message, nil) { _ in
-            xpc_connection_cancel(connection)
+        await withCheckedContinuation { continuation in
+            xpc_connection_send_message_with_reply(connection, message, nil) { _ in
+                xpc_connection_cancel(self.connection)
+                continuation.resume()
+            }
         }
     }
 
@@ -76,7 +70,7 @@ final class VMNetUplink: @unchecked Sendable {
         _ request: PrivilegedVMNetRequest,
         serviceName: String,
         teamIdentifier: String
-    ) async throws -> CInt {
+    ) async throws -> VMNetUplinkTransport {
         let encoded = try JSONEncoder().encode(request)
         return try await awaitUplinkReply(timeout: .seconds(5)) { reply in
             let connection = xpc_connection_create_mach_service(serviceName, nil, 0)
@@ -126,7 +120,7 @@ final class VMNetUplink: @unchecked Sendable {
                     reply.finish(.failure(EngineError(.internalError, "privileged networking helper returned an invalid packet socket")))
                     return
                 }
-                reply.finish(.success(descriptor))
+                reply.finish(.success(.init(descriptor: descriptor, connection: connection)))
             }
         }
     }
@@ -134,7 +128,7 @@ final class VMNetUplink: @unchecked Sendable {
     static func awaitUplinkReply(
         timeout: Duration,
         start: @escaping @Sendable (VMNetUplinkReply) -> Void
-    ) async throws -> CInt {
+    ) async throws -> VMNetUplinkTransport {
         try await withCheckedThrowingContinuation { continuation in
             let reply = VMNetUplinkReply(continuation: continuation)
             Task {
@@ -171,12 +165,17 @@ final class VMNetUplink: @unchecked Sendable {
     }
 }
 
+struct VMNetUplinkTransport: @unchecked Sendable {
+    let descriptor: CInt
+    let connection: xpc_connection_t
+}
+
 final class VMNetUplinkReply: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<CInt, Error>?
+    private var continuation: CheckedContinuation<VMNetUplinkTransport, Error>?
     private var connection: xpc_connection_t?
 
-    init(continuation: CheckedContinuation<CInt, Error>) {
+    init(continuation: CheckedContinuation<VMNetUplinkTransport, Error>) {
         self.continuation = continuation
     }
 
@@ -191,12 +190,13 @@ final class VMNetUplinkReply: @unchecked Sendable {
         lock.unlock()
     }
 
-    func finish(_ result: Result<CInt, Error>) {
+    func finish(_ result: Result<VMNetUplinkTransport, Error>) {
         lock.lock()
         guard let continuation else {
             lock.unlock()
-            if case let .success(descriptor) = result {
-                close(descriptor)
+            if case let .success(transport) = result {
+                close(transport.descriptor)
+                xpc_connection_cancel(transport.connection)
             }
             return
         }
@@ -205,7 +205,7 @@ final class VMNetUplinkReply: @unchecked Sendable {
         self.connection = nil
         lock.unlock()
 
-        if let connection {
+        if case .failure = result, let connection {
             xpc_connection_cancel(connection)
         }
         continuation.resume(with: result)

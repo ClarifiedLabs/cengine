@@ -9,9 +9,19 @@ private final class SendableXPCObject: @unchecked Sendable {
     init(_ value: xpc_object_t) { self.value = value }
 }
 
+private final class HelperPeerSession: @unchecked Sendable {
+    var isClosed = false
+    var networkIDs: Set<String> = []
+}
+
+private struct OwnedHelperVMNetUplink {
+    let owner: HelperPeerSession
+    let uplink: HelperVMNetUplink
+}
+
 @main enum CEngineNetworkHelper {
     private static let uplinkLock = NSLock()
-    nonisolated(unsafe) private static var uplinks: [String: HelperVMNetUplink] = [:]
+    nonisolated(unsafe) private static var uplinks: [String: OwnedHelperVMNetUplink] = [:]
 
     static func main() {
         guard geteuid() == 0 else {
@@ -30,14 +40,25 @@ private final class SendableXPCObject: @unchecked Sendable {
                 : "anchor apple generic and identifier \"\(PrivilegedPortProtocol.engineIdentifier)\" and certificate leaf[subject.OU] = \"\(team)\""
             let status = requirement.withCString { xpc_connection_set_peer_code_signing_requirement(peer, $0) }
             guard status == 0 else { xpc_connection_cancel(peer); return }
-            xpc_connection_set_event_handler(peer) { message in handle(message, peer: peer) }
+            let session = HelperPeerSession()
+            xpc_connection_set_event_handler(peer) { message in
+                if xpc_get_type(message) == XPC_TYPE_ERROR {
+                    Task { await stopUplinks(for: session) }
+                    return
+                }
+                handle(message, peer: peer, session: session)
+            }
             xpc_connection_activate(peer)
         }
         xpc_connection_activate(listener)
         dispatchMain()
     }
 
-    private static func handle(_ message: xpc_object_t, peer: xpc_connection_t) {
+    private static func handle(
+        _ message: xpc_object_t,
+        peer: xpc_connection_t,
+        session: HelperPeerSession
+    ) {
         guard xpc_get_type(message) == XPC_TYPE_DICTIONARY,
               let reply = xpc_dictionary_create_reply(message) else { return }
         do {
@@ -67,10 +88,31 @@ private final class SendableXPCObject: @unchecked Sendable {
                 let peerBox = SendableXPCObject(peer)
                 Task {
                     do {
-                        let previous = uplinkLock.withLock { uplinks.removeValue(forKey: request.id) }
+                        let previous = uplinkLock.withLock { () -> HelperVMNetUplink? in
+                            guard !session.isClosed else { return nil }
+                            guard let previous = uplinks.removeValue(forKey: request.id) else { return nil }
+                            previous.owner.networkIDs.remove(request.id)
+                            return previous.uplink
+                        }
                         await previous?.stop()
+                        guard !uplinkLock.withLock({ session.isClosed }) else {
+                            throw EngineError(.internalError, "vmnet client disconnected")
+                        }
                         let (uplink, clientDescriptor) = try await HelperVMNetUplink.start(request: request)
-                        uplinkLock.withLock { uplinks[request.id] = uplink }
+                        let registration = uplinkLock.withLock { () -> (Bool, HelperVMNetUplink?) in
+                            guard !session.isClosed else { return (false, nil) }
+                            let displaced = uplinks.removeValue(forKey: request.id)
+                            displaced?.owner.networkIDs.remove(request.id)
+                            uplinks[request.id] = OwnedHelperVMNetUplink(owner: session, uplink: uplink)
+                            session.networkIDs.insert(request.id)
+                            return (true, displaced?.uplink)
+                        }
+                        guard registration.0 else {
+                            await uplink.stop()
+                            close(clientDescriptor)
+                            throw EngineError(.internalError, "vmnet client disconnected")
+                        }
+                        await registration.1?.stop()
                         xpc_dictionary_set_bool(replyBox.value, "ok", true)
                         xpc_dictionary_set_fd(replyBox.value, "packet-socket", clientDescriptor)
                         close(clientDescriptor)
@@ -88,7 +130,12 @@ private final class SendableXPCObject: @unchecked Sendable {
                 let replyBox = SendableXPCObject(reply)
                 let peerBox = SendableXPCObject(peer)
                 Task {
-                    let uplink = uplinkLock.withLock { uplinks.removeValue(forKey: id) }
+                    let uplink = uplinkLock.withLock { () -> HelperVMNetUplink? in
+                        guard let owned = uplinks[id], owned.owner === session else { return nil }
+                        uplinks.removeValue(forKey: id)
+                        session.networkIDs.remove(id)
+                        return owned.uplink
+                    }
                     await uplink?.stop()
                     xpc_dictionary_set_bool(replyBox.value, "ok", true)
                     xpc_connection_send_message(peerBox.value, replyBox.value)
@@ -101,6 +148,26 @@ private final class SendableXPCObject: @unchecked Sendable {
             setError(error, reply: reply)
         }
         xpc_connection_send_message(peer, reply)
+    }
+
+    private static func stopUplinks(for session: HelperPeerSession) async {
+        let owned = uplinkLock.withLock { () -> [(String, HelperVMNetUplink)] in
+            guard !session.isClosed else { return [] }
+            session.isClosed = true
+            let values = session.networkIDs.compactMap { id -> (String, HelperVMNetUplink)? in
+                guard let value = uplinks[id], value.owner === session else { return nil }
+                return (id, value.uplink)
+            }
+            session.networkIDs.removeAll()
+            return values
+        }
+        for (id, uplink) in owned {
+            await uplink.stop()
+            uplinkLock.withLock {
+                guard let value = uplinks[id], value.owner === session, value.uplink === uplink else { return }
+                uplinks.removeValue(forKey: id)
+            }
+        }
     }
 
     private static func bindRequest(_ message: xpc_object_t) throws -> PrivilegedPortRequest {
@@ -118,7 +185,7 @@ private final class SendableXPCObject: @unchecked Sendable {
             throw EngineError(.badRequest, "invalid vmnet network id")
         }
         guard (1...4094).contains(request.vlan) else { throw EngineError(.badRequest, "invalid vmnet VLAN") }
-        _ = try HelperVMNetUplink.ipv4Subnet(request.subnet)
+        _ = try HelperVMNetUplink.ipv4Gateway(request.gateway, in: request.subnet)
         if !request.ipv6Subnet.isEmpty { _ = try HelperVMNetUplink.ipv6Prefix(request.ipv6Subnet) }
         for port in request.ports {
             var address = in_addr()
@@ -224,8 +291,8 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         if !request.dhcpEnabled {
             vmnet_network_configuration_disable_dhcp(configuration)
         }
-        let (subnet, mask) = try ipv4Subnet(request.subnet)
-        var subnetValue = subnet
+        let (_, mask) = try ipv4Subnet(request.subnet)
+        var subnetValue = try ipv4Gateway(request.gateway, in: request.subnet)
         var maskValue = mask
         guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
             throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
@@ -256,6 +323,12 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         }
         let networkOwner = RetainedOpaquePointer(networkObject, release: releaseCFObject)
         let descriptor = xpc_dictionary_create(nil, nil, 0)
+        // A cengine uplink is a VLAN trunk carrying many container MAC addresses,
+        // not a single VM interface using a vmnet-assigned address.
+        xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false)
+        // Frames arrive from a virtio device, so vmnet must complete transport
+        // checksums before forwarding them onto the shared network.
+        xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, true)
         let queue = DispatchQueue(label: "dev.cengine.vmnet.\(request.id)")
         var reference: interface_ref?
         do {
@@ -282,6 +355,19 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &sockets) == 0 else {
             await stopInterface(reference, queue: queue)
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        do {
+            for descriptor in sockets {
+                var bufferSize: CInt = 4 * 1024 * 1024
+                guard setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &bufferSize, socklen_t(MemoryLayout.size(ofValue: bufferSize))) == 0,
+                      setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &bufferSize, socklen_t(MemoryLayout.size(ofValue: bufferSize))) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+        } catch {
+            sockets.forEach { close($0) }
+            await stopInterface(reference, queue: queue)
+            throw error
         }
         let value = HelperVMNetUplink(
             network: networkOwner,
@@ -412,6 +498,23 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         }
         let bits: UInt32 = prefix == 0 ? 0 : UInt32.max << UInt32(32 - prefix)
         return (subnet, in_addr(s_addr: bits.bigEndian))
+    }
+
+    static func ipv4Gateway(_ value: String, in subnet: String) throws -> in_addr {
+        let (networkAddress, maskAddress) = try ipv4Subnet(subnet)
+        var gateway = in_addr()
+        guard inet_pton(AF_INET, value, &gateway) == 1 else {
+            throw EngineError(.badRequest, "invalid IPv4 gateway \(value)")
+        }
+        let network = UInt32(bigEndian: networkAddress.s_addr)
+        let mask = UInt32(bigEndian: maskAddress.s_addr)
+        let address = UInt32(bigEndian: gateway.s_addr)
+        let first = network & mask
+        let last = first | ~mask
+        guard address & mask == first, address != first, address != last else {
+            throw EngineError(.badRequest, "IPv4 gateway \(value) is outside subnet \(subnet)")
+        }
+        return gateway
     }
 
     static func ipv6Prefix(_ value: String) throws -> (in6_addr, UInt8) {

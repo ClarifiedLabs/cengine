@@ -16,11 +16,24 @@ public struct RawVirtualMachineConfiguration: Sendable {
         }
     }
 
+    public struct BlockDisk: Sendable {
+        public let identifier: String
+        public let source: URL
+        public let readOnly: Bool
+
+        public init(identifier: String, source: URL, readOnly: Bool = false) {
+            self.identifier = identifier
+            self.source = source
+            self.readOnly = readOnly
+        }
+    }
+
     public let id: String
     public let kernel: URL
     public let initialRamdisk: URL
     public let rootDisk: URL
     public let rootDiskReadOnly: Bool
+    public let additionalDisks: [BlockDisk]
     public let cpus: Int
     public let memoryBytes: UInt64
     public let networkFileHandle: FileHandle?
@@ -34,6 +47,7 @@ public struct RawVirtualMachineConfiguration: Sendable {
         initialRamdisk: URL,
         rootDisk: URL,
         rootDiskReadOnly: Bool = false,
+        additionalDisks: [BlockDisk] = [],
         cpus: Int,
         memoryBytes: UInt64,
         networkFileHandle: FileHandle? = nil,
@@ -46,6 +60,7 @@ public struct RawVirtualMachineConfiguration: Sendable {
         self.initialRamdisk = initialRamdisk
         self.rootDisk = rootDisk
         self.rootDiskReadOnly = rootDiskReadOnly
+        self.additionalDisks = additionalDisks
         self.cpus = cpus
         self.memoryBytes = memoryBytes
         self.networkFileHandle = networkFileHandle
@@ -63,15 +78,26 @@ public struct RawVirtualMachineConfiguration: Sendable {
         configuration.cpuCount = max(cpus, VZVirtualMachineConfiguration.minimumAllowedCPUCount)
         configuration.memorySize = max(memoryBytes, VZVirtualMachineConfiguration.minimumAllowedMemorySize)
 
-        let diskAttachment = try VZDiskImageStorageDeviceAttachment(
+        let rootAttachment = try VZDiskImageStorageDeviceAttachment(
             url: rootDisk,
             readOnly: rootDiskReadOnly,
             cachingMode: .cached,
             synchronizationMode: .full
         )
-        let disk = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
-        disk.blockDeviceIdentifier = "root"
-        configuration.storageDevices = [disk]
+        let rootDevice = VZVirtioBlockDeviceConfiguration(attachment: rootAttachment)
+        rootDevice.blockDeviceIdentifier = "root"
+        let volumeDevices = try additionalDisks.map { disk in
+            let attachment = try VZDiskImageStorageDeviceAttachment(
+                url: disk.source,
+                readOnly: disk.readOnly,
+                cachingMode: .cached,
+                synchronizationMode: .full
+            )
+            let device = VZVirtioBlockDeviceConfiguration(attachment: attachment)
+            device.blockDeviceIdentifier = disk.identifier
+            return device
+        }
+        configuration.storageDevices = [rootDevice] + volumeDevices
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]

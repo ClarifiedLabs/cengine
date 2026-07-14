@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Testing
 @testable import CEngineRuntime
 
@@ -18,5 +19,16 @@ import Testing
 
     @Test func vlanFrameRejectsUntaggedTraffic() {
         #expect(TrunkNetworkFabric.VLANFrame(Data(repeating: 0, count: 18)) == nil)
+    }
+
+    @Test func socketBackpressureDoesNotDisconnectFabricEndpoints() {
+        let nested = NSError(
+            domain: NSCocoaErrorDomain,
+            code: 512,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOBUFS))]
+        )
+        #expect(TrunkNetworkFabric.isTransientPacketWriteError(nested))
+        #expect(TrunkNetworkFabric.isTransientPacketWriteError(POSIXError(.EAGAIN)))
+        #expect(!TrunkNetworkFabric.isTransientPacketWriteError(POSIXError(.EPIPE)))
     }
 }

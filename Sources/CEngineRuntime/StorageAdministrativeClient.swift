@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 
 actor StorageAdministrativeClient {
+    private struct VolumeInUse: Error {}
     private struct Message: Codable {
         var version: Int = 2
         var type: String
@@ -26,7 +27,19 @@ actor StorageAdministrativeClient {
         self.tokenIssuer = tokenIssuer
     }
 
-    func deleteVolume(_ volume: String) throws {
+    func deleteVolume(_ volume: String) async throws {
+        for attempt in 0..<40 {
+            do {
+                try deleteVolumeOnce(volume)
+                return
+            } catch is VolumeInUse {
+                guard attempt < 39 else { throw EngineError(.conflict, "volume is in use") }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    private func deleteVolumeOnce(_ volume: String) throws {
         let descriptor = try UnixSocket.connect(path: socketPath)
         let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         try send(.init(type: "request", request: .init(id: 1, op: "handshake", volume: volume, token: tokenIssuer.token(for: volume))), to: file)
@@ -47,7 +60,7 @@ actor StorageAdministrativeClient {
             guard message.type == "response", let reply = message.reply else { continue }
             guard reply.id == id else { throw EngineError(.internalError, "storage response id mismatch") }
             if let value = reply.errno, value != 0 {
-                if value == EBUSY { throw EngineError(.conflict, "volume is in use") }
+                if value == EBUSY { throw VolumeInUse() }
                 throw EngineError(.internalError, "storage appliance returned errno \(value)")
             }
             return

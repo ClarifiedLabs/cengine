@@ -17,12 +17,12 @@ import Testing
 
     @Test func privilegedVMNetRequestRoundTripsAcrossXPCPayload() throws {
         let request = PrivilegedVMNetRequest(
-            id: "bridge", vlan: 42, subnet: "172.24.0.0/16", ipv6Subnet: "fd00:24::/64",
+            id: "bridge", vlan: 42, subnet: "172.24.0.0/16", gateway: "172.24.0.1", ipv6Subnet: "fd00:24::/64",
             internalNetwork: false,
             dhcpEnabled: false,
             ports: [.init(proto: "tcp", externalPort: 8080, internalAddress: "172.24.0.2", internalPort: 80)]
         )
-        #expect(PrivilegedPortProtocol.version == 3)
+        #expect(PrivilegedPortProtocol.version == 4)
         let decoded = try JSONDecoder().decode(PrivilegedVMNetRequest.self, from: JSONEncoder().encode(request))
         #expect(decoded == request)
         #expect(decoded.dhcpEnabled == false)
@@ -37,9 +37,10 @@ import Testing
         #expect(boundary.subnet == "10.241.0.0/24")
         #expect(boundary.gateway == "10.241.0.1")
 
-        let last = RawVirtualizationBackend.automaticIPv4Network(vlan: 4094)
-        #expect(last.subnet == "10.255.254.0/24")
-        #expect(last.gateway == "10.255.254.1")
+        let last = RawVirtualizationBackend.automaticIPv4Network(vlan: 4093)
+        #expect(last.subnet == "10.255.253.0/24")
+        #expect(last.gateway == "10.255.253.1")
+        #expect(RawVirtualizationBackend.nextAvailableVLAN(used: Set(1...4093)) == nil)
     }
 
     @Test func unavailablePrivilegedNetworkingHelperHasBoundedDeadline() async {

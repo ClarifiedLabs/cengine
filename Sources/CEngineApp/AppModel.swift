@@ -47,12 +47,22 @@ extension SMAppService: AppService {}
     private let socketPath: String
     private let builderSettingsURL: URL
     private let containerSettingsURL: URL
+    private let serviceRegistrationRevision: String?
+    private let serviceRegistrationDefaults: UserDefaults
+    private let waitForServiceUnregistration: () async throws -> Void
     private var refreshTask: Task<Void, Never>?
+
+    static let serviceRegistrationRevisionKey = "serviceRegistrationRevision"
 
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         agent: any AppService = SMAppService.agent(plistName: CEngineServices.agentPlist),
         helper: any AppService = SMAppService.daemon(plistName: CEngineServices.helperPlist),
+        serviceRegistrationRevision: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+        serviceRegistrationDefaults: UserDefaults = .standard,
+        waitForServiceUnregistration: @escaping () async throws -> Void = {
+            try await Task.sleep(for: .seconds(2))
+        },
         openLoginItemsSettings: @escaping () -> Void = { SMAppService.openSystemSettingsLoginItems() }
     ) {
         self.agent = agent
@@ -62,6 +72,9 @@ extension SMAppService: AppService {}
         socketPath = paths.socket.path
         builderSettingsURL = paths.builderSettings
         containerSettingsURL = paths.containerSettings
+        self.serviceRegistrationRevision = serviceRegistrationRevision
+        self.serviceRegistrationDefaults = serviceRegistrationDefaults
+        self.waitForServiceUnregistration = waitForServiceUnregistration
         client = DockerSocketClient(socketPath: socketPath)
         let builderSettings = (try? BuilderSettings.load(from: builderSettingsURL)) ?? .default
         builderCPUs = builderSettings.cpus
@@ -72,10 +85,17 @@ extension SMAppService: AppService {}
         showOnboarding = !UserDefaults.standard.bool(forKey: "completedOnboarding")
     }
 
-    func start() {
+    func start() async {
         do {
+            let registrationChanged = try await unregisterOutdatedServicesIfNeeded()
             try registerRequiredNetworking()
             try registerEngineIfNetworkingIsReady()
+            if registrationChanged, let serviceRegistrationRevision {
+                serviceRegistrationDefaults.set(
+                    serviceRegistrationRevision,
+                    forKey: Self.serviceRegistrationRevisionKey
+                )
+            }
         } catch {
             self.error = "Could not enable required cengine services: \(error.localizedDescription)"
         }
@@ -241,6 +261,28 @@ extension SMAppService: AppService {}
             // The service is registered at that point, so only propagate actual failures.
             if helper.status != .requiresApproval { throw error }
         }
+    }
+
+    private func unregisterOutdatedServicesIfNeeded() async throws -> Bool {
+        guard let serviceRegistrationRevision,
+              serviceRegistrationDefaults.string(forKey: Self.serviceRegistrationRevisionKey) != serviceRegistrationRevision
+        else { return false }
+
+        var unregisteredService = false
+        if agent.status == .enabled || agent.status == .requiresApproval {
+            try await agent.unregister()
+            unregisteredService = true
+        }
+        if helper.status == .enabled || helper.status == .requiresApproval {
+            try await helper.unregister()
+            unregisteredService = true
+        }
+        if unregisteredService {
+            // ServiceManagement may report asynchronous unregistration complete
+            // before launchd has discarded the old job and code requirement.
+            try await waitForServiceUnregistration()
+        }
+        return true
     }
 
     private func registerEngineIfNetworkingIsReady() throws {

@@ -5,8 +5,12 @@ import Darwin
 import Foundation
 
 public actor RawVirtualizationBackend: ContainerBackend {
+    enum VolumeStorageMode: String, Codable, Sendable { case block, shared }
+
     public static let defaultRootDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
+    public static let defaultVolumeDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
     public static let defaultStorageDiskBytes: UInt64 = 512 * 1_024 * 1_024 * 1_024
+    static let managementServerAddress = "100.64.0.1"
 
     private let root: URL
     private let kernel: URL
@@ -14,9 +18,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private let store: OCIContentStore
     private let tokenIssuer: VolumeAccessToken
     private let infrastructure: VMShimClient
-    private let storageAdmin: StorageAdministrativeClient
+    private let storage: StorageAdministrativeClient
+    private let portForwarder = PortForwarder()
     private var shims: [String: VMShimClient] = [:]
     private var completions: [String: Int32] = [:]
+    private var completionTasks: [String: Task<Int32, Never>] = [:]
     private var networks: [String: NetworkRecord] = [:]
     private var networkVLANs: [String: UInt16] = [:]
     private var appliedNetworks: [String: Set<String>] = [:]
@@ -27,20 +33,28 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private var execBridges: [String: ContainerIOBridge] = [:]
     private var execMonitors: [String: ContainerLogMonitor] = [:]
     private var execShims: [String: VMShimClient] = [:]
+    private var preparedBindSources: [String: [Int: PreparedBindSource]] = [:]
+    private var volumeStorageModes: [String: VolumeStorageMode] = [:]
 
     public init(root: URL, kernel: URL, containerInitialRamdisk: URL, storageInitialRamdisk: URL) async throws {
         self.root = root
         self.kernel = kernel
         self.containerInitialRamdisk = containerInitialRamdisk
         let containers = root.appending(path: "containers", directoryHint: .isDirectory)
+        let volumes = root.appending(path: "volumes", directoryHint: .isDirectory)
         let infrastructureRoot = root.appending(path: "infrastructure", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: containers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: volumes, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: infrastructureRoot, withIntermediateDirectories: true)
         store = try OCIContentStore(root: root.appending(path: "content"))
         if let data = try? Data(contentsOf: root.appending(path: "networks.json")),
            let state = try? JSONDecoder().decode([String: NetworkState].self, from: data) {
             networks = state.mapValues(\.record)
             networkVLANs = state.mapValues(\.vlan)
+        }
+        if let data = try? Data(contentsOf: root.appending(path: "volume-storage.json")),
+           let state = try? JSONDecoder().decode([String: VolumeStorageMode].self, from: data) {
+            volumeStorageModes = state
         }
 
         let secretURL = infrastructureRoot.appending(path: "volume-token-secret")
@@ -69,17 +83,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
             macAddress: "02:ce:00:00:00:01",
             socketPath: try Self.makeRuntimeSocketPath(),
             logPath: infrastructureRoot.appending(path: "shim.log").path,
-            kernelArguments: [tokenIssuer.kernelArgument],
+            kernelArguments: [
+                tokenIssuer.kernelArgument,
+                "cengine.management_address=\(Self.managementServerAddress)/10",
+                "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
+            ],
             fileSystemSocketPath: try Self.makeRuntimeSocketPath(),
-            networkSocketPath: try Self.makeRuntimeSocketPath()
+            networkSocketPath: try Self.makeRuntimeSocketPath(),
+            vlans: [VMShimProtocol.managementVLAN]
         )
         infrastructure = try await Self.recoverOrLaunch(infrastructureSpec)
+        storage = StorageAdministrativeClient(
+            socketPath: infrastructureSpec.fileSystemSocketPath!,
+            tokenIssuer: tokenIssuer
+        )
         _ = try await infrastructure.boot()
-        guard let storageSocketPath = infrastructure.specification.fileSystemSocketPath else {
-            throw EngineError(.internalError, "storage shim has no filesystem transport socket")
-        }
-        storageAdmin = StorageAdministrativeClient(socketPath: storageSocketPath, tokenIssuer: tokenIssuer)
-
         let entries = (try? FileManager.default.contentsOfDirectory(at: containers, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
         for directory in entries {
             let specURL = directory.appending(path: "shim.json")
@@ -92,6 +110,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func shutdown() async {
         // Shims own running VMs. Daemon shutdown intentionally only drops control connections.
+        portForwarder.stopAll()
         for monitor in logMonitors.values { monitor.stop(finishOutput: false) }
         logMonitors.removeAll()
         for monitor in execMonitors.values { monitor.stop(finishOutput: false) }
@@ -144,7 +163,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let path = ioDirectory.appending(path: name).path
             if !FileManager.default.fileExists(atPath: path) { FileManager.default.createFile(atPath: path, contents: nil) }
         }
-        try Self.prepareBindSources(container.mounts)
+        let bindSources = try HostBindSourceResolver(root: root.appending(path: "bind-sources")).resolve(container.mounts)
+        preparedBindSources[container.id] = bindSources
         try Self.createSparseFile(at: disk, size: Self.defaultRootDiskBytes)
         let specification = VMShimProtocol.Specification(
             containerID: container.id,
@@ -153,20 +173,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
             kernelPath: kernel.path,
             initialRamdiskPath: containerInitialRamdisk.path,
             rootDiskPath: disk.path,
+            volumeDisks: [],
             cpus: max(container.cpus, 1),
             memoryBytes: max(container.memoryBytes, 256 * 1_024 * 1_024),
             macAddress: Self.macAddress(container.id),
             bindShares: container.mounts.enumerated().compactMap { index, mount in
-                guard mount.kind == .bind else { return nil }
-                let source = URL(filePath: mount.source)
-                let isDirectory = (try? source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                return .init(tag: "bind-\(index)", source: (isDirectory ? source : source.deletingLastPathComponent()).path, readOnly: mount.readOnly)
+                guard mount.kind == .bind, let source = bindSources[index] else { return nil }
+                return .init(tag: "bind-\(index)", source: source.shareRoot.path, readOnly: mount.readOnly)
             } + [.init(tag: "cengine-io", source: ioDirectory.path, readOnly: false)],
             socketPath: try Self.makeRuntimeSocketPath(),
             logPath: directory.appending(path: "shim.log").path,
-            fileSystemSocketPath: infrastructure.specification.fileSystemSocketPath,
+            kernelArguments: [
+                "cengine.management_address=\(Self.managementAddress(for: container.id))",
+                "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
+            ],
             networkSocketPath: infrastructure.specification.networkSocketPath,
-            vlans: container.networks.compactMap { networkVLANs[$0.networkID] }
+            vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN]
         )
         let shim = try await VMShimClient.launch(specification: specification)
         do {
@@ -176,69 +198,139 @@ public actor RawVirtualizationBackend: ContainerBackend {
             shims[container.id] = shim
         } catch {
             _ = try? await shim.shutdown()
+            preparedBindSources.removeValue(forKey: container.id)
             try? FileManager.default.removeItem(at: directory)
             throw error
         }
     }
 
     public func start(_ container: ContainerRecord) async throws -> [PortBinding] {
-        guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
+        guard let preparedShim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         let image = try await resolvedImage(container.image, platform: container.platform)
-        let stdin = root.appending(path: "containers/\(container.id)/io/stdin")
-        if FileManager.default.fileExists(atPath: stdin.path) { let handle = try FileHandle(forWritingTo: stdin); try handle.truncate(atOffset: 0); try handle.close() }
-        _ = try ensureIO(container)
+        let modes = try resolveVolumeStorageModes(for: container)
+        let shim = try await reconfigureVolumeDisks(preparedShim, container: container, modes: modes)
+        _ = try ensureIO(container, replacingStoppedSession: true)
         _ = try await shim.boot()
         struct Prepared: Decodable { let status: String }
-        let prepared: Prepared = try await shim.guest(operation: "prepare", payload: try workload(container, image: image), response: Prepared.self)
+        let prepared: Prepared = try await shim.guest(operation: "prepare", payload: try workload(container, image: image, volumeModes: modes), response: Prepared.self)
         guard prepared.status == "prepared" else { throw EngineError(.internalError, "guest did not prepare workload") }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let pid: Int? }
         let response: Status = try await shim.guest(operation: "start", payload: Empty(), response: Status.self)
         guard response.status == "running" else { throw EngineError(.internalError, "workload did not start") }
         completions.removeValue(forKey: container.id)
-        activeContainers[container.id] = container
-        try await synchronizeFabric()
-        return container.ports
+        do {
+            var active = container
+            if !container.ports.isEmpty {
+                guard let ipv4 = container.networks.compactMap(\.ipv4Address).first else {
+                    throw EngineError(.conflict, "published ports require an IPv4 container endpoint")
+                }
+                active.ports = try await portForwarder.start(
+                    containerID: container.id,
+                    guestIPv4Address: ipv4,
+                    guestIPv6Address: container.networks.compactMap(\.ipv6Address).first,
+                    bindings: container.ports
+                )
+            }
+            activeContainers[container.id] = active
+            try await synchronizeFabric()
+            return active.ports
+        } catch {
+            portForwarder.stop(containerID: container.id)
+            activeContainers.removeValue(forKey: container.id)
+            _ = try? await shim.stop()
+            throw error
+        }
     }
 
     public func stop(_ container: ContainerRecord, timeoutSeconds: Int) async throws -> Int32 {
+        if let code = completions[container.id] { return code }
         guard let shim = shims[container.id] else { return completions[container.id] ?? container.exitCode ?? 0 }
         struct Signal: Encodable { let signal: Int }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let exitCode: Int? }
         _ = try? await shim.guest(operation: "signal", payload: Signal(signal: Self.signalNumber(container.stopSignal)), response: Status.self)
-        let code: Int32
-        do {
-            code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) { let value: Status = try await shim.guest(operation: "wait", payload: Empty(), response: Status.self); return Int32(value.exitCode ?? 0) }
-        } catch {
-            _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
-            let value: Status = try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
-            code = Int32(value.exitCode ?? 137)
+        if let existing = completionTasks[container.id] {
+            let code: Int32
+            do {
+                code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) { await existing.value }
+            } catch {
+                _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
+                code = await existing.value
+            }
+            return await recordCompletion(container, code: code)
         }
-        completions[container.id] = code
-        activeContainers.removeValue(forKey: container.id)
-        try? await synchronizeFabric()
-        _ = try? await shim.stop()
-        return code
+        let task = Task {
+            let code: Int32
+            do {
+                code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) {
+                    let value: Status = try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                    return Int32(value.exitCode ?? 0)
+                }
+            } catch {
+                _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
+                let value: Status? = try? await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                code = Int32(value?.exitCode ?? 137)
+            }
+            _ = try? await shim.stop()
+            return code
+        }
+        completionTasks[container.id] = task
+        return await recordCompletion(container, code: task.value)
     }
 
     public func wait(_ container: ContainerRecord) async throws -> Int32 {
         if let code = completions[container.id] { return code }
         guard let shim = shims[container.id] else { return container.exitCode ?? 0 }
         struct Empty: Encodable {}; struct Status: Decodable { let exitCode: Int? }
-        let value: Status = try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
-        let code = Int32(value.exitCode ?? 0)
-        completions[container.id] = code
-        activeContainers.removeValue(forKey: container.id)
-        try? await synchronizeFabric()
-        logMonitors[container.id]?.stop()
-        _ = try? await shim.stop()
-        return code
+        let task: Task<Int32, Never>
+        if let existing = completionTasks[container.id] {
+            task = existing
+        } else {
+            task = Task {
+                let value: Status? = try? await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                _ = try? await shim.stop()
+                return value.map { Int32($0.exitCode ?? 0) } ?? container.exitCode ?? 137
+            }
+            completionTasks[container.id] = task
+        }
+        return await recordCompletion(container, code: task.value)
     }
 
-    public func completion(_ container: ContainerRecord) async -> Int32? { completions[container.id] }
+    public func completion(_ container: ContainerRecord) async -> Int32? {
+        if let code = completions[container.id] { return code }
+        return try? await wait(container)
+    }
 
-    public func io(for container: ContainerRecord) async throws -> ContainerIOBridge { try ensureIO(container) }
+    public func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery {
+        guard let shim = shims[container.id] else { return .unavailable }
+        let status = try await shim.status()
+        switch status.state {
+        case .running:
+            struct Empty: Encodable {}
+            struct WorkloadStatus: Decodable { let status: String; let exitCode: Int? }
+            let workload: WorkloadStatus = try await shim.guest(
+                operation: "status", payload: Empty(), response: WorkloadStatus.self
+            )
+            guard workload.status == "running" else {
+                let code = Int32(workload.exitCode ?? 0)
+                completions[container.id] = code
+                _ = try? await shim.stop()
+                return .exited(code)
+            }
+            try await restoreLiveContainer(container)
+            return .running
+        case .paused:
+            try await restoreLiveContainer(container)
+            return .paused
+        default:
+            return .unavailable
+        }
+    }
+
+    public func io(for container: ContainerRecord) async throws -> ContainerIOBridge {
+        try ensureIO(container, replacingStoppedSession: true)
+    }
 
     public func logs(for container: ContainerRecord) async throws -> Data { try ensureIO(container).logData() }
 
@@ -253,16 +345,24 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge {
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
+        let image = try await resolvedImage(container.image, platform: container.platform)
         let ioDirectory = root.appending(path: "containers/\(container.id)/io")
         let stdout = ioDirectory.appending(path: "exec-\(exec.id)-stdout"); let stderr = ioDirectory.appending(path: "exec-\(exec.id)-stderr"); let stdin = ioDirectory.appending(path: "exec-\(exec.id)-stdin")
         for url in [stdout,stderr,stdin] { if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) } }
+        let stdinClosed = stdin.appendingPathExtension("closed")
+        try? FileManager.default.removeItem(at: stdinClosed)
+        if !exec.configuration.attachStdin { FileManager.default.createFile(atPath: stdinClosed.path, contents: nil) }
         let bridge = ContainerIOBridge(tty: exec.configuration.tty, logURL: ioDirectory.appending(path: "exec-\(exec.id)-docker.log"))
         let monitor = ContainerLogMonitor(stdoutURL: stdout, stderrURL: stderr, inputURL: stdin, bridge: bridge); monitor.start()
         execBridges[exec.id] = bridge; execMonitors[exec.id] = monitor; execShims[exec.id] = shim
         struct Spec: Encodable { let id: String; let arguments, environment: [String]; let workingDirectory, user: String; let terminal: Bool }
         struct Status: Decodable { let status: String }
         let configuration = exec.configuration
-        _ = try await shim.guest(operation: "prepare-exec", payload: Spec(id: exec.id, arguments: configuration.arguments, environment: configuration.environment, workingDirectory: configuration.workingDirectory, user: configuration.user, terminal: configuration.tty), response: Status.self)
+        let containerEnvironment = Self.mergeEnvironment(
+            image: image.configuration.config?.environment ?? [], container: container.environment
+        )
+        let environment = Self.mergeEnvironment(image: containerEnvironment, container: configuration.environment)
+        _ = try await shim.guest(operation: "prepare-exec", payload: Spec(id: exec.id, arguments: configuration.arguments, environment: environment, workingDirectory: configuration.workingDirectory, user: configuration.user, terminal: configuration.tty), response: Status.self)
         return bridge
     }
 
@@ -276,7 +376,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func execCompletion(_ exec: ExecRecord) async -> Int32? {
         guard let shim = execShims[exec.id] else { return exec.exitCode }
         struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let exitCode: Int? }
-        guard let value: Status = try? await shim.guest(operation: "exec-status", payload: Request(id: exec.id), response: Status.self), value.status == "exited" else { return nil }
+        guard let value: Status = try? await shim.guest(operation: "wait-exec", payload: Request(id: exec.id), response: Status.self), value.status == "exited" else { return nil }
         execMonitors.removeValue(forKey: exec.id)?.stop(); return Int32(value.exitCode ?? 0)
     }
 
@@ -287,7 +387,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let value: Status? = try? await shim.guest(operation: "exec-status", payload: Request(id: exec.id), response: Status.self); return Int32(value?.pid ?? 0)
     }
 
-    public func execStatus(_ exec: ExecRecord) async -> Int32? { await execCompletion(exec) }
+    public func execStatus(_ exec: ExecRecord) async -> Int32? {
+        guard let shim = execShims[exec.id] else { return exec.exitCode }
+        struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let exitCode: Int? }
+        guard let value: Status = try? await shim.guest(operation: "exec-status", payload: Request(id: exec.id), response: Status.self), value.status == "exited" else { return nil }
+        return Int32(value.exitCode ?? 0)
+    }
 
     public func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String) {
         let record = ExecRecord(containerID: container.id, configuration: .init(arguments: arguments, environment: container.environment, workingDirectory: container.workingDirectory, user: container.user))
@@ -320,7 +425,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws { _ = try await stop(container, timeoutSeconds: timeoutSeconds); _ = try await start(container) }
 
     public func delete(_ container: ContainerRecord) async throws {
+        portForwarder.stop(containerID: container.id)
         if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }
+        completionTasks.removeValue(forKey: container.id)?.cancel()
         completions.removeValue(forKey: container.id)
         activeContainers.removeValue(forKey: container.id)
         logMonitors.removeValue(forKey: container.id)?.stop()
@@ -331,13 +438,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func cleanupOrphans(keeping containerIDs: Set<String>) async throws {
         let orphanIDs = shims.keys.filter { !containerIDs.contains($0) }
         for id in orphanIDs {
+            portForwarder.stop(containerID: id)
             if let shim = shims.removeValue(forKey: id) { _ = try? await shim.shutdown() }
         }
     }
 
     public func deleteVolume(_ name: String) async throws {
         guard !name.isEmpty, !name.contains("/") else { throw EngineError(.badRequest, "invalid volume name") }
-        try await storageAdmin.deleteVolume(name)
+        try await storage.deleteVolume(name)
+        try? FileManager.default.removeItem(at: volumeDiskURL(name: name))
+        volumeStorageModes.removeValue(forKey: name)
+        try persistVolumeStorageModes()
     }
 
     public func restoreNetworks(_ values: [NetworkRecord]) async throws -> [NetworkRecord] {
@@ -346,6 +457,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             if let existing = networks[value.id] { restored.append(existing) }
             else { restored.append(try await createNetwork(value)) }
         }
+        try await synchronizeFabric()
         return restored
     }
 
@@ -385,7 +497,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let existing = appliedNetworks[container.id] ?? []
             struct NetworkRequest: Encodable { let endpoint: GuestProtocol.NetworkEndpoint?; let name: String? }
             struct Status: Decodable { let status: String }
-            _ = try await shim.configureNetwork(vlans: desired.compactMap { networkVLANs[$0] })
+            _ = try await shim.configureNetwork(vlans: desired.compactMap { networkVLANs[$0] } + [VMShimProtocol.managementVLAN])
             for id in existing.subtracting(desired) {
                 _ = try? await shim.guest(operation: "disconnect-network", payload: NetworkRequest(endpoint: nil, name: id), response: Status.self)
             }
@@ -442,42 +554,93 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return try await pull(reference, platform: platform, credentials: nil) { _ in }
     }
 
-    private func ensureIO(_ container: ContainerRecord) throws -> ContainerIOBridge {
-        if let existing = bridges[container.id] { return existing }
+    private func recordCompletion(_ container: ContainerRecord, code: Int32) async -> Int32 {
+        completionTasks.removeValue(forKey: container.id)
+        if let existing = completions[container.id] { return existing }
+        completions[container.id] = code
+        activeContainers.removeValue(forKey: container.id)
+        try? await synchronizeFabric()
+        portForwarder.stop(containerID: container.id)
+        logMonitors.removeValue(forKey: container.id)?.stop()
+        return code
+    }
+
+    private func ensureIO(_ container: ContainerRecord, replacingStoppedSession: Bool = false,
+                          preservingExistingFiles: Bool = false) throws -> ContainerIOBridge {
+        if let existing = bridges[container.id] {
+            if !replacingStoppedSession || logMonitors[container.id] != nil { return existing }
+            existing.finishOutput()
+            bridges.removeValue(forKey: container.id)
+        }
         let directory = root.appending(path: "containers/\(container.id)/io", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        for name in ["docker.log", "docker.log.entries"] { try? FileManager.default.removeItem(at: directory.appending(path: name)) }
+        for name in ["stdout", "stderr", "stdin"] {
+            let url = directory.appending(path: name)
+            if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+            if !preservingExistingFiles {
+                let handle = try FileHandle(forWritingTo: url); try handle.truncate(atOffset: 0); try handle.close()
+            }
+        }
+        let stdinClosed = directory.appending(path: "stdin.closed")
+        if !preservingExistingFiles {
+            try? FileManager.default.removeItem(at: stdinClosed)
+            if !container.openStdin { FileManager.default.createFile(atPath: stdinClosed.path, contents: nil) }
+        }
         let bridge = ContainerIOBridge(tty: container.tty, logURL: directory.appending(path: "docker.log"))
         let monitor = ContainerLogMonitor(directory: directory, bridge: bridge)
-        bridges[container.id] = bridge; logMonitors[container.id] = monitor; monitor.start()
+        bridges[container.id] = bridge; logMonitors[container.id] = monitor
+        monitor.start(atEnd: preservingExistingFiles)
         return bridge
+    }
+
+    private func restoreLiveContainer(_ container: ContainerRecord) async throws {
+        preparedBindSources[container.id] = try HostBindSourceResolver(
+            root: root.appending(path: "bind-sources")
+        ).resolve(container.mounts)
+        _ = try ensureIO(container, preservingExistingFiles: true)
+        var active = container
+        if !container.ports.isEmpty {
+            guard let ipv4 = container.networks.compactMap(\.ipv4Address).first else {
+                throw EngineError(.conflict, "published ports require an IPv4 container endpoint")
+            }
+            active.ports = try await portForwarder.start(
+                containerID: container.id,
+                guestIPv4Address: ipv4,
+                guestIPv6Address: container.networks.compactMap(\.ipv6Address).first,
+                bindings: container.ports
+            )
+        }
+        knownContainers[container.id] = active
+        activeContainers[container.id] = active
     }
 
     private func pull(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws -> OCIStoredImage {
         try await store.pull(reference: reference, platform: platform, credentials: credentials, progress: progress)
     }
 
-    private func workload(_ container: ContainerRecord, image: OCIStoredImage) async throws -> GuestProtocol.Workload {
+    private func workload(_ container: ContainerRecord, image: OCIStoredImage, volumeModes: [String: VolumeStorageMode]) async throws -> GuestProtocol.Workload {
         let config = image.configuration.config
         let arguments = (container.entrypoint ?? config?.entrypoint ?? []) + (container.command ?? config?.command ?? [])
         guard !arguments.isEmpty else { throw EngineError(.badRequest, "container has no command") }
         let environment = Self.mergeEnvironment(image: config?.environment ?? [], container: container.environment)
+        let bindSources = preparedBindSources[container.id] ?? [:]
+        let blockVolumes = Self.volumeNames(in: container.mounts).filter { volumeModes[$0] != .shared }
+        let volumeDevices = try Dictionary(uniqueKeysWithValues: blockVolumes.enumerated().map {
+            ($0.element, try Self.volumeDevicePath(index: $0.offset))
+        })
         let mounts = container.mounts.enumerated().map { index, mount in
             let bindSubpath: String? = {
                 guard mount.kind == .bind else { return mount.subpath }
-                let source = URL(filePath: mount.source)
-                let isDirectory = (try? source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                let base = isDirectory ? nil : source.lastPathComponent
-                return [base, mount.subpath].compactMap { $0 }.joined(separator: "/").nilIfEmpty
+                return [bindSources[index]?.subpath, mount.subpath].compactMap { $0 }.joined(separator: "/").nilIfEmpty
             }()
             let options = mount.kind == .tmpfs ? ["size=\(max(mount.tmpfsSizeBytes ?? 64 * 1_024 * 1_024, 0))", String(format: "mode=%o", mount.tmpfsMode ?? 0o1777)] : []
             return GuestProtocol.Mount(
                 kind: mount.kind.rawValue,
                 source: mount.kind == .bind ? "bind-\(index)" : mount.source,
+                device: mount.kind == .volume ? volumeDevices[mount.source] : nil,
                 destination: mount.destination,
                 readOnly: mount.readOnly,
                 options: options,
-                token: mount.kind == .volume ? tokenIssuer.token(for: mount.source) : nil,
                 subpath: bindSubpath,
                 noCopy: mount.noCopy
             )
@@ -488,12 +651,111 @@ public actor RawVirtualizationBackend: ContainerBackend {
             workingDirectory: container.workingDirectory.isEmpty ? (config?.workingDirectory ?? "/") : container.workingDirectory,
             hostname: container.hostname, user: Self.user(container.user.isEmpty ? config?.user : container.user),
             terminal: container.tty, readOnlyRoot: container.readOnlyRootfs, stopSignal: container.stopSignal,
+            volumeServer: volumeModes.values.contains(.shared) ? Self.managementServerAddress : nil,
             mounts: mounts, networks: networkEndpoints(container), hosts: networkHosts(container), resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: 0), privileged: container.privileged
         )
     }
 
+    private func ensureVolumeDisks(names: [String]) throws -> [VMShimProtocol.VolumeDisk] {
+        try names.map { name in
+            guard !name.isEmpty, !name.contains("/") else {
+                throw EngineError(.badRequest, "invalid volume name")
+            }
+            let disk = volumeDiskURL(name: name)
+            try Self.createSparseFile(at: disk, size: Self.defaultVolumeDiskBytes)
+            return .init(name: name, path: disk.path)
+        }
+    }
+
+    private func resolveVolumeStorageModes(for container: ContainerRecord) throws -> [String: VolumeStorageMode] {
+        let names = Self.volumeNames(in: container.mounts)
+        var referenceCounts: [String: Int] = [:]
+        for known in knownContainers.values {
+            for name in Self.volumeNames(in: known.mounts) {
+                referenceCounts[name, default: 0] += 1
+            }
+        }
+        if knownContainers[container.id] == nil {
+            for name in names { referenceCounts[name, default: 0] += 1 }
+        }
+        let resolved = try Self.resolveVolumeStorageModes(
+            names: names,
+            referenceCounts: referenceCounts,
+            existing: volumeStorageModes
+        )
+        if resolved != volumeStorageModes {
+            volumeStorageModes = resolved
+            try persistVolumeStorageModes()
+        }
+        return resolved
+    }
+
+    static func resolveVolumeStorageModes(
+        names: [String],
+        referenceCounts: [String: Int],
+        existing: [String: VolumeStorageMode]
+    ) throws -> [String: VolumeStorageMode] {
+        var resolved = existing
+        for name in names {
+            if resolved[name] == .block, referenceCounts[name, default: 1] > 1 {
+                throw EngineError(.conflict, "volume \(name) is block-backed and cannot be attached to multiple container VMs")
+            }
+            if resolved[name] == nil {
+                resolved[name] = referenceCounts[name, default: 1] > 1 ? .shared : .block
+            }
+        }
+        return resolved
+    }
+
+    private func reconfigureVolumeDisks(
+        _ shim: VMShimClient,
+        container: ContainerRecord,
+        modes: [String: VolumeStorageMode]
+    ) async throws -> VMShimClient {
+        let desiredNames = Self.volumeNames(in: container.mounts).filter { modes[$0] != .shared }
+        if shim.specification.volumeDisks.map(\.name) == desiredNames { return shim }
+        let status = try await shim.status()
+        guard status.state != .running && status.state != .paused else {
+            throw EngineError(.conflict, "cannot change volume storage while the container VM is running")
+        }
+        _ = try await shim.shutdown()
+        var specification = shim.specification
+        specification.generation += 1
+        specification.token = Self.randomToken()
+        specification.socketPath = try Self.makeRuntimeSocketPath()
+        specification.volumeDisks = try ensureVolumeDisks(names: desiredNames)
+        let replacement = try await VMShimClient.launch(specification: specification)
+        shims[container.id] = replacement
+        return replacement
+    }
+
+    private func volumeDiskURL(name: String) -> URL {
+        let digest = SHA256.hash(data: Data(name.utf8)).map { String(format: "%02x", $0) }.joined()
+        return root.appending(path: "volumes/\(digest).ext4")
+    }
+
+    private func persistVolumeStorageModes() throws {
+        let data = try JSONEncoder().encode(volumeStorageModes)
+        try data.write(to: root.appending(path: "volume-storage.json"), options: .atomic)
+    }
+
+    static func volumeNames(in mounts: [MountRecord]) -> [String] {
+        var seen = Set<String>()
+        return mounts.compactMap { mount in
+            guard mount.kind == .volume, seen.insert(mount.source).inserted else { return nil }
+            return mount.source
+        }
+    }
+
+    static func volumeDevicePath(index: Int) throws -> String {
+        guard (0..<25).contains(index), let suffix = UnicodeScalar(98 + index) else {
+            throw EngineError(.badRequest, "a container may mount at most 25 volumes")
+        }
+        return "/dev/vd\(Character(suffix))"
+    }
+
     private func networkEndpoints(_ container: ContainerRecord) -> [GuestProtocol.NetworkEndpoint] {
-        container.networks.compactMap { endpoint in
+        container.networks.enumerated().compactMap { index, endpoint in
             guard let network = networks[endpoint.networkID], let vlan = networkVLANs[endpoint.networkID] else { return nil }
             var addresses: [String] = []
             if let address = endpoint.ipv4Address, !address.isEmpty { addresses.append(Self.withPrefix(address, from: network.subnet)) }
@@ -504,7 +766,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             return .init(
                 networkID: endpoint.networkID,
                 vlan: vlan,
-                name: "v\(vlan)",
+                name: "eth\(index)",
                 macAddress: Self.macAddress(container.id + endpoint.networkID),
                 addresses: addresses,
                 gateways: gateways,
@@ -527,7 +789,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     static func automaticIPv4Network(vlan: UInt16) -> (subnet: String, gateway: String) {
-        precondition((1...4094).contains(vlan), "VLAN must be in the allocatable range")
+        precondition((1..<VMShimProtocol.managementVLAN).contains(vlan), "VLAN must be in the allocatable range")
         let slot = Int(vlan)
         let secondOctet = 240 + (slot / 256)
         let thirdOctet = slot % 256
@@ -537,8 +799,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func allocateVLAN() throws -> UInt16 {
         let used = Set(networkVLANs.values)
-        guard let vlan = (1...4094).first(where: { !used.contains(UInt16($0)) }) else { throw EngineError(.conflict, "all VLAN identifiers are allocated") }
-        return UInt16(vlan)
+        guard let vlan = Self.nextAvailableVLAN(used: used) else { throw EngineError(.conflict, "all VLAN identifiers are allocated") }
+        return vlan
+    }
+
+    static func nextAvailableVLAN(used: Set<UInt16>) -> UInt16? {
+        (1..<VMShimProtocol.managementVLAN).first(where: { !used.contains($0) })
+    }
+
+    static func managementAddress(for containerID: String) -> String {
+        let digest = Array(SHA256.hash(data: Data(containerID.utf8)))
+        let second = 64 | Int(digest[0] & 0x3f)
+        let third = Int(digest[1])
+        var fourth = Int(digest[2])
+        if second == 64, third == 0, fourth < 2 { fourth = 2 }
+        return "100.\(second).\(third).\(fourth)/10"
     }
 
     private func persistNetworks() throws {
@@ -549,14 +824,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private func synchronizeFabric() async throws {
         let values = networks.compactMap { id, network -> VMShimClient.FabricNetwork? in
             guard let vlan = networkVLANs[id], !network.subnet.isEmpty else { return nil }
-            let ports = activeContainers.values.flatMap { container -> [VMShimClient.FabricPort] in
-                guard let endpoint = container.networks.first(where: { $0.networkID == id }), let address = endpoint.ipv4Address, !address.isEmpty else { return [] }
-                return container.ports.compactMap { binding in
-                    guard binding.hostPort != 0 else { return nil }
-                    return .init(proto: binding.proto, externalPort: binding.hostPort, internalAddress: address, internalPort: binding.containerPort)
-                }
-            }
-            return .init(id: id, vlan: vlan, subnet: network.subnet, ipv6Subnet: network.ipv6Subnet, internalNetwork: network.internalNetwork, isolated: network.ipv4GatewayMode == .isolated, ports: ports)
+            return .init(id: id, vlan: vlan, subnet: network.subnet, gateway: network.gateway, ipv6Subnet: network.ipv6Subnet, internalNetwork: network.internalNetwork, isolated: network.ipv4GatewayMode == .isolated, ports: [])
         }
         _ = try await infrastructure.configureFabric(networks: values.sorted { $0.id < $1.id })
     }
@@ -641,16 +909,61 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let handle = try FileHandle(forWritingTo: url); try handle.truncate(atOffset: size); try handle.close()
     }
 
-    private static func prepareBindSources(_ mounts: [MountRecord]) throws {
-        for mount in mounts where mount.kind == .bind {
-            let source = URL(filePath: mount.source)
-            if FileManager.default.fileExists(atPath: source.path) { continue }
-            guard mount.createSourceIfMissing != false else { throw EngineError(.notFound, "bind source \(mount.source) does not exist") }
-            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+    private struct NetworkState: Codable { let record: NetworkRecord; let vlan: UInt16 }
+}
+
+struct PreparedBindSource: Sendable, Equatable {
+    let shareRoot: URL
+    let subpath: String?
+}
+
+struct HostBindSourceResolver: Sendable {
+    let root: URL
+
+    func resolve(_ mounts: [MountRecord]) throws -> [Int: PreparedBindSource] {
+        var resolved: [Int: PreparedBindSource] = [:]
+        for (index, mount) in mounts.enumerated() where mount.kind == .bind {
+            let requested = URL(filePath: mount.source)
+            if FileManager.default.fileExists(atPath: requested.path) {
+                let isDirectory = (try? requested.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                resolved[index] = .init(
+                    shareRoot: isDirectory ? requested : requested.deletingLastPathComponent(),
+                    subpath: isDirectory ? nil : requested.lastPathComponent
+                )
+                continue
+            }
+            guard mount.createSourceIfMissing != false else {
+                throw EngineError(.notFound, "bind source \(mount.source) does not exist")
+            }
+            do {
+                try FileManager.default.createDirectory(at: requested, withIntermediateDirectories: true)
+                resolved[index] = .init(shareRoot: requested, subpath: nil)
+            } catch {
+                guard Self.isHostNamespaceWriteRestriction(error) else { throw error }
+                let digest = SHA256.hash(data: Data(requested.path.utf8)).map { String(format: "%02x", $0) }.joined()
+                let managed = root.appending(path: digest, directoryHint: .isDirectory)
+                try FileManager.default.createDirectory(at: managed, withIntermediateDirectories: true)
+                resolved[index] = .init(shareRoot: managed, subpath: nil)
+            }
         }
+        return resolved
     }
 
-    private struct NetworkState: Codable { let record: NetworkRecord; let vlan: UInt16 }
+    private static func isHostNamespaceWriteRestriction(_ error: Error) -> Bool {
+        let value = error as NSError
+        if value.domain == NSCocoaErrorDomain,
+           value.code == CocoaError.fileWriteNoPermission.rawValue || value.code == CocoaError.fileWriteVolumeReadOnly.rawValue {
+            return true
+        }
+        if value.domain == NSPOSIXErrorDomain,
+           value.code == EACCES || value.code == EPERM || value.code == EROFS {
+            return true
+        }
+        if let underlying = value.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isHostNamespaceWriteRestriction(underlying)
+        }
+        return false
+    }
 }
 
 private extension String { var nilIfEmpty: String? { isEmpty ? nil : self } }

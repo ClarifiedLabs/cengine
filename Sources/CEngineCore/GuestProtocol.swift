@@ -50,16 +50,17 @@ public enum GuestProtocol {
         public var terminal: Bool
         public var readOnlyRoot: Bool
         public var stopSignal: String
+        public var volumeServer: String?
         public var mounts: [Mount]
         public var networks: [NetworkEndpoint]
         public var hosts: [String: String]
         public var resources: Resources
         public var privileged: Bool
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false) {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false) {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
-            self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
+            self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
         }
     }
 
@@ -74,14 +75,14 @@ public enum GuestProtocol {
     public struct Mount: Codable, Sendable, Equatable {
         public var kind: String
         public var source: String
+        public var device: String?
         public var destination: String
         public var readOnly: Bool
         public var options: [String]
-        public var token: String?
         public var subpath: String?
         public var noCopy: Bool
-        public init(kind: String, source: String, destination: String, readOnly: Bool, options: [String] = [], token: String? = nil, subpath: String? = nil, noCopy: Bool = false) {
-            self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly; self.options = options; self.token = token; self.subpath = subpath; self.noCopy = noCopy
+        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false) {
+            self.kind = kind; self.source = source; self.device = device; self.destination = destination; self.readOnly = readOnly; self.options = options; self.subpath = subpath; self.noCopy = noCopy
         }
     }
 

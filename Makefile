@@ -21,10 +21,11 @@ CENGINE_COMPAT_ENV = CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/
 	CENGINE_KERNEL="$(CENGINE_GUEST_OUTPUT)/vmlinux" \
 	CENGINE_CONTAINER_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/container-initramfs.cpio.gz" \
 	CENGINE_STORAGE_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/storage-initramfs.cpio.gz"
+CENGINE_COMPAT_RESET = python3 Scripts/reset-compat-runtime.py --binary "$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine"
 
 export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME
 
-.PHONY: all build guest-assets guest-initramfs kernel test test-guest test-compat test-compat-soak test-compat-oracle dist-cli package release release-list test-release clean help
+.PHONY: all build guest-assets guest-initramfs kernel test test-guest test-compat test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system dist-cli package release release-list test-release clean help
 
 all: dist-cli
 
@@ -37,9 +38,11 @@ help:
 		'make kernel        Build the pinned cengine Linux kernel' \
 		'make test          Run the Xcode test suite' \
 		'make test-guest    Run Linux guest service unit tests' \
-		'make test-compat  Run Docker API and Compose compatibility tests against an isolated daemon' \
+		'make test-compat  Reset, rebuild, run Docker compatibility tests, and reset again' \
 		'make test-compat-soak  Run the compatibility suite three times with shuffled ordering' \
 		'make test-compat-oracle  Compare deterministic contracts with DOCKER_REFERENCE_HOST' \
+		'make test-compat-reset  Stop this worktree’s orphaned compatibility VMs and remove temporary roots' \
+		'make test-compat-reset-system  Also restart vmnet system state after a helper crash' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
 		'make package       Build local unsigned PKG and DMG release artifacts' \
 		'make release       Create a GitHub release tag (VERSION=patch|minor|major|X.Y.Z)' \
@@ -50,45 +53,35 @@ help:
 build:
 	$(XCODEBUILD) -project "$(XCODE_PROJECT)" -scheme cengine -configuration Debug -derivedDataPath "$(XCODE_DERIVED_DATA)" $(XCODE_COMMON_FLAGS) $(XCODE_METADATA_FLAGS) build
 
-guest-assets: kernel guest-initramfs
+guest-assets: kernel
 
 guest-initramfs:
 	./Scripts/build-guest-assets.sh
 
-kernel:
+kernel: build
 	./Scripts/build-kernel.sh
 
 test:
 	@python3 tools/tests/test-compat-harness.py
 	$(XCODEBUILD) -project "$(XCODE_PROJECT)" -scheme cengine -configuration Debug -derivedDataPath "$(XCODE_DERIVED_DATA)" $(XCODE_COMMON_FLAGS) $(XCODE_METADATA_FLAGS) -destination '$(XCODE_DESTINATION)' $(XCODE_RESULT_BUNDLE_FLAGS) test
 
-test-guest:
+test-guest: build guest-initramfs
 	./Scripts/test-guest.sh
 
-test-compat: build guest-initramfs
-	@Scripts/sign-compat-binary.sh .build/xcode-derived/Build/Products/Debug/cengine
-	@python3 -m venv .build/compat-venv
-	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
-	@$(CENGINE_COMPAT_ENV) \
-		.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility
+test-compat:
+	@$(CENGINE_COMPAT_ENV) Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)
 
-test-compat-soak: build guest-initramfs
-	@Scripts/sign-compat-binary.sh .build/xcode-derived/Build/Products/Debug/cengine
-	@python3 -m venv .build/compat-venv
-	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
-	@for seed in 101 202 303; do \
-		echo "Running compatibility soak seed $$seed"; \
-		CENGINE_TEST_SEED="$$seed" $(CENGINE_COMPAT_ENV) \
-			.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini Tests/Compatibility || exit $$?; \
-	done
+test-compat-soak:
+	@$(CENGINE_COMPAT_ENV) Scripts/run-compat-tests.sh soak $(COMPAT_ARGS)
 
-test-compat-oracle: build guest-initramfs
-	@test -n "$(DOCKER_REFERENCE_HOST)" || (echo 'DOCKER_REFERENCE_HOST is required' >&2; exit 2)
-	@Scripts/sign-compat-binary.sh .build/xcode-derived/Build/Products/Debug/cengine
-	@python3 -m venv .build/compat-venv
-	@.build/compat-venv/bin/pip install --disable-pip-version-check -q -r Tests/Compatibility/requirements.txt
-	@DOCKER_REFERENCE_HOST="$(DOCKER_REFERENCE_HOST)" $(CENGINE_COMPAT_ENV) \
-		.build/compat-venv/bin/python -m pytest -c Tests/Compatibility/pytest.ini -m oracle Tests/Compatibility
+test-compat-oracle:
+	@DOCKER_REFERENCE_HOST="$(DOCKER_REFERENCE_HOST)" $(CENGINE_COMPAT_ENV) Scripts/run-compat-tests.sh oracle $(COMPAT_ARGS)
+
+test-compat-reset:
+	@$(CENGINE_COMPAT_RESET)
+
+test-compat-reset-system:
+	@$(CENGINE_COMPAT_RESET) --system-networking
 
 dist-cli: test guest-assets
 	XCODE_DERIVED_DATA="$(XCODE_DERIVED_DATA)" XCODE_SOURCE_PACKAGES="$(XCODE_SOURCE_PACKAGES)" ./Scripts/build-release.sh

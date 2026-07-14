@@ -113,6 +113,11 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-033` | `test_multiple_containers_stream_stats_concurrently` | ✅ Pass | Support | **cengine-owned.** Multiple simultaneous stats streams produce independent samples. |
 | `CTR-034` | `test_network_none_has_only_loopback` | ✅ Pass | Support | **cengine-owned.** Network mode `none` persists across inspect and exposes only loopback in the guest. |
 | `CTR-035` | `test_debian_package_install_uses_ext4_rootfs` | ✅ Pass | Support | **cengine-owned.** Debian package installation creates `/etc/ssl` on the guest ext4 root without host-filesystem permission failures. |
+| `CTR-036` | `test_exec_hijack_closes_after_process_exit` | ✅ Pass | Support | **cengine-owned.** Attached exec closes its hijacked HTTP stream promptly when the guest process exits. |
+| `CTR-037` | `test_short_lived_container_reaches_exited_state` | ✅ Pass | Support | **cengine-owned.** A naturally exiting guest process is reconciled without requiring an explicit stop request. |
+| `CTR-038` | `test_attached_exec_streams_stdin_before_eof` | ✅ Pass | Support | **cengine-owned.** Attached exec stdin remains open for streamed data and receives EOF when the client half-closes. |
+| `CTR-039` | `test_attached_exec_preserves_multiline_stdin_bytes` | ✅ Pass | Support | **cengine-owned.** Attached exec preserves structured multi-line stdin byte-for-byte. |
+| `CTR-040` | `test_exec_inherits_and_overrides_container_environment` | ✅ Pass | Support | **cengine-owned.** Exec inherits image and container environment before applying exec-specific overrides. |
 
 ## Images
 
@@ -170,7 +175,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |
 | `VOL-004` | `test_volume_subpath_mounts_existing_directory` | ✅ Pass | Support | **cengine-owned.** Existing volume subdirectories mount safely and traversal is rejected. |
 | `VOL-005` | `test_tmpfs_size_and_mode_options` | ✅ Pass | Support | **cengine-owned.** Structured tmpfs size and mode options are applied in the guest. |
-| `VOL-006` | `test_volume_preserves_inodes_across_link_and_rename` | ✅ Pass | Support | **cengine-owned.** FUSE node handles preserve hard-link identity across directory rename. |
+| `VOL-006` | `test_volume_preserves_inodes_across_link_and_rename` | ✅ Pass | Support | **cengine-owned.** Stable NFS file handles preserve hard-link identity across directory rename. |
 
 ## Docker Compose 5.3.1
 
@@ -199,6 +204,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `REC-002` | `test_daemon_restart_during_active_io_and_stats` | ✅ Pass | Support | **cengine-owned.** Recovery remains correct while log and stats streams are active. |
 | `REC-003` | `test_daemon_restart_recreates_usable_network_interfaces` | ✅ Pass | Support | **cengine-owned.** Logical vmnet restoration recreates a carrier-up interface with working DNS and internet access. |
 | `REC-004` | `test_running_workload_survives_daemon_process_replacement` | ✅ Pass | Support | **cengine-owned.** A daemon process replacement reconnects to the existing VM shim without changing container start time. |
+| `REC-005` | `test_vmnet_reservation_is_released_when_infrastructure_shim_exits` | ✅ Pass | Support | **cengine-owned.** Infrastructure shim termination releases its privileged vmnet reservations before recovery. |
 
 ## Docker CLI
 

@@ -3,7 +3,7 @@ import Darwin
 
 public enum PrivilegedPortProtocol {
     public static let serviceName = "dev.cengine.network-helper"
-    public static let version: Int64 = 3
+    public static let version: Int64 = 4
     public static let engineIdentifier = "dev.cengine.engine"
     public static let helperIdentifier = "dev.cengine.network-helper"
 }
@@ -54,6 +54,7 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
     public let id: String
     public let vlan: UInt16
     public let subnet: String
+    public let gateway: String
     public let ipv6Subnet: String
     public let internalNetwork: Bool
     public let dhcpEnabled: Bool
@@ -63,6 +64,7 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
         id: String,
         vlan: UInt16,
         subnet: String,
+        gateway: String,
         ipv6Subnet: String,
         internalNetwork: Bool,
         dhcpEnabled: Bool,
@@ -71,6 +73,7 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
         self.id = id
         self.vlan = vlan
         self.subnet = subnet
+        self.gateway = gateway
         self.ipv6Subnet = ipv6Subnet
         self.internalNetwork = internalNetwork
         self.dhcpEnabled = dhcpEnabled

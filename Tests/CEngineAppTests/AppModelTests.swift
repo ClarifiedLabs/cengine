@@ -27,10 +27,15 @@ import CEngineCore
             registrationError: NSError(domain: SMAppServiceErrorDomain, code: 1)
         )
         var settingsOpenCount = 0
-        let model = AppModel(agent: agent, helper: helper) { settingsOpenCount += 1 }
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: nil,
+            openLoginItemsSettings: { settingsOpenCount += 1 }
+        )
         defer { model.setActive(false) }
 
-        model.start()
+        await model.start()
 
         #expect(helper.registerCount == 1)
         #expect(agent.registerCount == 0)
@@ -43,20 +48,20 @@ import CEngineCore
         #expect(settingsOpenCount == 1)
     }
 
-    @MainActor @Test func enabledNetworkingRegistersEngineService() {
+    @MainActor @Test func enabledNetworkingRegistersEngineService() async {
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
-        let model = AppModel(agent: agent, helper: helper)
+        let model = AppModel(agent: agent, helper: helper, serviceRegistrationRevision: nil)
         defer { model.setActive(false) }
 
-        model.start()
+        await model.start()
 
         #expect(helper.registerCount == 0)
         #expect(agent.registerCount == 1)
         #expect(model.engineStatus == "Running")
     }
 
-    @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() {
+    @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() async {
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(
             status: .notFound,
@@ -64,14 +69,70 @@ import CEngineCore
             registrationError: NSError(domain: SMAppServiceErrorDomain, code: 1)
         )
         var settingsOpenCount = 0
-        let model = AppModel(agent: agent, helper: helper) { settingsOpenCount += 1 }
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: nil,
+            openLoginItemsSettings: { settingsOpenCount += 1 }
+        )
         defer { model.setActive(false) }
 
-        model.start()
+        await model.start()
 
         #expect(settingsOpenCount == 0)
         #expect(agent.registerCount == 0)
         #expect(model.error?.contains("Could not enable required cengine services") == true)
+    }
+
+    @MainActor @Test func appUpgradeRefreshesEnabledServiceRegistrations() async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("24", forKey: AppModel.serviceRegistrationRevisionKey)
+        var unregistrationWaitCount = 0
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: "25",
+            serviceRegistrationDefaults: defaults,
+            waitForServiceUnregistration: { unregistrationWaitCount += 1 }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+
+        #expect(agent.unregisterCount == 1)
+        #expect(helper.unregisterCount == 1)
+        #expect(helper.registerCount == 1)
+        #expect(agent.registerCount == 1)
+        #expect(unregistrationWaitCount == 1)
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
+    }
+
+    @MainActor @Test func currentAppBuildKeepsEnabledServiceRegistrations() async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("25", forKey: AppModel.serviceRegistrationRevisionKey)
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: "25",
+            serviceRegistrationDefaults: defaults,
+            waitForServiceUnregistration: { Issue.record("unexpected registration delay") }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+
+        #expect(agent.unregisterCount == 0)
+        #expect(helper.unregisterCount == 0)
+        #expect(agent.registerCount == 0)
+        #expect(helper.registerCount == 0)
     }
 }
 
@@ -80,6 +141,7 @@ import CEngineCore
     let statusAfterRegistration: SMAppService.Status
     let registrationError: Error?
     var registerCount = 0
+    var unregisterCount = 0
 
     init(
         status: SMAppService.Status,
@@ -98,6 +160,7 @@ import CEngineCore
     }
 
     func unregister() async throws {
+        unregisterCount += 1
         status = .notRegistered
     }
 }

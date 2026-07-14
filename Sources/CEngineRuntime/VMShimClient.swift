@@ -5,7 +5,7 @@ import Foundation
 
 public final class VMShimClient: @unchecked Sendable {
     public struct FabricPort: Codable, Hashable, Sendable { public var proto: String; public var externalPort: UInt16; public var internalAddress: String; public var internalPort: UInt16 }
-    public struct FabricNetwork: Codable, Hashable, Sendable { public var id: String; public var vlan: UInt16; public var subnet: String; public var ipv6Subnet: String; public var internalNetwork: Bool; public var isolated: Bool; public var ports: [FabricPort] }
+    public struct FabricNetwork: Codable, Hashable, Sendable { public var id: String; public var vlan: UInt16; public var subnet: String; public var gateway: String; public var ipv6Subnet: String; public var internalNetwork: Bool; public var isolated: Bool; public var ports: [FabricPort] }
     public struct GuestCall: Codable, Sendable { public var operation: String; public var payload: Data }
     public struct RootFSRequest: Codable, Sendable { public var contentStorePath: String; public var layers: [OCIDescriptor] }
 

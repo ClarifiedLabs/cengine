@@ -29,6 +29,9 @@ enum SystemTar {
 
     @discardableResult private static func run(_ arguments: [String], captureOutput: Bool) throws -> Data {
         let process = Process(); process.executableURL = URL(filePath: "/usr/bin/tar"); process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment["COPYFILE_DISABLE"] = "1"
+        process.environment = environment
         let output = Pipe(); let errors = Pipe(); process.standardError = errors
         if captureOutput { process.standardOutput = output }
         try process.run()

@@ -25,7 +25,7 @@ func CopyIn(source, destination string, ownership []Ownership) error {
 	source = filepath.Join("/run/cengine/io", filepath.Clean("/"+source))
 	target, err := containerPath(root, destination); if err != nil { return err }
 	if err := copyContents(source, target); err != nil { return err }
-	for _, owner := range ownership { path, err := containerPath(target, owner.Path); if err != nil { return err }; if err := os.Lchown(path, int(owner.User), int(owner.Group)); err != nil && !errors.Is(err, os.ErrNotExist) { return err } }
+	for _, owner := range ownership { path, err := archivePath(target, owner.Path); if err != nil { return err }; if err := os.Lchown(path, int(owner.User), int(owner.Group)); err != nil && !errors.Is(err, os.ErrNotExist) { return err } }
 	return syncRoot(root)
 }
 
@@ -52,6 +52,7 @@ func Top(pid int) ([]Process,error) { root:=fmt.Sprintf("/proc/%d/root/proc",pid
 
 func mountedRoot()(string,error){root:="/run/cengine/rootfs";if err:=disk.EnsureExt4("/dev/vda",root,"cengine-root");err!=nil{return "",err};return root,nil}
 func containerPath(root,value string)(string,error){if !filepath.IsAbs(value){return "",syscall.EINVAL};clean:=filepath.Clean(value);if clean=="/"{return root,nil};relative:=strings.TrimPrefix(clean,"/");if relative==".."||strings.HasPrefix(relative,"../"){return "",syscall.EPERM};return filepath.Join(root,relative),nil}
+func archivePath(root,value string)(string,error){if value==""||filepath.IsAbs(value){return "",syscall.EINVAL};clean:=filepath.Clean(value);if clean==".."||strings.HasPrefix(clean,"../"){return "",syscall.EPERM};if clean=="."{return root,nil};return filepath.Join(root,clean),nil}
 func copyContents(source,target string)error{if err:=os.MkdirAll(target,0755);err!=nil{return err};entries,err:=os.ReadDir(source);if err!=nil{return err};for _,entry:=range entries{if err:=copyEntry(filepath.Join(source,entry.Name()),filepath.Join(target,entry.Name()));err!=nil{return err}};return nil}
 func copyEntry(source,target string)error{info,err:=os.Lstat(source);if err!=nil{return err};if info.IsDir(){if err:=os.MkdirAll(target,info.Mode().Perm());err!=nil{return err};entries,err:=os.ReadDir(source);if err!=nil{return err};for _,entry:=range entries{if err:=copyEntry(filepath.Join(source,entry.Name()),filepath.Join(target,entry.Name()));err!=nil{return err}};return nil};if info.Mode()&os.ModeSymlink!=0{value,err:=os.Readlink(source);if err!=nil{return err};_ = os.RemoveAll(target);return os.Symlink(value,target)};if !info.Mode().IsRegular(){return fmt.Errorf("unsupported transfer entry %s",source)};input,err:=os.Open(source);if err!=nil{return err};defer input.Close();_ = os.RemoveAll(target);output,err:=os.OpenFile(target,os.O_CREATE|os.O_EXCL|os.O_WRONLY,info.Mode().Perm());if err!=nil{return err};_,copyErr:=io.Copy(output,input);closeErr:=output.Close();if copyErr!=nil{return copyErr};return closeErr}
 func syncRoot(path string)error{fd,err:=unix.Open(path,unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,0);if err!=nil{return err};defer unix.Close(fd);return unix.Syncfs(fd)}

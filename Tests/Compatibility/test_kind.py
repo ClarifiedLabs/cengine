@@ -13,6 +13,12 @@ import pytest
 from harness import docker_environment
 
 
+KIND_NODE_IMAGE = (
+    "mirror.gcr.io/kindest/node@"
+    "sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+)
+
+
 def kind(
     daemon, *arguments: str, network: str, timeout: int = 600,
 ) -> subprocess.CompletedProcess[str]:
@@ -41,10 +47,48 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
     try:
         result = kind(
             daemon, "create", "cluster", "--name", name,
+            "--image", KIND_NODE_IMAGE, "--retain",
             "--kubeconfig", str(kubeconfig), "--wait", "5m",
             network=network,
         )
-        assert result.returncode == 0, f"kind create cluster failed:\n{result.stdout}"
+        if result.returncode != 0:
+            diagnostics = []
+            for container in client.containers.list(all=True):
+                if container.name.startswith(f"{name}-"):
+                    container.reload()
+                    state = container.attrs["State"]
+                    inspection_output = "container stopped before live diagnostics"
+                    if state.get("Running"):
+                        try:
+                            inspection = container.exec_run([
+                                "sh", "-c",
+                                "systemctl is-system-running 2>&1 || true; "
+                                "systemctl --failed --no-pager 2>&1 || true; "
+                                "printf '\nPROCESSES\n'; ps auxww; "
+                                "printf '\nMOUNTS\n'; mount; "
+                                "printf '\nCONTAINERD STATUS\n'; "
+                                "systemctl status containerd --no-pager 2>&1 || true; "
+                                "printf '\nCONTAINERD JOURNAL\n'; "
+                                "journalctl -b -u containerd --no-pager 2>&1 || true; "
+                                "printf '\nCONTAINERD PLUGINS\n'; "
+                                "ctr plugins ls 2>&1 || true; "
+                                "printf '\nCONTAINERD CONFIG\n'; "
+                                "cat /etc/containerd/config.toml 2>&1 || true; "
+                                "printf '\nJOURNAL\n'; "
+                                "journalctl -b --no-pager -n 200 2>&1 || true",
+                            ])
+                            inspection_output = inspection.output.decode(errors="replace")
+                        except docker.errors.APIError as error:
+                            inspection_output = f"live diagnostics failed: {error}"
+                    diagnostics.append(
+                        f"{container.name} state: {state}\n"
+                        f"{container.logs().decode(errors='replace')}\n"
+                        f"{inspection_output}"
+                    )
+            pytest.fail(
+                f"kind create cluster failed:\n{result.stdout}\n"
+                f"node diagnostics:\n{'\n'.join(diagnostics)}"
+            )
         created = True
         kind_network = client.networks.get(network)
         assert kind_network.attrs["Options"][

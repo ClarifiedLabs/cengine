@@ -76,7 +76,23 @@ public actor TrunkNetworkFabric {
         for recipient in recipients {
             guard let file = endpoints[recipient]?.file else { continue }
             do { try file.write(contentsOf: data) }
-            catch { unregister(recipient) }
+            catch {
+                if Self.isTransientPacketWriteError(error) { continue }
+                FileHandle.standardError.write(Data("network fabric write to \(recipient.rawValue) failed (\(data.count) bytes): \(error)\n".utf8))
+                unregister(recipient)
+            }
+        }
+    }
+
+    static func isTransientPacketWriteError(_ error: Error) -> Bool {
+        var current = error as NSError
+        while true {
+            if current.domain == NSPOSIXErrorDomain,
+               current.code == Int(ENOBUFS) || current.code == Int(EAGAIN) || current.code == Int(EWOULDBLOCK) {
+                return true
+            }
+            guard let underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError else { return false }
+            current = underlying
         }
     }
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import docker
 import pytest
 
-from harness import docker_environment
+from harness import COMPATIBILITY_OWNER_FILE, docker_environment, terminate_compatibility_runtime
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -23,6 +23,27 @@ DEFAULT_KERNEL = pathlib.Path.home() / "Library/Application Support/cengine/asse
 DEFAULT_CONTAINER_INITRAMFS = pathlib.Path.home() / "Library/Application Support/cengine/assets/container-initramfs.cpio.gz"
 DEFAULT_STORAGE_INITRAMFS = pathlib.Path.home() / "Library/Application Support/cengine/assets/storage-initramfs.cpio.gz"
 DEFAULT_IMAGE = "alpine:latest"
+DEFAULT_IMAGE_SOURCE = "mirror.gcr.io/library/alpine:latest"
+FIXTURE_IMAGES = [
+    (
+        "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+        "mirror.gcr.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+    ),
+    (
+        "nginx@sha256:54f2a904c251d5a34adf545a72d32515a15e08418dae0266e23be2e18c66fefa",
+        "mirror.gcr.io/library/nginx@sha256:54f2a904c251d5a34adf545a72d32515a15e08418dae0266e23be2e18c66fefa",
+    ),
+    ("busybox:latest", "mirror.gcr.io/library/busybox:latest"),
+    ("debian:trixie-slim", "mirror.gcr.io/library/debian:trixie-slim"),
+    (
+        "registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
+        "mirror.gcr.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
+    ),
+    (
+        "mirror.gcr.io/kindest/node@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5",
+        "mirror.gcr.io/kindest/node@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5",
+    ),
+]
 
 
 def expected_git_commit(binary: pathlib.Path) -> str:
@@ -45,6 +66,10 @@ def expected_git_commit(binary: pathlib.Path) -> str:
     return result.stdout.strip()
 
 
+def clone_tree(source: pathlib.Path, destination: pathlib.Path) -> None:
+    subprocess.run(["/bin/cp", "-cR", str(source), str(destination)], check=True)
+
+
 @dataclass
 class Daemon:
     binary: pathlib.Path
@@ -64,6 +89,7 @@ class Daemon:
         self.runtime = self.work / "run"
         self.socket = self.runtime / "docker.sock"
         self.log_path = self.work / "daemon.log"
+        (self.work / COMPATIBILITY_OWNER_FILE).write_text(f"{self.binary.resolve()}\n")
         self.root.mkdir()
         self.runtime.mkdir()
 
@@ -127,6 +153,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         print(f"compatibility test order seed: {seed}")
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    outcome = yield
+    setattr(item, f"report_{call.when}", outcome.get_result())
+
+
 def pytest_report_header() -> list[str]:
     commands = {
         "Docker CLI": ["docker", "--version"],
@@ -167,8 +199,8 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         raise pytest.UsageError(f"compatibility ledger IDs have no tests: {', '.join(sorted(missing))}")
 
 
-@pytest.fixture(scope="session")
-def daemon() -> Daemon:
+@pytest.fixture
+def daemon(request: pytest.FixtureRequest, image_cache: pathlib.Path) -> Daemon:
     binary = pathlib.Path(os.environ.get("CENGINE_BINARY", DEFAULT_BINARY))
     kernel = pathlib.Path(os.environ.get("CENGINE_KERNEL", DEFAULT_KERNEL))
     container_initramfs = pathlib.Path(os.environ.get("CENGINE_CONTAINER_INITRAMFS", DEFAULT_CONTAINER_INITRAMFS))
@@ -186,16 +218,37 @@ def daemon() -> Daemon:
     work = pathlib.Path(tempfile.mkdtemp(prefix="cengine-compat-"))
     value = Daemon(binary=binary, kernel=kernel, container_initramfs=container_initramfs,
                    storage_initramfs=storage_initramfs, work=work)
-    value.start()
-    yield value
-    value.stop()
-    if value.process is not None and value.process.returncode not in (-15, -9, 0):
-        print("\ncengine daemon log:\n" + value.logs())
-    shutil.rmtree(work, ignore_errors=True)
+    cached_content = image_cache / "content"
+    if cached_content.is_dir():
+        clone_tree(cached_content, value.root / "content")
+    try:
+        value.start()
+        yield value
+    finally:
+        value.stop()
+        failed = any(
+            getattr(request.node, f"report_{phase}", None) is not None
+            and getattr(request.node, f"report_{phase}").failed
+            for phase in ("setup", "call", "teardown")
+        )
+        if failed:
+            lines = value.logs().splitlines()
+            print("\ncengine daemon log (last 200 lines):\n" + "\n".join(lines[-200:]))
+        if value.process is not None and value.process.returncode not in (-15, -9, 0):
+            print("\ncengine daemon log:\n" + value.logs())
+        terminate_compatibility_runtime(value.binary, roots=(value.root,))
+        shutil.rmtree(work, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
-def client(daemon: Daemon) -> docker.DockerClient:
+def image_cache():
+    root = REPO_ROOT / ".build/compat-image-cache-v1"
+    root.mkdir(parents=True, exist_ok=True)
+    yield root
+
+
+@pytest.fixture
+def client(daemon: Daemon, image_cache: pathlib.Path) -> docker.DockerClient:
     socket = daemon["socket"]
     assert isinstance(socket, pathlib.Path)
     value = docker.DockerClient(base_url=f"unix://{socket}", timeout=180, version="auto")
@@ -207,12 +260,33 @@ def client(daemon: Daemon) -> docker.DockerClient:
             f"cengine binary identity mismatch: expected GitCommit {expected}, daemon reports {actual} "
             f"(binary: {daemon.binary}, socket: {socket})"
         )
-    value.images.pull(os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE))
+    image = os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE)
+    source = os.environ.get(
+        "CENGINE_TEST_IMAGE_SOURCE",
+        DEFAULT_IMAGE_SOURCE if image == DEFAULT_IMAGE else image,
+    )
+    seeds = [(image, source)] + FIXTURE_IMAGES
+    for target, seed_source in seeds:
+        try:
+            value.images.get(target)
+            continue
+        except docker.errors.ImageNotFound:
+            pass
+        pulled = value.images.pull(seed_source)
+        if seed_source != target:
+            value.api.tag(pulled.id, repository=target)
+        value.images.get(target)
+    cached_content = image_cache / "content"
+    if not cached_content.exists():
+        temporary = image_cache / "content.tmp"
+        shutil.rmtree(temporary, ignore_errors=True)
+        clone_tree(daemon.root / "content", temporary)
+        temporary.rename(cached_content)
     yield value
     value.close()
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(autouse=True)
 def verify_docker_cli_target(daemon: Daemon, client: docker.DockerClient):
     name = f"compat-target-{uuid.uuid4().hex[:8]}"
     network = client.networks.create(name, labels={"dev.cengine.compat": "true"})
@@ -235,52 +309,7 @@ def verify_docker_cli_target(daemon: Daemon, client: docker.DockerClient):
 
 
 @pytest.fixture(autouse=True)
-def clean_resources(client: docker.DockerClient):
-    image = os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE)
-    try:
-        client.images.get(image)
-    except docker.errors.NotFound:
-        client.images.pull(image)
-    yield
-    errors: list[str] = []
-    for container in client.containers.list(all=True):
-        try:
-            container.reload()
-            if container.status == "paused":
-                container.unpause()
-                container.reload()
-            if container.status == "running":
-                container.stop(timeout=1)
-            container.remove(force=True)
-        except Exception as error:  # cleanup should preserve the original test failure
-            errors.append(f"container {container.name}: {error}")
-    for volume in client.volumes.list():
-        if volume.attrs.get("Labels", {}).get("dev.cengine.compat") != "true":
-            continue
-        try:
-            volume.remove(force=True)
-        except Exception as error:
-            errors.append(f"volume {volume.name}: {error}")
-    for network in client.networks.list():
-        if not network.name.startswith("compat-"):
-            continue
-        try:
-            network.remove()
-        except Exception as error:
-            errors.append(f"network {network.name}: {error}")
-    for value in client.images.list():
-        if any("alpine" in tag for tag in value.tags):
-            continue
-        try:
-            client.images.remove(value.id, force=True)
-        except Exception as error:
-            errors.append(f"image {value.id}: {error}")
-    if errors:
-        pytest.fail("resource cleanup failed:\n" + "\n".join(errors))
-
-
-@pytest.fixture(autouse=True)
-def daemon_survived(daemon: Daemon):
+def daemon_survived(daemon: Daemon, request: pytest.FixtureRequest):
     yield
     assert daemon.process is not None and daemon.process.poll() is None, (
         "cengine daemon exited during the test:\n" + daemon.logs()

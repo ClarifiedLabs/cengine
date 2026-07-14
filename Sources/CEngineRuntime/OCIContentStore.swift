@@ -135,6 +135,18 @@ public actor OCIContentStore {
         var references: [String: OCIDescriptor] = [:]
     }
 
+    private struct DockerArchiveEntry: Decodable {
+        let config: String
+        let repoTags: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case config = "Config"
+            case repoTags = "RepoTags"
+        }
+
+        var configDigest: String { "sha256:" + URL(filePath: config).lastPathComponent }
+    }
+
     private let root: URL
     private let blobRoot: URL
     private let indexURL: URL
@@ -336,17 +348,44 @@ public actor OCIContentStore {
     public func importLayout(_ directory: URL) throws -> [BackendImage] {
         let indexData = try Data(contentsOf: directory.appending(path: "index.json"))
         let layoutIndex = try decoder.decode(OCIIndex.self, from: indexData)
-        var imported: [BackendImage] = []
+        let archiveURL = directory.appending(path: "manifest.json")
+        let archiveEntries = (try? decoder.decode(
+            [DockerArchiveEntry].self,
+            from: Data(contentsOf: archiveURL)
+        )) ?? []
+        var references = Set<String>()
         for descriptor in layoutIndex.manifests {
             var seen = Set<String>()
             try importDescriptor(descriptor, from: directory, seen: &seen)
-            let reference = descriptor.annotations?["org.opencontainers.image.ref.name"] ?? descriptor.digest
-            try tag(descriptor, as: reference)
+            var descriptorReferences: [String] = []
+            if let reference = descriptor.annotations?["org.opencontainers.image.ref.name"]
+                ?? descriptor.annotations?["io.containerd.image.name"] {
+                descriptorReferences.append(reference)
+            }
+            let configurations = try configurationDigests(in: descriptor)
+            descriptorReferences.append(contentsOf: archiveEntries.compactMap { entry in
+                configurations.contains(entry.configDigest) ? entry.repoTags : nil
+            }.flatMap { $0 })
+            if descriptorReferences.isEmpty { descriptorReferences = [descriptor.digest] }
+            for reference in Set(descriptorReferences) {
+                try tag(descriptor, as: reference)
+                references.insert(ImageReference.normalized(reference))
+            }
         }
         let all = try summaries()
-        let references = Set(layoutIndex.manifests.map { $0.annotations?["org.opencontainers.image.ref.name"] ?? $0.digest })
-        imported = all.filter { references.contains($0.reference) }
-        return imported
+        return all.filter { references.contains($0.reference) }
+    }
+
+    private func configurationDigests(in descriptor: OCIDescriptor) throws -> Set<String> {
+        if Self.indexMediaTypes.contains(descriptor.mediaType) {
+            let value = try decoder.decode(OCIIndex.self, from: data(for: descriptor.digest))
+            return try value.manifests.reduce(into: Set<String>()) { result, child in
+                result.formUnion(try configurationDigests(in: child))
+            }
+        }
+        guard Self.manifestMediaTypes.contains(descriptor.mediaType) else { return [] }
+        let value = try decoder.decode(OCIManifest.self, from: data(for: descriptor.digest))
+        return [value.config.digest]
     }
 
     public func exportLayout(references requested: [String], platform: String) throws -> Data {
@@ -354,7 +393,7 @@ public actor OCIContentStore {
         var roots: [OCIDescriptor] = []
         var digests = Set<String>()
         for name in names {
-            guard var descriptor = index.references[name] else { throw EngineError(.notFound, "image \(name) not found") }
+            var descriptor = try image(reference: name, platform: platform).manifestDescriptor
             var annotations = descriptor.annotations ?? [:]
             annotations["org.opencontainers.image.ref.name"] = name
             descriptor.annotations = annotations
@@ -393,7 +432,8 @@ public actor OCIContentStore {
     }
 
     public func prune() throws -> [String] {
-        var descriptors = Dictionary(uniqueKeysWithValues: index.references.values.map { ($0.digest, $0) })
+        var descriptors: [String: OCIDescriptor] = [:]
+        for descriptor in index.references.values { descriptors[descriptor.digest] = descriptor }
         var reachable = Set(descriptors.keys)
         var pending = Array(reachable)
         while let digest = pending.popLast() {
@@ -467,7 +507,13 @@ struct OCIRegistryReference: Sendable {
         registry = String(normalized[..<slash])
         let remainder = String(normalized[normalized.index(after: slash)...])
         if let at = remainder.lastIndex(of: "@") {
-            repository = String(remainder[..<at])
+            let named = String(remainder[..<at])
+            if let colon = named.lastIndex(of: ":"),
+               !named[named.index(after: colon)...].contains("/") {
+                repository = String(named[..<colon])
+            } else {
+                repository = named
+            }
             selector = String(remainder[remainder.index(after: at)...])
         } else if let colon = remainder.lastIndex(of: ":"),
                   !remainder[remainder.index(after: colon)...].contains("/") {

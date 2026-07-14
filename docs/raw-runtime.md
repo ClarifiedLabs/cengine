@@ -30,21 +30,24 @@ filesystem.
 
 ## Volumes
 
-Container guests mount named volumes through cenginefs, a FUSE-over-vsock
-protocol proxied between the container and storage shims. Protocol objects are
-connection-scoped inode and open-handle IDs, not host paths. The server uses
-`openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`, parent directory descriptors,
-and `*at` syscalls. It supports hard links, rename, xattrs, locks, allocation,
-statfs, device nodes, direct I/O, fsync, and cross-client invalidation. Volume
-tokens are HMACs derived from a persistent infrastructure secret.
+The storage appliance exports its ext4 volume directory over NFSv3 on VLAN
+4094, which is reserved from Docker networks. Each container supervisor has a
+deterministic address in `100.64.0.0/10`, mounts that export once with the Linux
+kernel NFS client, and bind-mounts only authorized named-volume directories into
+the workload namespace. The workload never receives the parent trunk interface
+or access to the export root. This presents standard `nfs` mount metadata to
+Linux tools such as cAdvisor while retaining one container per VM and one ext4
+owner for concurrently shared volumes. The authenticated vsock storage protocol
+remains limited to administrative operations such as volume deletion.
 
 ## Networking
 
-Every VM has one file-handle-backed trunk NIC. A container shim transports
+Every VM has one file-handle-backed trunk NIC. The storage VM and every
+container supervisor share the isolated management VLAN 4094. A container shim transports
 framed Ethernet packets to the infrastructure shim. The switch learns MACs and
 forwards only within the VLANs authorized for that shim. cengine-init creates
 VLAN devices on the trunk and moves only those devices into the workload network
-namespace; the workload cannot access the trunk parent.
+namespace; the workload cannot access the trunk parent or management VLAN.
 
 Each normal Docker network has a raw vmnet shared-mode uplink configured with
 the same IPv4 subnet. The root networking service adds/removes VLAN tags and

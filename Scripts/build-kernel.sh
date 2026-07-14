@@ -3,13 +3,20 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION=$(tr -d '[:space:]' < "$ROOT/Configuration/kernel-version")
-COMMIT=acb7cf4c1184e27622be0faf89244d5001ed1e87
+COMMIT=$(tr -d '[:space:]' < "$ROOT/Configuration/kernel-commit")
 CACHE=${CENGINE_GUEST_CACHE:-"$ROOT/.build/guest-cache"}
 SOURCE=${KERNEL_SOURCE:-"$CACHE/linux-$VERSION"}
 OUTPUT=${CENGINE_GUEST_OUTPUT:-"$ROOT/.build/guest"}
-EMPTY_CONTEXT="$CACHE/empty-context"
+BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/Debug/cengine"}
+IMAGE=${CENGINE_KERNEL_BUILD_IMAGE:-debian:trixie-slim}
+JOBS=${CENGINE_KERNEL_BUILD_JOBS:-4}
+CPUS=${CENGINE_KERNEL_BUILD_CPUS:-4}
+MEMORY=${CENGINE_KERNEL_BUILD_MEMORY:-8g}
 
-mkdir -p "$CACHE" "$OUTPUT" "$EMPTY_CONTEXT"
+mkdir -p "$CACHE" "$OUTPUT"
+if [ -f "$SOURCE/Makefile" ] && [ "$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)" != "$COMMIT" ]; then
+    rm -rf "$SOURCE"
+fi
 if [ ! -f "$SOURCE/Makefile" ]; then
     rm -rf "$SOURCE"
     git init -q "$SOURCE"
@@ -22,31 +29,45 @@ test "$(git -C "$SOURCE" rev-parse HEAD)" = "$COMMIT" || {
     exit 2
 }
 
-docker buildx build \
-    --progress plain \
-    --platform linux/arm64 \
-    --build-context "kernel=$SOURCE" \
-    --build-context "config=$ROOT/Configuration" \
-    --output "type=local,dest=$OUTPUT" \
-    --file - \
-    "$EMPTY_CONTEXT" <<'EOF'
-# syntax=docker/dockerfile:1.7
-FROM debian:trixie-slim AS build
-RUN apt-get -o APT::Sandbox::User=root update && \
-    DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root install -y --no-install-recommends bc bison build-essential ca-certificates flex libelf-dev libssl-dev && \
-    rm -rf /var/lib/apt/lists/*
-COPY --from=kernel / /linux
-COPY --from=config /cengine-kernel.fragment /fragment
-RUN mkdir /build && \
-    make -C /linux O=/build ARCH=arm64 defconfig && \
-    /linux/scripts/kconfig/merge_config.sh -m -O /build /build/.config /fragment && \
-    make -C /linux O=/build ARCH=arm64 olddefconfig && \
-    grep -qx 'CONFIG_FUSE_FS=y' /build/.config && \
-    grep -qx 'CONFIG_VIRTIO_FS=y' /build/.config && \
-    make -C /linux O=/build ARCH=arm64 -j"$(nproc)" Image
+if [ ! -f "$OUTPUT/vmlinux" ]; then
+    bootstrap=${CENGINE_BOOTSTRAP_KERNEL:-}
+    if [ -z "$bootstrap" ] && [ -f "$HOME/Library/Application Support/cengine/assets/vmlinux" ]; then
+        bootstrap="$HOME/Library/Application Support/cengine/assets/vmlinux"
+    fi
+    if [ -z "$bootstrap" ] && [ -f "$ROOT/dist/share/cengine/vmlinux" ]; then
+        bootstrap="$ROOT/dist/share/cengine/vmlinux"
+    fi
+    if [ -z "$bootstrap" ] || [ ! -f "$bootstrap" ]; then
+        echo "a bootstrap cengine kernel is required; set CENGINE_BOOTSTRAP_KERNEL or install cengine guest assets" >&2
+        exit 2
+    fi
+    cp "$bootstrap" "$OUTPUT/vmlinux"
+fi
 
-FROM scratch
-COPY --from=build /build/arch/arm64/boot/Image /vmlinux
-EOF
+CENGINE_GUEST_OUTPUT="$OUTPUT" "$ROOT/Scripts/build-guest-assets.sh"
+rm -f "$OUTPUT/vmlinux.next"
 
+CENGINE_BINARY="$BINARY" \
+CENGINE_KERNEL="$OUTPUT/vmlinux" \
+CENGINE_CONTAINER_INITRAMFS="$OUTPUT/container-initramfs.cpio.gz" \
+CENGINE_STORAGE_INITRAMFS="$OUTPUT/storage-initramfs.cpio.gz" \
+"$ROOT/Scripts/run-isolated-cengine.sh" sh -eu -c '
+    docker pull "$1"
+    docker run --rm \
+        --cpus "$7" \
+        --memory "$8" \
+        --mount "type=bind,src=$2,dst=/linux,readonly" \
+        --mount "type=bind,src=$3,dst=/fragment,readonly" \
+        --mount "type=bind,src=$4,dst=/compile,readonly" \
+        --mount "type=bind,src=$5,dst=/output" \
+        "$1" /bin/sh /compile "$6"
+' cengine-kernel-build \
+    "$IMAGE" "$SOURCE" "$ROOT/Configuration/cengine-kernel.fragment" \
+    "$ROOT/Scripts/compile-kernel-in-guest.sh" "$OUTPUT" "$JOBS" "$CPUS" "$MEMORY"
+
+mv "$OUTPUT/vmlinux.next" "$OUTPUT/vmlinux"
+cat "$ROOT/Configuration/kernel-version" \
+    "$ROOT/Configuration/kernel-commit" \
+    "$ROOT/Configuration/cengine-kernel.fragment" \
+    | shasum -a 256 | awk '{print $1}' > "$OUTPUT/kernel-input.sha256"
 echo "Built pinned Linux $VERSION ($COMMIT) at $OUTPUT/vmlinux"

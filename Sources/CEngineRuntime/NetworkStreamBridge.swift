@@ -28,7 +28,8 @@ final class NetworkStreamBridge: @unchecked Sendable {
             guard let self else { return }
             let packet = handle.availableData
             guard !packet.isEmpty else { self.finish(); return }
-            do { try self.writeFrame(packet) } catch { self.finish() }
+            do { try self.writeFrame(packet) }
+            catch { self.fail("write stream frame", error: error, packetSize: packet.count) }
         }
         stream.readabilityHandler = { [weak self] handle in
             guard let self else { return }
@@ -62,12 +63,27 @@ final class NetworkStreamBridge: @unchecked Sendable {
         buffer.append(data)
         while buffer.count >= 4 {
             let size = buffer.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-            guard size > 0, size <= 65_535 else { buffer.removeAll(); finish(); return }
+            guard size > 0, size <= 65_535 else {
+                buffer.removeAll()
+                fail("decode stream frame", error: EngineError(.badRequest, "invalid Ethernet frame size \(size)"))
+                return
+            }
             guard buffer.count >= Int(size) + 4 else { return }
             let packet = buffer.subdata(in: 4..<(Int(size) + 4))
             buffer.removeSubrange(0..<(Int(size) + 4))
-            do { try datagrams.write(contentsOf: packet) } catch { finish(); return }
+            do { try datagrams.write(contentsOf: packet) }
+            catch {
+                if TrunkNetworkFabric.isTransientPacketWriteError(error) { continue }
+                fail("write datagram frame", error: error, packetSize: packet.count)
+                return
+            }
         }
+    }
+
+    private func fail(_ operation: String, error: Error, packetSize: Int? = nil) {
+        let size = packetSize.map { " (\($0) bytes)" } ?? ""
+        FileHandle.standardError.write(Data("network relay \(operation) failed\(size): \(error)\n".utf8))
+        finish()
     }
 
     static func readRegistration(_ descriptor: Int32) throws -> (NetworkRegistration, FileHandle) {

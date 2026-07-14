@@ -20,6 +20,13 @@ public struct BackendEndpointAddress: Sendable {
     }
 }
 
+public enum BackendContainerRecovery: Sendable, Equatable {
+    case running
+    case paused
+    case exited(Int32)
+    case unavailable
+}
+
 public protocol ContainerBackend: Sendable {
     func shutdown() async
     func pullImage(_ reference: String, platform: String) async throws
@@ -60,6 +67,7 @@ public protocol ContainerBackend: Sendable {
     func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String)
     func deleteVolume(_ name: String) async throws
     func cleanupOrphans(keeping containerIDs: Set<String>) async throws
+    func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery
     func pullImage(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws
     func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry]
     func updateNetworkRecords(_ containers: [ContainerRecord]) async throws
@@ -129,6 +137,7 @@ public extension ContainerBackend {
     }
     func deleteVolume(_: String) async throws {}
     func cleanupOrphans(keeping _: Set<String>) async throws {}
+    func recover(_: ContainerRecord) async throws -> BackendContainerRecovery { .unavailable }
     func pullImage(_ reference: String, platform: String, credentials _: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws {
         try await pullImage(reference, platform: platform)
         await progress(.init(completedItems: 1, totalItems: 1))

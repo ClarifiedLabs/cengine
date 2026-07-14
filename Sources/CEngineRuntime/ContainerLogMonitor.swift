@@ -21,8 +21,15 @@ final class ContainerLogMonitor: @unchecked Sendable {
         self.stdoutURL = stdoutURL; self.stderrURL = stderrURL; self.inputURL = inputURL; self.bridge = bridge
     }
 
-    func start() {
+    func start(atEnd: Bool = false) {
         guard task == nil else { return }
+        if atEnd {
+            for url in [stdoutURL, stderrURL] {
+                if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                    offsets[url] = UInt64(size)
+                }
+            }
+        }
         task = Task.detached { [weak self] in
             while !Task.isCancelled {
                 self?.drain(self?.stdoutURL, stream: .stdout)
@@ -32,6 +39,7 @@ final class ContainerLogMonitor: @unchecked Sendable {
         }
         let input = inputURL
         inputTask = Task.detached { [bridge] in
+            defer { FileManager.default.createFile(atPath: input.appendingPathExtension("closed").path, contents: nil) }
             for await data in bridge.stream() {
                 do {
                     if !FileManager.default.fileExists(atPath: input.path) { FileManager.default.createFile(atPath: input.path, contents: nil) }
@@ -58,4 +66,5 @@ final class ContainerLogMonitor: @unchecked Sendable {
             if !data.isEmpty { try bridge.writer(stream).write(data) }
         } catch { try? handle.close() }
     }
+
 }

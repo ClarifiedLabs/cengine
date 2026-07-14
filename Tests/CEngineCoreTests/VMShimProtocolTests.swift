@@ -18,6 +18,63 @@ import Testing
         #expect(throws: EngineError.self) { try VMShimProtocol.decode(frame) }
     }
 
+    @Test func shimSpecificationPersistsVolumeDisks() throws {
+        let specification = VMShimProtocol.Specification(
+            containerID: "volume-container",
+            generation: 1,
+            token: "secret",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: "/root.ext4",
+            volumeDisks: [.init(name: "data", path: "/data.ext4")],
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:04",
+            socketPath: "/tmp/control.sock",
+            logPath: "/tmp/shim.log"
+        )
+
+        let data = try JSONEncoder().encode(specification)
+        #expect(try JSONDecoder().decode(VMShimProtocol.Specification.self, from: data) == specification)
+    }
+
+    @Test func managementVLANIsReservedFromDockerNetworks() {
+        #expect(VMShimProtocol.managementVLAN == 4_094)
+        #if os(macOS)
+        #expect(RawVirtualizationBackend.nextAvailableVLAN(used: Set(1..<VMShimProtocol.managementVLAN)) == nil)
+        #expect(RawVirtualizationBackend.nextAvailableVLAN(used: []) == 1)
+        #endif
+    }
+
+    #if os(macOS)
+    @Test func multiContainerVolumesUseSharedStorageBeforeVMsStart() throws {
+        let modes = try RawVirtualizationBackend.resolveVolumeStorageModes(
+            names: ["compose-data", "buildkit-state"],
+            referenceCounts: ["compose-data": 2, "buildkit-state": 1],
+            existing: [:]
+        )
+
+        #expect(modes["compose-data"] == .shared)
+        #expect(modes["buildkit-state"] == .block)
+        #expect(throws: EngineError.self) {
+            try RawVirtualizationBackend.resolveVolumeStorageModes(
+                names: ["buildkit-state"],
+                referenceCounts: ["buildkit-state": 2],
+                existing: ["buildkit-state": .block]
+            )
+        }
+    }
+    #endif
+
+    #if os(macOS)
+    @Test func managementAddressesStayInsideIsolatedSubnetAndAvoidServer() {
+        let address = RawVirtualizationBackend.managementAddress(for: "container-id")
+        #expect(address.hasPrefix("100."))
+        #expect(address.hasSuffix("/10"))
+        #expect(address != "100.64.0.1/10")
+    }
+    #endif
+
     #if os(macOS)
     @Test func runtimeSocketsRemainBelowDarwinPathLimitForLongDataRoots() throws {
         let socket = try RawVirtualizationBackend.makeRuntimeSocketPath()
@@ -54,6 +111,38 @@ import Testing
         #expect(arguments.contains("console=hvc0"))
         #expect(arguments.contains("cengine.id=test-container"))
         #expect(!arguments.contains("pci=off"))
+    }
+
+    @Test func dockerVolumesMapAfterTheRootVirtioBlockDevice() throws {
+        #expect(try RawVirtualizationBackend.volumeDevicePath(index: 0) == "/dev/vdb")
+        #expect(try RawVirtualizationBackend.volumeDevicePath(index: 24) == "/dev/vdz")
+        #expect(throws: EngineError.self) { try RawVirtualizationBackend.volumeDevicePath(index: 25) }
+    }
+
+    @MainActor @Test func containerShutdownDoesNotOwnInfrastructureTransportSockets() {
+        func specification(kind: VMShimProtocol.Specification.Kind) -> VMShimProtocol.Specification {
+            VMShimProtocol.Specification(
+                kind: kind,
+                containerID: "socket-owner",
+                generation: 1,
+                token: "secret",
+                kernelPath: "/kernel",
+                initialRamdiskPath: "/initramfs",
+                rootDiskPath: "/root.ext4",
+                cpus: 1,
+                memoryBytes: 268_435_456,
+                macAddress: "02:ce:00:00:00:03",
+                socketPath: "/tmp/control.sock",
+                logPath: "/tmp/shim.log",
+                fileSystemSocketPath: "/tmp/filesystem.sock",
+                networkSocketPath: "/tmp/network.sock"
+            )
+        }
+
+        #expect(VMShimServer.ownedSocketPaths(specification(kind: .container)) == ["/tmp/control.sock"])
+        #expect(Set(VMShimServer.ownedSocketPaths(specification(kind: .storage))) == [
+            "/tmp/control.sock", "/tmp/filesystem.sock", "/tmp/network.sock",
+        ])
     }
 
     @MainActor @Test func virtioSocketAttemptsHaveABoundedDeadline() async {

@@ -11,7 +11,6 @@ import Foundation
     private var failure: String?
     private var listener: Int32 = -1
     private var serviceListener: Int32 = -1
-    private var filesystemRelay: UnixVirtioSocketRelay?
     private var serviceRelays: [UUID: BidirectionalDescriptorRelay] = [:]
     private let fabric = TrunkNetworkFabric()
     private var networkListener: Int32 = -1
@@ -61,7 +60,7 @@ import Foundation
             let payload = try await perform(decoded)
             try file.write(contentsOf: VMShimProtocol.encode(.init(id: decoded.id, token: specification.token, operation: decoded.operation, payload: payload)))
             if decoded.operation == .shutdown {
-                for path in [specification.socketPath, specification.fileSystemSocketPath, specification.networkSocketPath].compactMap({ $0 }) {
+                for path in Self.ownedSocketPaths(specification) {
                     try? FileManager.default.removeItem(atPath: path)
                 }
                 Darwin.exit(0)
@@ -75,6 +74,14 @@ import Foundation
                 error: failure
             )))
         }
+    }
+
+    static func ownedSocketPaths(_ specification: VMShimProtocol.Specification) -> [String] {
+        var paths = [specification.socketPath]
+        if specification.kind == .storage {
+            paths.append(contentsOf: [specification.fileSystemSocketPath, specification.networkSocketPath].compactMap { $0 })
+        }
+        return paths
     }
 
     private func perform(_ request: VMShimProtocol.Envelope) async throws -> Data {
@@ -102,7 +109,7 @@ import Foundation
             guard let payload = request.payload else { throw EngineError(.badRequest, "network configuration has no payload") }
             let configuration = try JSONDecoder().decode(Configuration.self, from: payload)
             guard configuration.vlans.allSatisfy({ (1...4094).contains($0) }) else { throw EngineError(.badRequest, "invalid VLAN membership") }
-            activeVLANs = configuration.vlans
+            activeVLANs = Array(Set(configuration.vlans).union([VMShimProtocol.managementVLAN])).sorted()
             if let machine {
                 guard let path = specification.networkSocketPath else {
                     throw EngineError(.internalError, "container shim has no network transport socket")
@@ -126,9 +133,11 @@ import Foundation
             try await machine.resume(); state = .running; try persist(); return try JSONEncoder().encode(status())
         case .stop:
             if let machine { try await machine.forceStop() }
+            if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             machine = nil; state = .stopped; try persist(); return try JSONEncoder().encode(status())
         case .shutdown:
             if let machine { try? await machine.forceStop() }
+            if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             machine = nil; state = .stopped; try persist(); return try JSONEncoder().encode(status())
         }
     }
@@ -143,6 +152,9 @@ import Foundation
                 initialRamdisk: URL(filePath: specification.initialRamdiskPath),
                 rootDisk: URL(filePath: specification.rootDiskPath),
                 rootDiskReadOnly: specification.rootDiskReadOnly,
+                additionalDisks: specification.volumeDisks.enumerated().map { index, disk in
+                    .init(identifier: "volume\(index)", source: URL(filePath: disk.path))
+                },
                 cpus: specification.cpus,
                 memoryBytes: specification.memoryBytes,
                 macAddress: specification.macAddress,
@@ -152,19 +164,17 @@ import Foundation
             let value = try RawContainerVirtualMachine(configuration: config)
             if specification.kind == .storage {
                 try await value.startInfrastructure(servicePort: GuestProtocol.fileSystemPort)
+                await fabric.register(.init("storage-service"), file: value.trunk.fabricFileHandle, vlans: Set(activeVLANs))
             } else {
                 try await value.start()
-                guard let fileSystemPath = specification.fileSystemSocketPath,
-                      let networkPath = specification.networkSocketPath else {
-                    throw EngineError(.internalError, "container shim transport sockets are missing")
+                guard let networkPath = specification.networkSocketPath else {
+                    throw EngineError(.internalError, "container shim network transport socket is missing")
                 }
-                let relay = UnixVirtioSocketRelay(socketPath: fileSystemPath)
-                try value.install(listener: relay.listener, port: GuestProtocol.fileSystemPort)
-                filesystemRelay = relay
                 try connectFabric(value, path: networkPath)
             }
             machine = value; state = .running; failure = nil; try persist()
         } catch {
+            if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             state = .failed; failure = error.localizedDescription; try? persist(); throw error
         }
     }
@@ -247,7 +257,7 @@ import Foundation
         let desired = Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) })
         for id in Set(fabricNetworks.keys).union(desired.keys) where fabricNetworks[id] != desired[id] {
             if let existing = uplinks.removeValue(forKey: id) {
-                await fabric.unregister(.init("uplink-\(id)")); existing.stop()
+                await fabric.unregister(.init("uplink-\(id)")); await existing.stop()
             }
             fabricNetworks.removeValue(forKey: id)
             guard let network = desired[id] else { continue }

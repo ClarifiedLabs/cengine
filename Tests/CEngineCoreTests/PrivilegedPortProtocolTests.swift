@@ -26,6 +26,7 @@ import Testing
             id: "bridge",
             vlan: 1,
             subnet: "10.240.1.0/24",
+            gateway: "10.240.1.1",
             ipv6Subnet: "",
             internalNetwork: false,
             dhcpEnabled: false,
@@ -36,7 +37,8 @@ import Testing
             PrivilegedVMNetRequest.self,
             from: JSONEncoder().encode(request)
         )
-        #expect(PrivilegedPortProtocol.version == 3)
+        #expect(PrivilegedPortProtocol.version == 4)
+        #expect(decoded.gateway == "10.240.1.1")
         #expect(decoded.dhcpEnabled == false)
     }
 

@@ -147,6 +147,9 @@ func (s *session) dispatch(req *protocol.FSRequestBody) (*protocol.FSResponseBod
 		fd, err := s.handle(req.Handle); if err != nil { return nil, err }
 		if req.Flags != 0 { return &protocol.FSResponseBody{}, unix.Fdatasync(fd) }
 		return &protocol.FSResponseBody{}, unix.Fsync(fd)
+	case "fsync-node":
+		n, err := s.node(req.Node); if err != nil { return nil, err }
+		return &protocol.FSResponseBody{}, fsyncNode(n.fd, req.Flags)
 	case "flush":
 		fd, err := s.handle(req.Handle); if err != nil { return nil, err }
 		dup, err := unix.Dup(fd); if err == nil { err = unix.Close(dup) }; return &protocol.FSResponseBody{}, err
@@ -172,6 +175,16 @@ func (s *session) dispatch(req *protocol.FSRequestBody) (*protocol.FSResponseBod
 	case "getlk", "setlk", "setlkw": return s.lock(req)
 	default: return nil, syscall.ENOSYS
 	}
+}
+
+func fsyncNode(pathFD int, flags uint32) error {
+	fd, err := unix.Open(fmt.Sprintf("/proc/self/fd/%d", pathFD), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil { return err }
+	defer unix.Close(fd)
+	var attr unix.Stat_t
+	if err := unix.Fstat(fd, &attr); err != nil { return err }
+	if flags != 0 && attr.Mode&unix.S_IFMT != unix.S_IFDIR { return unix.Fdatasync(fd) }
+	return unix.Fsync(fd)
 }
 
 func (s *service) deleteVolume(owner *session) error {
@@ -321,16 +334,25 @@ func (s *session) setattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody
 		if req.Flags&(1|8) != 0 { return nil, syscall.EPERM }
 		attr, err := statFD(n.fd); if err == nil { s.svc.invalidate(s.volume, protocol.FSInvalidationEvent{Node: req.Node}) }; return &protocol.FSResponseBody{Attr:&attr},err
 	}
-	fd, err := unix.Open(fmt.Sprintf("/proc/self/fd/%d", n.fd), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0); if err != nil { return nil, err }; defer unix.Close(fd)
+	fd, err := unix.Open(fmt.Sprintf("/proc/self/fd/%d", n.fd), setattrOpenFlags(req), 0); if err != nil { return nil, err }; defer unix.Close(fd)
 	if req.Flags&1 != 0 { if err := unix.Fchmod(fd, req.Mode); err != nil { return nil, err } }
 	if req.Flags&8 != 0 { if err := unix.Ftruncate(fd, req.Size); err != nil { return nil, err } }
 	attr, err := statFD(n.fd); if err == nil { s.svc.invalidate(s.volume, protocol.FSInvalidationEvent{Node: req.Node}) }
 	return &protocol.FSResponseBody{Attr: &attr}, err
 }
 
+func setattrOpenFlags(req *protocol.FSRequestBody) int {
+	flags := unix.O_RDONLY | unix.O_NONBLOCK | unix.O_CLOEXEC
+	if req.Flags&8 != 0 {
+		flags = unix.O_RDWR | unix.O_NONBLOCK | unix.O_CLOEXEC
+	}
+	return flags
+}
+
 func (s *session) xattrFD(node uint64) (int, error) { n, err := s.node(node); if err != nil { return -1, err }; attr,err:=statFD(n.fd);if err!=nil{return -1,err};if attr.Mode&unix.S_IFMT==unix.S_IFLNK{return -1,syscall.ENOTSUP};return unix.Open(fmt.Sprintf("/proc/self/fd/%d", n.fd), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0) }
-func (s *session) getxattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody, error) { fd, err := s.xattrFD(req.Node); if err != nil { return nil, err }; defer unix.Close(fd); size, err := unix.Fgetxattr(fd, req.Xattr, nil); if err != nil { return nil, err }; data := make([]byte,size); _, err = unix.Fgetxattr(fd,req.Xattr,data); return &protocol.FSResponseBody{Data:data},err }
-func (s *session) listxattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody, error) { fd, err := s.xattrFD(req.Node); if err != nil { return nil, err }; defer unix.Close(fd); size, err := unix.Flistxattr(fd,nil); if err != nil { return nil, err }; data:=make([]byte,size); _,err=unix.Flistxattr(fd,data); if err != nil{return nil,err}; names:=strings.Split(strings.TrimRight(string(data),"\x00"),"\x00"); if len(names)==1&&names[0]==""{names=nil}; return &protocol.FSResponseBody{Names:names},nil }
+func (s *session) nodeIsSymlink(node uint64) (bool,error) { n,err:=s.node(node);if err!=nil{return false,err};attr,err:=statFD(n.fd);return attr.Mode&unix.S_IFMT==unix.S_IFLNK,err }
+func (s *session) getxattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody, error) { symlink,err:=s.nodeIsSymlink(req.Node);if err!=nil{return nil,err};if symlink{return nil,syscall.ENODATA};fd, err := s.xattrFD(req.Node); if err != nil { return nil, err }; defer unix.Close(fd); size, err := unix.Fgetxattr(fd, req.Xattr, nil); if err != nil { return nil, err }; data := make([]byte,size); _, err = unix.Fgetxattr(fd,req.Xattr,data); return &protocol.FSResponseBody{Data:data},err }
+func (s *session) listxattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody, error) { symlink,err:=s.nodeIsSymlink(req.Node);if err!=nil{return nil,err};if symlink{return &protocol.FSResponseBody{},nil};fd, err := s.xattrFD(req.Node); if err != nil { return nil, err }; defer unix.Close(fd); size, err := unix.Flistxattr(fd,nil); if err != nil { return nil, err }; data:=make([]byte,size); _,err=unix.Flistxattr(fd,data); if err != nil{return nil,err}; names:=strings.Split(strings.TrimRight(string(data),"\x00"),"\x00"); if len(names)==1&&names[0]==""{names=nil}; return &protocol.FSResponseBody{Names:names},nil }
 func (s *session) setxattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody, error) { fd, err:=s.xattrFD(req.Node); if err!=nil{return nil,err}; defer unix.Close(fd); err=unix.Fsetxattr(fd,req.Xattr,req.Value,int(req.Flags)); if err==nil{s.svc.invalidate(s.volume,protocol.FSInvalidationEvent{Node:req.Node})}; return &protocol.FSResponseBody{},err }
 func (s *session) removexattr(req *protocol.FSRequestBody) (*protocol.FSResponseBody, error) { fd, err:=s.xattrFD(req.Node); if err!=nil{return nil,err}; defer unix.Close(fd); err=unix.Fremovexattr(fd,req.Xattr); if err==nil{s.svc.invalidate(s.volume,protocol.FSInvalidationEvent{Node:req.Node})}; return &protocol.FSResponseBody{},err }
 

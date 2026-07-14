@@ -383,7 +383,7 @@ public struct DockerRouter: Sendable {
                 try await runtime.pushImage(reference, credentials: registryCredentials(request.headers))
                 output = "{\"status\":\"Pushed\",\"progressDetail\":{}}\n"
             } catch {
-                let message = error.localizedDescription
+                let message = "failed to resolve \(ImageReference.normalized(reference)): \(error.localizedDescription)"
                 let escaped = message.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
                 output = "{\"errorDetail\":{\"message\":\"\(escaped)\"},\"error\":\"\(escaped)\"}\n"
             }

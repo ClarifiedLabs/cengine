@@ -3,6 +3,7 @@ import Foundation
 public enum VMShimProtocol {
     public static let version: UInt32 = 2
     public static let maximumFrameSize = 16 * 1_024 * 1_024
+    public static let managementVLAN: UInt16 = 4_094
 
     public enum Operation: String, Codable, Sendable {
         case boot
@@ -76,6 +77,7 @@ public enum VMShimProtocol {
         public var initialRamdiskPath: String
         public var rootDiskPath: String
         public var rootDiskReadOnly: Bool
+        public var volumeDisks: [VolumeDisk]
         public var cpus: Int
         public var memoryBytes: UInt64
         public var macAddress: String
@@ -96,6 +98,7 @@ public enum VMShimProtocol {
             initialRamdiskPath: String,
             rootDiskPath: String,
             rootDiskReadOnly: Bool = false,
+            volumeDisks: [VolumeDisk] = [],
             cpus: Int,
             memoryBytes: UInt64,
             macAddress: String,
@@ -115,6 +118,7 @@ public enum VMShimProtocol {
             self.initialRamdiskPath = initialRamdiskPath
             self.rootDiskPath = rootDiskPath
             self.rootDiskReadOnly = rootDiskReadOnly
+            self.volumeDisks = volumeDisks
             self.cpus = cpus
             self.memoryBytes = memoryBytes
             self.macAddress = macAddress
@@ -125,6 +129,16 @@ public enum VMShimProtocol {
             self.fileSystemSocketPath = fileSystemSocketPath
             self.networkSocketPath = networkSocketPath
             self.vlans = vlans
+        }
+    }
+
+    public struct VolumeDisk: Codable, Sendable, Equatable {
+        public var name: String
+        public var path: String
+
+        public init(name: String, path: String) {
+            self.name = name
+            self.path = path
         }
     }
 

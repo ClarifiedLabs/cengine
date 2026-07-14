@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -148,5 +150,31 @@ def test_daemon_restart_recreates_usable_network_interfaces(daemon, client: dock
             "sh", "-c", "nslookup registry-1.docker.io && nc -z -w 5 1.1.1.1 443"
         ])
         assert code == 0, output.decode(errors="replace")
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("REC-005")
+def test_vmnet_reservation_is_released_when_infrastructure_shim_exits(
+    daemon, client: docker.DockerClient
+):
+    suffix = uuid.uuid4().hex[:8]
+    network = client.networks.create(f"compat-vmnet-owner-{suffix}")
+    pattern = str(daemon.root / "infrastructure" / "shim.json")
+    result = subprocess.run(
+        ["pgrep", "-f", pattern], text=True, stdout=subprocess.PIPE, check=True
+    )
+    shim_pids = [int(value) for value in result.stdout.split()]
+    assert len(shim_pids) == 1
+    os.kill(shim_pids[0], signal.SIGKILL)
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        value = recovered.networks.get(network.id)
+        container = recovered.containers.create(IMAGE, command="top", network=value.name)
+        container.start()
+        code, carrier = container.exec_run(["cat", "/sys/class/net/eth0/carrier"])
+        assert (code, carrier.strip()) == (0, b"1")
     finally:
         recovered.close()

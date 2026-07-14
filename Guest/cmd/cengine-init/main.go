@@ -13,6 +13,7 @@ import (
 	"strconv"
 
 	"dev.cengine/guest/internal/boot"
+	guestnetwork "dev.cengine/guest/internal/network"
 	"dev.cengine/guest/internal/operations"
 	"dev.cengine/guest/internal/protocol"
 	guestrootfs "dev.cengine/guest/internal/rootfs"
@@ -58,6 +59,21 @@ func main() {
 	}
 	if err := boot.MountVirtioFS("cengine-io", "/run/cengine/io"); err != nil {
 		log.Fatalf("mount I/O share: %v", err)
+	}
+	managementAddress, err := boot.KernelParameter("cengine.management_address")
+	if err != nil {
+		log.Fatal(err)
+	}
+	managementVLAN, err := boot.KernelParameter("cengine.management_vlan")
+	if err != nil {
+		log.Fatal(err)
+	}
+	vlan, err := strconv.ParseUint(managementVLAN, 10, 16)
+	if err != nil {
+		log.Fatalf("parse management VLAN: %v", err)
+	}
+	if err := guestnetwork.ConfigureManagement(managementAddress, uint16(vlan)); err != nil {
+		log.Fatalf("configure management network: %v", err)
 	}
 	listener, err := vsock.Listen(protocol.ControlPort)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,6 +30,8 @@ func RunExecStage1(pid int) error {
 	defer runtime.UnlockOSThread()
 	rootFD,err:=unix.Open(fmt.Sprintf("/proc/%d/root",pid),unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC,0);if err!=nil{return fmt.Errorf("open workload root: %w",err)}
 	root:=os.NewFile(uintptr(rootFD),"workload-root");if root==nil{_ = unix.Close(rootFD);return errors.New("workload root is unavailable")};defer root.Close()
+	gate:=os.NewFile(4,"exec-cgroup-ready");if gate==nil{return errors.New("exec cgroup readiness file descriptor is unavailable")};defer gate.Close()
+	var ready [1]byte;if _,err:=io.ReadFull(gate,ready[:]);err!=nil{return fmt.Errorf("wait for exec cgroup placement: %w",err)}
 	if err:=joinWorkloadNamespaces(pid, namespaceOperations{unshare:unix.Unshare,open:unix.Open,setns:unix.Setns,close:unix.Close});err!=nil{return err}
 	spec:=os.NewFile(3,"exec-spec");if spec==nil{return errors.New("exec specification is unavailable")}
 	command:=exec.Command("/proc/self/exe",execStage2Argument);command.ExtraFiles=[]*os.File{spec,root};command.Stdin=os.Stdin;command.Stdout=os.Stdout;command.Stderr=os.Stderr
@@ -54,7 +57,7 @@ func RunExecStage2() error {
 	file:=os.NewFile(3,"exec-spec");if file==nil{return errors.New("exec specification is unavailable")};defer file.Close();data,err:=io.ReadAll(io.LimitReader(file,protocol.MaxControlFrame));if err!=nil{return err};var spec protocol.ExecSpec;if err:=json.Unmarshal(data,&spec);err!=nil{return err}
 	root:=os.NewFile(4,"workload-root");if root==nil{return errors.New("workload root is unavailable")};defer root.Close();if err:=enterExecRoot(int(root.Fd()),unix.Fchdir,unix.Chroot);err!=nil{return err};working:=spec.WorkingDirectory;if working==""{working="/"};if err:=os.Chdir(working);err!=nil{return err}
 	uid,gid,err:=parseExecUser(spec.User);if err!=nil{return err};if err:=unix.Setgroups(nil);err!=nil{return err};if err:=unix.Setgid(gid);err!=nil{return err};if err:=unix.Setuid(uid);err!=nil{return err}
-	environment:=spec.Environment;if len(environment)==0{environment=[]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}};for _,value:=range environment{parts:=strings.SplitN(value,"=",2);if len(parts)==2{_ = os.Setenv(parts[0],parts[1])}}
+	hostname,_:=os.Hostname();environment:=processEnvironment(spec.Environment,hostname,homeDirectory(uid),spec.Terminal);for _,value:=range environment{parts:=strings.SplitN(value,"=",2);if len(parts)==2{_ = os.Setenv(parts[0],parts[1])}}
 	if len(spec.Arguments)==0{return errors.New("exec requires arguments")};path,err:=exec.LookPath(spec.Arguments[0]);if err!=nil{return err};return unix.Exec(path,spec.Arguments,environment)
 }
 
@@ -66,7 +69,14 @@ func enterExecRoot(fd int, fchdir func(int)error, chroot func(string)error) erro
 
 func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error { if spec.ID==""||len(spec.Arguments)==0{return errors.New("exec requires id and arguments")};s.mu.Lock();defer s.mu.Unlock();if s.command==nil{return errors.New("workload is not running")};if _,exists:=s.execStatus[spec.ID];exists{return errors.New("exec already exists")};s.execStatus[spec.ID]=protocol.ProcessStatus{Status:"created"};data,err:=json.Marshal(spec);if err!=nil{return err};return os.WriteFile("/run/cengine/io/exec-"+spec.ID+".json",data,0600) }
 
-func (s *Supervisor) StartExec(id string)(protocol.ProcessStatus,error){s.mu.Lock();if s.command==nil||s.command.Process==nil{s.mu.Unlock();return protocol.ProcessStatus{},errors.New("workload is not running")};if _,exists:=s.execs[id];exists{s.mu.Unlock();return s.execStatus[id],errors.New("exec is running")};pid:=s.command.Process.Pid;s.mu.Unlock();data,err:=os.ReadFile("/run/cengine/io/exec-"+id+".json");if err!=nil{return protocol.ProcessStatus{},err};reader,writer,err:=os.Pipe();if err!=nil{return protocol.ProcessStatus{},err};stdout,err:=os.OpenFile("/run/cengine/io/exec-"+id+"-stdout",os.O_CREATE|os.O_APPEND|os.O_WRONLY,0644);if err!=nil{return protocol.ProcessStatus{},err};stderr,err:=os.OpenFile("/run/cengine/io/exec-"+id+"-stderr",os.O_CREATE|os.O_APPEND|os.O_WRONLY,0644);if err!=nil{stdout.Close();return protocol.ProcessStatus{},err};stdinReader,stdinWriter:=io.Pipe();command:=exec.Command("/proc/self/exe",execStage1Argument,strconv.Itoa(pid));command.ExtraFiles=[]*os.File{reader};command.Stdout=stdout;command.Stderr=stderr;command.Stdin=stdinReader;if err:=command.Start();err!=nil{reader.Close();writer.Close();stdout.Close();stderr.Close();stdinReader.Close();stdinWriter.Close();return protocol.ProcessStatus{},err};reader.Close();stdout.Close();stderr.Close();stdinReader.Close();if _,err:=writer.Write(data);err!=nil{writer.Close();stdinWriter.Close();_ = command.Process.Kill();return protocol.ProcessStatus{},err};writer.Close();status:=protocol.ProcessStatus{Status:"running",PID:command.Process.Pid};s.mu.Lock();s.execs[id]=command;s.execStatus[id]=status;s.mu.Unlock();go s.reapExec(id,command);go pumpInput("/run/cengine/io/exec-"+id+"-stdin",stdinWriter,command);return status,nil}
+func (s *Supervisor) StartExec(id string)(protocol.ProcessStatus,error){s.mu.Lock();if s.command==nil||s.command.Process==nil{s.mu.Unlock();return protocol.ProcessStatus{},errors.New("workload is not running")};if _,exists:=s.execs[id];exists{s.mu.Unlock();return s.execStatus[id],errors.New("exec is running")};pid:=s.command.Process.Pid;workloadID:=s.spec.ID;s.mu.Unlock();data,err:=os.ReadFile("/run/cengine/io/exec-"+id+".json");if err!=nil{return protocol.ProcessStatus{},err};reader,writer,err:=os.Pipe();if err!=nil{return protocol.ProcessStatus{},err};gateReader,gateWriter,err:=os.Pipe();if err!=nil{reader.Close();writer.Close();return protocol.ProcessStatus{},err};stdout,err:=os.OpenFile("/run/cengine/io/exec-"+id+"-stdout",os.O_CREATE|os.O_APPEND|os.O_WRONLY,0644);if err!=nil{reader.Close();writer.Close();gateReader.Close();gateWriter.Close();return protocol.ProcessStatus{},err};stderr,err:=os.OpenFile("/run/cengine/io/exec-"+id+"-stderr",os.O_CREATE|os.O_APPEND|os.O_WRONLY,0644);if err!=nil{reader.Close();writer.Close();gateReader.Close();gateWriter.Close();stdout.Close();return protocol.ProcessStatus{},err};stdinReader,stdinWriter:=io.Pipe();command:=exec.Command("/proc/self/exe",execStage1Argument,strconv.Itoa(pid));command.ExtraFiles=[]*os.File{reader,gateReader};command.Stdout=stdout;command.Stderr=stderr;command.Stdin=stdinReader;if err:=command.Start();err!=nil{reader.Close();writer.Close();gateReader.Close();gateWriter.Close();stdout.Close();stderr.Close();stdinReader.Close();stdinWriter.Close();return protocol.ProcessStatus{},err};reader.Close();gateReader.Close();stdout.Close();stderr.Close();if _,err:=writer.Write(data);err!=nil{writer.Close();gateWriter.Close();stdinWriter.Close();_ = command.Process.Kill();return protocol.ProcessStatus{},err};writer.Close();if err:=placeExecInCgroup("/sys/fs/cgroup",workloadID,id,command.Process.Pid);err!=nil{gateWriter.Close();stdinWriter.Close();_ = command.Process.Kill();return protocol.ProcessStatus{},err};if _,err:=gateWriter.Write([]byte{1});err!=nil{gateWriter.Close();stdinWriter.Close();_ = command.Process.Kill();return protocol.ProcessStatus{},err};gateWriter.Close();status:=protocol.ProcessStatus{Status:"running",PID:command.Process.Pid};s.mu.Lock();s.execs[id]=command;s.execStatus[id]=status;s.mu.Unlock();go s.reapExec(id,command);go pumpInput("/run/cengine/io/exec-"+id+"-stdin",stdinWriter,command);return status,nil}
+
+func placeExecInCgroup(root, workloadID, execID string, pid int) error {
+	path:=filepath.Join(root,"cengine",workloadID,"cengine-exec-"+execID)
+	if err:=os.MkdirAll(path,0755);err!=nil{return fmt.Errorf("create exec cgroup: %w",err)}
+	if err:=os.WriteFile(filepath.Join(path,"cgroup.procs"),[]byte(strconv.Itoa(pid)),0644);err!=nil{return fmt.Errorf("place exec in cgroup: %w",err)}
+	return nil
+}
 
 func (s *Supervisor) ExecStatus(id string)protocol.ProcessStatus{s.mu.Lock();defer s.mu.Unlock();return s.execStatus[id]}
 func (s *Supervisor) SignalExec(id string,signal int)error{s.mu.Lock();defer s.mu.Unlock();command:=s.execs[id];if command==nil||command.Process==nil{return errors.New("exec is not running")};if signal<=0||signal>=65{return syscall.EINVAL};return unix.Kill(command.Process.Pid,unix.Signal(signal))}

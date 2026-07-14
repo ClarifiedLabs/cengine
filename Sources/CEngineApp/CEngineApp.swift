@@ -9,7 +9,7 @@ struct CEngineApplication: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 760, minHeight: 500)
-                .task { model.start() }
+                .task { await model.start() }
                 .sheet(isPresented: $model.showOnboarding) {
                     OnboardingView {
                         await model.completeOnboarding()
