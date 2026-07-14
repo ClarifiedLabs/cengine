@@ -12,6 +12,7 @@ IMAGE=${CENGINE_KERNEL_BUILD_IMAGE:-debian:trixie-slim}
 JOBS=${CENGINE_KERNEL_BUILD_JOBS:-4}
 CPUS=${CENGINE_KERNEL_BUILD_CPUS:-4}
 MEMORY=${CENGINE_KERNEL_BUILD_MEMORY:-8g}
+HOST_OS=${CENGINE_HOST_OS:-$(uname -s)}
 
 mkdir -p "$CACHE" "$OUTPUT"
 if [ -f "$SOURCE/Makefile" ] && [ "$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)" != "$COMMIT" ]; then
@@ -29,43 +30,59 @@ test "$(git -C "$SOURCE" rev-parse HEAD)" = "$COMMIT" || {
     exit 2
 }
 
-if [ ! -f "$OUTPUT/vmlinux" ]; then
-    bootstrap=${CENGINE_BOOTSTRAP_KERNEL:-}
-    if [ -z "$bootstrap" ] && [ -f "$HOME/Library/Application Support/cengine/assets/vmlinux" ]; then
-        bootstrap="$HOME/Library/Application Support/cengine/assets/vmlinux"
-    fi
-    if [ -z "$bootstrap" ] && [ -f "$ROOT/dist/share/cengine/vmlinux" ]; then
-        bootstrap="$ROOT/dist/share/cengine/vmlinux"
-    fi
-    if [ -z "$bootstrap" ] || [ ! -f "$bootstrap" ]; then
-        echo "a bootstrap cengine kernel is required; set CENGINE_BOOTSTRAP_KERNEL or install cengine guest assets" >&2
+case "$HOST_OS" in
+    Linux)
+        KERNEL_SOURCE="$SOURCE" \
+        CENGINE_GUEST_OUTPUT="$OUTPUT" \
+        CENGINE_KERNEL_BUILD_IMAGE="$IMAGE" \
+        CENGINE_KERNEL_BUILD_JOBS="$JOBS" \
+            "$ROOT/Scripts/build-kernel-linux.sh"
+        ;;
+    Darwin)
+        if [ ! -f "$OUTPUT/vmlinux" ]; then
+            bootstrap=${CENGINE_BOOTSTRAP_KERNEL:-}
+            if [ -z "$bootstrap" ] && [ -f "$HOME/Library/Application Support/cengine/assets/vmlinux" ]; then
+                bootstrap="$HOME/Library/Application Support/cengine/assets/vmlinux"
+            fi
+            if [ -z "$bootstrap" ] && [ -f "$ROOT/dist/share/cengine/vmlinux" ]; then
+                bootstrap="$ROOT/dist/share/cengine/vmlinux"
+            fi
+            if [ -z "$bootstrap" ] || [ ! -f "$bootstrap" ]; then
+                echo "a bootstrap cengine kernel is required; set CENGINE_BOOTSTRAP_KERNEL or install cengine guest assets" >&2
+                exit 2
+            fi
+            cp "$bootstrap" "$OUTPUT/vmlinux"
+        fi
+
+        CENGINE_GUEST_OUTPUT="$OUTPUT" "$ROOT/Scripts/build-guest-assets.sh"
+        rm -f "$OUTPUT/vmlinux.next"
+
+        CENGINE_BINARY="$BINARY" \
+        CENGINE_KERNEL="$OUTPUT/vmlinux" \
+        CENGINE_CONTAINER_INITRAMFS="$OUTPUT/container-initramfs.cpio.gz" \
+        CENGINE_STORAGE_INITRAMFS="$OUTPUT/storage-initramfs.cpio.gz" \
+        "$ROOT/Scripts/run-isolated-cengine.sh" sh -eu -c '
+            docker pull "$1"
+            docker run --rm \
+                --cpus "$7" \
+                --memory "$8" \
+                --mount "type=bind,src=$2,dst=/linux,readonly" \
+                --mount "type=bind,src=$3,dst=/fragment,readonly" \
+                --mount "type=bind,src=$4,dst=/compile,readonly" \
+                --mount "type=bind,src=$5,dst=/output" \
+                "$1" /bin/sh /compile "$6"
+        ' cengine-kernel-build \
+            "$IMAGE" "$SOURCE" "$ROOT/Configuration/cengine-kernel.fragment" \
+            "$ROOT/Scripts/compile-kernel-in-guest.sh" "$OUTPUT" "$JOBS" "$CPUS" "$MEMORY"
+
+        mv "$OUTPUT/vmlinux.next" "$OUTPUT/vmlinux"
+        ;;
+    *)
+        echo "unsupported kernel build host: $HOST_OS" >&2
         exit 2
-    fi
-    cp "$bootstrap" "$OUTPUT/vmlinux"
-fi
+        ;;
+esac
 
-CENGINE_GUEST_OUTPUT="$OUTPUT" "$ROOT/Scripts/build-guest-assets.sh"
-rm -f "$OUTPUT/vmlinux.next"
-
-CENGINE_BINARY="$BINARY" \
-CENGINE_KERNEL="$OUTPUT/vmlinux" \
-CENGINE_CONTAINER_INITRAMFS="$OUTPUT/container-initramfs.cpio.gz" \
-CENGINE_STORAGE_INITRAMFS="$OUTPUT/storage-initramfs.cpio.gz" \
-"$ROOT/Scripts/run-isolated-cengine.sh" sh -eu -c '
-    docker pull "$1"
-    docker run --rm \
-        --cpus "$7" \
-        --memory "$8" \
-        --mount "type=bind,src=$2,dst=/linux,readonly" \
-        --mount "type=bind,src=$3,dst=/fragment,readonly" \
-        --mount "type=bind,src=$4,dst=/compile,readonly" \
-        --mount "type=bind,src=$5,dst=/output" \
-        "$1" /bin/sh /compile "$6"
-' cengine-kernel-build \
-    "$IMAGE" "$SOURCE" "$ROOT/Configuration/cengine-kernel.fragment" \
-    "$ROOT/Scripts/compile-kernel-in-guest.sh" "$OUTPUT" "$JOBS" "$CPUS" "$MEMORY"
-
-mv "$OUTPUT/vmlinux.next" "$OUTPUT/vmlinux"
 cat "$ROOT/Configuration/kernel-version" \
     "$ROOT/Configuration/kernel-commit" \
     "$ROOT/Configuration/cengine-kernel.fragment" \

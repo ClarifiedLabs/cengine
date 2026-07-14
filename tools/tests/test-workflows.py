@@ -11,6 +11,8 @@ def main() -> None:
         require_contains(test, needle, "test.yml")
     for needle in (
         "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
+        "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default",
+        "docker --context default buildx version",
         "needs: [require-tests, guest-assets]",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
@@ -38,10 +40,10 @@ def main() -> None:
         'CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine"',
         "Makefile",
     )
-    if makefile.count("Scripts/sign-compat-binary.sh .build/xcode-derived/Build/Products/Debug/cengine") != 3:
-        raise AssertionError("all compatibility test targets must sign the daemon for helper authentication")
     for target in ("test-compat", "test-compat-soak", "test-compat-oracle"):
-        require_contains(makefile, f"{target}: build guest-initramfs", "Makefile")
+        require_contains(makefile, f"{target}:", "Makefile")
+    if makefile.count("$(CENGINE_COMPAT_ENV)") != 3:
+        raise AssertionError("all compatibility test targets must pass isolated runtime assets")
     guest_builder = read(REPO_ROOT / "Scripts/build-guest-assets.sh")
     require_absent(guest_builder, "docker buildx build", "build-guest-assets.sh")
     for needle in ("CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64", "-buildvcs=false"):

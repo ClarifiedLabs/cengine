@@ -14,6 +14,7 @@ XCODE_RESULT_BUNDLE ?=
 CENGINE_GUEST_OUTPUT ?= $(CURDIR)/.build/guest
 CENGINE_GIT_COMMIT ?= $(shell git rev-parse --short=7 HEAD 2>/dev/null || printf unknown)
 CENGINE_BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+CENGINE_HOST_OS ?= $(shell uname -s)
 XCODE_COMMON_FLAGS = -clonedSourcePackagesDirPath "$(XCODE_SOURCE_PACKAGES)" -skipPackagePluginValidation -skipMacroValidation
 XCODE_RESULT_BUNDLE_FLAGS = $(if $(XCODE_RESULT_BUNDLE),-resultBundlePath "$(XCODE_RESULT_BUNDLE)",)
 XCODE_METADATA_FLAGS = CENGINE_GIT_COMMIT="$(CENGINE_GIT_COMMIT)" CENGINE_BUILD_TIME="$(CENGINE_BUILD_TIME)"
@@ -23,7 +24,7 @@ CENGINE_COMPAT_ENV = CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/
 	CENGINE_STORAGE_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/storage-initramfs.cpio.gz"
 CENGINE_COMPAT_RESET = python3 Scripts/reset-compat-runtime.py --binary "$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine"
 
-export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME
+export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME CENGINE_HOST_OS
 
 .PHONY: all build guest-assets guest-initramfs kernel test test-guest test-compat test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system dist-cli package release release-list test-release clean help
 
@@ -54,18 +55,27 @@ build:
 	$(XCODEBUILD) -project "$(XCODE_PROJECT)" -scheme cengine -configuration Debug -derivedDataPath "$(XCODE_DERIVED_DATA)" $(XCODE_COMMON_FLAGS) $(XCODE_METADATA_FLAGS) build
 
 guest-assets: kernel
+	./Scripts/build-guest-assets.sh
 
 guest-initramfs:
 	./Scripts/build-guest-assets.sh
 
+ifeq ($(CENGINE_HOST_OS),Darwin)
 kernel: build
+endif
+
+kernel:
 	./Scripts/build-kernel.sh
 
 test:
 	@python3 tools/tests/test-compat-harness.py
 	$(XCODEBUILD) -project "$(XCODE_PROJECT)" -scheme cengine -configuration Debug -derivedDataPath "$(XCODE_DERIVED_DATA)" $(XCODE_COMMON_FLAGS) $(XCODE_METADATA_FLAGS) -destination '$(XCODE_DESTINATION)' $(XCODE_RESULT_BUNDLE_FLAGS) test
 
+ifeq ($(CENGINE_HOST_OS),Darwin)
 test-guest: build guest-initramfs
+endif
+
+test-guest:
 	./Scripts/test-guest.sh
 
 test-compat:
@@ -109,6 +119,7 @@ release:
 test-release:
 	@python3 tools/tests/test-release.py
 	@python3 tools/tests/test-workflows.py
+	@python3 tools/tests/test_guest_build_scripts.py
 	@python3 tools/tests/test-homebrew-formula.py
 	@python3 tools/tests/test-launchd-plists.py
 	@python3 tools/tests/test-package.py

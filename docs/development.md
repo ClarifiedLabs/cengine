@@ -21,8 +21,14 @@ make test-release
 `CEngineCoreTests` and `CEngineAPITests` through the shared `cengine` scheme.
 `make guest-assets` builds the exact pinned Linux kernel, static Go guest
 services, static `mke2fs`, both deterministic initramfs files, and checksums.
-The Linux toolchain runs through `CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default:
-`default`) so it never recursively invokes the cengine Docker context.
+On Linux ARM64, including release CI, the kernel and `mke2fs` toolchains run
+through Docker Buildx, while the guest services use a checksum-pinned Linux Go
+toolchain. The kernel builder uses `CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default:
+`default`).
+On macOS, the kernel build runs inside an isolated cengine container using an
+installed or explicitly configured bootstrap kernel. This keeps release asset
+production independent of Virtualization.framework while preserving local
+cengine dogfooding.
 `make dist-cli` runs the tests and stages `dist/cengine` plus `dist/share/cengine`.
 `make package` creates `dist/cengine-<marketing-version>.pkg` for local
 release-artifact testing, using `MARKETING_VERSION` from the Xcode project.

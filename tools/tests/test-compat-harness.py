@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -67,8 +68,31 @@ def main() -> None:
     assert makefile.count("$(CENGINE_COMPAT_ENV)") == 3
     assert "test-compat-reset-system:" in makefile
     assert "Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)" in makefile
-    assert "kernel: build" in makefile
-    assert "test-guest: build guest-initramfs" in makefile
+    assert "CENGINE_HOST_OS ?= $(shell uname -s)" in makefile
+    assert "ifeq ($(CENGINE_HOST_OS),Darwin)\nkernel: build\nendif" in makefile
+    assert "ifeq ($(CENGINE_HOST_OS),Darwin)\ntest-guest: build guest-initramfs\nendif" in makefile
+
+    linux_guest_dry_run = subprocess.run(
+        ["make", "--no-print-directory", "-n", "CENGINE_HOST_OS=Linux", "test-guest"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "xcodebuild" not in linux_guest_dry_run
+    assert "build-guest-assets.sh" not in linux_guest_dry_run
+    assert "./Scripts/test-guest.sh" in linux_guest_dry_run
+
+    linux_guest_assets_dry_run = subprocess.run(
+        ["make", "--no-print-directory", "-n", "CENGINE_HOST_OS=Linux", "guest-assets"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "xcodebuild" not in linux_guest_assets_dry_run
+    assert "./Scripts/build-kernel.sh" in linux_guest_assets_dry_run
+    assert "./Scripts/build-guest-assets.sh" in linux_guest_assets_dry_run
 
     runner = (REPO_ROOT / "Scripts" / "run-compat-tests.sh").read_text()
     assert runner.index("$RESET") < runner.index("make -C")
@@ -96,13 +120,20 @@ def main() -> None:
     assert '/bin/cp -cR "$IMAGE_CACHE/content" "$ENGINE_ROOT/content"' in isolated
 
     kernel_builder = (REPO_ROOT / "Scripts" / "build-kernel.sh").read_text()
+    linux_kernel_builder = (REPO_ROOT / "Scripts" / "build-kernel-linux.sh").read_text()
     guest_tests = (REPO_ROOT / "Scripts" / "test-guest.sh").read_text()
     assert "docker buildx" not in kernel_builder
     assert "docker buildx" not in guest_tests
+    assert '"$ROOT/Scripts/build-kernel-linux.sh"' in kernel_builder
+    assert 'docker --context "$DOCKER_CONTEXT" buildx build' in linux_kernel_builder
+    assert '"$ROOT/Scripts/run-isolated-cengine.sh"' not in linux_kernel_builder
+    assert "compile-kernel-in-guest.sh" in linux_kernel_builder
     assert "CENGINE_KERNEL_BUILD_CPUS" in kernel_builder
     assert "CENGINE_KERNEL_BUILD_MEMORY" in kernel_builder
     assert '"$ROOT/Scripts/run-isolated-cengine.sh"' in kernel_builder
     assert '"$ROOT/Scripts/run-isolated-cengine.sh"' in guest_tests
+    assert "command -v go" in guest_tests
+    assert 'cd "$ROOT/Guest"' in guest_tests
     assert 'go test ./...' in guest_tests
 
     kernel_check = (REPO_ROOT / "Scripts" / "check-guest-kernel.sh").read_text()
