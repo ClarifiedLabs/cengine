@@ -175,7 +175,7 @@ public actor EngineRuntime {
         let index = try containerIndex(identifier)
         guard snapshot.containers[index].phase != .running else { return }
         let record = snapshot.containers[index]
-        if record.phase == .exited || record.phase == .dead {
+        if record.phase == .dead {
             try await backend.delete(record)
             try await backend.prepare(record)
         }

@@ -16,6 +16,7 @@ from harness import (  # noqa: E402
     VMNET_TEARDOWN_SETTLE_SECONDS,
     compatibility_root_owned_by,
     compatibility_runtime_processes,
+    control_plane_status_is_ready,
     docker_environment,
 )
 
@@ -36,6 +37,11 @@ def main() -> None:
     explicit = docker_environment("tcp://127.0.0.1:2375", base={})
     assert explicit == {"DOCKER_HOST": "tcp://127.0.0.1:2375"}
     assert VMNET_TEARDOWN_SETTLE_SECONDS >= 2.0
+    assert not control_plane_status_is_ready(0, b"")
+    assert not control_plane_status_is_ready(1, b"True")
+    assert not control_plane_status_is_ready(0, b"True False")
+    assert control_plane_status_is_ready(0, b"True")
+    assert control_plane_status_is_ready(0, "True True")
 
     binary = REPO_ROOT / ".build/xcode-derived/Build/Products/Debug/cengine"
     compatibility_root = pathlib.Path("/private/var/folders/test/T/cengine-compat-owned/root")

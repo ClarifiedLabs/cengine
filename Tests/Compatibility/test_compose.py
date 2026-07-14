@@ -121,10 +121,30 @@ def test_compose_exec_stop_start_and_restart(daemon, compose_project):
     compose(daemon, compose_project, "up", "-d")
     version = compose(daemon, compose_project, "exec", "-T", "web", "nginx", "-v")
     assert "nginx version" in version.stdout
+    compose(
+        daemon,
+        compose_project,
+        "exec",
+        "-T",
+        "web",
+        "sh",
+        "-c",
+        "printf retained >/tmp/cengine-stop-start-marker",
+    )
     compose(daemon, compose_project, "stop", "web")
     stopped = compose_json(daemon, compose_project, "ps", "-a", "--format", "json", "web")
     assert stopped[0]["State"] == "exited"
     compose(daemon, compose_project, "start", "web")
+    compose(
+        daemon,
+        compose_project,
+        "exec",
+        "-T",
+        "web",
+        "test",
+        "-f",
+        "/tmp/cengine-stop-start-marker",
+    )
     started_id = compose(daemon, compose_project, "ps", "-q", "web").stdout.strip()
     compose(daemon, compose_project, "restart", "web")
     assert compose(daemon, compose_project, "ps", "-q", "web").stdout.strip() == started_id

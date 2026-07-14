@@ -55,7 +55,14 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
         builder_container = client.containers.get(f"buildx_buildkit_{builder}0")
         assert builder_container.attrs["HostConfig"]["Memory"] == 4_294_967_296
         assert builder_container.attrs["HostConfig"]["NanoCpus"] == 4_000_000_000
-        image = client.images.get(tag)
+        try:
+            image = client.images.get(tag)
+        except docker.errors.ImageNotFound:
+            visible = sorted(tag for value in client.images.list(all=True) for tag in value.tags)
+            pytest.fail(
+                f"loaded image {tag} is not visible; images={visible}\n"
+                f"buildx output:\n{first.stdout}"
+            )
         assert tag in image.tags
         assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"
 

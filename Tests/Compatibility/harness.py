@@ -16,6 +16,17 @@ DOCKER_ENDPOINT_VARIABLES = (
     "DOCKER_TLS",
     "DOCKER_TLS_VERIFY",
 )
+
+
+def control_plane_status_is_ready(exit_code: int, output: bytes | str) -> bool:
+    if exit_code != 0:
+        return False
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+    statuses = output.split()
+    return bool(statuses) and all(status == "True" for status in statuses)
+
+
 COMPATIBILITY_OWNER_FILE = ".cengine-compat-owner"
 VMNET_TEARDOWN_SETTLE_SECONDS = 2.0
 

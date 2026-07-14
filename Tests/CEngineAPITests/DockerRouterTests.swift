@@ -73,13 +73,22 @@ private actor CompletionBackend: ContainerBackend {
         (0, "ok")
     }
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
-        [BackendImage(
-            id: "sha256:0123456789abcdef",
-            reference: "docker.io/example/imported:latest",
-            size: 123,
-            architecture: "arm64",
-            os: "linux"
-        )]
+        [
+            BackendImage(
+                id: "sha256:0123456789abcdef",
+                reference: "docker.io/example/imported:latest",
+                size: 123,
+                architecture: "arm64",
+                os: "linux"
+            ),
+            BackendImage(
+                id: "sha256:0123456789abcdef",
+                reference: "docker.io/library/imported-descriptor:latest",
+                size: 123,
+                architecture: "arm64",
+                os: "linux"
+            ),
+        ]
     }
 }
 
@@ -166,15 +175,19 @@ private actor ImageStoreBackend: ContainerBackend {
 private actor RestartBackend: ContainerBackend {
     private var exitCode: Int32?
     private var starts = 0
+    private var prepares = 0
+    private var deletes = 0
     init(exitCode: Int32? = nil) { self.exitCode = exitCode }
     func pullImage(_: String, platform _: String) async throws {}
-    func prepare(_: ContainerRecord) async throws {}
+    func prepare(_: ContainerRecord) async throws { prepares += 1 }
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { starts += 1; return container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
-    func delete(_: ContainerRecord) async throws {}
+    func delete(_: ContainerRecord) async throws { deletes += 1 }
     func completion(_: ContainerRecord) async -> Int32? { defer { exitCode = nil }; return exitCode }
     func startCount() -> Int { starts }
+    func prepareCount() -> Int { prepares }
+    func deleteCount() -> Int { deletes }
 }
 
 private actor AuthImageBackend: ContainerBackend {
@@ -999,6 +1012,26 @@ private actor AuthImageBackend: ContainerBackend {
         let image = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
         #expect(image["Architecture"] as? String == "arm64")
         #expect(image["Os"] as? String == "linux")
+        #expect(Set(image["RepoTags"] as? [String] ?? []) == [
+            "example/imported:latest", "imported-descriptor:latest",
+        ])
+    }
+
+    @Test func startingAStoppedContainerPreservesItsPreparedBackend() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = RestartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "start-stopped", image: "debian"))
+
+        try await runtime.startContainer(record.id)
+        try await runtime.stopContainer(record.id, timeoutSeconds: 0)
+        try await runtime.startContainer(record.id)
+
+        #expect(await backend.prepareCount() == 1)
+        #expect(await backend.deleteCount() == 0)
+        #expect(await backend.startCount() == 2)
+        #expect(try await runtime.container(record.id).phase == .running)
     }
 
     @Test func detachedExitIsReconciledAndLogsAreServed() async throws {

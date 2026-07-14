@@ -11,7 +11,24 @@ extension EngineRuntime {
         try archive.write(to: archiveURL, options: .atomic)
         try SystemTar.extract(archiveURL, to: layout)
         let loaded = try await backend.loadImages(fromOCILayout: layout)
-        let records = loaded.map { ImageRecord(id: $0.id, references: [$0.reference], createdAt: $0.createdAt, size: $0.size, architecture: $0.architecture, os: $0.os) }
+        var recordsByID: [String: ImageRecord] = [:]
+        for image in loaded {
+            if var record = recordsByID[image.id] {
+                record.references = Array(Set(record.references + [image.reference])).sorted()
+                recordsByID[image.id] = record
+            } else {
+                let existingReferences = snapshot.images.first(where: { $0.id == image.id })?.references ?? []
+                recordsByID[image.id] = ImageRecord(
+                    id: image.id,
+                    references: Array(Set(existingReferences + [image.reference])).sorted(),
+                    createdAt: image.createdAt,
+                    size: image.size,
+                    architecture: image.architecture,
+                    os: image.os
+                )
+            }
+        }
+        let records = recordsByID.values.sorted { $0.id < $1.id }
         for record in records {
             snapshot.images.removeAll { $0.id == record.id || !$0.references.filter(record.references.contains).isEmpty }
             snapshot.images.append(record)

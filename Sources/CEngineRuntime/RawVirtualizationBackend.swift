@@ -218,6 +218,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         struct Status: Decodable { let status: String; let pid: Int? }
         let response: Status = try await shim.guest(operation: "start", payload: Empty(), response: Status.self)
         guard response.status == "running" else { throw EngineError(.internalError, "workload did not start") }
+        completionTasks.removeValue(forKey: container.id)?.cancel()
         completions.removeValue(forKey: container.id)
         do {
             var active = container

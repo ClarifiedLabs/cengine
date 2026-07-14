@@ -5,12 +5,13 @@ from __future__ import annotations
 import pathlib
 import shutil
 import subprocess
+import time
 import uuid
 
 import docker
 import pytest
 
-from harness import docker_environment
+from harness import control_plane_status_is_ready, docker_environment
 
 
 KIND_NODE_IMAGE = (
@@ -36,6 +37,35 @@ def kind(
     )
 
 
+def wait_for_control_plane_ready(
+    client: docker.DockerClient, name: str, timeout: int = 300,
+) -> str | None:
+    node = client.containers.get(f"{name}-control-plane")
+    deadline = time.monotonic() + timeout
+    last_result = "readiness command has not run"
+    command = [
+        "kubectl",
+        "--kubeconfig=/etc/kubernetes/admin.conf",
+        "get",
+        "nodes",
+        "--selector=node-role.kubernetes.io/control-plane",
+        "-o=jsonpath={.items..status.conditions[-1:].status}",
+    ]
+    while time.monotonic() < deadline:
+        try:
+            exit_code, output = node.exec_run(command)
+            if control_plane_status_is_ready(exit_code, output):
+                return None
+            rendered_output = (
+                output.decode(errors="replace") if isinstance(output, bytes) else str(output)
+            )
+            last_result = f"exit {exit_code}: {rendered_output}"
+        except docker.errors.APIError as error:
+            last_result = f"Docker API error: {error}"
+        time.sleep(0.2)
+    return f"control-plane did not become Ready within {timeout}s; last result: {last_result}"
+
+
 @pytest.mark.compat("KND-001")
 def test_kind_create_cluster(daemon, client: docker.DockerClient):
     name = f"cengine-{uuid.uuid4().hex[:8]}"
@@ -48,10 +78,15 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
         result = kind(
             daemon, "create", "cluster", "--name", name,
             "--image", KIND_NODE_IMAGE, "--retain",
-            "--kubeconfig", str(kubeconfig), "--wait", "5m",
+            "--kubeconfig", str(kubeconfig),
             network=network,
         )
+        failure = None
         if result.returncode != 0:
+            failure = f"kind create cluster failed:\n{result.stdout}"
+        else:
+            failure = wait_for_control_plane_ready(client, name)
+        if failure is not None:
             diagnostics = []
             for container in client.containers.list(all=True):
                 if container.name.startswith(f"{name}-"):
@@ -86,7 +121,7 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
                         f"{inspection_output}"
                     )
             pytest.fail(
-                f"kind create cluster failed:\n{result.stdout}\n"
+                f"{failure}\n"
                 f"node diagnostics:\n{'\n'.join(diagnostics)}"
             )
         created = True
