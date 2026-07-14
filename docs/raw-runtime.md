@@ -24,21 +24,40 @@ verification, platform selection, and reachability pruning do not call an
 external engine. The guest applies gzip or zstd layers with whiteouts, xattrs,
 devices, deferred hard links, timestamps, and descriptor-safe path traversal.
 
-Each container has a sparse private ext4 disk. The storage appliance owns a
-separate sparse ext4 disk containing named volumes. macOS never mounts either
-filesystem.
+Each container has a sparse private ext4 root disk. Volumes with a single known
+consumer use their own sparse ext4 disk, attached directly to that container's
+VM. The storage appliance owns a separate sparse ext4 disk containing volumes
+that must be mounted by multiple container VMs. macOS never mounts any of these
+filesystems.
 
 ## Volumes
 
-The storage appliance exports its ext4 volume directory over NFSv3 on VLAN
-4094, which is reserved from Docker networks. Each container supervisor has a
-deterministic address in `100.64.0.0/10`, mounts that export once with the Linux
-kernel NFS client, and bind-mounts only authorized named-volume directories into
-the workload namespace. The workload never receives the parent trunk interface
-or access to the export root. This presents standard `nfs` mount metadata to
-Linux tools such as cAdvisor while retaining one container per VM and one ext4
-owner for concurrently shared volumes. The authenticated vsock storage protocol
-remains limited to administrative operations such as volume deletion.
+Volume placement is selected before its first workload start and persisted in
+`volume-storage.json`:
+
+- A volume referenced by one known container is block-backed. Its ext4 disk is
+  attached to that container VM and mounted by the guest supervisor. This gives
+  nested runtimes such as BuildKit and kind the local filesystem semantics
+  required by overlayfs.
+- A volume referenced by multiple known containers is shared. The storage
+  appliance is its sole ext4 owner and exports the volume over NFSv3.
+
+The storage appliance export is reachable only on management VLAN 4094, which
+is reserved from Docker networks. Each container supervisor has a deterministic
+address in `100.64.0.0/10`, mounts the export once with the Linux kernel NFS
+client, and bind-mounts only authorized shared-volume directories into the
+workload namespace. The workload never receives the parent trunk interface or
+access to the export root. This retains one container per VM while allowing one
+storage VM to provide coherent POSIX access to concurrently shared volumes. The
+authenticated vsock storage protocol remains limited to administrative
+operations such as volume deletion.
+
+The current runtime does not promote an already-used block-backed volume to
+shared storage. If a later container introduces a second reference after the
+volume's block mode has been persisted, start fails rather than attaching one
+writable ext4 disk to two VMs or silently copying potentially live data. Normal
+Compose creation works because all container references are known before the
+first workload starts.
 
 ## Networking
 
