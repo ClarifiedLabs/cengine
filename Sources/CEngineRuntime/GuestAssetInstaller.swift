@@ -6,14 +6,29 @@ public enum GuestAssetInstaller {
     public static let names = ["vmlinux", "container-initramfs.cpio.gz", "storage-initramfs.cpio.gz"]
 
     public static func isInstalled(paths: EnginePaths) -> Bool {
-        [paths.kernel, paths.containerInitialRamdisk, paths.storageInitialRamdisk].allSatisfy {
+        installedFiles(paths: paths).allSatisfy {
             guard let values = try? $0.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]) else { return false }
             return values.isRegularFile == true && (values.fileSize ?? 0) > 0
         }
     }
 
-    public static func install(paths: EnginePaths) throws {
-        let source = try locateSourceDirectory()
+    public static func needsInstall(paths: EnginePaths, source: URL? = nil) -> Bool {
+        guard isInstalled(paths: paths) else { return true }
+        guard let source = source ?? (try? locateSourceDirectory()) else { return false }
+        return !matchesSource(paths: paths, source: source)
+    }
+
+    static func matchesSource(paths: EnginePaths, source: URL) -> Bool {
+        let manifest = (try? String(contentsOf: source.appending(path: "SHA256SUMS"), encoding: .utf8)).map(digests(fromManifest:)) ?? [:]
+        for (name, installed) in zip(names, installedFiles(paths: paths)) {
+            let expected = manifest[name]?.lowercased() ?? (try? digest(of: source.appending(path: name)))
+            guard let expected, let actual = try? digest(of: installed), actual == expected else { return false }
+        }
+        return true
+    }
+
+    public static func install(paths: EnginePaths, source: URL? = nil) throws {
+        let source = try source ?? locateSourceDirectory()
         let destination = paths.kernel.deletingLastPathComponent()
         let staging = destination.deletingLastPathComponent().appending(path: ".assets-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
@@ -65,16 +80,29 @@ public enum GuestAssetInstaller {
     }
 
     private static func verify(directory: URL, manifest: String) throws {
-        let expected = Dictionary(uniqueKeysWithValues: manifest.split(whereSeparator: \.isNewline).compactMap { line -> (String, String)? in
+        let expected = digests(fromManifest: manifest)
+        for name in names {
+            guard let digest = expected[name] else { throw EngineError(.badRequest, "SHA256SUMS does not contain \(name)") }
+            guard try self.digest(of: directory.appending(path: name)) == digest.lowercased() else {
+                throw EngineError(.badRequest, "checksum mismatch for guest asset \(name)")
+            }
+        }
+    }
+
+    private static func installedFiles(paths: EnginePaths) -> [URL] {
+        [paths.kernel, paths.containerInitialRamdisk, paths.storageInitialRamdisk]
+    }
+
+    private static func digests(fromManifest manifest: String) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: manifest.split(whereSeparator: \.isNewline).compactMap { line -> (String, String)? in
             let fields = line.split(whereSeparator: \.isWhitespace)
             guard fields.count >= 2 else { return nil }
             return (String(fields[1]).trimmingCharacters(in: CharacterSet(charactersIn: "*")), String(fields[0]))
         })
-        for name in names {
-            guard let digest = expected[name] else { throw EngineError(.badRequest, "SHA256SUMS does not contain \(name)") }
-            let data = try Data(contentsOf: directory.appending(path: name), options: .mappedIfSafe)
-            let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            guard actual == digest.lowercased() else { throw EngineError(.badRequest, "checksum mismatch for guest asset \(name)") }
-        }
+    }
+
+    private static func digest(of file: URL) throws -> String {
+        let data = try Data(contentsOf: file, options: .mappedIfSafe)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

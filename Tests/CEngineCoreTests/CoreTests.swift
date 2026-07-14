@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import CEngineCore
@@ -43,6 +44,52 @@ private final class DataBox: @unchecked Sendable {
         let kernel = root.appending(path: "vmlinux")
         try Data("not a kernel".utf8).write(to: kernel)
         #expect(!GuestAssetInstaller.isInstalled(paths: EnginePaths(home: root)))
+    }
+
+    @Test func staleGuestAssetsAreReinstalledFromSource() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "source", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        for name in GuestAssetInstaller.names {
+            try Data("new \(name)".utf8).write(to: source.appending(path: name))
+        }
+        let paths = EnginePaths(home: root.appending(path: "home", directoryHint: .isDirectory))
+        #expect(GuestAssetInstaller.needsInstall(paths: paths, source: source))
+
+        let assets = paths.kernel.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+        for name in GuestAssetInstaller.names {
+            try Data("stale \(name)".utf8).write(to: assets.appending(path: name))
+        }
+        #expect(GuestAssetInstaller.isInstalled(paths: paths))
+        #expect(GuestAssetInstaller.needsInstall(paths: paths, source: source))
+
+        try GuestAssetInstaller.install(paths: paths, source: source)
+        #expect(!GuestAssetInstaller.needsInstall(paths: paths, source: source))
+        #expect(try Data(contentsOf: paths.kernel) == Data("new vmlinux".utf8))
+    }
+
+    @Test func guestAssetStalenessUsesSourceManifestWhenPresent() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "source", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        var manifest = ""
+        for name in GuestAssetInstaller.names {
+            let data = Data("asset \(name)".utf8)
+            try data.write(to: source.appending(path: name))
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            manifest += "\(digest)  \(name)\n"
+        }
+        try Data(manifest.utf8).write(to: source.appending(path: "SHA256SUMS"))
+
+        let paths = EnginePaths(home: root.appending(path: "home", directoryHint: .isDirectory))
+        try GuestAssetInstaller.install(paths: paths, source: source)
+        #expect(!GuestAssetInstaller.needsInstall(paths: paths, source: source))
+
+        try Data("tampered".utf8).write(to: paths.containerInitialRamdisk)
+        #expect(GuestAssetInstaller.needsInstall(paths: paths, source: source))
     }
 
     @Test func identifiersAreDockerCompatible() {

@@ -31,7 +31,7 @@ enum SystemManager {
 
     static func prepare(paths: EnginePaths) async throws {
         try paths.createDirectories()
-        if !GuestAssetInstaller.isInstalled(paths: paths) {
+        if GuestAssetInstaller.needsInstall(paths: paths) {
             print("Installing cengine kernel and guest initramfs assets...")
             try GuestAssetInstaller.install(paths: paths)
         }
