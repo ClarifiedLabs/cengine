@@ -202,6 +202,39 @@ private actor RestartBackend: ContainerBackend {
     func deleteCount() -> Int { deletes }
 }
 
+private actor LifecycleRaceBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var stopIsBlocked = false
+    private var starts = 0
+    private var prepares = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws { prepares += 1 }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        completionContinuation?.resume(returning: 0)
+        completionContinuation = nil
+        stopIsBlocked = true
+        await withCheckedContinuation { stopContinuation = $0 }
+        stopIsBlocked = false
+        return 0
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws { deletes += 1 }
+    func completion(_: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuation = $0 }
+    }
+    func isWaitingForCompletion() -> Bool { completionContinuation != nil }
+    func isStopBlocked() -> Bool { stopIsBlocked }
+    func releaseStop() { stopContinuation?.resume(); stopContinuation = nil }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
+}
+
 private actor AuthImageBackend: ContainerBackend {
     private var credentials: RegistryCredentials?
     private var pulled = false
@@ -1319,6 +1352,70 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(try await recovered.container(daemonRecord.id).phase == .running)
         #expect(try await recovered.container(daemonRecord.id).restartCount == 1)
         #expect(await recoveredBackend.startCount() == 1)
+    }
+
+    @Test func explicitStopSuppressesPolicyRestartWhenCompletionWinsRace() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = LifecycleRaceBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "intentional-stop", image: "debian")
+        record.restartPolicy = .init(name: "unless-stopped")
+        record = try await runtime.createContainer(record)
+        let containerID = record.id
+        try await runtime.startContainer(containerID)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+        let baselineCounts = await backend.counts()
+
+        let stop = Task { try await runtime.stopContainer(containerID) }
+        while !(await backend.isStopBlocked()) { await Task.yield() }
+        while try await runtime.container(containerID).phase != .exited { await Task.yield() }
+
+        let countsDuringStop = await backend.counts()
+        #expect(countsDuringStop.prepares == baselineCounts.prepares)
+        #expect(countsDuringStop.starts == baselineCounts.starts)
+        #expect(countsDuringStop.deletes == baselineCounts.deletes)
+        #expect(try await runtime.container(containerID).restartCount == 0)
+
+        await backend.releaseStop()
+        try await stop.value
+        #expect(try await runtime.container(containerID).phase == .exited)
+        #expect(await backend.counts().starts == baselineCounts.starts)
+    }
+
+    @Test func daemonRestartHonorsManualStopRestartPolicySemantics() async throws {
+        let alwaysRoot = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: alwaysRoot) }
+        let alwaysBackend = RestartBackend()
+        let firstAlways = try await EngineRuntime(root: alwaysRoot, backend: alwaysBackend)
+        var alwaysRecord = ContainerRecord(name: "stopped-always", image: "debian")
+        alwaysRecord.restartPolicy = .init(name: "always")
+        alwaysRecord = try await firstAlways.createContainer(alwaysRecord)
+        try await firstAlways.startContainer(alwaysRecord.id)
+        try await firstAlways.stopContainer(alwaysRecord.id)
+        #expect(try await firstAlways.container(alwaysRecord.id).phase == .exited)
+
+        let restartedBackend = RestartBackend()
+        let restarted = try await EngineRuntime(root: alwaysRoot, backend: restartedBackend)
+        #expect(try await restarted.container(alwaysRecord.id).phase == .running)
+        #expect(try await restarted.container(alwaysRecord.id).restartCount == 1)
+        #expect(await restartedBackend.startCount() == 1)
+
+        let unlessRoot = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: unlessRoot) }
+        let unlessBackend = RestartBackend()
+        let firstUnless = try await EngineRuntime(root: unlessRoot, backend: unlessBackend)
+        var unlessRecord = ContainerRecord(name: "stopped-unless", image: "debian")
+        unlessRecord.restartPolicy = .init(name: "unless-stopped")
+        unlessRecord = try await firstUnless.createContainer(unlessRecord)
+        try await firstUnless.startContainer(unlessRecord.id)
+        try await firstUnless.stopContainer(unlessRecord.id)
+
+        let stoppedBackend = RestartBackend()
+        let stopped = try await EngineRuntime(root: unlessRoot, backend: stoppedBackend)
+        #expect(try await stopped.container(unlessRecord.id).phase == .exited)
+        #expect(try await stopped.container(unlessRecord.id).restartCount == 0)
+        #expect(await stoppedBackend.startCount() == 0)
     }
 
     @Test func registryAuthProgressAndImageHistoryAreForwarded() async throws {

@@ -23,6 +23,13 @@ public struct ContainerWaitSubscription: Sendable {
 }
 
 public actor EngineRuntime {
+    private struct LifecycleIntent: Equatable {
+        enum Operation: Equatable { case stop, restart, remove, update }
+
+        let operation: Operation
+        let token = UUID()
+    }
+
     var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
     let backend: any ContainerBackend
@@ -32,6 +39,7 @@ public actor EngineRuntime {
     private var healthTasks: [String: Task<Void, Never>] = [:]
     private var exitWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var removalWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
+    private var lifecycleIntents: [String: LifecycleIntent] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -71,24 +79,28 @@ public actor EngineRuntime {
         }
         try await backend.cleanupOrphans(keeping: Set(snapshot.containers.map(\.id)))
         var recovered: [(String, Date)] = []
-        for index in snapshot.containers.indices where snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused {
+        for index in snapshot.containers.indices {
             let stale = snapshot.containers[index]
-            let recovery = (try? await backend.recover(stale)) ?? .unavailable
-            switch recovery {
-            case .running, .paused:
-                snapshot.containers[index].phase = recovery == .paused ? .paused : .running
-                let startedAt = snapshot.containers[index].startedAt ?? Date()
-                snapshot.containers[index].startedAt = startedAt
-                recovered.append((stale.id, startedAt))
-                continue
-            case .exited(let code):
-                snapshot.containers[index].exitCode = code
-            case .unavailable:
-                snapshot.containers[index].exitCode = 137
+            if stale.phase == .running || stale.phase == .paused {
+                let recovery = (try? await backend.recover(stale)) ?? .unavailable
+                switch recovery {
+                case .running, .paused:
+                    snapshot.containers[index].phase = recovery == .paused ? .paused : .running
+                    let startedAt = snapshot.containers[index].startedAt ?? Date()
+                    snapshot.containers[index].startedAt = startedAt
+                    recovered.append((stale.id, startedAt))
+                    continue
+                case .exited(let code):
+                    snapshot.containers[index].exitCode = code
+                case .unavailable:
+                    snapshot.containers[index].exitCode = 137
+                }
+                snapshot.containers[index].phase = .exited
+                snapshot.containers[index].finishedAt = Date()
+                guard Self.shouldRestart(stale, exitCode: snapshot.containers[index].exitCode ?? 137) else { continue }
+            } else {
+                guard stale.phase == .exited, stale.restartPolicy.name == "always" else { continue }
             }
-            snapshot.containers[index].phase = .exited
-            snapshot.containers[index].finishedAt = Date()
-            guard Self.shouldRestart(stale, exitCode: snapshot.containers[index].exitCode ?? 137) else { continue }
             do {
                 var restarted = snapshot.containers[index]
                 restarted.restartCount += 1
@@ -235,7 +247,10 @@ public actor EngineRuntime {
         if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
         if let restartPolicy { updated.restartPolicy = restartPolicy }
         if old.phase == .running || old.phase == .paused {
-            _ = try await backend.stop(old, timeoutSeconds: old.stopTimeoutSeconds)
+            let intent = try beginLifecycleIntent(.update, for: old.id)
+            defer { endLifecycleIntent(intent, for: old.id) }
+            let code = try await backend.stop(old, timeoutSeconds: old.stopTimeoutSeconds)
+            await recordCompletion(old.id, startedAt: old.startedAt, code: code)
             try await backend.delete(old)
             try await backend.prepare(updated)
             updated.ports = try await backend.start(updated)
@@ -289,6 +304,8 @@ public actor EngineRuntime {
             try await startContainer(identifier)
             return
         }
+        let intent = try beginLifecycleIntent(.restart, for: record.id)
+        defer { endLifecycleIntent(intent, for: record.id) }
         try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
         guard let current = try? containerIndex(record.id) else { throw EngineError(.conflict, "container was removed while restarting") }
         snapshot.containers[current].phase = .running
@@ -352,15 +369,10 @@ public actor EngineRuntime {
         let index = try containerIndex(identifier)
         guard snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused else { return }
         let record = snapshot.containers[index]
+        let intent = try beginLifecycleIntent(.stop, for: record.id)
+        defer { endLifecycleIntent(intent, for: record.id) }
         let code = try await backend.stop(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
-        guard let current = try? containerIndex(record.id) else { return }
-        snapshot.containers[current].phase = .exited
-        snapshot.containers[current].exitCode = code
-        snapshot.containers[current].finishedAt = Date()
-        resumeExitWaiters(record.id, code: code)
-        try await persist()
-        emit(containerEvent("die", snapshot.containers[current], extra: ["exitCode": String(code)]))
-        healthTasks.removeValue(forKey: record.id)?.cancel()
+        await recordCompletion(record.id, startedAt: record.startedAt, code: code)
     }
 
     public func waitContainer(_ identifier: String, condition: String? = nil) async throws -> Int32 {
@@ -390,9 +402,12 @@ public actor EngineRuntime {
     public func removeContainer(_ identifier: String, force: Bool, removeVolumes: Bool = false) async throws {
         let index = try containerIndex(identifier)
         let removed = snapshot.containers[index]
+        let intent = try beginLifecycleIntent(.remove, for: removed.id)
+        defer { endLifecycleIntent(intent, for: removed.id) }
         if removed.phase == .running || removed.phase == .paused {
             guard force else { throw EngineError(.conflict, "You cannot remove a running container. Stop the container before attempting removal or force remove.") }
-            _ = try await backend.stop(removed, timeoutSeconds: 0)
+            let code = try await backend.stop(removed, timeoutSeconds: 0)
+            await recordCompletion(removed.id, startedAt: removed.startedAt, code: code)
         }
         guard (try? containerIndex(removed.id)) != nil else { return }
         resumeExitWaiters(removed.id, code: removed.exitCode ?? 137)
@@ -909,8 +924,9 @@ public actor EngineRuntime {
         await recordCompletion(identifier, startedAt: startedAt, code: code)
     }
 
-    private func recordCompletion(_ identifier: String, startedAt: Date, code: Int32) async {
-        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .running,
+    private func recordCompletion(_ identifier: String, startedAt: Date?, code: Int32) async {
+        guard let index = try? containerIndex(identifier),
+              snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused,
               snapshot.containers[index].startedAt == startedAt else { return }
         snapshot.containers[index].phase = .exited
         snapshot.containers[index].exitCode = code
@@ -918,9 +934,10 @@ public actor EngineRuntime {
         resumeExitWaiters(identifier, code: code)
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
+        let intent = lifecycleIntents[identifier]?.operation
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
-        if !autoRemove, Self.shouldRestart(record, exitCode: code) {
+        if intent == nil, !autoRemove, Self.shouldRestart(record, exitCode: code) {
             do {
                 var restarted = record; restarted.restartCount += 1
                 try await backend.delete(record); try await backend.prepare(restarted)
@@ -936,7 +953,7 @@ public actor EngineRuntime {
                 if let current = try? containerIndex(identifier) { snapshot.containers[current].phase = .dead }
             }
         }
-        if autoRemove {
+        if autoRemove, intent == nil || intent == .stop {
             try? await backend.delete(record)
             try? await backend.deleteLogs(for: record)
             try? await removeAnonymousVolumes(usedBy: record)
@@ -945,6 +962,19 @@ public actor EngineRuntime {
             emit(containerEvent("destroy", record))
         }
         try? await persist()
+    }
+
+    private func beginLifecycleIntent(_ operation: LifecycleIntent.Operation, for identifier: String) throws -> LifecycleIntent {
+        guard lifecycleIntents[identifier] == nil else {
+            throw EngineError(.conflict, "container \(identifier) already has a lifecycle operation in progress")
+        }
+        let intent = LifecycleIntent(operation: operation)
+        lifecycleIntents[identifier] = intent
+        return intent
+    }
+
+    private func endLifecycleIntent(_ intent: LifecycleIntent, for identifier: String) {
+        if lifecycleIntents[identifier] == intent { lifecycleIntents.removeValue(forKey: identifier) }
     }
 
     private func waitSubscription(containerID: String, removal: Bool) -> ContainerWaitSubscription {

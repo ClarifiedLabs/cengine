@@ -154,6 +154,48 @@ def test_daemon_restart_recreates_usable_network_interfaces(daemon, client: dock
         recovered.close()
 
 
+@pytest.mark.compat("REC-006")
+def test_daemon_restart_honors_manually_stopped_restart_policies(
+    daemon, client: docker.DockerClient
+):
+    suffix = uuid.uuid4().hex[:8]
+    always = client.containers.create(
+        IMAGE, command="top", name=f"stopped-always-{suffix}",
+        restart_policy={"Name": "always"},
+    )
+    unless_stopped = client.containers.create(
+        IMAGE, command="top", name=f"stopped-unless-{suffix}",
+        restart_policy={"Name": "unless-stopped"},
+    )
+    always.start()
+    unless_stopped.start()
+    always.stop()
+    unless_stopped.stop()
+    always.reload()
+    unless_stopped.reload()
+    assert always.status == "exited"
+    assert unless_stopped.status == "exited"
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            restarted = recovered.containers.get(always.id)
+            restarted.reload()
+            if restarted.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"always container did not restart: {restarted.attrs['State']}")
+            time.sleep(0.2)
+        stopped = recovered.containers.get(unless_stopped.id)
+        stopped.reload()
+        assert stopped.status == "exited"
+        assert stopped.attrs["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
+    finally:
+        recovered.close()
+
+
 @pytest.mark.compat("REC-005")
 def test_vmnet_reservation_is_released_when_infrastructure_shim_exits(
     daemon, client: docker.DockerClient

@@ -30,7 +30,7 @@ digests.
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-040`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-012`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
 | Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-003` | Authenticated push and pull-back use a pinned local registry. |
-| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-005` | Recovery covers live workloads, log and stats streams, active networking, and vmnet reservation release. |
+| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
 
 ## API version envelope
@@ -211,6 +211,7 @@ builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 | `REC-003` | `test_daemon_restart_recreates_usable_network_interfaces` | ✅ Pass | Support | **cengine-owned.** Logical vmnet restoration recreates a carrier-up interface with working DNS and internet access. |
 | `REC-004` | `test_running_workload_survives_daemon_process_replacement` | ✅ Pass | Support | **cengine-owned.** A daemon process replacement reconnects to the existing VM shim without changing container start time. |
 | `REC-005` | `test_vmnet_reservation_is_released_when_infrastructure_shim_exits` | ✅ Pass | Support | **cengine-owned.** Infrastructure shim termination releases its privileged vmnet reservations before recovery. |
+| `REC-006` | `test_daemon_restart_honors_manually_stopped_restart_policies` | ✅ Pass | Support | **cengine-owned.** Manual stops suppress immediate policy restarts; daemon restart starts `always` containers but leaves `unless-stopped` containers stopped. |
 
 ## Docker CLI
 
