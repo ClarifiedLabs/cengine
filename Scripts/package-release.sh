@@ -35,6 +35,13 @@ remove_build_rpaths() {
     install_name_tool -delete_rpath "$rpath" "$binary"
   done < <(otool -l "$binary" | awk '/cmd LC_RPATH/ { found=1; next } found && /path / { print $2; found=0 }')
 }
+require_uninstrumented() {
+  local binary="$1"
+  if otool -l "$binary" | grep -q __llvm_prf; then
+    echo "Release binary $binary contains LLVM profiling instrumentation; build with code coverage disabled" >&2
+    exit 2
+  fi
+}
 
 VERSION="$(resolve_version)"
 BUILD_NUMBER="${CENGINE_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-1}}"
@@ -68,7 +75,8 @@ xcodebuild -project "$PROJECT_PATH" -scheme cengine -configuration Release \
   -skipPackagePluginValidation -skipMacroValidation \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
   CENGINE_GIT_COMMIT="$GIT_COMMIT" CENGINE_BUILD_TIME="$BUILD_TIME" \
-  CENGINE_TEAM_IDENTIFIER="$team_identifier" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" build
+  CENGINE_TEAM_IDENTIFIER="$team_identifier" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" \
+  ENABLE_CODE_COVERAGE=NO CLANG_COVERAGE_MAPPING=NO build
 
 SOURCE_APP="$PRODUCTS_DIR/cengine.app"
 SOURCE_ENGINE="$PRODUCTS_DIR/cengine"
@@ -95,6 +103,9 @@ ditto "$ROOT_DIR/.build/guest/SHA256SUMS" "$APP_PATH/Contents/Resources/guest/SH
 remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine"
 remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-engine"
 remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-network-helper"
+require_uninstrumented "$APP_PATH/Contents/MacOS/cengine"
+require_uninstrumented "$APP_PATH/Contents/MacOS/cengine-engine"
+require_uninstrumented "$APP_PATH/Contents/MacOS/cengine-network-helper"
 xattr -cr "$PAYLOAD_ROOT"
 ln -s /Applications/cengine.app/Contents/MacOS/cengine-engine "$PAYLOAD_ROOT/usr/local/bin/cengine"
 

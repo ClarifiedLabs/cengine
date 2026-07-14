@@ -54,6 +54,18 @@ def main() -> None:
     for contents, label in ((script, "package-release.sh"), (build_script, "build-release.sh"), (makefile, "Makefile")):
         require_contains(contents, "CENGINE_GIT_COMMIT", label)
         require_contains(contents, "CENGINE_BUILD_TIME", label)
+    for contents, label in (
+        (script, "package-release.sh"),
+        (build_script, "build-release.sh"),
+        (makefile, "Makefile"),
+    ):
+        require_contains(contents, "ENABLE_CODE_COVERAGE=NO", label)
+        require_contains(contents, "CLANG_COVERAGE_MAPPING=NO", label)
+    for contents, label in ((script, "package-release.sh"), (build_script, "build-release.sh")):
+        require_contains(contents, "require_uninstrumented", label)
+        require_contains(contents, "__llvm_prf", label)
+    if project.count("CLANG_COVERAGE_MAPPING = NO") != 2 or project.count("ENABLE_CODE_COVERAGE = NO") != 2:
+        raise AssertionError("shared Debug and Release build settings must disable coverage instrumentation")
     require_contains(info_plist, "$(CENGINE_GIT_COMMIT)", "cengine-Info.plist")
     require_contains(info_plist, "$(CENGINE_BUILD_TIME)", "cengine-Info.plist")
     require_contains(info_plist, "$(CENGINE_TEAM_IDENTIFIER)", "cengine-Info.plist")

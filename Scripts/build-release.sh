@@ -21,6 +21,14 @@ remove_build_rpaths() {
   done < <(otool -l "$binary" | awk '/cmd LC_RPATH/ { found=1; next } found && /path / { print $2; found=0 }')
 }
 
+require_uninstrumented() {
+  local binary="$1"
+  if otool -l "$binary" | grep -q __llvm_prf; then
+    echo "Release binary $binary contains LLVM profiling instrumentation; build with code coverage disabled" >&2
+    exit 2
+  fi
+}
+
 xcodebuild \
   -project "$PROJECT_PATH" \
   -scheme "$PRODUCT_NAME" \
@@ -31,11 +39,14 @@ xcodebuild \
   -skipMacroValidation \
   CENGINE_GIT_COMMIT="$GIT_COMMIT" \
   CENGINE_BUILD_TIME="$BUILD_TIME" \
+  ENABLE_CODE_COVERAGE=NO \
+  CLANG_COVERAGE_MAPPING=NO \
   build
 
 mkdir -p "$OUTPUT_DIR"
 ditto --norsrc --noextattr "$PRODUCTS_DIR/$PRODUCT_NAME" "$OUTPUT_DIR/$PRODUCT_NAME"
 remove_build_rpaths "$OUTPUT_DIR/$PRODUCT_NAME"
+require_uninstrumented "$OUTPUT_DIR/$PRODUCT_NAME"
 codesign --force --entitlements "$ROOT_DIR/Configuration/cengine.entitlements" --sign - "$OUTPUT_DIR/$PRODUCT_NAME"
 "$ROOT_DIR/Scripts/verify-entitlements.sh" "$OUTPUT_DIR/$PRODUCT_NAME"
 rm -rf "$OUTPUT_DIR/share/cengine"
