@@ -9,8 +9,12 @@ make guest-assets
 make test
 make test-guest
 make test-compat
+make test-compat-soak
+make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/docker.sock
+make test-compat-reset
 make dist-cli
 make package
+make test-release
 ```
 
 `make test` first checks compatibility-harness environment isolation, then runs
@@ -20,7 +24,8 @@ services, static `mke2fs`, both deterministic initramfs files, and checksums.
 The Linux toolchain runs through `CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default:
 `default`) so it never recursively invokes the cengine Docker context.
 `make dist-cli` runs the tests and stages `dist/cengine` plus `dist/share/cengine`.
-`make package` creates `dist/cengine-0.0.1.pkg` for local release-artifact testing.
+`make package` creates `dist/cengine-<marketing-version>.pkg` for local
+release-artifact testing, using `MARKETING_VERSION` from the Xcode project.
 
 `make test-compat` builds and signs the debug daemon, terminates orphaned
 compatibility daemons and VM shims owned by this worktree, removes their
@@ -121,8 +126,8 @@ import/list/inspect/history/delete and pruning; container lifecycle, health,
 stats, top, logs, attach, exec, archive copy, mounts, networking, ports, and
 pruning; and Docker-shaped network and volume lifecycle APIs. Direct
 `docker build` intentionally directs clients to Buildx. The managed Buildx
-builder pins BuildKit and uses its native snapshotter because overlayfs upper
-layers are incompatible with the VirtioFS-backed builder volume.
+builder pins BuildKit, stores its state on a block-backed ext4 volume, and uses
+the native snapshotter as part of cengine's tested Buildx contract.
 
 See [`docker-compatibility.md`](docker-compatibility.md) for the detailed
 compatibility ledger and test provenance.
@@ -132,8 +137,10 @@ compatibility ledger and test provenance.
 The signed app registers its bundled `dev.cengine.engine` LaunchAgent with
 `SMAppService`. The agent installs the bundled cengine guest assets, creates the
 cengine Docker context, starts the daemon, and configures the Buildx builder. The
-optional `dev.cengine.network-helper` LaunchDaemon binds exact specific-IP
-ports below 1024 and returns descriptors to the engine over authenticated XPC.
+privileged `dev.cengine.network-helper` LaunchDaemon owns raw vmnet uplinks and
+binds privileged published ports, returning descriptors to the engine over
+authenticated XPC. The app guides the user through approving this required
+networking service during onboarding.
 
 To develop without downloading a kernel or starting VMs:
 
@@ -147,7 +154,3 @@ DOCKER_HOST=unix://$HOME/.cengine/run/docker.sock docker info
 Public releases use one Developer ID signed, notarized, stapled `.pkg` for
 direct download and the Homebrew Cask. See
 [`release.md`](release.md) for the release process.
-
-Note: this project was created as part of testing gpt-5.6-sol. Planning used
-`xhigh` effort and implementation used `low` effort through commit
-`f78d30dcb6eae948fbdd271f08e5c82d1656457a`.

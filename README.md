@@ -151,4 +151,5 @@ are retried twice. The daemon logs to
 See [Development](docs/development.md) for build and test commands. Architecture
 and implementation details are documented in
 [Raw runtime architecture](docs/raw-runtime.md). Docker API and Compose support
-is tracked in [Docker compatibility](docs/docker-compatibility.md).
+is tracked in [Docker compatibility](docs/docker-compatibility.md), and current
+priorities are tracked in the [Roadmap](docs/roadmap.md).

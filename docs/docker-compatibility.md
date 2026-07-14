@@ -26,11 +26,11 @@ digests.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-014`, `CTR-019`–`CTR-024`, `CTR-026`, `CTR-029`, `CTR-031`–`CTR-034`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
-| Archive, exec, observability, update | `CTR-015`, `CTR-025`, `CTR-027`, `CTR-028`, `CTR-030`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
-| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `NET-001`–`NET-012`, `VOL-001`–`VOL-005`, `CLI-005` | SCTP is not assessed. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-040`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
+| Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-040`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
+| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-012`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
 | Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-002` | Authenticated push and pull-back use a pinned local registry. |
-| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-003` | Recovery is covered during log following, stats streaming, and active network use. |
+| Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-005` | Recovery covers live workloads, log and stats streams, active networking, and vmnet reservation release. |
 | Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
 
 ## API version envelope
@@ -189,7 +189,11 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CMP-006` | `test_compose_named_volume_down_semantics` | ✅ Pass | Support | Named data survives ordinary down and is deleted by `down --volumes`. |
 | `CMP-007` | `test_compose_waits_for_healthy_dependency` | ✅ Pass | Support | Health-conditioned dependencies start only after the prerequisite reports healthy. |
 
-## Docker Buildx 0.35
+## Docker Buildx and BuildKit 0.27.1
+
+The Buildx plugin is supplied by the host Docker CLI and its version is recorded
+in compatibility-test output rather than pinned by this repository. The managed
+builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|

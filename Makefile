@@ -44,7 +44,7 @@ help:
 		'make test-compat-reset  Stop this worktree’s orphaned compatibility VMs and remove temporary roots' \
 		'make test-compat-reset-system  Also restart vmnet system state after a helper crash' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
-		'make package       Build local unsigned PKG and DMG release artifacts' \
+		'make package       Build a local unsigned PKG release artifact' \
 		'make release       Create a GitHub release tag (VERSION=patch|minor|major|X.Y.Z)' \
 		'make release-list  List the current release tag' \
 		'make test-release  Run release tooling regression checks' \

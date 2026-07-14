@@ -9,9 +9,10 @@ Homebrew Cask in `ClarifiedLabs/homebrew-tap`.
 `release.yml` runs for `release-ci`, `v*.*.*` tags, and manual dispatch. It waits
 for a successful test run for the same commit before packaging.
 
-`release-ci` exercises the full signing and notarization paths and uploads both
-artifacts to Actions. It does not create a GitHub Release or update Homebrew.
-Tag runs publish the package and update the Homebrew Cask to use it.
+`release-ci` exercises the full signing and notarization paths and uploads the
+guest assets and signed package as workflow artifacts. It does not create a
+GitHub Release or update Homebrew. Tag runs publish the package and update the
+Homebrew Cask to use it.
 
 ## Required Secrets
 
@@ -50,18 +51,24 @@ make release VERSION=patch AUTOPUSH=1
 
 The helper updates Xcode `MARKETING_VERSION`, creates a conventional release
 commit when the version changes, and creates an annotated `vX.Y.Z` tag. The
-first `VERSION=patch` release uses the project version `0.0.1`.
+`patch`, `minor`, and `major` forms increment the highest existing release tag.
+When the repository has no release tag yet, they use the current Xcode project
+version without incrementing it.
 
-For a local payload-only package:
+For a local unsigned package:
 
 ```bash
 make package
-pkgutil --payload-files dist/cengine-0.0.1.pkg
-pkgutil --check-signature dist/cengine-0.0.1.pkg
+pkgutil --payload-files dist/cengine-X.Y.Z.pkg
+pkgutil --check-signature dist/cengine-X.Y.Z.pkg
 ```
 
+Replace `X.Y.Z` with the Xcode project's current `MARKETING_VERSION`. The local
+package is intentionally unsigned; `pkgutil --check-signature` reports that
+state. CI produces the Developer ID signed, notarized, and stapled package.
+
 Users open `cengine.app`; it registers the bundled engine LaunchAgent and offers
-the optional privileged networking helper during onboarding.
+the required privileged networking service for approval during onboarding.
 
 The PKG installs `/Applications/cengine.app` and `/usr/local/bin/cengine` and
 therefore requests administrator authorization. Homebrew installs the same PKG
