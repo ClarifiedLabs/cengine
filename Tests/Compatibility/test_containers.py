@@ -330,6 +330,25 @@ def test_top_and_update(client: docker.DockerClient, top):
     assert top.attrs["HostConfig"]["RestartPolicy"]["Name"] == "always"
 
 
+@pytest.mark.compat("CTR-041")
+def test_restart_policy_update_preserves_running_vm(top):
+    top.reload()
+    started_at = top.attrs["State"]["StartedAt"]
+    code, boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+    assert code == 0
+
+    warnings = top.update(restart_policy={"Name": "unless-stopped"})
+    assert warnings == {"Warnings": []} or warnings == []
+    top.reload()
+    code, updated_boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+
+    assert code == 0
+    assert top.status == "running"
+    assert top.attrs["State"]["StartedAt"] == started_at
+    assert updated_boot_id == boot_id
+    assert top.attrs["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
+
+
 @pytest.mark.compat("CTR-029")
 def test_follow_logs_streams_output_and_closes(client: docker.DockerClient):
     container = client.containers.create(

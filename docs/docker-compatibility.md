@@ -26,8 +26,8 @@ digests.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-040`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
-| Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-040`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-041`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
+| Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-041`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-012`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
 | Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-003` | Authenticated push and pull-back use a pinned local registry. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
@@ -118,6 +118,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-038` | `test_attached_exec_streams_stdin_before_eof` | ✅ Pass | Support | **cengine-owned.** Attached exec stdin remains open for streamed data and receives EOF when the client half-closes. |
 | `CTR-039` | `test_attached_exec_preserves_multiline_stdin_bytes` | ✅ Pass | Support | **cengine-owned.** Attached exec preserves structured multi-line stdin byte-for-byte. |
 | `CTR-040` | `test_exec_inherits_and_overrides_container_environment` | ✅ Pass | Support | **cengine-owned.** Exec inherits image and container environment before applying exec-specific overrides. |
+| `CTR-041` | `test_restart_policy_update_preserves_running_vm` | ✅ Pass | Support | **cengine-owned.** Updating only restart-policy metadata preserves the running VM, container start time, and guest boot identity. |
 
 ## Images
 

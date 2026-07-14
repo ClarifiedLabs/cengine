@@ -1281,6 +1281,35 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((pruneJSON["ContainersDeleted"] as? [String])?.contains(record.id) == true)
     }
 
+    @Test func restartPolicyUpdateDoesNotRecreateRunningContainer() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = RestartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let record = try await runtime.createContainer(ContainerRecord(name: "policy-only", image: "debian"))
+        try await runtime.startContainer(record.id)
+        let before = try await runtime.container(record.id)
+        let startedAt = try #require(before.startedAt)
+        let startCount = await backend.startCount()
+        let prepareCount = await backend.prepareCount()
+        let deleteCount = await backend.deleteCount()
+
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/policy-only/update",
+            body: Data(#"{"RestartPolicy":{"Name":"unless-stopped"}}"#.utf8)
+        ))
+
+        #expect(response.status == .ok)
+        let updated = try await runtime.container(record.id)
+        #expect(updated.phase == .running)
+        #expect(updated.startedAt == startedAt)
+        #expect(updated.restartPolicy.name == "unless-stopped")
+        #expect(await backend.startCount() == startCount)
+        #expect(await backend.prepareCount() == prepareCount)
+        #expect(await backend.deleteCount() == deleteCount)
+    }
+
     @Test func healthcheckTransitionsContainerToHealthy() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
