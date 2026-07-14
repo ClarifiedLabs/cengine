@@ -657,7 +657,7 @@ public actor EngineRuntime {
         try await persist(); return removed.map(\.name)
     }
 
-    public func createVolume(name: String, sizeBytes: UInt64 = 512 * 1024 * 1024 * 1024, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
+    public func createVolume(name: String, sizeBytes: UInt64 = VolumeRecord.defaultSizeBytes, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
         if let existing = snapshot.volumes.first(where: { $0.name == name }) { return existing }
         let record = VolumeRecord(name: name, createdAt: Date(), sizeBytes: sizeBytes, labels: labels, options: options, anonymous: anonymous)

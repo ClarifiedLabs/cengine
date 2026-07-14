@@ -32,18 +32,23 @@ import Testing
         #expect(arguments.contains("memory=4294967296"))
         #expect(arguments.contains("cpu-period=100000"))
         #expect(arguments.contains("cpu-quota=400000"))
+        #expect(arguments.contains("--oci-worker-snapshotter=overlayfs"))
     }
 
     @Test func builderInspectionMustMatchEveryManagedResource() {
-        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000""#
+        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
 
         #expect(DockerIntegration.builder(inspection, matches: .default))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 6, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 8)))
+        #expect(!DockerIntegration.builder(
+            inspection.replacingOccurrences(of: "overlayfs", with: "native"),
+            matches: .default
+        ))
     }
 
     @Test func configuringMatchingBuilderSelectsIt() throws {
-        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000""#
+        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
         var commands: [[String]] = []
 
         try DockerIntegration.configureBuilder(.default) { arguments in
@@ -54,6 +59,49 @@ import Testing
         #expect(commands == [
             ["buildx", "version"],
             ["buildx", "inspect", DockerIntegration.builderName],
+            [
+                "--context", DockerIntegration.contextName,
+                "buildx", "use", "--default", DockerIntegration.builderName,
+            ],
+        ])
+    }
+
+    @Test func configuringNativeBuilderReplacesItsState() throws {
+        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=native"#
+        var commands: [[String]] = []
+
+        try DockerIntegration.configureBuilder(.default) { arguments in
+            commands.append(arguments)
+            return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
+        }
+
+        #expect(commands == [
+            ["buildx", "version"],
+            ["buildx", "inspect", DockerIntegration.builderName],
+            ["buildx", "rm", "--force", DockerIntegration.builderName],
+            DockerIntegration.createBuilderArguments(.default),
+            [
+                "--context", DockerIntegration.contextName,
+                "buildx", "use", "--default", DockerIntegration.builderName,
+            ],
+        ])
+    }
+
+    @Test func configuringNewResourcesPreservesOverlayState() throws {
+        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let settings = BuilderSettings(cpus: 2, memoryGiB: 4)
+        var commands: [[String]] = []
+
+        try DockerIntegration.configureBuilder(settings) { arguments in
+            commands.append(arguments)
+            return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
+        }
+
+        #expect(commands == [
+            ["buildx", "version"],
+            ["buildx", "inspect", DockerIntegration.builderName],
+            ["buildx", "rm", "--force", "--keep-state", DockerIntegration.builderName],
+            DockerIntegration.createBuilderArguments(settings),
             [
                 "--context", DockerIntegration.contextName,
                 "buildx", "use", "--default", DockerIntegration.builderName,

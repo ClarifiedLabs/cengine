@@ -209,6 +209,8 @@ public struct NetworkRecord: Codable, Sendable {
 }
 
 public struct VolumeRecord: Codable, Sendable {
+    public static let defaultSizeBytes: UInt64 = 512 * 1_024 * 1_024 * 1_024
+
     public var name: String
     public var createdAt: Date
     public var sizeBytes: UInt64

@@ -44,7 +44,7 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
             "--driver-opt", "cpu-period=100000",
             "--driver-opt", "cpu-quota=400000",
             "--buildkitd-config", str(BUILDKIT_CONFIG),
-            "--buildkitd-flags", "--oci-worker-snapshotter=native",
+            "--buildkitd-flags", "--oci-worker-snapshotter=overlayfs",
             docker_host, docker_host=docker_host,
         )
         first = buildx(
@@ -94,7 +94,7 @@ def test_buildx_pull_succeeds_after_daemon_restart(daemon, client: docker.Docker
             "--driver-opt", f"image={BUILDKIT_IMAGE}",
             "--driver-opt", "memory=4294967296",
             "--buildkitd-config", str(BUILDKIT_CONFIG),
-            "--buildkitd-flags", "--oci-worker-snapshotter=native",
+            "--buildkitd-flags", "--oci-worker-snapshotter=overlayfs",
             docker_host, docker_host=docker_host,
         )
         buildx("inspect", "--builder", builder, "--bootstrap", docker_host=docker_host)
@@ -116,6 +116,42 @@ def test_buildx_pull_succeeds_after_daemon_restart(daemon, client: docker.Docker
         )
         assert "ERROR" not in result.stdout
         assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"
+    finally:
+        subprocess.run(
+            ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
+            env=docker_environment(docker_host), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=60,
+        )
+
+
+@pytest.mark.compat("BLD-003")
+def test_buildx_overlay_worker_has_large_state_volume(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    builder = f"compat-storage-builder-{suffix}"
+    tag = f"compat-storage-buildx:{suffix}"
+    docker_host = f"unix://{daemon.socket}"
+    try:
+        buildx(
+            "create", "--name", builder, "--driver", "docker-container",
+            "--driver-opt", f"image={BUILDKIT_IMAGE}",
+            "--driver-opt", "memory=4294967296",
+            "--buildkitd-config", str(BUILDKIT_CONFIG),
+            "--buildkitd-flags", "--oci-worker-snapshotter=overlayfs",
+            docker_host, docker_host=docker_host,
+        )
+        buildx(
+            "build", "--builder", builder, "--load", "--tag", tag,
+            "--file", str(BUILD_CONTEXT / "Dockerfile.parallel"), str(BUILD_CONTEXT),
+            docker_host=docker_host,
+        )
+
+        inspection = buildx("inspect", "--builder", builder, docker_host=docker_host)
+        assert "--oci-worker-snapshotter=overlayfs" in inspection.stdout
+        buildkit = client.containers.get(f"buildx_buildkit_{builder}0")
+        disk = buildkit.exec_run(["df", "-Pk", "/var/lib/buildkit"])
+        assert disk.exit_code == 0, disk.output.decode(errors="replace")
+        size_kib = int(disk.output.decode().splitlines()[-1].split()[1])
+        assert size_kib >= 500_000_000, f"BuildKit state volume is only {size_kib} KiB"
     finally:
         subprocess.run(
             ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,

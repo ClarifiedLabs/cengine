@@ -132,8 +132,9 @@ import/list/inspect/history/delete and pruning; container lifecycle, health,
 stats, top, logs, attach, exec, archive copy, mounts, networking, ports, and
 pruning; and Docker-shaped network and volume lifecycle APIs. Direct
 `docker build` intentionally directs clients to Buildx. The managed Buildx
-builder pins BuildKit, stores its state on a block-backed ext4 volume, and uses
-the native snapshotter as part of cengine's tested Buildx contract.
+builder pins BuildKit, stores its state on a 512 GiB sparse block-backed ext4
+volume, and uses the overlayfs snapshotter as part of cengine's tested Buildx
+contract.
 
 See [`docker-compatibility.md`](docker-compatibility.md) for the detailed
 compatibility ledger and test provenance.

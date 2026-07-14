@@ -7,6 +7,7 @@ public enum DockerIntegration {
     public static let contextName = "cengine"
     public static let builderName = "cengine-builder"
     public static let buildkitImage = "moby/buildkit:v0.27.1"
+    public static let buildkitSnapshotter = "overlayfs"
     private static let cpuPeriod = 100_000
 
     /// Locates an executable on PATH, falling back to the standard Homebrew
@@ -31,8 +32,8 @@ public enum DockerIntegration {
         _ = try? runDocker(["context", "rm", "-f", contextName])
     }
 
-    /// Creates the managed Buildx builder or reconciles its VM resource
-    /// settings while retaining the builder's cache volume.
+    /// Creates the managed Buildx builder or reconciles its configuration,
+    /// retaining the cache only when its snapshotter remains compatible.
     public static func configureBuilder(_ settings: BuilderSettings) throws {
         try settings.validate()
         guard executable(named: "docker") != nil else {
@@ -49,7 +50,10 @@ public enum DockerIntegration {
         let inspected = try? runDocker(["buildx", "inspect", builderName])
         if let inspected {
             if !builder(inspected, matches: settings) {
-                _ = try runDocker(["buildx", "rm", "--force", "--keep-state", builderName])
+                var removal = ["buildx", "rm", "--force"]
+                if builderUsesManagedSnapshotter(inspected) { removal.append("--keep-state") }
+                removal.append(builderName)
+                _ = try runDocker(removal)
                 _ = try runDocker(createBuilderArguments(settings))
             }
         } else {
@@ -67,7 +71,7 @@ public enum DockerIntegration {
             "--driver-opt", "memory=\(settings.memoryBytes)",
             "--driver-opt", "cpu-period=\(cpuPeriod)",
             "--driver-opt", "cpu-quota=\(settings.cpus * cpuPeriod)",
-            "--buildkitd-flags", "--oci-worker-snapshotter=native", contextName,
+            "--buildkitd-flags", "--oci-worker-snapshotter=\(buildkitSnapshotter)", contextName,
         ]
     }
 
@@ -77,8 +81,13 @@ public enum DockerIntegration {
             "memory=\"\(settings.memoryBytes)\"",
             "cpu-period=\"\(cpuPeriod)\"",
             "cpu-quota=\"\(settings.cpus * cpuPeriod)\"",
+            "--oci-worker-snapshotter=\(buildkitSnapshotter)",
         ]
         return expected.allSatisfy(inspection.contains)
+    }
+
+    static func builderUsesManagedSnapshotter(_ inspection: String) -> Bool {
+        inspection.contains("--oci-worker-snapshotter=\(buildkitSnapshotter)")
     }
 
     @discardableResult public static func runDocker(_ arguments: [String]) throws -> String {

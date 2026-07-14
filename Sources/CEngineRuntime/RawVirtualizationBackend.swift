@@ -8,8 +8,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     enum VolumeStorageMode: String, Codable, Sendable { case block, shared }
 
     public static let defaultRootDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
-    public static let defaultVolumeDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
-    public static let defaultStorageDiskBytes: UInt64 = 512 * 1_024 * 1_024 * 1_024
+    public static let defaultVolumeDiskBytes = VolumeRecord.defaultSizeBytes
+    public static let defaultStorageDiskBytes = VolumeRecord.defaultSizeBytes
     static let managementServerAddress = "100.64.0.1"
 
     private let root: URL

@@ -47,6 +47,12 @@ import Testing
     }
 
     #if os(macOS)
+    @Test func blockVolumesUseTheReportedSparseCapacity() {
+        #expect(VolumeRecord.defaultSizeBytes == 512 * 1_024 * 1_024 * 1_024)
+        #expect(RawVirtualizationBackend.defaultVolumeDiskBytes == VolumeRecord.defaultSizeBytes)
+        #expect(RawVirtualizationBackend.defaultStorageDiskBytes == VolumeRecord.defaultSizeBytes)
+    }
+
     @Test func multiContainerVolumesUseSharedStorageBeforeVMsStart() throws {
         let modes = try RawVirtualizationBackend.resolveVolumeStorageModes(
             names: ["compose-data", "buildkit-state"],

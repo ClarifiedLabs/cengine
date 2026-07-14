@@ -27,8 +27,11 @@ devices, deferred hard links, timestamps, and descriptor-safe path traversal.
 Each container has a sparse private ext4 root disk. Volumes with a single known
 consumer use their own sparse ext4 disk, attached directly to that container's
 VM. The storage appliance owns a separate sparse ext4 disk containing volumes
-that must be mounted by multiple container VMs. macOS never mounts any of these
-filesystems.
+that must be mounted by multiple container VMs. Container root disks default to
+64 GiB; block-backed named volumes and the shared storage disk default to 512
+GiB. These files are sparse, so their host allocation grows with writes rather
+than consuming their logical capacity immediately. macOS never mounts any of
+these filesystems.
 
 ## Volumes
 

@@ -29,7 +29,7 @@ digests.
 | Container lifecycle and inspect | `CTR-001`–`CTR-040`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Higher-volume concurrent lifecycle stress is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-040`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-012`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
-| Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-002` | Authenticated push and pull-back use a pinned local registry. |
+| Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-003` | Authenticated push and pull-back use a pinned local registry. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-005` | Recovery covers live workloads, log and stats streams, active networking, and vmnet reservation release. |
 | Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
 
@@ -197,8 +197,9 @@ builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
-| `BLD-001` | `test_buildx_load_run_cache_and_volume_copy` | ✅ Pass | Support | The managed native-snapshotter builder supports non-scratch `COPY`, `RUN`, load, cache reuse, and volume initialization. |
+| `BLD-001` | `test_buildx_load_run_cache_and_volume_copy` | ✅ Pass | Support | The managed overlayfs builder supports non-scratch `COPY`, `RUN`, load, cache reuse, and volume initialization. |
 | `BLD-002` | `test_buildx_pull_succeeds_after_daemon_restart` | ✅ Pass | Support | **cengine-owned.** A recovered BuildKit VM regains carrier, DNS, and registry access for a fresh pull. |
+| `BLD-003` | `test_buildx_overlay_worker_has_large_state_volume` | ✅ Pass | Support | **cengine-owned.** Parallel stages use overlayfs on a 512 GiB sparse block-backed state volume. |
 
 ## Daemon recovery
 
