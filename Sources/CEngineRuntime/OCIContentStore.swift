@@ -481,10 +481,21 @@ public actor OCIContentStore {
         let handle = try FileHandle(forWritingTo: temporary)
         try handle.synchronize()
         try handle.close()
-        do { try FileManager.default.moveItem(at: temporary, to: destination) }
+        do {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(
+                    destination,
+                    withItemAt: temporary,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        }
         catch {
             try? FileManager.default.removeItem(at: temporary)
-            if !FileManager.default.fileExists(atPath: destination.path) { throw error }
+            throw error
         }
     }
 

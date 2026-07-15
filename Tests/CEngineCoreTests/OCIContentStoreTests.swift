@@ -27,16 +27,18 @@ import Testing
         #expect(try await store.data(for: descriptor.digest) == data)
     }
 
-    @Test func referencesPersistAcrossStoreInstances() async throws {
+    @Test func updatedReferencesPersistAcrossStoreInstances() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let first = try OCIContentStore(root: root)
         let descriptor = try await first.put(Data("manifest".utf8), mediaType: "application/vnd.oci.image.manifest.v1+json")
         try await first.tag(descriptor, as: "alpine:latest")
+        try await first.tag(descriptor, as: "example:latest")
 
         let second = try OCIContentStore(root: root)
 
         #expect(await second.descriptor(for: "alpine:latest") == descriptor)
+        #expect(await second.descriptor(for: "example:latest") == descriptor)
     }
 
     @Test func pruneDeduplicatesDescriptorsSharedByMultipleTags() async throws {
