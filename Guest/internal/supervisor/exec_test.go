@@ -3,18 +3,91 @@
 package supervisor
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"os/exec"
 	"reflect"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
 
+type testReadWriter struct {
+	io.ReadWriter
+}
+
+func TestAttachedExecStdinCanBeReopenedThroughDevStdin(t *testing.T) {
+	stream := testReadWriter{ReadWriter: struct {
+		io.Reader
+		io.Writer
+	}{Reader: bytes.NewBufferString("pipe-stdin"), Writer: io.Discard}}
+	stdin, cancel, err := attachedExecStdin(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	defer stdin.Close()
+	command := exec.Command("sh", "-c", "cat /dev/stdin")
+	command.Stdin = stdin
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(output) != "pipe-stdin" {
+		t.Fatalf("unexpected reopened stdin %q", output)
+	}
+}
+
+func TestDockerStreamMuxFramesAttachedExecOutput(t *testing.T) {
+	var output bytes.Buffer
+	mux := &dockerStreamMux{writer: &output}
+	payload := bytes.Repeat([]byte("x"), 256*1024)
+
+	written, err := mux.stream(2).Write(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != len(payload) {
+		t.Fatalf("wrote %d bytes, want %d", written, len(payload))
+	}
+	framed := output.Bytes()
+	if len(framed) != len(payload)+8 {
+		t.Fatalf("framed output is %d bytes, want %d", len(framed), len(payload)+8)
+	}
+	if framed[0] != 2 || !bytes.Equal(framed[1:4], []byte{0, 0, 0}) {
+		t.Fatalf("invalid Docker stream header %v", framed[:4])
+	}
+	if size := binary.BigEndian.Uint32(framed[4:8]); size != uint32(len(payload)) {
+		t.Fatalf("framed payload size is %d, want %d", size, len(payload))
+	}
+	if !bytes.Equal(framed[8:], payload) {
+		t.Fatal("framed payload was corrupted")
+	}
+}
+
+func TestDockerStreamMuxLeavesTerminalOutputUnframed(t *testing.T) {
+	var output bytes.Buffer
+	mux := &dockerStreamMux{writer: &output, terminal: true}
+	payload := []byte("terminal output")
+
+	if _, err := mux.stream(1).Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), payload) {
+		t.Fatalf("terminal output was framed: %q", output.Bytes())
+	}
+}
+
 func TestExecUnsharesFilesystemContextBeforeJoiningWorkloadNamespaces(t *testing.T) {
 	var calls []string
 	operations := namespaceOperations{
 		unshare: func(flag int) error { calls = append(calls, fmt.Sprintf("unshare:%d", flag)); return nil },
-		open: func(path string, _ int, _ uint32) (int, error) { calls = append(calls, "open:"+path); return len(calls), nil },
+		open: func(path string, _ int, _ uint32) (int, error) {
+			calls = append(calls, "open:"+path)
+			return len(calls), nil
+		},
 		setns: func(_ int, flag int) error { calls = append(calls, fmt.Sprintf("setns:%d", flag)); return nil },
 		close: func(_ int) error { return nil },
 	}

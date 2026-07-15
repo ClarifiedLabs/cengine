@@ -348,6 +348,19 @@ public actor EngineRuntime {
         Task { [weak self] in await self?.monitorExec(identifier) }
     }
 
+    public func startAttachedExec(_ identifier: String) async throws -> CInt? {
+        var exec = try exec(identifier)
+        guard !exec.running, exec.exitCode == nil else {
+            throw EngineError(.conflict, "exec instance has already run")
+        }
+        guard let descriptor = try await backend.startAttachedExec(exec) else { return nil }
+        exec.running = true
+        exec.pid = await backend.execPID(exec)
+        execs[identifier] = exec
+        Task { [weak self] in await self?.monitorExec(identifier) }
+        return descriptor
+    }
+
     public func resizeExec(_ identifier: String, width: UInt16, height: UInt16) async throws {
         try await backend.resizeExec(exec(identifier), width: width, height: height)
     }

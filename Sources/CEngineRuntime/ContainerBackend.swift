@@ -44,6 +44,7 @@ public protocol ContainerBackend: Sendable {
     func kill(_ container: ContainerRecord, signal: String) async throws
     func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge
     func startExec(_ exec: ExecRecord) async throws
+    func startAttachedExec(_ exec: ExecRecord) async throws -> CInt?
     func execCompletion(_ exec: ExecRecord) async -> Int32?
     func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge
     func execPID(_ exec: ExecRecord) async -> Int32
@@ -92,6 +93,7 @@ public extension ContainerBackend {
         throw EngineError(.unsupported, "exec is unavailable for this backend")
     }
     func startExec(_: ExecRecord) async throws { throw EngineError(.unsupported, "exec is unavailable for this backend") }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? { nil }
     func execCompletion(_: ExecRecord) async -> Int32? { nil }
     func execIO(_: ExecRecord) async throws -> ContainerIOBridge { throw EngineError(.notFound, "exec I/O is unavailable") }
     func execPID(_: ExecRecord) async -> Int32 { 0 }

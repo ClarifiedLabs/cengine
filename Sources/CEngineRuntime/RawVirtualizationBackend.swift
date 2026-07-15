@@ -340,14 +340,26 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let bridge = ContainerIOBridge(tty: exec.configuration.tty, logURL: ioDirectory.appending(path: "exec-\(exec.id)-docker.log"))
         let monitor = ContainerLogMonitor(stdoutURL: stdout, stderrURL: stderr, inputURL: stdin, bridge: bridge); monitor.start()
         execBridges[exec.id] = bridge; execMonitors[exec.id] = monitor; execShims[exec.id] = shim
-        struct Spec: Encodable { let id: String; let arguments, environment: [String]; let workingDirectory, user: String; let terminal: Bool }
+        struct Spec: Encodable {
+            let id: String; let arguments, environment: [String]; let workingDirectory, user: String
+            let terminal, attachStdin, attachStdout, attachStderr: Bool
+        }
         struct Status: Decodable { let status: String }
         let configuration = exec.configuration
         let containerEnvironment = Self.mergeEnvironment(
             image: image.configuration.config?.environment ?? [], container: container.environment
         )
         let environment = Self.mergeEnvironment(image: containerEnvironment, container: configuration.environment)
-        _ = try await shim.guest(operation: "prepare-exec", payload: Spec(id: exec.id, arguments: configuration.arguments, environment: environment, workingDirectory: configuration.workingDirectory, user: configuration.user, terminal: configuration.tty), response: Status.self)
+        _ = try await shim.guest(
+            operation: "prepare-exec",
+            payload: Spec(
+                id: exec.id, arguments: configuration.arguments, environment: environment,
+                workingDirectory: configuration.workingDirectory, user: configuration.user,
+                terminal: configuration.tty, attachStdin: configuration.attachStdin,
+                attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr
+            ),
+            response: Status.self
+        )
         return bridge
     }
 
@@ -356,6 +368,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
         struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let pid: Int? }
         let status: Status = try await shim.guest(operation: "start-exec", payload: Request(id: exec.id), response: Status.self)
         guard status.status == "running" else { throw EngineError(.internalError, "exec did not start") }
+    }
+
+    public func startAttachedExec(_ exec: ExecRecord) async throws -> CInt? {
+        guard let shim = execShims[exec.id] else { throw EngineError(.notFound, "exec is unavailable") }
+        return try await shim.startExecStream(id: exec.id)
     }
 
     public func execCompletion(_ exec: ExecRecord) async -> Int32? {

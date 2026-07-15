@@ -87,6 +87,12 @@ func main() {
 	defer rootListener.Close()
 	go serveRootFS(rootListener)
 	state := &controlServer{process: supervisor.New()}
+	execListener, err := vsock.Listen(protocol.ExecIOPort)
+	if err != nil {
+		log.Fatalf("listen on exec I/O vsock: %v", err)
+	}
+	defer execListener.Close()
+	go state.serveExecIO(execListener)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -95,6 +101,55 @@ func main() {
 		}
 		go state.serve(connection)
 	}
+}
+
+func (state *controlServer) serveExecIO(listener net.Listener) {
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			log.Printf("accept exec I/O connection: %v", err)
+			continue
+		}
+		go state.handleExecIO(connection)
+	}
+}
+
+func (state *controlServer) handleExecIO(connection net.Conn) {
+	defer connection.Close()
+	request, err := protocol.ReadEnvelope(connection)
+	if err != nil {
+		return
+	}
+	response := protocol.Envelope{ID: request.ID, Operation: request.Operation}
+	if request.Operation != "start-exec-stream" {
+		response.Error = &protocol.Error{Code: "unsupported", Message: "unsupported exec I/O operation"}
+		_ = protocol.WriteEnvelope(connection, response)
+		return
+	}
+	var value struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(request.Payload, &value); err != nil {
+		response.Error = &protocol.Error{Code: "invalid_request", Message: err.Error()}
+		_ = protocol.WriteEnvelope(connection, response)
+		return
+	}
+
+	prepared := false
+	_, err = state.process.StartExecAttached(value.ID, connection, func(protocol.ProcessStatus) error {
+		prepared = true
+		return nil
+	})
+	if err != nil {
+		log.Printf("attached exec stream %s failed: %v", value.ID, err)
+		if !prepared {
+			response.Payload = nil
+			response.Error = &protocol.Error{Code: "exec", Message: err.Error()}
+			_ = protocol.WriteEnvelope(connection, response)
+		}
+		return
+	}
+	state.process.WaitExec(value.ID)
 }
 
 func serveRootFS(listener net.Listener) {

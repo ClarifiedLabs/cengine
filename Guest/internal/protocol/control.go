@@ -13,6 +13,7 @@ const (
 	ControlPort       = 4100
 	FileSystemPort    = 4101
 	RootFSContentPort = 4102
+	ExecIOPort        = 4103
 	MaxControlFrame   = 16 << 20
 	MaxFileSystemIO   = 4 << 20
 )
@@ -107,6 +108,9 @@ type ExecSpec struct {
 	WorkingDirectory string   `json:"workingDirectory"`
 	User             string   `json:"user"`
 	Terminal         bool     `json:"terminal"`
+	AttachStdin      bool     `json:"attachStdin"`
+	AttachStdout     bool     `json:"attachStdout"`
+	AttachStderr     bool     `json:"attachStderr"`
 }
 
 type RootFSLayer struct {

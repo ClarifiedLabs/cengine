@@ -111,6 +111,68 @@ def test_exec_inherits_and_overrides_container_environment(client: docker.Docker
     assert container_only == "present"
 
 
+@pytest.mark.compat("CTR-043")
+def test_attached_exec_streams_large_stdin_without_filesystem_polling(daemon, client: docker.DockerClient):
+    container = client.containers.run(
+        "alpine:latest", ["sh", "-c", "while :; do sleep 1; done"], detach=True
+    )
+    payload_size = 128 * 1024 * 1024
+    started = time.monotonic()
+    result = subprocess.run(
+        ["docker", "--host", f"unix://{daemon.socket}", "exec", "-i", container.id, "wc", "-c"],
+        input=b"x" * payload_size,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout.strip() == str(payload_size).encode()
+    assert elapsed < 5, f"128 MiB attached exec transfer took {elapsed:.2f}s"
+
+
+@pytest.mark.compat("CTR-044")
+def test_attached_exec_flushes_short_output_before_eof(daemon, client: docker.DockerClient):
+    container = client.containers.run(
+        "alpine:latest", ["sh", "-c", "while :; do sleep 1; done"], detach=True
+    )
+
+    # Buildx keeps attached stdin open while short-lived setup commands run. The
+    # remote process must still finish without waiting for client-side stdin EOF.
+    process = subprocess.Popen(
+        [
+            "docker", "--host", f"unix://{daemon.socket}", "exec", "-i", container.id,
+            "printf", "%s", "open-stdin",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.wait(timeout=10) == 0
+        assert process.stdout.read() == b"open-stdin"
+    finally:
+        process.stdin.close()
+        if process.poll() is None:
+            process.kill()
+
+    for index in range(20):
+        expected = f"eof-{index:02d}".encode()
+        result = subprocess.run(
+            [
+                "docker", "--host", f"unix://{daemon.socket}", "exec", container.id,
+                "printf", "%s", expected.decode(),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        assert result.stdout == expected
+
+
 @pytest.mark.compat("VOL-006")
 def test_volume_preserves_inodes_across_link_and_rename(client: docker.DockerClient):
     volume = client.volumes.create(

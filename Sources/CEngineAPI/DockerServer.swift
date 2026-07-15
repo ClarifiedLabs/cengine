@@ -383,7 +383,10 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
     let requiredUpgradeHeaders: [String] = []
     private let router: DockerRouter
     private let lock = NSLock()
-    private struct Pending: Sendable { let io: ContainerIOBridge; let execID: String? }
+    private enum Pending: Sendable {
+        case buffered(io: ContainerIOBridge, execID: String?)
+        case stream(Channel)
+    }
     private var pending: [ObjectIdentifier: Pending] = [:]
 
     init(router: DockerRouter) { self.router = router }
@@ -402,16 +405,34 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
             do {
                 let pending: Pending
                 switch target {
-                case .container(let id): pending = try await .init(io: router.containerIO(id), execID: nil)
-                case .exec(let id): pending = try await .init(io: router.execIO(id), execID: id)
+                case .container(let id):
+                    pending = try await .buffered(io: router.containerIO(id), execID: nil)
+                case .exec(let id):
+                    if let descriptor = try await router.startAttachedExec(id) {
+                        let stream = try await ClientBootstrap(group: channel.eventLoop)
+                            .channelOption(ChannelOptions.autoRead, value: false)
+                            .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                            .withConnectedSocket(descriptor)
+                            .get()
+                        pending = .stream(stream)
+                    } else {
+                        pending = try await .buffered(io: router.execIO(id), execID: id)
+                    }
                 }
-                self.lock.withLock { self.pending[ObjectIdentifier(channel as AnyObject)] = pending }
+                let key = ObjectIdentifier(channel as AnyObject)
+                self.lock.withLock { self.pending[key] = pending }
+                channel.closeFuture.whenComplete { _ in
+                    let abandoned = self.lock.withLock { self.pending.removeValue(forKey: key) }
+                    if case .stream(let stream)? = abandoned { stream.close(promise: nil) }
+                }
                 channel.eventLoop.execute {
                     var headers = initialResponseHeaders
                     headers.replaceOrAdd(name: "Content-Type", value: "application/vnd.docker.raw-stream")
                     promise.succeed(headers)
                 }
             } catch {
+                let message = "docker stream upgrade failed for \(upgradeRequest.uri): \(EngineError.message(for: error))\n"
+                try? FileHandle.standardError.write(contentsOf: Data(message.utf8))
                 channel.eventLoop.execute { promise.fail(error) }
             }
         }
@@ -423,17 +444,37 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
         guard let pending = lock.withLock({ pending.removeValue(forKey: key) }) else {
             return context.eventLoop.makeFailedFuture(EngineError(.internalError, "attach I/O was not prepared"))
         }
-        let pipeline = context.pipeline
-        return pipeline.removeHandler(name: "docker-http").flatMap {
-            pipeline.addHandler(ContainerAttachHandler(io: pending.io))
-        }.map {
-            if let execID = pending.execID {
-                Task {
-                    do { try await self.router.startExec(execID) }
-                    catch { pending.io.finishOutput() }
+        let channel = context.channel
+        let pipeline = channel.pipeline
+        let result = channel.setOption(ChannelOptions.autoRead, value: false).flatMap {
+            pipeline.removeHandler(name: "docker-http")
+        }.flatMap {
+            switch pending {
+            case .buffered(let io, let execID):
+                return pipeline.addHandler(ContainerAttachHandler(io: io)).flatMap {
+                    channel.setOption(ChannelOptions.autoRead, value: true)
+                }.map {
+                    if let execID {
+                        Task {
+                            do { try await self.router.startExec(execID) }
+                            catch { io.finishOutput() }
+                        }
+                    }
                 }
+            case .stream(let stream):
+                return pipeline.addHandler(StreamingRelayHandler(peer: stream)).and(
+                    stream.pipeline.addHandler(StreamingRelayHandler(peer: channel))
+                ).flatMap { _ in
+                    channel.setOption(ChannelOptions.autoRead, value: true).and(
+                        stream.setOption(ChannelOptions.autoRead, value: true)
+                    )
+                }.map { _ in }
             }
         }
+        if case .stream(let stream) = pending {
+            result.whenFailure { _ in stream.close(promise: nil) }
+        }
+        return result
     }
 
     private enum UpgradeTarget: Sendable { case container(String), exec(String) }
@@ -447,6 +488,49 @@ private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Se
             return .exec(String(path.dropFirst("/exec/".count).dropLast("/start".count)))
         }
         return nil
+    }
+}
+
+private final class StreamingRelayHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    private let peer: Channel
+
+    init(peer: Channel) { self.peer = peer }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        peer.write(unwrapInboundIn(data), promise: nil)
+    }
+
+    func channelReadComplete(context: ChannelHandlerContext) {
+        peer.flush()
+        context.fireChannelReadComplete()
+    }
+
+    func channelWritabilityChanged(context: ChannelHandlerContext) {
+        peer.setOption(ChannelOptions.autoRead, value: context.channel.isWritable).whenFailure { _ in
+            self.peer.close(promise: nil)
+        }
+        context.fireChannelWritabilityChanged()
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let event = event as? ChannelEvent, event == .inputClosed {
+            peer.flush()
+            peer.close(mode: .output, promise: nil)
+            return
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        peer.flush()
+        peer.close(promise: nil)
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        peer.close(promise: nil)
+        context.close(promise: nil)
     }
 }
 

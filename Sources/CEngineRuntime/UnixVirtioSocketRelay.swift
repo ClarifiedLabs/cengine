@@ -55,6 +55,8 @@ final class BidirectionalDescriptorRelay: @unchecked Sendable {
     private let completion: @Sendable () -> Void
     private let lock = NSLock()
     private var finished = false
+    private var leftInputClosed = false
+    private var rightInputClosed = false
 
     init(left: FileHandle, right: FileHandle, close: @escaping @Sendable () -> Void, completion: @escaping @Sendable () -> Void) {
         self.left = left
@@ -64,15 +66,46 @@ final class BidirectionalDescriptorRelay: @unchecked Sendable {
     }
 
     func start() {
-        left.readabilityHandler = { [weak self] in self?.forward(from: $0, to: self?.right) }
-        right.readabilityHandler = { [weak self] in self?.forward(from: $0, to: self?.left) }
+        startLeftToRight()
+        startRightToLeft()
     }
 
-    private func forward(from source: FileHandle, to target: FileHandle?) {
+    func startLeftToRight() {
+        left.readabilityHandler = { [weak self] in self?.forward(from: $0, to: self?.right, leftToRight: true) }
+    }
+
+    func startRightToLeft() {
+        right.readabilityHandler = { [weak self] in self?.forward(from: $0, to: self?.left, leftToRight: false) }
+    }
+
+    func cancel() { finish() }
+
+    private func forward(from source: FileHandle, to target: FileHandle?, leftToRight: Bool) {
         guard let target else { finish(); return }
         let data = source.availableData
-        guard !data.isEmpty else { finish(); return }
+        guard !data.isEmpty else {
+            halfClose(source: source, target: target, leftToRight: leftToRight)
+            return
+        }
         do { try target.write(contentsOf: data) } catch { finish() }
+    }
+
+    private func halfClose(source: FileHandle, target: FileHandle, leftToRight: Bool) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        if leftToRight {
+            guard !leftInputClosed else { lock.unlock(); return }
+            leftInputClosed = true
+        } else {
+            guard !rightInputClosed else { lock.unlock(); return }
+            rightInputClosed = true
+        }
+        source.readabilityHandler = nil
+        let bothClosed = leftInputClosed && rightInputClosed
+        lock.unlock()
+
+        _ = Darwin.shutdown(target.fileDescriptor, SHUT_WR)
+        if bothClosed { finish() }
     }
 
     private func finish() {
@@ -81,8 +114,8 @@ final class BidirectionalDescriptorRelay: @unchecked Sendable {
         finished = true
         left.readabilityHandler = nil
         right.readabilityHandler = nil
-        closeAction()
         lock.unlock()
+        closeAction()
         completion()
     }
 }

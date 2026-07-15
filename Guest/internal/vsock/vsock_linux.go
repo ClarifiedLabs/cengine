@@ -106,6 +106,7 @@ func newConn(fd int, local, remote Addr) net.Conn {
 func (value *conn) Read(data []byte) (int, error)        { return value.file.Read(data) }
 func (value *conn) Write(data []byte) (int, error)       { return value.file.Write(data) }
 func (value *conn) Close() error                         { return value.file.Close() }
+func (value *conn) CloseRead() error                     { return unix.Shutdown(int(value.file.Fd()), unix.SHUT_RD) }
 func (value *conn) LocalAddr() net.Addr                  { return value.local }
 func (value *conn) RemoteAddr() net.Addr                 { return value.remote }
 func (value *conn) SetDeadline(deadline time.Time) error { return value.file.SetDeadline(deadline) }

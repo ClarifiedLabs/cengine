@@ -62,6 +62,10 @@ import Foundation
             let decoded = try VMShimProtocol.decode(try readFrame(file))
             request = decoded
             guard decoded.token == specification.token else { throw EngineError(.unauthorized, "invalid VM shim token") }
+            if decoded.operation == .startExecStream {
+                try await startExecStream(decoded, local: file)
+                return
+            }
             let payload = try await perform(decoded)
             try file.write(contentsOf: VMShimProtocol.encode(.init(id: decoded.id, token: specification.token, operation: decoded.operation, payload: payload)))
             if decoded.operation == .shutdown {
@@ -109,6 +113,8 @@ import Foundation
             let store = try OCIContentStore(root: URL(filePath: value.contentStorePath))
             try await RootFSContentStreamer(store: store).prepare(machine: machine, layers: value.layers)
             return try JSONEncoder().encode(Empty())
+        case .startExecStream:
+            throw EngineError(.internalError, "exec streams must be upgraded before dispatch")
         case .configureNetwork:
             struct Configuration: Decodable { let vlans: [UInt16] }
             guard let payload = request.payload else { throw EngineError(.badRequest, "network configuration has no payload") }
@@ -308,6 +314,55 @@ import Foundation
             relay.start()
         } catch {
             try? local.close()
+        }
+    }
+
+    private func startExecStream(_ request: VMShimProtocol.Envelope, local: FileHandle) async throws {
+        guard let payload = request.payload else { throw EngineError(.badRequest, "exec stream request has no payload") }
+        guard let machine else { throw EngineError(.conflict, "VM guest control is unavailable") }
+        _ = try JSONDecoder().decode(VMShimClient.ExecStreamRequest.self, from: payload)
+
+        let connection = try await machine.connect(toPort: GuestProtocol.execIOPort)
+        let streamConnection = SendableVirtioSocketConnection(connection)
+        let target = FileHandle(fileDescriptor: connection.fileDescriptor, closeOnDealloc: false)
+        let setupDescriptor = Darwin.dup(connection.fileDescriptor)
+        guard setupDescriptor >= 0 else {
+            streamConnection.connection.close()
+            throw EngineError(.internalError, "duplicate exec stream descriptor: \(String(cString: strerror(errno)))")
+        }
+        let setup = FileHandle(fileDescriptor: setupDescriptor, closeOnDealloc: true)
+        do {
+            let guestRequest = GuestProtocol.Envelope(operation: "start-exec-stream", payload: payload)
+            let setupData = try GuestProtocol.encode(guestRequest)
+
+            try local.write(contentsOf: VMShimProtocol.encode(.init(
+                id: request.id,
+                token: specification.token,
+                operation: request.operation,
+                payload: try JSONEncoder().encode(Empty())
+            )))
+
+            let id = UUID()
+            let relay = BidirectionalDescriptorRelay(
+                left: local,
+                right: target,
+                close: { try? local.close(); streamConnection.connection.close() },
+                completion: { [weak self] in Task { @MainActor in self?.serviceRelays.removeValue(forKey: id) } }
+            )
+            serviceRelays[id] = relay
+            relay.startRightToLeft()
+            do {
+                try setup.write(contentsOf: setupData)
+                try setup.close()
+            } catch {
+                relay.cancel()
+                throw error
+            }
+            relay.startLeftToRight()
+        } catch {
+            try? setup.close()
+            streamConnection.connection.close()
+            throw error
         }
     }
 

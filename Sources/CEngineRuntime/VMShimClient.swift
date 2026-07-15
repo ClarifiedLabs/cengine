@@ -8,6 +8,7 @@ public final class VMShimClient: @unchecked Sendable {
     public struct FabricNetwork: Codable, Hashable, Sendable { public var id: String; public var vlan: UInt16; public var subnet: String; public var gateway: String; public var ipv6Subnet: String; public var internalNetwork: Bool; public var isolated: Bool; public var ports: [FabricPort] }
     public struct GuestCall: Codable, Sendable { public var operation: String; public var payload: Data }
     public struct RootFSRequest: Codable, Sendable { public var contentStorePath: String; public var layers: [OCIDescriptor] }
+    public struct ExecStreamRequest: Codable, Sendable { public var id: String }
 
     public let specification: VMShimProtocol.Specification
 
@@ -44,6 +45,10 @@ public final class VMShimClient: @unchecked Sendable {
     public func resume() async throws -> VMShimProtocol.Status { try await request(.resume, response: VMShimProtocol.Status.self) }
     public func stop() async throws -> VMShimProtocol.Status { try await request(.stop, response: VMShimProtocol.Status.self) }
     public func shutdown() async throws -> VMShimProtocol.Status { try await request(.shutdown, response: VMShimProtocol.Status.self) }
+
+    public func startExecStream(id: String) async throws -> CInt {
+        try await Task.detached { [self] in try requestExecStream(id: id) }.value
+    }
 
     public func guest<Payload: Encodable, Response: Decodable>(operation: String, payload: Payload, response: Response.Type) async throws -> Response {
         let call = GuestCall(operation: operation, payload: try JSONEncoder().encode(payload))
@@ -88,6 +93,30 @@ public final class VMShimClient: @unchecked Sendable {
         if let failure = reply.error { throw EngineError(.internalError, "VM shim \(failure.code): \(failure.message)") }
         guard let payload = reply.payload else { throw EngineError(.internalError, "VM shim response has no payload") }
         return payload
+    }
+
+    private func requestExecStream(id: String) throws -> CInt {
+        let descriptor = try UnixSocket.connect(path: specification.socketPath)
+        do {
+            let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+            let envelope = VMShimProtocol.Envelope(
+                token: specification.token,
+                operation: .startExecStream,
+                payload: try JSONEncoder().encode(ExecStreamRequest(id: id))
+            )
+            try file.write(contentsOf: VMShimProtocol.encode(envelope))
+            let reply = try VMShimProtocol.decode(try readFrame(file))
+            guard reply.id == envelope.id else {
+                throw EngineError(.internalError, "VM shim response id mismatch")
+            }
+            if let failure = reply.error {
+                throw EngineError(.internalError, "VM shim \(failure.code): \(failure.message)")
+            }
+            return descriptor
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
     }
 
     private func readFrame(_ file: FileHandle) throws -> Data {
