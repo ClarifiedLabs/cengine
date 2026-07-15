@@ -14,7 +14,12 @@ from dataclasses import dataclass, field
 import docker
 import pytest
 
-from harness import COMPATIBILITY_OWNER_FILE, docker_environment, terminate_compatibility_runtime
+from harness import (
+    COMPATIBILITY_OWNER_FILE,
+    compatibility_image_cache_key,
+    docker_environment,
+    terminate_compatibility_runtime,
+)
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -44,6 +49,15 @@ FIXTURE_IMAGES = [
         "mirror.gcr.io/kindest/node@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5",
     ),
 ]
+
+
+def fixture_image_seeds() -> list[tuple[str, str]]:
+    image = os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE)
+    source = os.environ.get(
+        "CENGINE_TEST_IMAGE_SOURCE",
+        DEFAULT_IMAGE_SOURCE if image == DEFAULT_IMAGE else image,
+    )
+    return [(image, source)] + FIXTURE_IMAGES
 
 
 def expected_git_commit(binary: pathlib.Path) -> str:
@@ -242,7 +256,8 @@ def daemon(request: pytest.FixtureRequest, image_cache: pathlib.Path) -> Daemon:
 
 @pytest.fixture(scope="session")
 def image_cache():
-    root = REPO_ROOT / ".build/compat-image-cache-v1"
+    key = compatibility_image_cache_key(fixture_image_seeds())
+    root = REPO_ROOT / ".build" / f"compat-image-cache-{key}"
     root.mkdir(parents=True, exist_ok=True)
     yield root
 
@@ -260,13 +275,7 @@ def client(daemon: Daemon, image_cache: pathlib.Path) -> docker.DockerClient:
             f"cengine binary identity mismatch: expected GitCommit {expected}, daemon reports {actual} "
             f"(binary: {daemon.binary}, socket: {socket})"
         )
-    image = os.environ.get("CENGINE_TEST_IMAGE", DEFAULT_IMAGE)
-    source = os.environ.get(
-        "CENGINE_TEST_IMAGE_SOURCE",
-        DEFAULT_IMAGE_SOURCE if image == DEFAULT_IMAGE else image,
-    )
-    seeds = [(image, source)] + FIXTURE_IMAGES
-    for target, seed_source in seeds:
+    for target, seed_source in fixture_image_seeds():
         try:
             value.images.get(target)
             continue

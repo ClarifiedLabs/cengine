@@ -14,6 +14,7 @@ from harness import (  # noqa: E402
     DOCKER_ENDPOINT_VARIABLES,
     COMPATIBILITY_OWNER_FILE,
     VMNET_TEARDOWN_SETTLE_SECONDS,
+    compatibility_image_cache_key,
     compatibility_root_owned_by,
     compatibility_runtime_processes,
     control_plane_status_is_ready,
@@ -42,6 +43,14 @@ def main() -> None:
     assert not control_plane_status_is_ready(0, b"True False")
     assert control_plane_status_is_ready(0, b"True")
     assert control_plane_status_is_ready(0, "True True")
+
+    cache_key = compatibility_image_cache_key([("alpine:latest", "mirror/alpine:latest")])
+    assert cache_key == compatibility_image_cache_key([("alpine:latest", "mirror/alpine:latest")])
+    assert cache_key != compatibility_image_cache_key([("alpine:latest", "alpine:latest")])
+    assert cache_key != compatibility_image_cache_key([
+        ("alpine:latest", "mirror/alpine:latest"),
+        ("busybox:latest", "mirror/busybox:latest"),
+    ])
 
     binary = REPO_ROOT / ".build/xcode-derived/Build/Products/Debug/cengine"
     compatibility_root = pathlib.Path("/private/var/folders/test/T/cengine-compat-owned/root")

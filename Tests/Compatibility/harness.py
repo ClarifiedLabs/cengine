@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import pathlib
 import signal
@@ -16,6 +18,11 @@ DOCKER_ENDPOINT_VARIABLES = (
     "DOCKER_TLS",
     "DOCKER_TLS_VERIFY",
 )
+
+
+def compatibility_image_cache_key(seeds: list[tuple[str, str]]) -> str:
+    encoded = json.dumps(seeds, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def control_plane_status_is_ready(exit_code: int, output: bytes | str) -> bool:
