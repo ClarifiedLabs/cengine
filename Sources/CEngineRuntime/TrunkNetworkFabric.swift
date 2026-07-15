@@ -11,6 +11,7 @@ public actor TrunkNetworkFabric {
     private struct Endpoint {
         let file: FileHandle
         var vlans: Set<UInt16>
+        let registration: UUID?
     }
 
     private struct LearnedAddress: Hashable {
@@ -30,12 +31,20 @@ public actor TrunkNetworkFabric {
     public init() {}
 
     public func register(_ id: EndpointID, file: FileHandle, vlans: Set<UInt16> = []) {
+        register(id, file: file, vlans: vlans, registration: nil)
+    }
+
+    func register(_ id: EndpointID, file: FileHandle, vlans: Set<UInt16>, registration: UUID) {
+        register(id, file: file, vlans: vlans, registration: Optional(registration))
+    }
+
+    private func register(_ id: EndpointID, file: FileHandle, vlans: Set<UInt16>, registration: UUID?) {
         unregister(id)
-        endpoints[id] = Endpoint(file: file, vlans: vlans)
+        endpoints[id] = Endpoint(file: file, vlans: vlans, registration: registration)
         file.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else {
-                Task { await self?.unregister(id) }
+                Task { await self?.unregister(id, registration: registration) }
                 return
             }
             Task { await self?.receive(data, from: id) }
@@ -43,6 +52,15 @@ public actor TrunkNetworkFabric {
     }
 
     public func unregister(_ id: EndpointID) {
+        unregister(id, registration: nil)
+    }
+
+    func unregister(_ id: EndpointID, registration: UUID) {
+        unregister(id, registration: Optional(registration))
+    }
+
+    private func unregister(_ id: EndpointID, registration: UUID?) {
+        if let registration, endpoints[id]?.registration != registration { return }
         endpoints[id]?.file.readabilityHandler = nil
         endpoints.removeValue(forKey: id)
         learned = learned.filter { $0.value != id }

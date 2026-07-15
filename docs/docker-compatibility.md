@@ -172,6 +172,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `NET-010` | `test_isolated_gateway_allows_only_network_peers` | ✅ Pass | Support | **cengine-owned.** Isolated gateway mode permits peer traffic and blocks host and internet traffic. |
 | `NET-011` | `test_isolated_gateway_options_round_trip_and_require_internal` | ✅ Pass | Support | **cengine-owned.** Docker bridge gateway options round-trip and isolated mode requires an internal network. |
 | `NET-012` | `test_isolated_gateway_filter_cannot_be_bypassed_by_adding_a_route` | ✅ Pass | Support | **cengine-owned.** The external frame filter remains effective when a privileged guest adds a default route. |
+| `NET-013` | `test_creating_container_preserves_existing_network_connectivity` | ✅ Pass | Support | **cengine-owned.** Replacing a running container's fabric bridge preserves its gateway, DNS, and Internet path. |
 | `VOL-001` | `test_volume_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
 | `VOL-002` | `test_empty_named_volume_copies_image_directory` | ✅ Pass | Support | **cengine-owned.** Empty named volumes receive image directory contents. |
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |

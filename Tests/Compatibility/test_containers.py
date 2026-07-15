@@ -619,6 +619,24 @@ def test_isolated_gateway_filter_cannot_be_bypassed_by_adding_a_route(client: do
     assert not _can_reach_internet(container)
 
 
+@pytest.mark.compat("NET-013")
+def test_creating_container_preserves_existing_network_connectivity(client: docker.DockerClient):
+    network = client.networks.get("default")
+    container = _network_container(client, network)
+    gateway = _gateway(network)
+    assert _host_http_request(container, gateway) == (0, b"host-ok", True)
+
+    client.containers.create(IMAGE, command="true")
+    time.sleep(0.5)
+
+    for _ in range(3):
+        assert _host_http_request(container, gateway) == (0, b"host-ok", True)
+    code, _ = container.exec_run([
+        "sh", "-c", "nslookup registry-1.docker.io >/dev/null && nc -z -w 5 1.1.1.1 443",
+    ])
+    assert code == 0
+
+
 @pytest.mark.compat("CTR-034")
 def test_network_none_has_only_loopback(client: docker.DockerClient):
     container = client.containers.create(IMAGE, command="top", network_mode="none")

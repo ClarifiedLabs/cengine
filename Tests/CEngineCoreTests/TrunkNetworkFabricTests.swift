@@ -31,4 +31,22 @@ import Testing
         #expect(TrunkNetworkFabric.isTransientPacketWriteError(POSIXError(.EAGAIN)))
         #expect(!TrunkNetworkFabric.isTransientPacketWriteError(POSIXError(.EPIPE)))
     }
+
+    @Test func staleRegistrationCannotUnregisterReplacementEndpoint() async throws {
+        let fabric = TrunkNetworkFabric()
+        let id = TrunkNetworkFabric.EndpointID("container")
+        let first = try RawPacketTrunk()
+        let second = try RawPacketTrunk()
+        let firstRegistration = UUID()
+        let secondRegistration = UUID()
+
+        await fabric.register(id, file: first.fabricFileHandle, vlans: [1], registration: firstRegistration)
+        await fabric.register(id, file: second.fabricFileHandle, vlans: [2], registration: secondRegistration)
+        await fabric.unregister(id, registration: firstRegistration)
+
+        #expect(await fabric.memberships(id) == [2])
+
+        await fabric.unregister(id, registration: secondRegistration)
+        #expect(await fabric.memberships(id).isEmpty)
+    }
 }

@@ -4,6 +4,11 @@ import Darwin
 import Foundation
 
 @MainActor public final class VMShimServer {
+    private struct NetworkBridgeRegistration {
+        let generation: UUID
+        let bridge: NetworkStreamBridge
+    }
+
     private let specification: VMShimProtocol.Specification
     private var machine: RawContainerVirtualMachine?
     private var state: VMShimProtocol.State = .created
@@ -15,7 +20,7 @@ import Foundation
     private let fabric = TrunkNetworkFabric()
     private var networkListener: Int32 = -1
     private var networkBridge: NetworkStreamBridge?
-    private var networkBridges: [String: NetworkStreamBridge] = [:]
+    private var networkBridges: [String: NetworkBridgeRegistration] = [:]
     private var activeVLANs: [UInt16]
     private var uplinks: [String: VMNetUplink] = [:]
     private var fabricNetworks: [String: VMShimClient.FabricNetwork] = [:]
@@ -238,19 +243,36 @@ import Foundation
         do {
             let trunk = try RawPacketTrunk()
             let id = TrunkNetworkFabric.EndpointID(registration.endpointID)
-            await fabric.register(id, file: trunk.fabricFileHandle, vlans: Set(registration.vlans))
+            let generation = UUID()
             let bridge = try NetworkStreamBridge(datagrams: trunk.virtualMachineFileHandle, stream: stream) { [weak self] in
                 Task { @MainActor in
-                    await self?.fabric.unregister(id)
-                    self?.networkBridges.removeValue(forKey: registration.endpointID)
+                    await self?.removeNetworkBridge(
+                        endpointID: registration.endpointID,
+                        generation: generation
+                    )
                 }
             }
-            networkBridges[registration.endpointID]?.finish()
-            networkBridges[registration.endpointID] = bridge
+            let previous = networkBridges.updateValue(
+                .init(generation: generation, bridge: bridge),
+                forKey: registration.endpointID
+            )
+            previous?.bridge.finish()
+            await fabric.register(
+                id,
+                file: trunk.fabricFileHandle,
+                vlans: Set(registration.vlans),
+                registration: generation
+            )
             bridge.start()
         } catch {
             try? stream.close()
         }
+    }
+
+    private func removeNetworkBridge(endpointID: String, generation: UUID) async {
+        guard networkBridges[endpointID]?.generation == generation else { return }
+        networkBridges.removeValue(forKey: endpointID)
+        await fabric.unregister(.init(endpointID), registration: generation)
     }
 
     private func configureFabric(_ values: [VMShimClient.FabricNetwork]) async throws {
