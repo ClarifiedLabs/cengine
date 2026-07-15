@@ -26,7 +26,7 @@ digests.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-046`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-046`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-046`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-012`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
 | Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-003` | Authenticated push and pull-back use a pinned local registry. |
@@ -241,12 +241,13 @@ builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 | `CLI-005` | `test_cli_network_and_volume_lifecycle` | ✅ Pass | Support | Network and volume create, list, and remove commands. |
 | `CLI-006` | `test_cli_system_disk_usage` | ✅ Pass | Support | Base and verbose `docker system df` render engine-owned usage. |
 | `CLI-007` | `test_cli_detached_kind_shaped_run` | ✅ Pass | Support | Detached runs acknowledge next-exit waits before start and preserve kind-style network and mount configuration. |
+| `CLI-008` | `test_cengine_run_scopes_container_resources_and_process_behavior` | ✅ Pass | Support | The cengine wrapper preserves process behavior, isolates its Docker endpoint, and overrides create-time CPU and memory without changing ordinary defaults. |
 
 ## kind 0.32.0
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
-| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster creates a fresh dedicated network, reaches readiness, and is deleted through the isolated cengine daemon. |
+| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster created through a scoped cengine resource wrapper receives the requested limits, reaches readiness, and is deleted through the isolated daemon. |
 
 ## Optional Docker differential oracle
 

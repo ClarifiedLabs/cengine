@@ -474,6 +474,131 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(explicitHost["NanoCpus"] as? Int == 1_000_000_000)
     }
 
+    @Test func scopedCreateResourcesOverrideOnlySpecifiedFields() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try ContainerSettings(cpus: 3, memoryGiB: 3).save(
+            to: root.appending(path: ContainerSettings.fileName)
+        )
+        let runtime = try await EngineRuntime(root: root)
+        let cpuRouter = DockerRouter(
+            runtime: runtime,
+            root: root,
+            containerResourceOverride: .init(cpus: 2)
+        )
+
+        let explicit = await cpuRouter.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/create?name=scoped-explicit",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Memory":1073741824,"NanoCpus":1000000000}}"#.utf8)
+        ))
+        let explicitBody = try #require(JSONSerialization.jsonObject(with: explicit.body) as? [String: Any])
+        let explicitID = try #require(explicitBody["Id"] as? String)
+        let explicitInspect = await cpuRouter.route(.init(method: .GET, uri: "/v1.44/containers/\(explicitID)/json"))
+        let explicitObject = try #require(JSONSerialization.jsonObject(with: explicitInspect.body) as? [String: Any])
+        let explicitHost = try #require(explicitObject["HostConfig"] as? [String: Any])
+        #expect(explicitHost["Memory"] as? Int == 1_073_741_824)
+        #expect(explicitHost["NanoCpus"] as? Int == 2_000_000_000)
+
+        let memoryRouter = DockerRouter(
+            runtime: runtime,
+            root: root,
+            containerResourceOverride: .init(memoryGiB: 2)
+        )
+        let defaults = await memoryRouter.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/create?name=scoped-default",
+            body: Data(#"{"Image":"alpine"}"#.utf8)
+        ))
+        let defaultsBody = try #require(JSONSerialization.jsonObject(with: defaults.body) as? [String: Any])
+        let defaultsID = try #require(defaultsBody["Id"] as? String)
+        let defaultsInspect = await memoryRouter.route(.init(method: .GET, uri: "/v1.44/containers/\(defaultsID)/json"))
+        let defaultsObject = try #require(JSONSerialization.jsonObject(with: defaultsInspect.body) as? [String: Any])
+        let defaultsHost = try #require(defaultsObject["HostConfig"] as? [String: Any])
+        #expect(defaultsHost["Memory"] as? Int == 2_147_483_648)
+        #expect(defaultsHost["NanoCpus"] as? Int == 3_000_000_000)
+    }
+
+    @Test func resourceScopeSocketFollowsOwnerProcessLifetime() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let sockets = URL(filePath: "/tmp/cengine-scope-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: sockets)
+        }
+        let runtime = try await EngineRuntime(root: root)
+        let manager = ContainerResourceScopeManager(runtime: runtime, root: root, socketDirectory: sockets)
+        let owner = Process()
+        owner.executableURL = URL(filePath: "/bin/sleep")
+        owner.arguments = ["30"]
+        try owner.run()
+
+        do {
+            let scope = try await manager.create(
+                ownerPID: owner.processIdentifier,
+                resources: .init(cpus: 1, memoryGiB: 1)
+            )
+            let path = String(scope.dockerHost.dropFirst("unix://".count))
+            #expect(FileManager.default.fileExists(atPath: path))
+
+            owner.terminate()
+            owner.waitUntilExit()
+            for _ in 0..<100 where FileManager.default.fileExists(atPath: path) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(!FileManager.default.fileExists(atPath: path))
+            try await manager.shutdown()
+        } catch {
+            if owner.isRunning { owner.terminate() }
+            try? await manager.shutdown()
+            throw error
+        }
+    }
+
+    @Test func resourceScopeControlEndpointCreatesAndDeletesSocket() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let sockets = URL(filePath: "/tmp/cengine-scope-api-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: sockets)
+        }
+        let runtime = try await EngineRuntime(root: root)
+        let manager = ContainerResourceScopeManager(runtime: runtime, root: root, socketDirectory: sockets)
+        let router = DockerRouter(runtime: runtime, root: root, resourceScopeManager: manager)
+
+        do {
+            let invalid = await router.route(.init(
+                method: .POST,
+                uri: "/_cengine/v1/resource-scopes",
+                body: try JSONEncoder().encode(ContainerResourceScopeCreateRequest(ownerPID: getpid()))
+            ))
+            #expect(invalid.status == .badRequest)
+
+            let created = await router.route(.init(
+                method: .POST,
+                uri: "/_cengine/v1/resource-scopes",
+                body: try JSONEncoder().encode(ContainerResourceScopeCreateRequest(
+                    ownerPID: getpid(), cpus: 1, memoryGiB: 1
+                ))
+            ))
+            #expect(created.status == .created)
+            let scope = try JSONDecoder().decode(ContainerResourceScope.self, from: created.body)
+            let path = String(scope.dockerHost.dropFirst("unix://".count))
+            #expect(FileManager.default.fileExists(atPath: path))
+
+            let deleted = await router.route(.init(
+                method: .DELETE,
+                uri: "/_cengine/v1/resource-scopes/\(scope.id)"
+            ))
+            #expect(deleted.status == .noContent)
+            #expect(!FileManager.default.fileExists(atPath: path))
+            try await manager.shutdown()
+        } catch {
+            try? await manager.shutdown()
+            throw error
+        }
+    }
+
     @Test func networkAndVolumeResponsesUseDockerSchema() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

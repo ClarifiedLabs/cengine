@@ -378,7 +378,7 @@ public final class DockerServer: @unchecked Sendable {
     }
 }
 
-private final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
+final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
     let supportedProtocol = "tcp"
     let requiredUpgradeHeaders: [String] = []
     private let router: DockerRouter

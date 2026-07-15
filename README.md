@@ -100,6 +100,21 @@ cengine container resources --cpus 2 --memory 2g
 Explicit Docker or Compose CPU and memory limits take precedence over these
 defaults. Existing containers are not changed.
 
+For tools that create containers without exposing resource flags, run the tool
+through a temporary cengine resource scope:
+
+```sh
+cengine run --cpus 2 --memory 2g -- kind create cluster
+```
+
+The selected values override CPU or memory settings supplied by the wrapped
+tool and apply to each container it creates. Flags omitted from `cengine run`
+continue to use the tool's value or the ordinary container default. The scope
+exists only while the command runs, so concurrent Docker clients continue to
+use the normal defaults; containers created by the command remain afterward.
+The wrapped tool must honor `DOCKER_HOST` and must not select another Docker
+host or context explicitly.
+
 ## Volumes
 
 cengine chooses a volume's storage mode from the container topology known

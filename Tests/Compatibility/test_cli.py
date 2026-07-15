@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
+import time
 import uuid
 
 import pytest
@@ -100,3 +101,64 @@ def test_cli_detached_kind_shaped_run(daemon):
     assert '"Destination":"/var"' in mounts and '"Source":"/lib/modules"' in mounts
     docker(daemon, "rm", "--force", "--volumes", name)
     docker(daemon, "network", "rm", network)
+
+
+@pytest.mark.compat("CLI-008")
+def test_cengine_run_scopes_container_resources_and_process_behavior(daemon):
+    binary = str(daemon.binary)
+    socket = daemon["socket"]
+    assert isinstance(socket, pathlib.Path)
+    environment = docker_environment(socket)
+    environment["DOCKER_CONTEXT"] = "unrelated-context"
+    environment["DOCKER_TLS_VERIFY"] = "1"
+
+    process = subprocess.run(
+        [
+            binary, "run", "--socket", str(socket), "--cpus", "1", "--",
+            "/usr/bin/python3", "-c",
+            'import os,sys; print("|".join((os.environ["DOCKER_"+"HOST"], '
+            'os.environ.get("DOCKER_CONTEXT", "unset"), '
+            'os.environ.get("DOCKER_TLS_VERIFY", "unset")))); sys.exit(23)',
+        ],
+        env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=30,
+    )
+    assert process.returncode == 23, process.stdout
+    docker_host, context, tls = process.stdout.strip().split("|")
+    assert docker_host.startswith("unix:///tmp/cengine-")
+    assert context == "unset"
+    assert tls == "unset"
+    scoped_socket = pathlib.Path(docker_host.removeprefix("unix://"))
+    deadline = time.monotonic() + 2
+    while scoped_socket.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not scoped_socket.exists()
+
+    scoped = f"cli-scoped-{uuid.uuid4().hex[:8]}"
+    ordinary = f"cli-ordinary-{uuid.uuid4().hex[:8]}"
+    try:
+        created = subprocess.run(
+            [
+                binary, "run", "--socket", str(socket), "--cpus", "2", "--memory", "2g", "--",
+                "docker", "create", "--name", scoped, "--cpus", "1", "--memory", "1g", IMAGE, "top",
+            ],
+            env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=60,
+        )
+        assert created.returncode == 0, created.stdout
+        docker(daemon, "create", "--name", ordinary, IMAGE, "top")
+        scoped_limits = docker(
+            daemon, "inspect", "--format", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}", scoped,
+        ).stdout.strip()
+        ordinary_limits = docker(
+            daemon, "inspect", "--format", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}", ordinary,
+        ).stdout.strip()
+        assert scoped_limits == "2000000000 2147483648"
+        assert ordinary_limits == "4000000000 1073741824"
+    finally:
+        for name in (scoped, ordinary):
+            subprocess.run(
+                ["docker", "--host", f"unix://{socket}", "rm", "--force", name],
+                env=docker_environment(socket),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            )

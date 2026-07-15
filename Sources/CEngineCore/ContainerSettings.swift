@@ -41,3 +41,32 @@ public struct ContainerSettings: Codable, Equatable, Sendable {
         try encoder.encode(self).write(to: url, options: .atomic)
     }
 }
+
+public struct ContainerResourceOverride: Codable, Equatable, Sendable {
+    public var cpus: Int?
+    public var memoryGiB: Int?
+
+    public init(cpus: Int? = nil, memoryGiB: Int? = nil) {
+        self.cpus = cpus
+        self.memoryGiB = memoryGiB
+    }
+
+    public var memoryBytes: UInt64? {
+        memoryGiB.map { UInt64($0) * 1_024 * 1_024 * 1_024 }
+    }
+
+    public func validate(
+        maximumCPUs: Int = ProcessInfo.processInfo.activeProcessorCount,
+        maximumMemoryGiB: Int = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
+    ) throws {
+        guard cpus != nil || memoryGiB != nil else {
+            throw EngineError(.badRequest, "at least one container resource override is required")
+        }
+        if let cpus, !(1...maximumCPUs).contains(cpus) {
+            throw EngineError(.badRequest, "container CPUs must be between 1 and \(maximumCPUs)")
+        }
+        if let memoryGiB, !(1...maximumMemoryGiB).contains(memoryGiB) {
+            throw EngineError(.badRequest, "container memory must be between 1 and \(maximumMemoryGiB) GiB")
+        }
+    }
+}

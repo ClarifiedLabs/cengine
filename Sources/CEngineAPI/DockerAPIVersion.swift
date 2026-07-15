@@ -33,7 +33,8 @@ struct DockerRequestTarget: Sendable {
         let originalPath = components.path
         let segments = originalPath.split(separator: "/", omittingEmptySubsequences: true)
 
-        if originalPath == "/_ping" || originalPath == "/version" {
+        if originalPath == "/_ping" || originalPath == "/version"
+            || originalPath.hasPrefix("/_cengine/v1/") {
             return Self(version: .maximum, components: components, path: originalPath)
         }
 

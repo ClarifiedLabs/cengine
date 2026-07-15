@@ -22,6 +22,7 @@ KIND_NODE_IMAGE = (
 
 def kind(
     daemon, *arguments: str, network: str, timeout: int = 600,
+    resources: tuple[int, int] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     executable = shutil.which("kind")
     if executable is None:
@@ -31,8 +32,15 @@ def kind(
     environment = docker_environment(socket)
     environment["KIND_EXPERIMENTAL_PROVIDER"] = "docker"
     environment["KIND_EXPERIMENTAL_DOCKER_NETWORK"] = network
+    command = [executable, *arguments]
+    if resources is not None:
+        cpus, memory_gib = resources
+        command = [
+            str(daemon.binary), "run", "--socket", str(socket),
+            "--cpus", str(cpus), "--memory", f"{memory_gib}g", "--", *command,
+        ]
     return subprocess.run(
-        [executable, *arguments], env=environment, text=True,
+        command, env=environment, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
     )
 
@@ -79,7 +87,7 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
             daemon, "create", "cluster", "--name", name,
             "--image", KIND_NODE_IMAGE, "--retain",
             "--kubeconfig", str(kubeconfig),
-            network=network,
+            network=network, resources=(2, 2),
         )
         failure = None
         if result.returncode != 0:
@@ -125,6 +133,9 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
                 f"node diagnostics:\n{'\n'.join(diagnostics)}"
             )
         created = True
+        node = client.containers.get(f"{name}-control-plane")
+        assert node.attrs["HostConfig"]["NanoCpus"] == 2_000_000_000
+        assert node.attrs["HostConfig"]["Memory"] == 2 * 1024 * 1024 * 1024
         kind_network = client.networks.get(network)
         assert kind_network.attrs["Options"][
             "com.docker.network.bridge.enable_ip_masquerade"

@@ -39,6 +39,7 @@ private final class DaemonLock {
             case "service": try await service(arguments)
             case "builder": try await builder(arguments)
             case "container": try container(arguments)
+            case "run": try await run(arguments)
             case "vm-shim": try await vmShim(arguments)
             case "version", "--version": print("cengine \(CEngineVersion.shortVersion())")
             case "system": try await system(arguments)
@@ -81,11 +82,16 @@ private final class DaemonLock {
             )
         }
         let runtime = try await EngineRuntime(root: root, backend: backend)
-        let server = DockerServer(socketPath: socket, router: DockerRouter(runtime: runtime, root: root))
+        let resourceScopes = ContainerResourceScopeManager(runtime: runtime, root: root)
+        let server = DockerServer(
+            socketPath: socket,
+            router: DockerRouter(runtime: runtime, root: root, resourceScopeManager: resourceScopes)
+        )
         do {
             try await server.start()
         } catch {
             try? await server.shutdown()
+            try? await resourceScopes.shutdown()
             throw error
         }
         if managed {
@@ -108,9 +114,11 @@ private final class DaemonLock {
         do {
             try await server.wait()
             try await server.shutdown()
+            try await resourceScopes.shutdown()
             await runtime.shutdown()
         } catch {
             try? await server.shutdown()
+            try? await resourceScopes.shutdown()
             await runtime.shutdown()
             throw error
         }
@@ -260,6 +268,67 @@ private final class DaemonLock {
         print("Default container resources updated to \(settings.cpus) CPUs and \(settings.memoryGiB) GiB memory.")
     }
 
+    private static func run(_ arguments: [String]) async throws {
+        guard let separator = arguments.firstIndex(of: "--") else {
+            throw EngineError(.badRequest, "run requires `--` before the command")
+        }
+        let options = arguments[..<separator]
+        let command = Array(arguments[arguments.index(after: separator)...])
+        guard !command.isEmpty else { throw EngineError(.badRequest, "run requires a command after `--`") }
+
+        var resources = ContainerResourceOverride()
+        var socket = EnginePaths().socket.path
+        var index = options.startIndex
+        while index < options.endIndex {
+            let name = options[index]
+            let valueIndex = options.index(after: index)
+            guard valueIndex < options.endIndex else { throw EngineError(.badRequest, "\(name) requires a value") }
+            let value = options[valueIndex]
+            switch name {
+            case "--cpus":
+                guard let cpus = Int(value) else { throw EngineError(.badRequest, "invalid CPU count: \(value)") }
+                resources.cpus = cpus
+            case "--memory":
+                resources.memoryGiB = try memoryGiB(value)
+            case "--socket":
+                socket = value
+            default:
+                throw EngineError(.badRequest, "unknown run option: \(name)")
+            }
+            index = options.index(valueIndex, offsetBy: 1)
+        }
+        try resources.validate()
+
+        let scope = try await CEngineControlClient.createResourceScope(
+            socketPath: socket,
+            ownerPID: getpid(),
+            resources: resources
+        )
+        guard setenv("DOCKER_HOST", scope.dockerHost, 1) == 0 else {
+            await CEngineControlClient.removeResourceScope(socketPath: socket, id: scope.id)
+            throw EngineError(.internalError, "could not configure DOCKER_HOST")
+        }
+        for name in ["DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"] {
+            unsetenv(name)
+        }
+
+        let executionError = replaceProcess(with: command)
+        await CEngineControlClient.removeResourceScope(socketPath: socket, id: scope.id)
+        throw EngineError(
+            executionError == ENOENT ? .notFound : .internalError,
+            "could not execute \(command[0]): \(String(cString: strerror(executionError)))"
+        )
+    }
+
+    private static func replaceProcess(with arguments: [String]) -> Int32 {
+        var pointers = arguments.map { strdup($0) } + [nil]
+        defer { for pointer in pointers where pointer != nil { free(pointer) } }
+        _ = pointers.withUnsafeMutableBufferPointer { buffer in
+            execvp(buffer[0], buffer.baseAddress)
+        }
+        return errno
+    }
+
     private static func parseResources(
         _ values: [String], cpus: inout Int, memory: inout Int, subject: String
     ) throws {
@@ -314,6 +383,7 @@ private final class DaemonLock {
         Usage: cengine <command>
           builder resources [--cpus COUNT] [--memory GiB]
           container resources [--cpus COUNT] [--memory GiB]
+          run [--socket PATH] [--cpus COUNT] [--memory GiB] -- COMMAND [ARGS...]
           daemon [--socket PATH] [--root PATH] [--kernel PATH] [--container-initramfs PATH] [--storage-initramfs PATH] [--metadata-only]
           service run
           system status|doctor|install|uninstall

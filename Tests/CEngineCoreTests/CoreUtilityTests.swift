@@ -164,6 +164,21 @@ import Testing
             try ContainerSettings(cpus: 4, memoryGiB: 17).validate(maximumCPUs: 8, maximumMemoryGiB: 16)
         }
     }
+
+    @Test func resourceOverrideValidatesIndependentFields() throws {
+        try ContainerResourceOverride(cpus: 2).validate(maximumCPUs: 8, maximumMemoryGiB: 16)
+        try ContainerResourceOverride(memoryGiB: 4).validate(maximumCPUs: 8, maximumMemoryGiB: 16)
+        #expect(ContainerResourceOverride(memoryGiB: 2).memoryBytes == 2_147_483_648)
+        #expect(throws: EngineError.self) {
+            try ContainerResourceOverride().validate(maximumCPUs: 8, maximumMemoryGiB: 16)
+        }
+        #expect(throws: EngineError.self) {
+            try ContainerResourceOverride(cpus: 9).validate(maximumCPUs: 8, maximumMemoryGiB: 16)
+        }
+        #expect(throws: EngineError.self) {
+            try ContainerResourceOverride(memoryGiB: 17).validate(maximumCPUs: 8, maximumMemoryGiB: 16)
+        }
+    }
 }
 
 @Suite struct EngineErrorMessageTests {

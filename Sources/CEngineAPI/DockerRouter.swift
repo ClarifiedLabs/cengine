@@ -27,6 +27,8 @@ public struct APIResponse: Sendable {
 public struct DockerRouter: Sendable {
     private let runtime: EngineRuntime
     private let root: URL
+    private let containerResourceOverride: ContainerResourceOverride?
+    private let resourceScopeManager: ContainerResourceScopeManager?
     private let decoder = JSONDecoder()
 
     private func nonEmpty(_ value: String?) -> String? {
@@ -34,7 +36,17 @@ public struct DockerRouter: Sendable {
     }
     private let encoder = JSONEncoder()
 
-    public init(runtime: EngineRuntime, root: URL) { self.runtime = runtime; self.root = root }
+    public init(
+        runtime: EngineRuntime,
+        root: URL,
+        containerResourceOverride: ContainerResourceOverride? = nil,
+        resourceScopeManager: ContainerResourceScopeManager? = nil
+    ) {
+        self.runtime = runtime
+        self.root = root
+        self.containerResourceOverride = containerResourceOverride
+        self.resourceScopeManager = resourceScopeManager
+    }
 
     public func route(_ request: APIRequest) async -> APIResponse {
         do { return try await handle(request) }
@@ -53,6 +65,20 @@ public struct DockerRouter: Sendable {
         let query = queryItems(components)
 
         switch (request.method, path) {
+        case (.POST, "/_cengine/v1/resource-scopes"):
+            guard let resourceScopeManager else { throw EngineError(.notFound, "page not found") }
+            let input = try decoder.decode(ContainerResourceScopeCreateRequest.self, from: request.body)
+            let scope = try await resourceScopeManager.create(
+                ownerPID: input.ownerPID,
+                resources: .init(cpus: input.cpus, memoryGiB: input.memoryGiB)
+            )
+            return json(status: .created, scope)
+        case (.DELETE, let value) where value.hasPrefix("/_cengine/v1/resource-scopes/"):
+            guard let resourceScopeManager else { throw EngineError(.notFound, "page not found") }
+            let id = String(value.dropFirst("/_cengine/v1/resource-scopes/".count))
+            guard !id.isEmpty else { throw EngineError(.badRequest, "resource scope ID is required") }
+            await resourceScopeManager.remove(id)
+            return APIResponse(status: .noContent)
         case (.GET, "/_ping"), (.HEAD, "/_ping"):
             return APIResponse(status: .ok, headers: ["Api-Version": DockerAPIVersion.maximum.description, "Docker-Experimental": "true"], body: request.method == .HEAD ? Data() : Data("OK".utf8))
         case (.GET, "/version"):
@@ -107,6 +133,8 @@ public struct DockerRouter: Sendable {
                 let period = max(input.HostConfig?.CpuPeriod ?? 100_000, 1)
                 record.cpus = max(1, Int((quota + period - 1) / period))
             }
+            if let memoryBytes = containerResourceOverride?.memoryBytes { record.memoryBytes = memoryBytes }
+            if let cpus = containerResourceOverride?.cpus { record.cpus = cpus }
             record.stopSignal = input.StopSignal ?? "SIGTERM"
             record.stopTimeoutSeconds = input.StopTimeout ?? 10
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)

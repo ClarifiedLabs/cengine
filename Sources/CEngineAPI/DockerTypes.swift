@@ -3,6 +3,17 @@ import CEngineRuntime
 import Foundation
 
 public struct DockerErrorBody: Codable, Sendable { public let message: String }
+public struct ContainerResourceScopeCreateRequest: Codable, Sendable {
+    public let ownerPID: Int32
+    public let cpus: Int?
+    public let memoryGiB: Int?
+
+    public init(ownerPID: Int32, cpus: Int? = nil, memoryGiB: Int? = nil) {
+        self.ownerPID = ownerPID
+        self.cpus = cpus
+        self.memoryGiB = memoryGiB
+    }
+}
 public struct DockerEventResponse: Encodable, Sendable {
     public let status: String?; public let id: String?; public let `Type`: String; public let Action: String
     public let Actor: ActorResponse; public let time: Int64; public let timeNano: Int64
