@@ -409,6 +409,50 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func resume(_ container: ContainerRecord) async throws { guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.resume() }
     public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws { _ = try await stop(container, timeoutSeconds: timeoutSeconds); _ = try await start(container) }
 
+    public func updateResources(_ container: ContainerRecord) async throws {
+        guard container.phase != .paused else {
+            throw EngineError(.conflict, "cannot update resources while container \(container.id) is paused")
+        }
+        if container.phase != .running {
+            if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }
+            guard try await relaunchPreparedShim(container) != nil else {
+                throw EngineError(.notFound, "container VM preparation is unavailable")
+            }
+            knownContainers[container.id] = container
+            return
+        }
+        guard let shim = shims[container.id] else {
+            throw EngineError(.notFound, "container VM shim is unavailable")
+        }
+        guard container.cpus <= shim.specification.cpus else {
+            throw EngineError(
+                .conflict,
+                "requested CPU limit of \(container.cpus) exceeds running VM capacity of \(shim.specification.cpus); stop the container before increasing its VM capacity"
+            )
+        }
+        guard container.memoryBytes <= shim.specification.memoryBytes else {
+            throw EngineError(
+                .conflict,
+                "requested memory limit of \(container.memoryBytes) bytes exceeds running VM capacity of \(shim.specification.memoryBytes) bytes; stop the container before increasing its VM capacity"
+            )
+        }
+        let resources = GuestProtocol.Resources(
+            memoryBytes: container.memoryBytes,
+            cpuQuota: Int64(container.cpus * 100_000),
+            cpuPeriod: 100_000,
+            pids: 0
+        )
+        struct Status: Decodable { let status: String }
+        let response: Status = try await shim.guest(
+            operation: "update-resources", payload: resources, response: Status.self
+        )
+        guard response.status == "running" else {
+            throw EngineError(.conflict, "workload is not running")
+        }
+        knownContainers[container.id] = container
+        activeContainers[container.id] = container
+    }
+
     public func delete(_ container: ContainerRecord) async throws {
         portForwarder.stop(containerID: container.id)
         if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }

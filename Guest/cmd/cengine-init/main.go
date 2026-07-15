@@ -164,6 +164,15 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 			return nil, err
 		}
 		return json.Marshal(status)
+	case "update-resources":
+		var resources protocol.Resources
+		if err := json.Unmarshal(request.Payload, &resources); err != nil {
+			return nil, fmt.Errorf("decode resources: %w", err)
+		}
+		if err := state.process.UpdateResources(resources); err != nil {
+			return nil, err
+		}
+		return json.Marshal(state.process.Status())
 	case "signal":
 		var signal protocol.SignalRequest
 		if err := json.Unmarshal(request.Payload, &signal); err != nil {

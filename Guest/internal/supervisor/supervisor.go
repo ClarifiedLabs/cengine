@@ -27,13 +27,13 @@ import (
 const stage2Argument = "cengine-workload-stage2"
 
 type Supervisor struct {
-	mu             sync.Mutex
-	spec           *protocol.WorkloadSpec
-	command        *exec.Cmd
-	status         protocol.ProcessStatus
-	waiters        []chan protocol.ProcessStatus
-	execs          map[string]*exec.Cmd
-	execStatus     map[string]protocol.ProcessStatus
+	mu         sync.Mutex
+	spec       *protocol.WorkloadSpec
+	command    *exec.Cmd
+	status     protocol.ProcessStatus
+	waiters    []chan protocol.ProcessStatus
+	execs      map[string]*exec.Cmd
+	execStatus map[string]protocol.ProcessStatus
 }
 
 func New() *Supervisor {
@@ -378,22 +378,85 @@ func applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return err
 	}
-	limits := map[string]string{"memory.max": "max", "pids.max": "max", "cpu.max": "max"}
-	if spec.Resources.MemoryBytes > 0 {
-		limits["memory.max"] = fmt.Sprint(spec.Resources.MemoryBytes)
-	}
-	if spec.Resources.PIDs > 0 {
-		limits["pids.max"] = fmt.Sprint(spec.Resources.PIDs)
-	}
-	if spec.Resources.CPUQuota > 0 && spec.Resources.CPUPeriod > 0 {
-		limits["cpu.max"] = fmt.Sprintf("%d %d", spec.Resources.CPUQuota, spec.Resources.CPUPeriod)
-	}
-	for name, value := range limits {
-		if err := os.WriteFile(filepath.Join(path, name), []byte(value), 0644); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+	if err := writeCgroupResourceLimits(path, spec.Resources, true); err != nil {
+		return err
 	}
 	return os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0644)
+}
+
+type cgroupResourceLimit struct {
+	name  string
+	value string
+}
+
+func cgroupResourceLimits(resources protocol.Resources) []cgroupResourceLimit {
+	memory := "max"
+	if resources.MemoryBytes > 0 {
+		memory = fmt.Sprint(resources.MemoryBytes)
+	}
+	cpu := "max"
+	if resources.CPUQuota > 0 && resources.CPUPeriod > 0 {
+		cpu = fmt.Sprintf("%d %d", resources.CPUQuota, resources.CPUPeriod)
+	}
+	pids := "max"
+	if resources.PIDs > 0 {
+		pids = fmt.Sprint(resources.PIDs)
+	}
+	return []cgroupResourceLimit{
+		{name: "memory.max", value: memory},
+		{name: "cpu.max", value: cpu},
+		{name: "pids.max", value: pids},
+	}
+}
+
+func writeCgroupResourceLimits(path string, resources protocol.Resources, ignoreMissing bool) error {
+	return replaceCgroupResourceLimits(path, resources, ignoreMissing, os.ReadFile, os.WriteFile)
+}
+
+func replaceCgroupResourceLimits(
+	path string,
+	resources protocol.Resources,
+	ignoreMissing bool,
+	readFile func(string) ([]byte, error),
+	writeFile func(string, []byte, os.FileMode) error,
+) error {
+	type previousValue struct {
+		path  string
+		value []byte
+	}
+	previous := []previousValue{}
+	for _, limit := range cgroupResourceLimits(resources) {
+		file := filepath.Join(path, limit.name)
+		old, err := readFile(file)
+		if errors.Is(err, os.ErrNotExist) && ignoreMissing {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read %s: %w", limit.name, err)
+		}
+		if err := writeFile(file, []byte(limit.value), 0644); err != nil {
+			for index := len(previous) - 1; index >= 0; index-- {
+				_ = writeFile(previous[index].path, previous[index].value, 0644)
+			}
+			return fmt.Errorf("update %s: %w", limit.name, err)
+		}
+		previous = append(previous, previousValue{path: file, value: old})
+	}
+	return nil
+}
+
+func (s *Supervisor) UpdateResources(resources protocol.Resources) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.command == nil || s.command.Process == nil || s.spec == nil || s.status.Status != "running" {
+		return errors.New("workload is not running")
+	}
+	path := filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID)
+	if err := writeCgroupResourceLimits(path, resources, false); err != nil {
+		return err
+	}
+	s.spec.Resources = resources
+	return nil
 }
 
 func enableCgroupControllers(path string) error {

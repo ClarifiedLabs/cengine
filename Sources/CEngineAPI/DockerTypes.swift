@@ -175,7 +175,8 @@ public struct ContainerWaitResponse: Encodable, Sendable {
     public let Error: DockerErrorBody?
 }
 public struct ContainerUpdateRequest: Decodable, Sendable {
-    public var Memory: Int64?; public var NanoCpus: Int64?; public var RestartPolicy: RestartPolicy?
+    public var Memory: Int64?; public var NanoCpus: Int64?; public var CpuPeriod: Int64?; public var CpuQuota: Int64?
+    public var RestartPolicy: RestartPolicy?
     public struct RestartPolicy: Decodable, Sendable { public var Name: String; public var MaximumRetryCount: Int? }
 }
 public struct ContainerUpdateResponse: Encodable, Sendable { public let Warnings: [String] }

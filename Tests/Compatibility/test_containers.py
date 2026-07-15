@@ -323,11 +323,28 @@ def test_container_stats_complete(daemon, top):
 def test_top_and_update(client: docker.DockerClient, top):
     processes = top.top(ps_args="-ef")
     assert processes["Titles"] and processes["Processes"]
-    warnings = top.update(mem_limit="64m", restart_policy={"Name": "always"})
+    top.reload()
+    started_at = top.attrs["State"]["StartedAt"]
+    code, boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+    assert code == 0
+    warnings = top.update(
+        mem_limit="64m", cpu_quota=200_000, cpu_period=100_000,
+        restart_policy={"Name": "always"},
+    )
     assert warnings == {"Warnings": []} or warnings == []
     top.reload()
+    code, limits = top.exec_run([
+        "sh", "-c", "cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max",
+    ])
+    assert code == 0
+    code, updated_boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+    assert code == 0
     assert top.attrs["HostConfig"]["Memory"] == 64 * 1024 * 1024
+    assert top.attrs["HostConfig"]["NanoCpus"] == 2_000_000_000
     assert top.attrs["HostConfig"]["RestartPolicy"]["Name"] == "always"
+    assert top.attrs["State"]["StartedAt"] == started_at
+    assert updated_boot_id == boot_id
+    assert limits.splitlines() == [b"67108864", b"200000 100000"]
 
 
 @pytest.mark.compat("CTR-041")
@@ -347,6 +364,27 @@ def test_restart_policy_update_preserves_running_vm(top):
     assert top.attrs["State"]["StartedAt"] == started_at
     assert updated_boot_id == boot_id
     assert top.attrs["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
+
+
+@pytest.mark.compat("CTR-042")
+def test_live_resource_update_rejects_limits_above_vm_capacity(top):
+    top.reload()
+    memory = top.attrs["HostConfig"]["Memory"]
+    started_at = top.attrs["State"]["StartedAt"]
+    code, boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+    assert code == 0
+
+    with pytest.raises(errors.APIError) as caught:
+        top.update(mem_limit="2g")
+
+    assert caught.value.response.status_code == 409
+    top.reload()
+    code, updated_boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+    assert code == 0
+    assert top.status == "running"
+    assert top.attrs["HostConfig"]["Memory"] == memory
+    assert top.attrs["State"]["StartedAt"] == started_at
+    assert updated_boot_id == boot_id
 
 
 @pytest.mark.compat("CTR-029")

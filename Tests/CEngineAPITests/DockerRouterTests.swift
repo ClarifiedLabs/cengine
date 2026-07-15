@@ -178,6 +178,7 @@ private actor RestartBackend: ContainerBackend {
     private var prepares = 0
     private var deletes = 0
     private var preparedContainers = Set<String>()
+    private var resourceUpdates: [ContainerRecord] = []
     init(exitCode: Int32? = nil) { self.exitCode = exitCode }
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_ container: ContainerRecord) async throws {
@@ -197,9 +198,11 @@ private actor RestartBackend: ContainerBackend {
         deletes += 1
     }
     func completion(_: ContainerRecord) async -> Int32? { defer { exitCode = nil }; return exitCode }
+    func updateResources(_ container: ContainerRecord) async throws { resourceUpdates.append(container) }
     func startCount() -> Int { starts }
     func prepareCount() -> Int { prepares }
     func deleteCount() -> Int { deletes }
+    func lastResourceUpdate() -> ContainerRecord? { resourceUpdates.last }
 }
 
 private actor LifecycleRaceBackend: ContainerBackend {
@@ -1305,6 +1308,38 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(updated.phase == .running)
         #expect(updated.startedAt == startedAt)
         #expect(updated.restartPolicy.name == "unless-stopped")
+        #expect(await backend.startCount() == startCount)
+        #expect(await backend.prepareCount() == prepareCount)
+        #expect(await backend.deleteCount() == deleteCount)
+    }
+
+    @Test func resourceUpdateDoesNotRecreateRunningContainer() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = RestartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let record = try await runtime.createContainer(ContainerRecord(name: "live-resources", image: "debian"))
+        try await runtime.startContainer(record.id)
+        let before = try await runtime.container(record.id)
+        let startedAt = try #require(before.startedAt)
+        let startCount = await backend.startCount()
+        let prepareCount = await backend.prepareCount()
+        let deleteCount = await backend.deleteCount()
+
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/live-resources/update",
+            body: Data(#"{"Memory":536870912,"NanoCpus":0,"CpuQuota":200000,"CpuPeriod":100000}"#.utf8)
+        ))
+
+        #expect(response.status == .ok)
+        let updated = try await runtime.container(record.id)
+        #expect(updated.phase == .running)
+        #expect(updated.startedAt == startedAt)
+        #expect(updated.memoryBytes == 512 * 1_024 * 1_024)
+        #expect(updated.cpus == 2)
+        #expect(await backend.lastResourceUpdate()?.memoryBytes == updated.memoryBytes)
+        #expect(await backend.lastResourceUpdate()?.cpus == updated.cpus)
         #expect(await backend.startCount() == startCount)
         #expect(await backend.prepareCount() == prepareCount)
         #expect(await backend.deleteCount() == deleteCount)

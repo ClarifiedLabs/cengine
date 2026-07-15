@@ -61,6 +61,7 @@ public protocol ContainerBackend: Sendable {
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
+    func updateResources(_ container: ContainerRecord) async throws
     func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress]
     func statistics(_ container: ContainerRecord) async throws -> BackendStatistics
     func top(_ container: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]])
@@ -125,6 +126,7 @@ public extension ContainerBackend {
         try await prepare(container)
         _ = try await start(container)
     }
+    func updateResources(_: ContainerRecord) async throws {}
     func endpointAddresses(for _: ContainerRecord) async -> [String: BackendEndpointAddress] { [:] }
     func statistics(_: ContainerRecord) async throws -> BackendStatistics {
         throw EngineError(.unsupported, "container statistics are unavailable for this backend")

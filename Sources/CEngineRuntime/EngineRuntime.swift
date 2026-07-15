@@ -24,7 +24,7 @@ public struct ContainerWaitSubscription: Sendable {
 
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
-        enum Operation: Equatable { case stop, restart, remove, update }
+        enum Operation: Equatable { case stop, restart, remove }
 
         let operation: Operation
         let token = UUID()
@@ -247,24 +247,10 @@ public actor EngineRuntime {
         if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
         if let restartPolicy { updated.restartPolicy = restartPolicy }
         let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
-        if resourcesChanged, old.phase == .running || old.phase == .paused {
-            let intent = try beginLifecycleIntent(.update, for: old.id)
-            defer { endLifecycleIntent(intent, for: old.id) }
-            let code = try await backend.stop(old, timeoutSeconds: old.stopTimeoutSeconds)
-            await recordCompletion(old.id, startedAt: old.startedAt, code: code)
-            try await backend.delete(old)
-            try await backend.prepare(updated)
-            updated.ports = try await backend.start(updated)
-            updated = await applyingEndpointAddresses(to: updated)
-            updated.phase = .running; updated.startedAt = Date(); updated.finishedAt = nil; updated.exitCode = nil
-        }
+        if resourcesChanged { try await backend.updateResources(updated) }
         snapshot.containers[index] = updated
         try await persist()
         emit(containerEvent("update", updated))
-        if updated.phase == .running, let startedAt = updated.startedAt {
-            let updatedID = updated.id
-            Task { [weak self] in await self?.monitorContainer(updatedID, startedAt: startedAt) }
-        }
         return updated
     }
 

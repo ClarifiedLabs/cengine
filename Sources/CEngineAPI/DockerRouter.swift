@@ -250,7 +250,15 @@ public struct DockerRouter: Sendable {
             let policy = input.RestartPolicy.map {
                 RestartPolicyRecord(name: $0.Name, maximumRetryCount: $0.MaximumRetryCount ?? 0)
             }
-            _ = try await runtime.updateContainer(id, memoryBytes: input.Memory, nanoCPUs: input.NanoCpus, restartPolicy: policy)
+            let nanoCPUs: Int64? = try {
+                if let value = input.NanoCpus, value > 0 { return value }
+                guard let quota = input.CpuQuota, quota > 0 else { return nil }
+                let period = max(input.CpuPeriod ?? 100_000, 1)
+                let (scaled, overflow) = quota.multipliedReportingOverflow(by: 1_000_000_000)
+                guard !overflow else { throw EngineError(.badRequest, "CPU quota is too large") }
+                return scaled / period + (scaled % period == 0 ? 0 : 1)
+            }()
+            _ = try await runtime.updateContainer(id, memoryBytes: input.Memory, nanoCPUs: nanoCPUs, restartPolicy: policy)
             return json(status: .ok, ContainerUpdateResponse(Warnings: []))
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
