@@ -55,14 +55,21 @@ final class ContainerLogMonitor: @unchecked Sendable {
         if finishOutput { bridge.finishOutput() }
     }
 
-    private func drain(_ url: URL?, stream: ContainerIOBridge.OutputStream) {
-        guard let url, let handle = try? FileHandle(forReadingFrom: url) else { return }
-        lock.lock(); let offset = offsets[url] ?? 0; lock.unlock()
+    func drain(
+        _ url: URL?, stream: ContainerIOBridge.OutputStream,
+        didReadOffset: @Sendable () -> Void = {}
+    ) {
+        guard let url else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        let offset = offsets[url] ?? 0
+        didReadOffset()
         do {
             try handle.seek(toOffset: offset)
             let data = try handle.readToEnd() ?? Data()
             let next = try handle.offset(); try handle.close()
-            lock.lock(); offsets[url] = next; lock.unlock()
+            offsets[url] = next
             if !data.isEmpty { try bridge.writer(stream).write(data) }
         } catch { try? handle.close() }
     }

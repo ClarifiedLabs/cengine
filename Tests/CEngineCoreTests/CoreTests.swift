@@ -1,4 +1,5 @@
 import CryptoKit
+import Dispatch
 import Foundation
 import Testing
 @testable import CEngineCore
@@ -9,6 +10,21 @@ private final class DataBox: @unchecked Sendable {
     private var storage = Data()
     func append(_ data: Data) { lock.withLock { storage.append(data) } }
     var value: Data { lock.withLock { storage } }
+}
+
+private final class DrainRendezvous: @unchecked Sendable {
+    private let lock = NSLock()
+    private let peerArrived = DispatchSemaphore(value: 0)
+    private var arrivals = 0
+
+    func wait() {
+        let arrival = lock.withLock { arrivals += 1; return arrivals }
+        if arrival == 1 {
+            _ = peerArrived.wait(timeout: .now() + .milliseconds(250))
+        } else if arrival == 2 {
+            peerArrived.signal()
+        }
+    }
 }
 
 @Suite struct CoreTests {
@@ -173,6 +189,43 @@ private final class DataBox: @unchecked Sendable {
         try bridge.writer(.stderr).write(Data("failure\n".utf8))
         #expect(Array(try bridge.logData().prefix(8)) == [2, 0, 0, 0, 0, 0, 0, 8])
         #expect(String(decoding: try bridge.logData().dropFirst(8), as: UTF8.self) == "failure\n")
+    }
+
+    @Test func containerLogMonitorDoesNotDuplicateConcurrentDrains() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let stdout = root.appending(path: "stdout")
+        let stderr = root.appending(path: "stderr")
+        let stdin = root.appending(path: "stdin")
+        let payload = Data("once".utf8)
+        try payload.write(to: stdout)
+        try Data().write(to: stderr)
+        try Data().write(to: stdin)
+        let bridge = ContainerIOBridge(tty: true, logURL: root.appending(path: "docker.log"))
+        let rendezvous = DrainRendezvous()
+        let monitor = ContainerLogMonitor(stdoutURL: stdout, stderrURL: stderr, inputURL: stdin, bridge: bridge)
+        let queue = DispatchQueue(label: "dev.cengine.tests.log-drain", attributes: .concurrent)
+        let start = DispatchSemaphore(value: 0)
+        let ready = DispatchGroup()
+        let completed = DispatchGroup()
+        let workers = 2
+
+        for _ in 0..<workers {
+            ready.enter()
+            completed.enter()
+            queue.async {
+                ready.leave()
+                start.wait()
+                monitor.drain(stdout, stream: .stdout, didReadOffset: rendezvous.wait)
+                completed.leave()
+            }
+        }
+        ready.wait()
+        for _ in 0..<workers { start.signal() }
+        completed.wait()
+
+        #expect(try bridge.logData() == payload)
     }
 
     @Test func containerIOFiltersLogStreamsTailAndTimestamps() throws {
