@@ -4,12 +4,6 @@ import Foundation
 import NIOCore
 import ServiceManagement
 
-struct ResourceItem: Identifiable, Hashable {
-    let id: String
-    let title: String
-    let detail: String
-}
-
 @MainActor protocol AppService {
     var status: SMAppService.Status { get }
     func register() throws
@@ -21,17 +15,23 @@ extension SMAppService: AppService {}
 @MainActor final class AppModel: ObservableObject {
     @Published var engineStatus = "Starting…"
     @Published var helperStatus = "Disabled"
-    @Published var version = "—"
-    @Published var diskUsage = "—"
     @Published var error: String?
-    @Published var containers: [ResourceItem] = []
-    @Published var images: [ResourceItem] = []
-    @Published var networks: [ResourceItem] = []
-    @Published var volumes: [ResourceItem] = []
+    @Published var refreshError: String?
+    @Published private(set) var snapshot: EngineSnapshot?
+    @Published private(set) var snapshotIsStale = false
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var containerDetails: [String: ContainerDetail] = [:]
+    @Published private(set) var imageDetails: [String: ImageDetail] = [:]
+    @Published private(set) var containerTelemetry: [String: ContainerTelemetry] = [:]
+    @Published private(set) var containerLogs: [String: [ContainerLogLine]] = [:]
+    @Published private(set) var detailErrors: [String: String] = [:]
+    @Published private(set) var volumeConsumerIDs: [String: [String]] = [:]
+    @Published private(set) var containerActionInProgress: String?
     @Published var helperNeedsApproval = false
     @Published var builderCPUs: Int
     @Published var builderMemoryGiB: Int
     @Published var builderSettingsStatus: String?
+    @Published private(set) var isApplyingBuilderSettings = false
     @Published var containerCPUs: Int
     @Published var containerMemoryGiB: Int
     @Published var containerSettingsStatus: String?
@@ -40,10 +40,38 @@ extension SMAppService: AppService {}
     let maximumCPUs = ProcessInfo.processInfo.activeProcessorCount
     let maximumMemoryGiB = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
 
+    var containers: [ContainerSummary] { snapshot?.containers ?? [] }
+    var images: [ImageSummary] { snapshot?.images ?? [] }
+    var networks: [NetworkSummary] { snapshot?.networks ?? [] }
+    var volumes: [VolumeSummary] { snapshot?.volumes ?? [] }
+
+    var containerSettingsValidationMessage: String? {
+        Self.validationMessage(
+            cpus: containerCPUs,
+            memoryGiB: containerMemoryGiB,
+            maximumCPUs: maximumCPUs,
+            maximumMemoryGiB: maximumMemoryGiB
+        )
+    }
+    var builderSettingsValidationMessage: String? {
+        Self.validationMessage(
+            cpus: builderCPUs,
+            memoryGiB: builderMemoryGiB,
+            maximumCPUs: maximumCPUs,
+            maximumMemoryGiB: maximumMemoryGiB
+        )
+    }
+    var containerSettingsDirty: Bool {
+        containerCPUs != savedContainerCPUs || containerMemoryGiB != savedContainerMemoryGiB
+    }
+    var builderSettingsDirty: Bool {
+        builderCPUs != savedBuilderCPUs || builderMemoryGiB != savedBuilderMemoryGiB
+    }
+
     private let agent: any AppService
     private let helper: any AppService
     private let openLoginItemsSettings: () -> Void
-    private let client: DockerSocketClient
+    private let client: any AppEngineClient
     private let socketPath: String
     private let builderSettingsURL: URL
     private let containerSettingsURL: URL
@@ -51,6 +79,11 @@ extension SMAppService: AppService {}
     private let serviceRegistrationDefaults: UserDefaults
     private let waitForServiceUnregistration: () async throws -> Void
     private var refreshTask: Task<Void, Never>?
+    private var previousStats: [String: ContainerStatsSample] = [:]
+    private var savedBuilderCPUs: Int
+    private var savedBuilderMemoryGiB: Int
+    private var savedContainerCPUs: Int
+    private var savedContainerMemoryGiB: Int
 
     static let serviceRegistrationRevisionKey = "serviceRegistrationRevision"
 
@@ -58,6 +91,7 @@ extension SMAppService: AppService {}
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         agent: any AppService = SMAppService.agent(plistName: CEngineServices.agentPlist),
         helper: any AppService = SMAppService.daemon(plistName: CEngineServices.helperPlist),
+        client: (any AppEngineClient)? = nil,
         serviceRegistrationRevision: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
         serviceRegistrationDefaults: UserDefaults = .standard,
         waitForServiceUnregistration: @escaping () async throws -> Void = {
@@ -72,16 +106,20 @@ extension SMAppService: AppService {}
         socketPath = paths.socket.path
         builderSettingsURL = paths.builderSettings
         containerSettingsURL = paths.containerSettings
+        self.client = client ?? DockerSocketClient(socketPath: paths.socket.path)
         self.serviceRegistrationRevision = serviceRegistrationRevision
         self.serviceRegistrationDefaults = serviceRegistrationDefaults
         self.waitForServiceUnregistration = waitForServiceUnregistration
-        client = DockerSocketClient(socketPath: socketPath)
         let builderSettings = (try? BuilderSettings.load(from: builderSettingsURL)) ?? .default
         builderCPUs = builderSettings.cpus
         builderMemoryGiB = builderSettings.memoryGiB
+        savedBuilderCPUs = builderSettings.cpus
+        savedBuilderMemoryGiB = builderSettings.memoryGiB
         let containerSettings = (try? ContainerSettings.load(from: containerSettingsURL)) ?? .default
         containerCPUs = containerSettings.cpus
         containerMemoryGiB = containerSettings.memoryGiB
+        savedContainerCPUs = containerSettings.cpus
+        savedContainerMemoryGiB = containerSettings.memoryGiB
         showOnboarding = !UserDefaults.standard.bool(forKey: "completedOnboarding")
     }
 
@@ -141,10 +179,15 @@ extension SMAppService: AppService {}
     }
 
     func applyBuilderSettings() async {
+        guard builderSettingsValidationMessage == nil else { return }
         let settings = BuilderSettings(cpus: builderCPUs, memoryGiB: builderMemoryGiB)
+        isApplyingBuilderSettings = true
         builderSettingsStatus = "Applying…"
+        defer { isApplyingBuilderSettings = false }
         do {
             try settings.save(to: builderSettingsURL)
+            savedBuilderCPUs = builderCPUs
+            savedBuilderMemoryGiB = builderMemoryGiB
         } catch {
             builderSettingsStatus = "Could not save"
             self.error = "Builder resources could not be saved: \(error.localizedDescription)"
@@ -166,9 +209,12 @@ extension SMAppService: AppService {}
     }
 
     func applyContainerSettings() {
+        guard containerSettingsValidationMessage == nil else { return }
         let settings = ContainerSettings(cpus: containerCPUs, memoryGiB: containerMemoryGiB)
         do {
             try settings.save(to: containerSettingsURL)
+            savedContainerCPUs = containerCPUs
+            savedContainerMemoryGiB = containerMemoryGiB
             containerSettingsStatus = "Saved; applies to new containers"
         } catch {
             containerSettingsStatus = "Could not save"
@@ -177,48 +223,158 @@ extension SMAppService: AppService {}
     }
 
     func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
         do {
             try registerEngineIfNetworkingIsReady()
         } catch {
             self.error = "Could not enable the cengine background service: \(error.localizedDescription)"
         }
         updateServiceStatus()
-        guard agent.status == .enabled else { return }
+        guard agent.status == .enabled else {
+            snapshotIsStale = snapshot != nil
+            return
+        }
         do {
             async let versionData = client.get("/v1.55/version")
             async let infoData = client.get("/v1.55/info")
             async let containerData = client.get("/v1.55/containers/json?all=1")
             async let imageData = client.get("/v1.55/images/json")
             async let networkData = client.get("/v1.55/networks")
-            async let volumeData = client.get("/v1.55/volumes")
+            async let diskData = client.get("/v1.55/system/df?verbose=true")
+            let payloads = try await (versionData, infoData, containerData, imageData, networkData, diskData)
             let decoder = JSONDecoder()
-            let version = try decoder.decode(VersionResponse.self, from: await versionData)
-            let info = try decoder.decode(InfoResponse.self, from: await infoData)
-            let containers = try decoder.decode([ContainerResponse].self, from: await containerData)
-            let images = try decoder.decode([ImageResponse].self, from: await imageData)
-            let networks = try decoder.decode([NetworkResponse].self, from: await networkData)
-            let volumes = try decoder.decode(VolumeEnvelope.self, from: await volumeData)
-            self.version = version.Version
-            diskUsage = "\(info.Containers) containers · \(images.count) images"
-            self.containers = containers.map {
-                ResourceItem(id: $0.Id, title: $0.Names.first?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? String($0.Id.prefix(12)), detail: "\($0.Image) · \($0.State)")
-            }
-            self.images = images.map {
-                ResourceItem(id: $0.Id, title: $0.RepoTags?.first ?? String($0.Id.prefix(19)), detail: ByteCountFormatter.string(fromByteCount: $0.Size, countStyle: .file))
-            }
-            self.networks = networks.map { ResourceItem(id: $0.Id, title: $0.Name, detail: $0.Driver) }
-            self.volumes = (volumes.Volumes ?? []).map {
-                ResourceItem(id: $0.Name, title: $0.Name, detail: $0.Mountpoint)
-            }
-            error = nil
+            let version = try decoder.decode(VersionResponse.self, from: payloads.0)
+            let info = try decoder.decode(InfoResponse.self, from: payloads.1)
+            let containers = try decoder.decode([ContainerSummary].self, from: payloads.2)
+            let images = try decoder.decode([ImageSummary].self, from: payloads.3)
+            let networks = try decoder.decode([NetworkSummary].self, from: payloads.4)
+            let diskUsage = try decoder.decode(DiskUsageResponse.self, from: payloads.5)
+            snapshot = EngineSnapshot(
+                version: version,
+                info: info,
+                containers: containers,
+                images: images,
+                networks: networks,
+                volumes: diskUsage.Volumes,
+                imageLayerBytes: diskUsage.LayersSize,
+                refreshedAt: Date()
+            )
+            snapshotIsStale = false
+            refreshError = nil
+            pruneCaches(for: containers, images: images)
         } catch {
+            snapshotIsStale = snapshot != nil
             if Self.isEngineUnavailable(error, socketPath: socketPath) {
-                // Expected while the daemon provisions on first start (which can take
-                // minutes) — show it inline rather than re-alerting every poll.
                 engineStatus = "Starting…"
+                refreshError = nil
             } else {
-                self.error = "Engine data is unavailable: \(error.localizedDescription)"
+                refreshError = "Engine data is unavailable: \(error.localizedDescription)"
             }
+        }
+    }
+
+    func loadContainerDetail(_ id: String, force: Bool = false) async {
+        if !force, containerDetails[id] != nil { return }
+        do {
+            let data = try await client.get("/v1.55/containers/\(id)/json")
+            containerDetails[id] = try JSONDecoder().decode(ContainerDetail.self, from: data)
+            detailErrors[id] = nil
+        } catch {
+            detailErrors[id] = "Container details are unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func loadContainerStatistics(_ id: String) async {
+        guard containers.first(where: { $0.id == id })?.isRunning == true else {
+            previousStats[id] = nil
+            containerTelemetry[id] = nil
+            return
+        }
+        do {
+            let data = try await client.get("/v1.55/containers/\(id)/stats?stream=false")
+            let sample = try JSONDecoder().decode(ContainerStatsSample.self, from: data)
+            containerTelemetry[id] = ContainerTelemetry(sample: sample, previous: previousStats[id])
+            previousStats[id] = sample
+            detailErrors["stats:\(id)"] = nil
+        } catch {
+            detailErrors["stats:\(id)"] = "Live statistics are unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func loadContainerLogs(_ id: String) async {
+        await loadContainerDetail(id)
+        do {
+            let data = try await client.get(
+                "/v1.55/containers/\(id)/logs?stdout=1&stderr=1&timestamps=1&tail=500"
+            )
+            containerLogs[id] = DockerLogParser.parse(data, tty: containerDetails[id]?.Config.Tty ?? false)
+            detailErrors["logs:\(id)"] = nil
+        } catch {
+            detailErrors["logs:\(id)"] = "Logs are unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func loadImageDetail(_ id: String, force: Bool = false) async {
+        if !force, imageDetails[id] != nil { return }
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        do {
+            let data = try await client.get("/v1.55/images/\(escaped)/json")
+            imageDetails[id] = try JSONDecoder().decode(ImageDetail.self, from: data)
+            detailErrors[id] = nil
+        } catch {
+            detailErrors[id] = "Image details are unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    func loadVolumeConsumers(_ name: String) async {
+        let ids = containers.map(\.id)
+        let missing = ids.filter { containerDetails[$0] == nil }
+        let client = self.client
+        let loaded = await withTaskGroup(of: (String, ContainerDetail?).self) { group in
+            for id in missing {
+                group.addTask {
+                    do {
+                        let data = try await client.get("/v1.55/containers/\(id)/json")
+                        return (id, try JSONDecoder().decode(ContainerDetail.self, from: data))
+                    } catch {
+                        return (id, nil)
+                    }
+                }
+            }
+            var result: [String: ContainerDetail] = [:]
+            for await (id, detail) in group {
+                if let detail { result[id] = detail }
+            }
+            return result
+        }
+        containerDetails.merge(loaded) { _, new in new }
+        volumeConsumerIDs[name] = ids.filter { id in
+            containerDetails[id]?.Mounts.contains {
+                $0.Type == "volume" && ($0.Name == name || $0.Source == name)
+            } == true
+        }
+    }
+
+    func containersAttached(to network: NetworkSummary) -> [ContainerSummary] {
+        containers.filter { container in
+            container.NetworkSettings.Networks.values.contains { $0.NetworkID == network.Id }
+                || container.NetworkSettings.Networks.keys.contains(network.Name)
+        }
+    }
+
+    func perform(_ action: ContainerAction, on id: String) async {
+        guard containerActionInProgress == nil else { return }
+        containerActionInProgress = id
+        defer { containerActionInProgress = nil }
+        do {
+            _ = try await client.post("/v1.55/containers/\(id)/\(action.rawValue)", body: Data())
+            detailErrors[id] = nil
+            await refresh()
+            await loadContainerDetail(id, force: true)
+        } catch {
+            self.error = "Could not \(action.rawValue) the container: \(error.localizedDescription)"
         }
     }
 
@@ -226,6 +382,19 @@ extension SMAppService: AppService {}
         if !FileManager.default.fileExists(atPath: socketPath) { return true }
         guard let ioError = error as? IOError else { return false }
         return ioError.errnoCode == ECONNREFUSED || ioError.errnoCode == ENOENT
+    }
+
+    nonisolated static func validationMessage(
+        cpus: Int,
+        memoryGiB: Int,
+        maximumCPUs: Int,
+        maximumMemoryGiB: Int
+    ) -> String? {
+        if !(1...maximumCPUs).contains(cpus) { return "CPUs must be between 1 and \(maximumCPUs)." }
+        if !(1...maximumMemoryGiB).contains(memoryGiB) {
+            return "Memory must be between 1 and \(maximumMemoryGiB) GiB."
+        }
+        return nil
     }
 
     func uninstall(deleteData: Bool) async {
@@ -246,6 +415,16 @@ extension SMAppService: AppService {}
         NSApplication.shared.terminate(nil)
     }
 
+    private func pruneCaches(for containers: [ContainerSummary], images: [ImageSummary]) {
+        let containerIDs = Set(containers.map(\.id))
+        let imageIDs = Set(images.map(\.id))
+        containerDetails = containerDetails.filter { containerIDs.contains($0.key) }
+        containerTelemetry = containerTelemetry.filter { containerIDs.contains($0.key) }
+        containerLogs = containerLogs.filter { containerIDs.contains($0.key) }
+        previousStats = previousStats.filter { containerIDs.contains($0.key) }
+        imageDetails = imageDetails.filter { imageIDs.contains($0.key) }
+    }
+
     private func updateServiceStatus() {
         engineStatus = Self.label(agent.status)
         helperStatus = Self.label(helper.status)
@@ -257,8 +436,6 @@ extension SMAppService: AppService {}
         do {
             try helper.register()
         } catch {
-            // Registering a LaunchDaemon reports launch-denied while approval is pending.
-            // The service is registered at that point, so only propagate actual failures.
             if helper.status != .requiresApproval { throw error }
         }
     }
@@ -277,11 +454,7 @@ extension SMAppService: AppService {}
             try await helper.unregister()
             unregisteredService = true
         }
-        if unregisteredService {
-            // ServiceManagement may report asynchronous unregistration complete
-            // before launchd has discarded the old job and code requirement.
-            try await waitForServiceUnregistration()
-        }
+        if unregisteredService { try await waitForServiceUnregistration() }
         return true
     }
 
@@ -299,13 +472,4 @@ extension SMAppService: AppService {}
         @unknown default: "Unknown"
         }
     }
-
 }
-
-private struct VersionResponse: Decodable { let Version: String }
-private struct InfoResponse: Decodable { let Containers: Int }
-private struct ContainerResponse: Decodable { let Id: String; let Names: [String]; let Image: String; let State: String }
-private struct ImageResponse: Decodable { let Id: String; let RepoTags: [String]?; let Size: Int64 }
-private struct NetworkResponse: Decodable { let Id: String; let Name: String; let Driver: String }
-private struct VolumeEnvelope: Decodable { let Volumes: [VolumeResponse]? }
-private struct VolumeResponse: Decodable { let Name: String; let Mountpoint: String }

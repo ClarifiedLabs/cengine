@@ -11,7 +11,7 @@ final class DockerSocketClient: @unchecked Sendable {
 
     deinit { try? group.syncShutdownGracefully() }
 
-    func get(_ path: String) async throws -> Data {
+    func request(method: HTTPMethod, path: String, body: Data = Data()) async throws -> Data {
         let promise = group.next().makePromise(of: Data.self)
         let channel = try await ClientBootstrap(group: group)
             .channelInitializer { channel in
@@ -23,11 +23,30 @@ final class DockerSocketClient: @unchecked Sendable {
         var headers = HTTPHeaders()
         headers.add(name: "Host", value: "localhost")
         headers.add(name: "Connection", value: "close")
+        if !body.isEmpty {
+            headers.add(name: "Content-Type", value: "application/json")
+        }
+        if method == .POST || !body.isEmpty {
+            headers.add(name: "Content-Length", value: String(body.count))
+        }
         try await channel.writeAndFlush(HTTPClientRequestPart.head(.init(
-            version: .http1_1, method: .GET, uri: path, headers: headers
+            version: .http1_1, method: method, uri: path, headers: headers
         ))).get()
+        if !body.isEmpty {
+            var buffer = channel.allocator.buffer(capacity: body.count)
+            buffer.writeBytes(body)
+            try await channel.writeAndFlush(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+        }
         try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
         return try await promise.futureResult.get()
+    }
+
+    func get(_ path: String) async throws -> Data {
+        try await request(method: .GET, path: path)
+    }
+
+    func post(_ path: String, body: Data = Data()) async throws -> Data {
+        try await request(method: .POST, path: path, body: body)
     }
 }
 

@@ -8,7 +8,7 @@ struct CEngineApplication: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 760, minHeight: 500)
+                .frame(minWidth: 920, minHeight: 600)
                 .task { await model.start() }
                 .sheet(isPresented: $model.showOnboarding) {
                     OnboardingView {
@@ -16,52 +16,89 @@ struct CEngineApplication: App {
                     }
                 }
         }
+        .defaultSize(width: 1_100, height: 720)
         .onChange(of: scenePhase) { _, phase in model.setActive(phase == .active) }
-        Settings { SettingsView().environmentObject(model).frame(width: 480) }
+        .commands { IntegratedSettingsCommands() }
     }
 }
 
-private struct ContentView: View {
+@MainActor final class AppNavigation: ObservableObject {
+    @Published var section: AppSection? = .dashboard
+    @Published var selectedContainerID: String?
+    @Published var selectedImageID: String?
+    @Published var selectedNetworkID: String?
+    @Published var selectedVolumeID: String?
+
+    func showContainer(_ id: String) {
+        selectedContainerID = id
+        section = .containers
+    }
+}
+
+struct ContentView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var selection: AppSection? = .dashboard
+    @StateObject private var navigation = AppNavigation()
 
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                List(AppSection.allCases, selection: $selection) { section in
-                    Label(section.title, systemImage: section.icon).tag(section)
+                List(AppSection.resourceSections, selection: $navigation.section) { section in
+                    Label(section.title, systemImage: section.icon).tag(Optional(section))
                 }
                 Divider()
-                SettingsLink {
+                Button {
+                    navigation.section = .settings
+                } label: {
                     Label("Settings", systemImage: "gearshape")
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .background(
+                            navigation.section == .settings ? Color.accentColor.opacity(0.16) : .clear,
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
             }
-            .navigationSplitViewColumnWidth(min: 150, ideal: 180)
+            .navigationSplitViewColumnWidth(min: 155, ideal: 180, max: 220)
         } detail: {
-            Group {
-                switch selection {
-                case .dashboard, nil: DashboardView()
-                case .containers: ResourceList(title: "Containers", items: model.containers)
-                case .images: ResourceList(title: "Images", items: model.images)
-                case .networks: ResourceList(title: "Networks", items: model.networks)
-                case .volumes: ResourceList(title: "Volumes", items: model.volumes)
-                }
+            switch navigation.section {
+            case .dashboard, nil:
+                DashboardView(navigation: navigation)
+            case .containers:
+                ContainersView(selection: $navigation.selectedContainerID)
+            case .images:
+                ImagesView(selection: $navigation.selectedImageID)
+            case .networks:
+                NetworksView(selection: $navigation.selectedNetworkID)
+            case .volumes:
+                VolumesView(selection: $navigation.selectedVolumeID)
+            case .settings:
+                SettingsView()
             }
-            .padding()
+        }
+        .focusedSceneValue(\.navigateToIntegratedSettings) {
+            navigation.section = .settings
         }
         .alert("cengine", isPresented: Binding(
-            get: { model.error != nil }, set: { if !$0 { model.error = nil } }
-        )) { Button("OK") { model.error = nil } } message: { Text(model.error ?? "") }
+            get: { model.error != nil },
+            set: { if !$0 { model.error = nil } }
+        )) {
+            Button("OK") { model.error = nil }
+        } message: {
+            Text(model.error ?? "")
+        }
     }
 }
 
-private enum AppSection: String, CaseIterable, Identifiable {
-    case dashboard, containers, images, networks, volumes
+enum AppSection: String, CaseIterable, Identifiable {
+    case dashboard, containers, images, networks, volumes, settings
+
+    static let resourceSections: [AppSection] = [.dashboard, .containers, .images, .networks, .volumes]
+
     var id: Self { self }
     var title: String { rawValue.capitalized }
     var icon: String {
@@ -71,59 +108,30 @@ private enum AppSection: String, CaseIterable, Identifiable {
         case .images: "square.stack.3d.up"
         case .networks: "network"
         case .volumes: "externaldrive"
+        case .settings: "gearshape"
         }
     }
 }
 
-private struct DashboardView: View {
-    @EnvironmentObject private var model: AppModel
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("cengine").font(.largeTitle.bold())
-            Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 10) {
-                row("Engine", model.engineStatus)
-                row("VM networking", model.helperStatus)
-                row("Version", model.version)
-                row("Resources", model.diskUsage)
-            }
-            if model.helperNeedsApproval {
-                GroupBox {
-                    HStack(alignment: .center, spacing: 16) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("VM networking needs administrator approval")
-                                .font(.headline)
-                            Text("Allow cengine in Login Items & Extensions before the engine can start container networks.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("Open Login Items & Extensions…") {
-                            model.openNetworkingApproval()
-                        }
-                    }
-                    .padding(4)
-                }
-            }
-            Button("Refresh") { Task { await model.refresh() } }
-            Spacer()
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-    private func row(_ name: String, _ value: String) -> some View {
-        GridRow { Text(name).foregroundStyle(.secondary); Text(value).textSelection(.enabled) }
+private struct NavigateToIntegratedSettingsKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
+extension FocusedValues {
+    var navigateToIntegratedSettings: (() -> Void)? {
+        get { self[NavigateToIntegratedSettingsKey.self] }
+        set { self[NavigateToIntegratedSettingsKey.self] = newValue }
     }
 }
 
-private struct ResourceList: View {
-    let title: String
-    let items: [ResourceItem]
-    var body: some View {
-        VStack(alignment: .leading) {
-            Text(title).font(.title.bold())
-            List(items) { item in
-                VStack(alignment: .leading) { Text(item.title); Text(item.detail).font(.caption).foregroundStyle(.secondary) }
-            }
+private struct IntegratedSettingsCommands: Commands {
+    @FocusedValue(\.navigateToIntegratedSettings) private var navigateToSettings
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") { navigateToSettings?() }
+                .keyboardShortcut(",", modifiers: .command)
+                .disabled(navigateToSettings == nil)
         }
     }
 }
@@ -135,89 +143,19 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Welcome to cengine").font(.largeTitle.bold())
             Text("cengine uses a privileged networking service to connect each container VM to macOS through vmnet.")
-            Text("macOS requires administrator approval before the engine can start.").foregroundStyle(.secondary)
+            Text("macOS requires administrator approval before the engine can start.")
+                .foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("Enable VM Networking") { Task { await complete() } }
                     .keyboardShortcut(.defaultAction)
             }
-        }.padding(28).frame(width: 520)
+        }
+        .padding(28)
+        .frame(width: 520)
     }
 
     func complete() async {
         await onComplete()
-    }
-}
-
-private struct SettingsView: View {
-    @EnvironmentObject private var model: AppModel
-    @State private var showingUninstall = false
-    @State private var deleteData = false
-    var body: some View {
-        Form {
-            Section("Container Defaults") {
-                Stepper("CPUs: \(model.containerCPUs)", value: $model.containerCPUs, in: 1...model.maximumCPUs)
-                Stepper(
-                    "Memory: \(model.containerMemoryGiB) GiB",
-                    value: $model.containerMemoryGiB,
-                    in: 1...model.maximumMemoryGiB
-                )
-                Text("Used for new containers when Docker or Compose does not specify resource limits.")
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button("Save Container Defaults") { model.applyContainerSettings() }
-                    if let status = model.containerSettingsStatus {
-                        Text(status).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
-            Section("Builder Resources") {
-                Stepper("CPUs: \(model.builderCPUs)", value: $model.builderCPUs, in: 1...model.maximumCPUs)
-                Stepper(
-                    "Memory: \(model.builderMemoryGiB) GiB",
-                    value: $model.builderMemoryGiB,
-                    in: 1...model.maximumMemoryGiB
-                )
-                Text("Changing resources recreates the managed builder VM while preserving its build cache.")
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button("Apply Builder Resources") { Task { await model.applyBuilderSettings() } }
-                    if let status = model.builderSettingsStatus {
-                        Text(status).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
-            Divider()
-            LabeledContent("VM Networking", value: model.helperStatus)
-            Text("Required for vmnet NAT, DNS, host access, and published ports.").font(.caption).foregroundStyle(.secondary)
-            if model.helperNeedsApproval {
-                HStack {
-                    Text("Administrator approval is required.").font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Open Login Items & Extensions…") { model.openNetworkingApproval() }
-                }
-            }
-            Divider()
-            Button("Uninstall cengine…", role: .destructive) { showingUninstall = true }
-        }.padding()
-        .sheet(isPresented: $showingUninstall) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Uninstall cengine?").font(.title2.bold())
-                Text("Services, Docker integration, the app, and CLI will be removed.")
-                Toggle("Delete containers, images, and volumes", isOn: $deleteData)
-                Text(deleteData ? "Engine data will be permanently deleted." : "Engine data will be preserved.")
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Spacer()
-                    Button("Cancel") { showingUninstall = false }.keyboardShortcut(.cancelAction)
-                    Button("Uninstall", role: .destructive) {
-                        showingUninstall = false
-                        Task { await model.uninstall(deleteData: deleteData) }
-                    }
-                }
-            }
-            .padding(24)
-            .frame(width: 460)
-        }
     }
 }
