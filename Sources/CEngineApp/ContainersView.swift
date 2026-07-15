@@ -47,7 +47,7 @@ struct ContainersView: View {
                     }
                 }
             }
-            .frame(minWidth: 430)
+            .frame(minWidth: 430, maxHeight: .infinity)
 
             Group {
                 if let id = selection, let container = model.containers.first(where: { $0.id == id }) {
@@ -60,8 +60,9 @@ struct ContainersView: View {
                     )
                 }
             }
-            .frame(minWidth: 340, idealWidth: 420)
+            .frame(minWidth: 340, idealWidth: 420, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .searchable(text: $searchText, prompt: "Search containers")
         .navigationTitle("Containers")
         .onChange(of: model.containers.map(\.id)) { _, ids in

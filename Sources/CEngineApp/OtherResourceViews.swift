@@ -44,7 +44,7 @@ struct ImagesView: View {
                     }
                 }
             }
-            .frame(minWidth: 430)
+            .frame(minWidth: 430, maxHeight: .infinity)
             Group {
                 if let id = selection, let image = model.images.first(where: { $0.id == id }) {
                     ImageInspector(image: image)
@@ -52,8 +52,9 @@ struct ImagesView: View {
                     ResourceSelectionState(title: "Select an image", icon: "square.stack.3d.up")
                 }
             }
-            .frame(minWidth: 340, idealWidth: 420)
+            .frame(minWidth: 340, idealWidth: 420, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .searchable(text: $searchText, prompt: "Search images")
         .navigationTitle("Images")
         .onChange(of: model.images.map(\.id)) { _, ids in
@@ -142,7 +143,7 @@ struct NetworksView: View {
                     }
                 }
             }
-            .frame(minWidth: 430)
+            .frame(minWidth: 430, maxHeight: .infinity)
             Group {
                 if let id = selection, let network = model.networks.first(where: { $0.id == id }) {
                     NetworkInspector(network: network)
@@ -150,8 +151,9 @@ struct NetworksView: View {
                     ResourceSelectionState(title: "Select a network", icon: "network")
                 }
             }
-            .frame(minWidth: 340, idealWidth: 420)
+            .frame(minWidth: 340, idealWidth: 420, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .searchable(text: $searchText, prompt: "Search networks")
         .navigationTitle("Networks")
         .onChange(of: model.networks.map(\.id)) { _, ids in
@@ -236,7 +238,7 @@ struct VolumesView: View {
                     }
                 }
             }
-            .frame(minWidth: 430)
+            .frame(minWidth: 430, maxHeight: .infinity)
             Group {
                 if let id = selection, let volume = model.volumes.first(where: { $0.id == id }) {
                     VolumeInspector(volume: volume)
@@ -244,8 +246,9 @@ struct VolumesView: View {
                     ResourceSelectionState(title: "Select a volume", icon: "externaldrive")
                 }
             }
-            .frame(minWidth: 340, idealWidth: 420)
+            .frame(minWidth: 340, idealWidth: 420, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .searchable(text: $searchText, prompt: "Search volumes")
         .navigationTitle("Volumes")
         .onChange(of: model.volumes.map(\.id)) { _, ids in
