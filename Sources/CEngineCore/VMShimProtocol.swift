@@ -83,6 +83,7 @@ public enum VMShimProtocol {
         public var memoryBytes: UInt64
         public var macAddress: String
         public var bindShares: [BindShare]
+        public var socketRelays: [SocketRelay]
         public var socketPath: String
         public var logPath: String
         public var kernelArguments: [String]
@@ -104,6 +105,7 @@ public enum VMShimProtocol {
             memoryBytes: UInt64,
             macAddress: String,
             bindShares: [BindShare] = [],
+            socketRelays: [SocketRelay] = [],
             socketPath: String,
             logPath: String,
             kernelArguments: [String] = [],
@@ -124,6 +126,7 @@ public enum VMShimProtocol {
             self.memoryBytes = memoryBytes
             self.macAddress = macAddress
             self.bindShares = bindShares
+            self.socketRelays = socketRelays
             self.socketPath = socketPath
             self.logPath = logPath
             self.kernelArguments = kernelArguments
@@ -152,6 +155,16 @@ public enum VMShimProtocol {
             self.tag = tag
             self.source = source
             self.readOnly = readOnly
+        }
+    }
+
+    public struct SocketRelay: Codable, Sendable, Equatable {
+        public var path: String
+        public var port: UInt32
+
+        public init(path: String, port: UInt32) {
+            self.path = path
+            self.port = port
         }
     }
 

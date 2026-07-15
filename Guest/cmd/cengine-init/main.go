@@ -41,6 +41,13 @@ func main() {
 	}
 	if supervisor.IsExecStage2(os.Args) {
 		if err := supervisor.RunExecStage2(); err != nil {
+			log.Print(err)
+			os.Exit(supervisor.ExecStageExitCode(err))
+		}
+		return
+	}
+	if supervisor.IsSocketProxyStage(os.Args) {
+		if err := supervisor.RunSocketProxyStage(os.Args); err != nil {
 			log.Fatal(err)
 		}
 		return

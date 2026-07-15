@@ -9,13 +9,14 @@ import (
 )
 
 const (
-	Version           = 1
-	ControlPort       = 4100
-	FileSystemPort    = 4101
-	RootFSContentPort = 4102
-	ExecIOPort        = 4103
-	MaxControlFrame   = 16 << 20
-	MaxFileSystemIO   = 4 << 20
+	Version             = 2
+	ControlPort         = 4100
+	FileSystemPort      = 4101
+	RootFSContentPort   = 4102
+	ExecIOPort          = 4103
+	SocketProxyPortBase = 4200
+	MaxControlFrame     = 16 << 20
+	MaxFileSystemIO     = 4 << 20
 )
 
 type Envelope struct {
@@ -66,6 +67,10 @@ type Mount struct {
 	Options     []string `json:"options,omitempty"`
 	Subpath     string   `json:"subpath,omitempty"`
 	NoCopy      bool     `json:"noCopy,omitempty"`
+	SocketPort  uint32   `json:"socketPort,omitempty"`
+	SocketMode  uint32   `json:"socketMode,omitempty"`
+	SocketUID   uint32   `json:"socketUID,omitempty"`
+	SocketGID   uint32   `json:"socketGID,omitempty"`
 }
 
 type NetworkEndpoint struct {

@@ -12,6 +12,7 @@ enum UnixSocket {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw systemError("create Unix socket") }
         do {
+            try suppressSIGPIPE(descriptor)
             try withAddress(path) { address, length in
                 guard Darwin.bind(descriptor, address, length) == 0 else { throw systemError("bind Unix socket") }
             }
@@ -28,6 +29,7 @@ enum UnixSocket {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw systemError("create Unix socket") }
         do {
+            try suppressSIGPIPE(descriptor)
             try withAddress(path) { address, length in
                 guard Darwin.connect(descriptor, address, length) == 0 else { throw systemError("connect Unix socket") }
             }
@@ -41,7 +43,23 @@ enum UnixSocket {
     static func accept(_ descriptor: Int32) throws -> Int32 {
         let client = Darwin.accept(descriptor, nil, nil)
         guard client >= 0 else { throw systemError("accept Unix socket") }
-        return client
+        do {
+            try suppressSIGPIPE(client)
+            return client
+        } catch {
+            close(client)
+            throw error
+        }
+    }
+
+    private static func suppressSIGPIPE(_ descriptor: Int32) throws {
+        var enabled: CInt = 1
+        guard setsockopt(
+            descriptor, SOL_SOCKET, SO_NOSIGPIPE,
+            &enabled, socklen_t(MemoryLayout<CInt>.size)
+        ) == 0 else {
+            throw systemError("configure Unix socket")
+        }
     }
 
     private static func withAddress<T>(_ path: String, body: (UnsafePointer<sockaddr>, socklen_t) throws -> T) throws -> T {

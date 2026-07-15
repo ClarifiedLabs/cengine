@@ -734,6 +734,9 @@ func enterWorkload(spec protocol.WorkloadSpec) error {
 		if err := unix.Mknod(filepath.Join(root, "dev", device.name), device.mode, device.dev); err != nil && !errors.Is(err, unix.EEXIST) {
 			return err
 		}
+		if err := unix.Chmod(filepath.Join(root, "dev", device.name), device.mode&07777); err != nil {
+			return err
+		}
 	}
 	if spec.Hostname != "" {
 		if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {
@@ -741,6 +744,9 @@ func enterWorkload(spec protocol.WorkloadSpec) error {
 		}
 	}
 	if err := unix.Chroot(root); err != nil {
+		return err
+	}
+	if err := startSocketProxies(spec.Mounts); err != nil {
 		return err
 	}
 	workingDirectory = spec.WorkingDirectory
@@ -1086,6 +1092,8 @@ func applyMount(root string, mount protocol.Mount) error {
 		if mount.ReadOnly {
 			return unix.Mount("", destination, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
 		}
+		return nil
+	case "socket":
 		return nil
 	case "volume":
 		staging := filepath.Join("/run/cengine/volumes", mount.Source)

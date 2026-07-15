@@ -17,6 +17,7 @@ import Foundation
     private var listener: Int32 = -1
     private var serviceListener: Int32 = -1
     private var serviceRelays: [UUID: BidirectionalDescriptorRelay] = [:]
+    private var hostSocketRelays: [UnixVirtioSocketRelay] = []
     private let fabric = TrunkNetworkFabric()
     private var networkListener: Int32 = -1
     private var networkBridge: NetworkStreamBridge?
@@ -145,11 +146,11 @@ import Foundation
         case .stop:
             if let machine { try await machine.forceStop() }
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
-            machine = nil; state = .stopped; try persist(); return try JSONEncoder().encode(status())
+            machine = nil; hostSocketRelays.removeAll(); state = .stopped; try persist(); return try JSONEncoder().encode(status())
         case .shutdown:
             if let machine { try? await machine.forceStop() }
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
-            machine = nil; state = .stopped; try persist(); return try JSONEncoder().encode(status())
+            machine = nil; hostSocketRelays.removeAll(); state = .stopped; try persist(); return try JSONEncoder().encode(status())
         }
     }
 
@@ -173,6 +174,11 @@ import Foundation
                 kernelArguments: specification.kernelArguments
             )
             let value = try RawContainerVirtualMachine(configuration: config)
+            hostSocketRelays = try specification.socketRelays.map { specification in
+                let relay = UnixVirtioSocketRelay(socketPath: specification.path)
+                try value.install(listener: relay.listener, port: specification.port)
+                return relay
+            }
             if specification.kind == .storage {
                 try await value.startInfrastructure(servicePort: GuestProtocol.fileSystemPort)
                 await fabric.register(.init("storage-service"), file: value.trunk.fabricFileHandle, vlans: Set(activeVLANs))
@@ -186,6 +192,7 @@ import Foundation
             machine = value; state = .running; failure = nil; try persist()
         } catch {
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
+            hostSocketRelays.removeAll()
             state = .failed; failure = error.localizedDescription; try? persist(); throw error
         }
     }

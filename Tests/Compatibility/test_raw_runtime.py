@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import subprocess
 import time
 import uuid
@@ -19,6 +20,54 @@ def test_debian_package_install_uses_ext4_rootfs(client: docker.DockerClient):
         remove=True,
     )
     assert output.strip() == b"ext4-ok"
+
+
+@pytest.mark.compat("CTR-045")
+def test_unprivileged_standard_devices_are_world_accessible(client: docker.DockerClient):
+    output = client.containers.run(
+        "alpine:latest",
+        [
+            "sh", "-ec",
+            "for device in null zero full random urandom tty; do "
+            "test \"$(stat -c %a /dev/$device)\" = 666; done; "
+            "printf writable >/dev/null; echo devices-ok",
+        ],
+        user="65534:65534",
+        remove=True,
+    )
+    assert output.strip() == b"devices-ok"
+
+
+@pytest.mark.compat("CTR-046")
+def test_concurrent_vm_starts_remain_responsive(daemon, client: docker.DockerClient):
+    container_ids: list[str] = []
+
+    def start_container(index: int) -> str:
+        local = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=180, version="auto")
+        try:
+            container = local.containers.create(
+                "alpine:latest", ["sh", "-c", "while :; do sleep 1; done"],
+                name=f"concurrent-vm-{index}-{uuid.uuid4().hex[:8]}",
+            )
+            container_ids.append(container.id)
+            container.start()
+            result = container.exec_run(["sh", "-c", "printf responsive"])
+            assert result.exit_code == 0
+            assert result.output == b"responsive"
+            return container.id
+        finally:
+            local.close()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            started = list(pool.map(start_container, range(12)))
+        assert len(set(started)) == 12
+    finally:
+        for container_id in container_ids:
+            try:
+                client.containers.get(container_id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
 
 
 @pytest.mark.compat("CTR-036")

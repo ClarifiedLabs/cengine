@@ -5,14 +5,25 @@ package supervisor
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"reflect"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestExecStageExitCodeDistinguishesMissingExecutable(t *testing.T) {
+	if code := ExecStageExitCode(fmt.Errorf("look up command: %w", os.ErrNotExist)); code != 127 {
+		t.Fatalf("missing executable exit code is %d, want 127", code)
+	}
+	if code := ExecStageExitCode(errors.New("exec format error")); code != 126 {
+		t.Fatalf("non-missing exec failure exit code is %d, want 126", code)
+	}
+}
 
 type testReadWriter struct {
 	io.ReadWriter

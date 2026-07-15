@@ -30,6 +30,7 @@ import Testing
             cpus: 1,
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:04",
+            socketRelays: [.init(path: "/tmp/docker.sock", port: GuestProtocol.socketProxyPortBase)],
             socketPath: "/tmp/control.sock",
             logPath: "/tmp/shim.log"
         )

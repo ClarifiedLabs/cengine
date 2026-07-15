@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Dispatch
 import Foundation
 import Testing
@@ -130,9 +131,55 @@ private final class DrainRendezvous: @unchecked Sendable {
         let requested = URL(filePath: "/lib/cengine-bind-source-\(UUID().uuidString)")
         let mount = MountRecord(kind: .bind, source: requested.path, destination: "/data", createSourceIfMissing: true)
         let source = try #require(HostBindSourceResolver(root: managed).resolve([mount])[0])
-        #expect(source.shareRoot.path.hasPrefix(managed.path + "/"))
-        #expect(source.subpath == nil)
-        #expect(FileManager.default.fileExists(atPath: source.shareRoot.path))
+        guard case .virtioFS(let share) = source else {
+            Issue.record("managed bind source was not prepared as a VirtioFS share")
+            return
+        }
+        #expect(share.shareRoot.path.hasPrefix(managed.path + "/"))
+        #expect(share.subpath == nil)
+        #expect(FileManager.default.fileExists(atPath: share.shareRoot.path))
+    }
+
+    @Test func unixSocketBindUsesVsockRelayInsteadOfVirtioFS() throws {
+        let temporary = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let socket = temporary.appending(path: "docker.sock")
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let descriptor = try UnixSocket.listen(path: socket.path)
+        defer { close(descriptor) }
+
+        let mount = MountRecord(kind: .bind, source: socket.path, destination: "/var/run/docker.sock")
+        let source = try #require(HostBindSourceResolver(root: temporary).resolve([mount])[0])
+        guard case .socket(let relay) = source else {
+            Issue.record("Unix socket bind source was prepared as VirtioFS")
+            return
+        }
+        #expect(relay.path == socket)
+        #expect(relay.port == GuestProtocol.socketProxyPortBase)
+        #expect(relay.mode == 0o600)
+        #expect(relay.uid == UInt32(getuid()))
+        #expect(relay.gid == UInt32(getgid()))
+    }
+
+    @Test func unixSocketsSuppressSIGPIPEForListenersClientsAndAcceptedPeers() throws {
+        let temporary = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let socket = temporary.appending(path: "transport.sock")
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        let listener = try UnixSocket.listen(path: socket.path)
+        defer { close(listener) }
+        let client = try UnixSocket.connect(path: socket.path)
+        defer { close(client) }
+        let peer = try UnixSocket.accept(listener)
+        defer { close(peer) }
+
+        for descriptor in [listener, client, peer] {
+            var enabled: CInt = 0
+            var length = socklen_t(MemoryLayout<CInt>.size)
+            #expect(getsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, &length) == 0)
+            #expect(enabled == 1)
+        }
     }
 
     @Test func portForwarderResolvesEphemeralHostPort() async throws {

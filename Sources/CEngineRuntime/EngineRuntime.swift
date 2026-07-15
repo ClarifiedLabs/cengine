@@ -32,7 +32,9 @@ public actor EngineRuntime {
 
     var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
+    private let endpointAllocationStore: AtomicStore<[String: Int]>
     let backend: any ContainerBackend
+    private var endpointAllocationCursors: [String: Int]
     private var execs: [String: ExecRecord] = [:]
     private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
     private var eventHistory: [RuntimeEvent] = []
@@ -40,11 +42,17 @@ public actor EngineRuntime {
     private var exitWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var removalWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var lifecycleIntents: [String: LifecycleIntent] = [:]
+    private var pendingContainerNames: [String: String] = [:]
+    private var pendingContainerIDs = Set<String>()
+    private var pendingContainers: [String: ContainerRecord] = [:]
+    private var startingContainerIDs = Set<String>()
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
+        self.endpointAllocationStore = AtomicStore(url: root.appending(path: "endpoint-allocation.json"))
         self.backend = backend
         self.snapshot = try await store.load(default: EngineSnapshot())
+        self.endpointAllocationCursors = try await endpointAllocationStore.load(default: [:])
         let persistedNetworks = Dictionary(uniqueKeysWithValues: snapshot.networks.map { ($0.id, $0) })
         self.snapshot.networks = try await backend.restoreNetworks(snapshot.networks)
         let remappedNetworkIDs = Set(snapshot.networks.compactMap { network -> String? in
@@ -53,6 +61,9 @@ public actor EngineRuntime {
             return network.id
         })
         if !remappedNetworkIDs.isEmpty {
+            endpointAllocationCursors = endpointAllocationCursors.filter {
+                !remappedNetworkIDs.contains(Self.networkID(fromAllocationCursorKey: $0.key))
+            }
             for container in snapshot.containers.indices {
                 for endpoint in snapshot.containers[container].networks.indices
                     where remappedNetworkIDs.contains(snapshot.containers[container].networks[endpoint].networkID) {
@@ -147,7 +158,9 @@ public actor EngineRuntime {
     }
 
     public func listContainers(all: Bool) -> [ContainerRecord] {
-        snapshot.containers.filter { all || $0.phase == .running || $0.phase == .paused }
+        snapshot.containers.filter {
+            !startingContainerIDs.contains($0.id) && (all || $0.phase == .running || $0.phase == .paused)
+        }
             .sorted { $0.createdAt > $1.createdAt }
     }
 
@@ -165,21 +178,40 @@ public actor EngineRuntime {
     public func createContainer(_ input: ContainerRecord) async throws -> ContainerRecord {
         var record = input
         guard Identifier.validateName(record.name) else { throw EngineError(.badRequest, "invalid container name: \(record.name)") }
-        guard !snapshot.containers.contains(where: { $0.name == record.name || $0.id == record.id }) else {
-            throw EngineError(.conflict, "Conflict. The container name \"/\(record.name)\" is already in use.")
+        if let conflictingID = pendingContainerNames[record.name]
+            ?? snapshot.containers.first(where: { $0.name == record.name || $0.id == record.id })?.id
+            ?? (pendingContainerIDs.contains(record.id) ? record.id : nil) {
+            throw Self.containerNameConflict(name: record.name, conflictingID: conflictingID)
+        }
+        pendingContainerNames[record.name] = record.id
+        pendingContainerIDs.insert(record.id)
+        defer {
+            pendingContainerNames.removeValue(forKey: record.name)
+            pendingContainerIDs.remove(record.id)
+            pendingContainers.removeValue(forKey: record.id)
         }
         if record.networks.isEmpty, record.networkDisabled != true,
            let network = snapshot.networks.first(where: { $0.name == "default" }) {
             record.networks = [.init(networkID: network.id)]
         }
         record = try allocatingEndpointAddresses(to: record)
+        try await persistEndpointAllocationCursors()
         try validateEndpoints(record)
+        pendingContainers[record.id] = record
         try await backend.prepare(record)
         snapshot.containers.append(record)
         try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
         emit(containerEvent("create", record))
         return record
+    }
+
+    private static func containerNameConflict(name: String, conflictingID: String) -> EngineError {
+        EngineError(
+            .conflict,
+            "Conflict. The container name \"/\(name)\" is already in use by container \"\(conflictingID)\". "
+                + "You have to remove (or rename) that container to be able to reuse that name."
+        )
     }
 
     public func startContainer(_ identifier: String) async throws {
@@ -189,6 +221,8 @@ public actor EngineRuntime {
         if record.phase == .dead {
             try await backend.delete(record)
         }
+        startingContainerIDs.insert(record.id)
+        defer { startingContainerIDs.remove(record.id) }
         try await backend.prepare(record)
         let resolvedPorts = try await backend.start(record)
         guard let current = try? containerIndex(record.id) else {
@@ -426,8 +460,8 @@ public actor EngineRuntime {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid container name: \(name)") }
         let normalized = name.normalizedContainerName
         let index = try containerIndex(identifier)
-        guard !snapshot.containers.indices.contains(where: { $0 != index && snapshot.containers[$0].name == normalized }) else {
-            throw EngineError(.conflict, "Conflict. The container name \"/\(normalized)\" is already in use.")
+        if let conflicting = snapshot.containers.indices.first(where: { $0 != index && snapshot.containers[$0].name == normalized }) {
+            throw Self.containerNameConflict(name: normalized, conflictingID: snapshot.containers[conflicting].id)
         }
         snapshot.containers[index].name = normalized
         try await persist()
@@ -613,6 +647,7 @@ public actor EngineRuntime {
             ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil
         ))
         snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
+        try await persistEndpointAllocationCursors()
         do {
             try validateEndpoints(snapshot.containers[index])
             try await backend.updateNetworkRecords(snapshot.containers)
@@ -711,7 +746,7 @@ public actor EngineRuntime {
                 ipv4IsStatic: endpoint.ipv4AddressIsStatic,
                 ipv6IsStatic: endpoint.ipv6AddressIsStatic
             )
-            for peer in snapshot.containers where peer.id != record.id {
+            for peer in snapshot.containers + Array(pendingContainers.values) where peer.id != record.id {
                 for existing in peer.networks where existing.networkID == endpoint.networkID {
                     if endpoint.ipv4AddressIsStatic, endpoint.ipv4Address == existing.ipv4Address {
                         throw EngineError(.conflict, "IPv4 address \(endpoint.ipv4Address ?? "") is already allocated")
@@ -730,29 +765,39 @@ public actor EngineRuntime {
             guard let network = snapshot.networks.first(where: { $0.id == record.networks[index].networkID }) else {
                 throw EngineError(.notFound, "network \(record.networks[index].networkID) not found")
             }
-            let peers = snapshot.containers
+            let peers = (snapshot.containers + Array(pendingContainers.values))
                 .filter { $0.id != record.id }
                 .flatMap(\.networks)
                 .filter { $0.networkID == network.id }
             if record.networks[index].ipv4Address == nil, !network.subnet.isEmpty {
-                record.networks[index].ipv4Address = try Self.nextAddress(
+                let cursorKey = Self.allocationCursorKey(networkID: network.id, family: AF_INET)
+                let allocation = try Self.nextAddress(
                     in: network.subnet,
                     gateway: network.gateway,
-                    used: Set(peers.compactMap(\.ipv4Address) + record.networks.compactMap(\.ipv4Address))
+                    used: Set(peers.compactMap(\.ipv4Address) + record.networks.compactMap(\.ipv4Address)),
+                    after: endpointAllocationCursors[cursorKey] ?? 0
                 )
+                record.networks[index].ipv4Address = allocation.address
+                endpointAllocationCursors[cursorKey] = allocation.offset
             }
             if record.networks[index].ipv6Address == nil, !network.ipv6Subnet.isEmpty {
-                record.networks[index].ipv6Address = try Self.nextAddress(
+                let cursorKey = Self.allocationCursorKey(networkID: network.id, family: AF_INET6)
+                let allocation = try Self.nextAddress(
                     in: network.ipv6Subnet,
                     gateway: network.ipv6Gateway,
-                    used: Set(peers.compactMap(\.ipv6Address) + record.networks.compactMap(\.ipv6Address))
+                    used: Set(peers.compactMap(\.ipv6Address) + record.networks.compactMap(\.ipv6Address)),
+                    after: endpointAllocationCursors[cursorKey] ?? 0
                 )
+                record.networks[index].ipv6Address = allocation.address
+                endpointAllocationCursors[cursorKey] = allocation.offset
             }
         }
         return record
     }
 
-    private static func nextAddress(in subnet: String, gateway: String, used: Set<String>) throws -> String {
+    private static func nextAddress(
+        in subnet: String, gateway: String, used: Set<String>, after cursor: Int
+    ) throws -> (address: String, offset: Int) {
         let components = subnet.split(separator: "/", maxSplits: 1).map(String.init)
         guard components.count == 2, let prefix = Int(components[1]) else {
             throw EngineError(.badRequest, "invalid network subnet \(subnet)")
@@ -771,7 +816,9 @@ public actor EngineRuntime {
         let lastOffset = hostBits >= 16 ? 65_535 : (1 << hostBits) - 1
         let reserved = Set(used.map { $0.split(separator: "/", maxSplits: 1).first.map(String.init) ?? $0 } + [gateway])
         guard lastOffset >= 1 else { throw EngineError(.conflict, "network \(subnet) has no allocatable addresses") }
-        for offset in 1...lastOffset {
+        let firstOffset = cursor >= 1 && cursor < lastOffset ? cursor + 1 : 1
+        let offsets = Array(firstOffset...lastOffset) + (firstOffset > 1 ? Array(1..<firstOffset) : [])
+        for offset in offsets {
             if family == AF_INET, offset == lastOffset { continue }
             var candidate = network
             var carry = offset
@@ -781,9 +828,21 @@ public actor EngineRuntime {
                 carry = value >> 8
             }
             guard let value = addressString(candidate, family: family), !reserved.contains(value) else { continue }
-            return value
+            return (value, offset)
         }
         throw EngineError(.conflict, "network \(subnet) has no free addresses")
+    }
+
+    private static func allocationCursorKey(networkID: String, family: Int32) -> String {
+        "\(networkID)/\(family == AF_INET6 ? "ipv6" : "ipv4")"
+    }
+
+    private static func networkID(fromAllocationCursorKey key: String) -> String {
+        key.split(separator: "/", maxSplits: 1).first.map(String.init) ?? key
+    }
+
+    private func persistEndpointAllocationCursors() async throws {
+        try await endpointAllocationStore.save(endpointAllocationCursors)
     }
 
     private static func addressBytes(_ value: String, family: Int32) -> [UInt8]? {

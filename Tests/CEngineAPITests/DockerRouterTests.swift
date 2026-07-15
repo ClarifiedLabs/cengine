@@ -130,6 +130,27 @@ private actor BlockingStartBackend: ContainerBackend {
     func releaseStart() { continuation?.resume(); continuation = nil }
 }
 
+private actor BlockingPrepareBackend: ContainerBackend {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var prepares = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {
+        prepares += 1
+        await withCheckedContinuation { continuations.append($0) }
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func prepareCount() -> Int { prepares }
+    func releasePreparations() {
+        let pending = continuations
+        continuations.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
 private actor ConcurrentDeleteBackend: ContainerBackend {
     private var arrivals = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -1170,6 +1191,78 @@ private actor AuthImageBackend: ContainerBackend {
         } catch let error as EngineError {
             #expect(error.code == .conflict)
         }
+    }
+
+    @Test func containerListDoesNotPublishAContainerDuringItsStartTransition() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "starting", image: "debian"))
+        let start = Task { try await runtime.startContainer(record.id) }
+        while !(await backend.hasEnteredStart()) { await Task.yield() }
+
+        #expect(await runtime.listContainers(all: true).isEmpty)
+
+        await backend.releaseStart()
+        try await start.value
+        let listed = await runtime.listContainers(all: true)
+        #expect(listed.map(\.id) == [record.id])
+        #expect(listed.first?.phase == .running)
+    }
+
+    @Test func concurrentCreatesReserveContainerNamesBeforeBackendPreparation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingPrepareBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = Task {
+            try await runtime.createContainer(ContainerRecord(name: "shared-name", image: "debian"))
+        }
+        while await backend.prepareCount() == 0 { await Task.yield() }
+        let second = Task {
+            try await runtime.createContainer(ContainerRecord(name: "shared-name", image: "debian"))
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        await backend.releasePreparations()
+
+        var successes = 0
+        var conflicts = 0
+        for result in [await first.result, await second.result] {
+            switch result {
+            case .success:
+                successes += 1
+            case .failure(let error as EngineError) where error.code == .conflict:
+                conflicts += 1
+                #expect(error.message.contains("is already in use by container"))
+            case .failure(let error):
+                Issue.record("unexpected create error: \(error)")
+            }
+        }
+        #expect(successes == 1)
+        #expect(conflicts == 1)
+        #expect(await backend.prepareCount() == 1)
+        #expect(await runtime.listContainers(all: true).count == 1)
+    }
+
+    @Test func concurrentCreatesReserveEndpointAddressesBeforeBackendPreparation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingPrepareBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = Task {
+            try await runtime.createContainer(ContainerRecord(name: "first-endpoint", image: "debian"))
+        }
+        while await backend.prepareCount() < 1 { await Task.yield() }
+        let second = Task {
+            try await runtime.createContainer(ContainerRecord(name: "second-endpoint", image: "debian"))
+        }
+        while await backend.prepareCount() < 2 { await Task.yield() }
+        await backend.releasePreparations()
+
+        let created = try await (first.value, second.value)
+        let endpoints = [created.0, created.1].compactMap { $0.networks.first?.ipv4Address }
+        #expect(Set(endpoints) == ["192.168.64.2", "192.168.64.3"])
     }
 
     @Test func concurrentContainerRemovalsDoNotUseStaleIndices() async throws {

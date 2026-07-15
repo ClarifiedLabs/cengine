@@ -19,4 +19,20 @@ import Testing
         #expect(firstEndpoint.ipv6Address == "fd00:ce::2")
         #expect(secondEndpoint.ipv6Address == "fd00:ce::3")
     }
+
+    @Test func removedEndpointAddressIsNotImmediatelyReusedAcrossRuntimeRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let firstRuntime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let first = try await firstRuntime.createContainer(ContainerRecord(name: "first", image: "example"))
+        try await firstRuntime.removeContainer(first.id, force: false)
+
+        let restartedRuntime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let second = try await restartedRuntime.createContainer(ContainerRecord(name: "second", image: "example"))
+        let endpoint = try #require(second.networks.first)
+
+        #expect(endpoint.ipv4Address == "192.168.64.3")
+        #expect(endpoint.ipv6Address == "fd00:ce::3")
+    }
 }

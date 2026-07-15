@@ -538,7 +538,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
         knownContainers = Dictionary(uniqueKeysWithValues: containers.map { ($0.id, $0) })
         activeContainers = Dictionary(uniqueKeysWithValues: containers.filter { $0.phase == .running || $0.phase == .paused }.map { ($0.id, $0) })
         for container in containers {
-            guard let shim = shims[container.id], (try? await shim.status().state) == .running else { continue }
+            guard activeContainers[container.id] != nil, let shim = shims[container.id],
+                  (try? await shim.status().state) == .running else { continue }
             let desired = Set(container.networks.map(\.networkID))
             let existing = appliedNetworks[container.id] ?? []
             struct NetworkRequest: Encodable { let endpoint: GuestProtocol.NetworkEndpoint?; let name: String? }
@@ -715,9 +716,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
             memoryBytes: max(container.memoryBytes, 256 * 1_024 * 1_024),
             macAddress: Self.macAddress(container.id),
             bindShares: container.mounts.enumerated().compactMap { index, mount in
-                guard mount.kind == .bind, let source = bindSources[index] else { return nil }
-                return .init(tag: "bind-\(index)", source: source.shareRoot.path, readOnly: mount.readOnly)
+                guard mount.kind == .bind, let source = bindSources[index],
+                      case .virtioFS(let share) = source else { return nil }
+                return .init(tag: "bind-\(index)", source: share.shareRoot.path, readOnly: mount.readOnly)
             } + [.init(tag: "cengine-io", source: ioDirectory.path, readOnly: false)],
+            socketRelays: bindSources.values.compactMap { source in
+                guard case .socket(let socket) = source else { return nil }
+                return .init(path: socket.path.path, port: socket.port)
+            }.sorted { $0.port < $1.port },
             socketPath: try Self.makeRuntimeSocketPath(),
             logPath: directory.appending(path: "shim.log").path,
             kernelArguments: [
@@ -739,10 +745,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let volumeDevices = try Dictionary(uniqueKeysWithValues: blockVolumes.enumerated().map {
             ($0.element, try Self.volumeDevicePath(index: $0.offset))
         })
-        let mounts = container.mounts.enumerated().map { index, mount in
+        let mounts = container.mounts.enumerated().map { index, mount -> GuestProtocol.Mount in
+            if let source = bindSources[index], case .socket(let socket) = source {
+                return GuestProtocol.Mount(
+                    kind: "socket", source: mount.source, destination: mount.destination,
+                    readOnly: mount.readOnly, socketPort: socket.port, socketMode: socket.mode,
+                    socketUID: socket.uid, socketGID: socket.gid
+                )
+            }
             let bindSubpath: String? = {
                 guard mount.kind == .bind else { return mount.subpath }
-                return [bindSources[index]?.subpath, mount.subpath].compactMap { $0 }.joined(separator: "/").nilIfEmpty
+                guard let source = bindSources[index], case .virtioFS(let share) = source else { return mount.subpath }
+                return [share.subpath, mount.subpath].compactMap { $0 }.joined(separator: "/").nilIfEmpty
             }()
             let options = mount.kind == .tmpfs ? ["size=\(max(mount.tmpfsSizeBytes ?? 64 * 1_024 * 1_024, 0))", String(format: "mode=%o", mount.tmpfsMode ?? 0o1777)] : []
             return GuestProtocol.Mount(
@@ -1023,9 +1037,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private struct NetworkState: Codable { let record: NetworkRecord; let vlan: UInt16 }
 }
 
-struct PreparedBindSource: Sendable, Equatable {
+struct PreparedVirtioFSBind: Sendable, Equatable {
     let shareRoot: URL
     let subpath: String?
+}
+
+struct PreparedSocketBind: Sendable, Equatable {
+    let path: URL
+    let port: UInt32
+    let mode: UInt32
+    let uid: UInt32
+    let gid: UInt32
+}
+
+enum PreparedBindSource: Sendable, Equatable {
+    case virtioFS(PreparedVirtioFSBind)
+    case socket(PreparedSocketBind)
 }
 
 struct HostBindSourceResolver: Sendable {
@@ -1036,11 +1063,27 @@ struct HostBindSourceResolver: Sendable {
         for (index, mount) in mounts.enumerated() where mount.kind == .bind {
             let requested = URL(filePath: mount.source)
             if FileManager.default.fileExists(atPath: requested.path) {
+                let canonical = requested.resolvingSymlinksInPath()
+                var metadata = stat()
+                if lstat(canonical.path, &metadata) == 0,
+                   metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK) {
+                    guard let offset = UInt32(exactly: index) else {
+                        throw EngineError(.badRequest, "too many container mounts")
+                    }
+                    let (port, overflow) = GuestProtocol.socketProxyPortBase.addingReportingOverflow(offset)
+                    guard !overflow else { throw EngineError(.badRequest, "too many container mounts") }
+                    resolved[index] = .socket(.init(
+                        path: canonical, port: port,
+                        mode: UInt32(metadata.st_mode & mode_t(0o7777)),
+                        uid: UInt32(metadata.st_uid), gid: UInt32(metadata.st_gid)
+                    ))
+                    continue
+                }
                 let isDirectory = (try? requested.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                resolved[index] = .init(
+                resolved[index] = .virtioFS(.init(
                     shareRoot: isDirectory ? requested : requested.deletingLastPathComponent(),
                     subpath: isDirectory ? nil : requested.lastPathComponent
-                )
+                ))
                 continue
             }
             guard mount.createSourceIfMissing != false else {
@@ -1048,13 +1091,13 @@ struct HostBindSourceResolver: Sendable {
             }
             do {
                 try FileManager.default.createDirectory(at: requested, withIntermediateDirectories: true)
-                resolved[index] = .init(shareRoot: requested, subpath: nil)
+                resolved[index] = .virtioFS(.init(shareRoot: requested, subpath: nil))
             } catch {
                 guard Self.isHostNamespaceWriteRestriction(error) else { throw error }
                 let digest = SHA256.hash(data: Data(requested.path.utf8)).map { String(format: "%02x", $0) }.joined()
                 let managed = root.appending(path: digest, directoryHint: .isDirectory)
                 try FileManager.default.createDirectory(at: managed, withIntermediateDirectories: true)
-                resolved[index] = .init(shareRoot: managed, subpath: nil)
+                resolved[index] = .virtioFS(.init(shareRoot: managed, subpath: nil))
             }
         }
         return resolved

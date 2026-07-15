@@ -1,11 +1,12 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 1
+    public static let version: UInt32 = 2
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
     public static let execIOPort: UInt32 = 4_103
+    public static let socketProxyPortBase: UInt32 = 4_200
     public static let maximumControlFrameSize = 16 * 1_024 * 1_024
 
     public struct Envelope: Sendable, Equatable {
@@ -82,8 +83,13 @@ public enum GuestProtocol {
         public var options: [String]
         public var subpath: String?
         public var noCopy: Bool
-        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false) {
+        public var socketPort: UInt32?
+        public var socketMode: UInt32?
+        public var socketUID: UInt32?
+        public var socketGID: UInt32?
+        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil) {
             self.kind = kind; self.source = source; self.device = device; self.destination = destination; self.readOnly = readOnly; self.options = options; self.subpath = subpath; self.noCopy = noCopy
+            self.socketPort = socketPort; self.socketMode = socketMode; self.socketUID = socketUID; self.socketGID = socketGID
         }
     }
 

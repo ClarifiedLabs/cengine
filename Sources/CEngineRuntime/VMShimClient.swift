@@ -47,7 +47,7 @@ public final class VMShimClient: @unchecked Sendable {
     public func shutdown() async throws -> VMShimProtocol.Status { try await request(.shutdown, response: VMShimProtocol.Status.self) }
 
     public func startExecStream(id: String) async throws -> CInt {
-        try await Task.detached { [self] in try requestExecStream(id: id) }.value
+        try await runBlocking { [self] in try requestExecStream(id: id) }
     }
 
     public func guest<Payload: Encodable, Response: Decodable>(operation: String, payload: Payload, response: Response.Type) async throws -> Response {
@@ -79,8 +79,22 @@ public final class VMShimClient: @unchecked Sendable {
     }
 
     private func request<Response: Decodable>(_ operation: VMShimProtocol.Operation, payloadData: Data?, response: Response.Type) async throws -> Response {
-        let payload = try await Task.detached { [self] in try requestData(operation, payloadData: payloadData) }.value
+        let payload = try await runBlocking { [self] in try requestData(operation, payloadData: payloadData) }
         return try JSONDecoder().decode(response, from: payload)
+    }
+
+    // Container wait requests can remain blocked for the workload's lifetime. Keep
+    // their synchronous socket reads off Swift's cooperative executor so a group
+    // of running containers cannot starve unrelated shim operations.
+    private func runBlocking<Result: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Result
+    ) async throws -> Result {
+        try await withCheckedThrowingContinuation { continuation in
+            Thread.detachNewThread {
+                do { continuation.resume(returning: try operation()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
     }
 
     private func requestData(_ operation: VMShimProtocol.Operation, payloadData: Data?) throws -> Data {

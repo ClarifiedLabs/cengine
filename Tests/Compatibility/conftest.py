@@ -48,6 +48,10 @@ FIXTURE_IMAGES = [
         "mirror.gcr.io/kindest/node@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5",
         "mirror.gcr.io/kindest/node@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5",
     ),
+    (
+        "testcontainers/ryuk:0.13.0",
+        "testcontainers/ryuk@sha256:2a5038e0424aee30b8e1ecaf3889eb18b1496baca035b5cbdfeb79faa06e867a",
+    ),
 ]
 
 

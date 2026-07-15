@@ -28,7 +28,7 @@ import Testing
     }
 
     @Test func controlEnvelopeRejectsUnsupportedVersion() throws {
-        let encoded = try GuestProtocol.encode(.init(version: 2, id: "request-1", operation: "ping"))
+        let encoded = try GuestProtocol.encode(.init(version: GuestProtocol.version + 1, id: "request-1", operation: "ping"))
 
         #expect(throws: EngineError.self) {
             try GuestProtocol.decode(encoded)
