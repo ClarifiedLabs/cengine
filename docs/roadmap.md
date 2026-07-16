@@ -15,42 +15,57 @@ Buildx builder, and daemon recovery path are implemented. The raw virtualization
 migration is complete; there is no remaining Apple Containerization migration
 phase.
 
-## Priorities
+## Compatibility priorities
 
-### 1. Add a VM-backed compatibility CI gate
+### 1. Complete multi-platform and OCI image behavior
 
-The complete compatibility suite is currently a local gate because GitHub-hosted
-runners cannot execute its Virtualization.framework scenarios. Add a maintained
-self-hosted Apple-silicon runner for pull requests and release commits.
+The largest concentrated API gap is modern image behavior across API
+v1.47-v1.55. Complete the platform-aware and OCI-facing operations used by
+current Docker clients before filling isolated informational fields.
 
-Completion criteria:
+Prioritize:
 
-- `make test-compat` runs from a clean lifecycle on every gated commit.
-- Failure artifacts include daemon, VM-shim, and pytest diagnostics.
-- Release packaging requires a successful VM-backed run for the same commit.
-
-### 2. Define the supported client-version envelope
-
-Docker-py and Compose are pinned for the compatibility suite, and the managed
-BuildKit image is pinned. The host Docker CLI and Buildx plugin are recorded but
-not pinned. Define minimum and tested Docker CLI and Buildx versions, then run a
-small version matrix or install a pinned reference Buildx plugin in the harness.
+- Image-list manifest summaries and OCI descriptor/manifest responses.
+- Platform selectors for image inspect, history, load, save, push, and delete.
+- Multi-platform image archive load and save without collapsing the stored
+  variants.
+- Image identities and attestations after the underlying manifest behavior is
+  in place.
 
 Completion criteria:
 
-- Documentation names minimum and reference client versions.
-- Compatibility runs fail clearly outside the supported envelope.
-- At least the minimum and reference Buildx versions exercise `BLD-001` and
-  `BLD-002`.
+- Each accepted option changes behavior rather than being silently ignored.
+- Multi-platform operations preserve and return the requested platform.
+- Compatibility contracts cover both a successful selection and a missing
+  platform.
+- Response shapes match a reference Docker Engine or documented Docker API
+  semantics at the negotiated API version.
 
-### 3. Prioritize API-version gaps by client demand
+### 2. Complete modern network endpoint and IPAM semantics
 
-The API v1.46-v1.55 assessment table in
-[Docker compatibility](docker-compatibility.md#api-version-envelope) is the
-endpoint-level backlog. Implement gaps when required by supported Docker,
-Compose, Buildx, or kind behavior rather than pursuing unused fields solely for
-nominal API completeness. Decide whether registry search (`IMG-004`) belongs in
-the supported surface.
+Close the remaining network behavior gaps that affect how clients create and
+inspect endpoints. These include endpoint sysctls, explicit IPv4 controls,
+gateway priority, IPAM status, and endpoint MAC address application. Make an
+explicit support decision for SCTP rather than leaving it unassessed.
+
+Completion criteria:
+
+- Accepted endpoint settings are applied in the guest and survive inspect and
+  daemon recovery.
+- Invalid or unsupported settings fail explicitly instead of being ignored.
+- Multi-network containers select routes according to gateway priority.
+- SCTP is either implemented and tested end to end or recorded as an intentional
+  compatibility gap.
+
+### 3. Close remaining client-visible API gaps
+
+Use the API v1.46-v1.55 assessment table in
+[Docker compatibility](docker-compatibility.md#api-version-envelope) as the
+endpoint-level backlog. After image and networking behavior, address the
+remaining container annotations, image-create events, registry search
+(`IMG-004`), system information, discovered-device information, and per-device
+blkio update fields. Implement these in observed Docker, Compose, Buildx, kind,
+and Testcontainers demand order.
 
 Completion criteria for each accepted gap:
 
@@ -59,20 +74,57 @@ Completion criteria for each accepted gap:
   practical.
 - The implementation matches a reference Docker Engine or documented Docker API
   semantics.
+- A deliberately unsupported behavior returns a clear error and is recorded as
+  an intentional gap rather than being silently accepted.
 
-### 4. Expand stress and protocol coverage
+### 4. Harden compatibility under sustained use
 
 Current black-box gaps include higher-volume concurrent container lifecycle
-stress, broader differential-oracle sampling, and an explicit decision on SCTP
-networking support.
+stress and broader differential-oracle sampling. Use these tests to find and fix
+observable lifecycle, recovery, cleanup, and response-shape incompatibilities
+after the functional API gaps above.
 
 Completion criteria:
 
 - Repeated concurrent lifecycle tests leave no VM, shim, vmnet, or temporary
   state behind.
-- The differential oracle covers the deterministic contracts most likely to
-  diverge from Docker Engine.
-- SCTP is either implemented and tested or recorded as an intentional gap.
+- The differential oracle covers deterministic image, network, inspect, event,
+  and error-response contracts that are likely to diverge from Docker Engine.
+- Any discovered divergence is fixed or recorded in the compatibility ledger.
+
+## Deferred validation and automation
+
+These improve repeatability and release confidence but do not expand Docker
+compatibility. Continue to use the local compatibility suite while functional
+compatibility work is prioritized.
+
+### Add a VM-backed compatibility CI gate
+
+The complete compatibility suite is currently a local gate because GitHub-hosted
+runners cannot execute its Virtualization.framework scenarios. When CI
+automation becomes a priority, add a maintained self-hosted Apple-silicon runner
+for pull requests and release commits.
+
+Completion criteria:
+
+- `make test-compat` runs from a clean lifecycle on every gated commit.
+- Failure artifacts include daemon, VM-shim, and pytest diagnostics.
+- Release packaging requires a successful VM-backed run for the same commit.
+
+### Define the supported client-version envelope
+
+Docker-py and Compose are pinned for the compatibility suite, and the managed
+BuildKit image is pinned. The host Docker CLI and Buildx plugin are recorded but
+not pinned. Later, define minimum and tested Docker CLI and Buildx versions, then
+run a small version matrix or install a pinned reference Buildx plugin in the
+harness.
+
+Completion criteria:
+
+- Documentation names minimum and reference client versions.
+- Compatibility runs fail clearly outside the supported envelope.
+- At least the minimum and reference Buildx versions exercise `BLD-001` and
+  `BLD-002`.
 
 ## Accepted constraints and non-goals
 
