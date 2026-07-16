@@ -62,6 +62,7 @@ public struct DockerRouter: Sendable {
         let components = target.components
         let path = target.path
         let version = target.version
+        let queries = multiQueryItems(components)
         let query = queryItems(components)
 
         switch (request.method, path) {
@@ -372,12 +373,22 @@ public struct DockerRouter: Sendable {
             try await runtime.removeVolume(String(value.dropFirst("/volumes/".count)), force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
         case (.GET, "/images/json"):
             let allContainers = await runtime.listContainers(all: true)
+            let includeIdentity = version >= .init(major: 1, minor: 54)
+                && (parseBool(query["identity"]) ?? false)
+            let includeManifests = version >= .init(major: 1, minor: 47)
+                && ((parseBool(query["manifests"]) ?? false) || includeIdentity)
             return json(status: .ok, filteredImages(await runtime.listImages(), filters: query["filters"]).map { image in
                 ImageSummaryResponse(
                     image,
                     containers: version >= .init(major: 1, minor: 51)
-                        ? allContainers.filter { $0.image == image.id || image.references.contains($0.image) }.count
-                        : -1
+                        ? allContainers.filter {
+                            $0.imageID == image.id || $0.image == image.id || image.references.contains($0.image)
+                        }.count
+                        : -1,
+                    containerRecords: allContainers,
+                    includeDescriptor: version >= .init(major: 1, minor: 48),
+                    includeManifests: includeManifests,
+                    includeIdentity: includeIdentity
                 )
             })
         case (.POST, "/images/create"):
@@ -389,18 +400,61 @@ public struct DockerRouter: Sendable {
             }.joined() + "{\"status\":\"Pull complete\",\"id\":\"\(image.id)\"}\n"
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(lines.utf8))
         case (.POST, "/images/load"):
-            let images = try await runtime.loadImages(archive: request.body)
+            let platforms = version >= .init(major: 1, minor: 48)
+                ? try imagePlatforms(
+                    queries["platform"] ?? [],
+                    repeated: version >= .init(major: 1, minor: 52)
+                )
+                : []
+            let images = try await runtime.loadImages(
+                archive: request.body,
+                platforms: platforms
+            )
             let output = images.map { "{\"stream\":\"Loaded image: \($0.references.first ?? $0.id)\\n\"}\n" }.joined()
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/images/".count).dropLast("/json".count)).removingPercentEncoding ?? value
-            return json(status: .ok, ImageInspectResponse(try await runtime.image(id), version: version))
+            let includeManifests = version >= .init(major: 1, minor: 48)
+                && (parseBool(query["manifests"]) ?? false)
+            let platform = version >= .init(major: 1, minor: 49)
+                ? try query["platform"].map(decodeImagePlatform)
+                : nil
+            if includeManifests && platform != nil {
+                throw EngineError(.badRequest, "manifests and platform options are mutually exclusive")
+            }
+            let image = try await runtime.image(id)
+            let selected = try selectedManifest(in: image, platform: platform)
+            return json(status: .ok, ImageInspectResponse(
+                image,
+                selectedManifest: selected,
+                includeManifests: includeManifests,
+                version: version
+            ))
+        case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/attestations"):
+            guard version >= .init(major: 1, minor: 55) else { throw EngineError(.notFound, "page not found") }
+            let id = String(value.dropFirst("/images/".count).dropLast("/attestations".count)).removingPercentEncoding ?? value
+            let platformValues = queries["platform"] ?? []
+            guard platformValues.count <= 1 else {
+                throw EngineError(.badRequest, "only one platform value is supported")
+            }
+            let platform = try platformValues.first.map(decodeImagePlatform)
+            let attestations = try await runtime.imageAttestations(
+                id,
+                platform: platform,
+                predicateTypes: queries["type"] ?? [],
+                includeStatement: parseBool(query["statement"]) ?? false
+            )
+            return json(status: .ok, try attestations.map(AttestationStatementResponse.init))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/history"):
             let id = String(value.dropFirst("/images/".count).dropLast("/history".count)).removingPercentEncoding ?? value
-            let (image, history) = try await runtime.imageHistory(id)
+            let platform = version >= .init(major: 1, minor: 48)
+                ? try query["platform"].map(decodeImagePlatform)
+                : nil
+            let (image, history) = try await runtime.imageHistory(id, platform: platform)
+            let selected = try selectedManifest(in: image, platform: platform)
             return json(status: .ok, history.enumerated().map { index, entry in
                 ImageHistoryResponse(
-                    Id: index == 0 ? image.id : "<missing>", Created: entry.created,
+                    Id: index == 0 ? selected?.imageID ?? image.id : "<missing>", Created: entry.created,
                     CreatedBy: entry.createdBy, Tags: index == 0 ? image.references : [],
                     Size: entry.emptyLayer ? 0 : image.size, Comment: entry.comment
                 )
@@ -414,9 +468,16 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/images/") && value.hasSuffix("/push"):
             let id = String(value.dropFirst("/images/".count).dropLast("/push".count)).removingPercentEncoding ?? value
             let reference = query["tag"].flatMap { $0.isEmpty ? nil : "\(id):\($0)" } ?? id
+            let platform = version >= .init(major: 1, minor: 46)
+                ? try query["platform"].map(decodeImagePlatform)
+                : nil
             let output: String
             do {
-                try await runtime.pushImage(reference, credentials: registryCredentials(request.headers))
+                try await runtime.pushImage(
+                    reference,
+                    platform: platform,
+                    credentials: registryCredentials(request.headers)
+                )
                 output = "{\"status\":\"Pushed\",\"progressDetail\":{}}\n"
             } catch {
                 let message = "failed to resolve \(ImageReference.normalized(reference)): \(error.localizedDescription)"
@@ -426,12 +487,31 @@ public struct DockerRouter: Sendable {
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/get"):
             let id = String(value.dropFirst("/images/".count).dropLast("/get".count)).removingPercentEncoding ?? value
-            return APIResponse(status: .ok, headers: ["Content-Type": "application/x-tar"], body: try await runtime.saveImage(id))
+            let platforms = version >= .init(major: 1, minor: 48)
+                ? try imagePlatforms(
+                    queries["platform"] ?? [],
+                    repeated: version >= .init(major: 1, minor: 52)
+                )
+                : []
+            return APIResponse(
+                status: .ok,
+                headers: ["Content-Type": "application/x-tar"],
+                body: try await runtime.saveImage(
+                    id,
+                    platforms: platforms
+                )
+            )
         case (.DELETE, let value) where value.hasPrefix("/images/"):
             let id = String(value.dropFirst("/images/".count)).removingPercentEncoding ?? value
-            let image = try await runtime.image(id)
-            try await runtime.removeImage(id, force: parseBool(query["force"]) ?? false)
-            return json(status: .ok, [ImageDeleteResponse(Deleted: image.id)])
+            let force = parseBool(query["force"]) ?? false
+            let platforms = version >= .init(major: 1, minor: 50)
+                ? try imagePlatforms(queries["platforms"] ?? [], repeated: true)
+                : []
+            if !platforms.isEmpty && !force {
+                throw EngineError(.conflict, "platform-specific image removal requires force=true")
+            }
+            let deleted = try await runtime.removeImage(id, force: force, platforms: platforms)
+            return json(status: .ok, deleted.map(ImageDeleteResponse.init))
         case (.POST, "/build"):
             throw EngineError(.unsupported, "the integrated builder is not supported; use the managed cengine-builder with docker buildx")
         default:
@@ -448,7 +528,44 @@ public struct DockerRouter: Sendable {
         guard let value = URLComponents(string: uri) else { throw EngineError(.badRequest, "invalid request URI") }
         return value
     }
-    private func queryItems(_ components: URLComponents) -> [String: String] { Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") }) }
+    private func multiQueryItems(_ components: URLComponents) -> [String: [String]] {
+        Dictionary(grouping: components.queryItems ?? [], by: \.name)
+            .mapValues { $0.map { $0.value ?? "" } }
+    }
+    private func queryItems(_ components: URLComponents) -> [String: String] {
+        multiQueryItems(components).compactMapValues(\.first)
+    }
+    private func decodeImagePlatform(_ value: String) throws -> OCIPlatform {
+        guard let data = value.data(using: .utf8) else {
+            throw EngineError(.badRequest, "invalid platform value")
+        }
+        do {
+            let platform = try decoder.decode(OCIPlatform.self, from: data)
+            guard !platform.os.isEmpty, !platform.architecture.isEmpty else {
+                throw EngineError(.badRequest, "platform os and architecture are required")
+            }
+            return platform
+        } catch let error as EngineError {
+            throw error
+        } catch {
+            throw EngineError(.badRequest, "invalid platform value: \(error.localizedDescription)")
+        }
+    }
+    private func imagePlatforms(_ values: [String], repeated: Bool) throws -> [OCIPlatform] {
+        guard repeated || values.count <= 1 else {
+            throw EngineError(.badRequest, "multiple platform values require API v1.52 or newer")
+        }
+        return try values.map(decodeImagePlatform)
+    }
+    private func selectedManifest(in image: ImageRecord, platform: OCIPlatform?) throws -> ImageManifestRecord? {
+        guard let platform else { return image.preferredManifest }
+        guard let manifest = image.manifests.first(where: {
+            $0.kind == .image && $0.available && $0.platform?.matches(platform) == true
+        }) else {
+            throw EngineError(.notFound, "image has no \(platform.description) manifest")
+        }
+        return manifest
+    }
     private func parseBool(_ value: String?) -> Bool? { value.map { $0 == "1" || $0.lowercased() == "true" } }
 
     private func registryCredentials(_ headers: HTTPHeaders) -> RegistryCredentials? {
@@ -660,6 +777,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public let Path: String
     public let Args: [String]
     public let Image: String
+    public let ImageManifestDescriptor: OCIDescriptor?
     public let State: StateResponse
     public let Config: ConfigResponse
     public let RestartCount: Int
@@ -714,7 +832,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
     init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
         let formatter = ISO8601DateFormatter()
         Id = record.id; Name = "/\(record.name)"; Created = formatter.string(from: record.createdAt)
-        Path = record.processArguments.first ?? ""; Args = Array(record.processArguments.dropFirst()); Image = record.image
+        Path = record.processArguments.first ?? ""; Args = Array(record.processArguments.dropFirst())
+        Image = record.imageID.isEmpty ? record.image : record.imageID
+        ImageManifestDescriptor = version >= .init(major: 1, minor: 48) ? record.imageManifestDescriptor : nil
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
         Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds) })
         RestartCount = record.restartCount

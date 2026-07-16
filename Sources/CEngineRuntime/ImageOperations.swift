@@ -18,10 +18,3 @@ public struct ImagePullProgress: Sendable {
     }
 }
 public typealias ImagePullProgressHandler = @Sendable (ImagePullProgress) async -> Void
-
-public struct ImageHistoryEntry: Sendable {
-    public let created: Int64; public let createdBy: String; public let comment: String; public let emptyLayer: Bool
-    public init(created: Int64, createdBy: String, comment: String, emptyLayer: Bool) {
-        self.created = created; self.createdBy = createdBy; self.comment = comment; self.emptyLayer = emptyLayer
-    }
-}

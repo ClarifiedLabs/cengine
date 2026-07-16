@@ -2,7 +2,7 @@ import CEngineCore
 import Foundation
 
 extension EngineRuntime {
-    public func loadImages(archive: Data) async throws -> [ImageRecord] {
+    public func loadImages(archive: Data, platforms: [OCIPlatform] = []) async throws -> [ImageRecord] {
         let temporary = FileManager.default.temporaryDirectory.appending(path: "cengine-image-load-\(UUID().uuidString)", directoryHint: .isDirectory)
         let archiveURL = temporary.appending(path: "image.tar")
         let layout = temporary.appending(path: "layout", directoryHint: .isDirectory)
@@ -10,7 +10,7 @@ extension EngineRuntime {
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         try archive.write(to: archiveURL, options: .atomic)
         try SystemTar.extract(archiveURL, to: layout)
-        let loaded = try await backend.loadImages(fromOCILayout: layout)
+        let loaded = try await backend.loadImages(fromOCILayout: layout, platforms: platforms)
         var recordsByID: [String: ImageRecord] = [:]
         for image in loaded {
             if var record = recordsByID[image.id] {
@@ -24,7 +24,11 @@ extension EngineRuntime {
                     createdAt: image.createdAt,
                     size: image.size,
                     architecture: image.architecture,
-                    os: image.os
+                    os: image.os,
+                    targetDescriptor: image.targetDescriptor,
+                    manifests: image.manifests,
+                    preferredManifestDigest: image.preferredManifestDigest,
+                    identity: image.identity
                 )
             }
         }

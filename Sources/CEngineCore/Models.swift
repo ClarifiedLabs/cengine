@@ -87,6 +87,8 @@ public struct ContainerRecord: Codable, Sendable {
     public var id: String
     public var name: String
     public var image: String
+    public var imageID: String
+    public var imageManifestDescriptor: OCIDescriptor?
     public var platform: String
     public var createdAt: Date
     public var phase: ContainerPhase
@@ -128,6 +130,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.id = id
         self.name = name
         self.image = image
+        self.imageID = ""
+        self.imageManifestDescriptor = nil
         self.platform = platform
         self.createdAt = Date()
         self.phase = .created
@@ -231,9 +235,33 @@ public struct ImageRecord: Codable, Sendable {
     public var size: Int64
     public var architecture: String
     public var os: String
+    public var targetDescriptor: OCIDescriptor?
+    public var manifests: [ImageManifestRecord]
+    public var preferredManifestDigest: String?
+    public var identity: ImageIdentityRecord?
 
-    public init(id: String, references: [String], createdAt: Date, size: Int64, architecture: String, os: String) {
+    public init(
+        id: String,
+        references: [String],
+        createdAt: Date,
+        size: Int64,
+        architecture: String,
+        os: String,
+        targetDescriptor: OCIDescriptor? = nil,
+        manifests: [ImageManifestRecord] = [],
+        preferredManifestDigest: String? = nil,
+        identity: ImageIdentityRecord? = nil
+    ) {
         self.id = id; self.references = references; self.createdAt = createdAt; self.size = size
         self.architecture = architecture; self.os = os
+        self.targetDescriptor = targetDescriptor
+        self.manifests = manifests
+        self.preferredManifestDigest = preferredManifestDigest
+        self.identity = identity
+    }
+
+    public var preferredManifest: ImageManifestRecord? {
+        preferredManifestDigest.flatMap { digest in manifests.first { $0.descriptor.digest == digest } }
+            ?? manifests.first { $0.kind == .image && $0.available }
     }
 }

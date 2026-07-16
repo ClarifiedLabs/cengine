@@ -29,10 +29,10 @@ digests.
 | Container lifecycle and inspect | `CTR-001`–`CTR-046`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-046`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-012`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
-| Images and build | `IMG-001`–`IMG-015`, `BLD-001`–`BLD-003` | Authenticated push and pull-back use a pinned local registry. |
+| Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, and authenticated registry round trips are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
-| Differential behavior | `ORC-001` | Optional and limited to deterministic container lifecycle behavior. |
+| Differential behavior | `ORC-001`–`ORC-002` | Optional lifecycle and multi-platform image response-shape comparisons require an explicit reference Docker Engine. |
 
 ## API version envelope
 
@@ -54,19 +54,19 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
 | 1.45 | Named-volume mount `VolumeOptions.Subpath` | Supported | Existing subdirectories are safely resolved beneath the named-volume root. |
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
-| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Tmpfs size and mode are applied; the other additions remain gaps. |
-| 1.47 | Image-list manifest summaries | Gap | The `manifests` option and `Manifests` response are not implemented. |
-| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Gap | These optional parameters and response fields are not implemented. |
-| 1.49 | Platform-specific image inspect and firewall backend info | Gap | Image inspect uses the stored image platform; `FirewallBackend` is absent. |
-| 1.50 | Platform-selective image deletion and discovered-device info | Gap | Deletion applies to the stored image and `DiscoveredDevices` is absent. |
+| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Tmpfs size/mode and platform-selective push are applied; the other additions remain gaps. |
+| 1.47 | Image-list manifest summaries | Supported | `manifests=true` returns available, missing, image, and attestation manifest summaries. |
+| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Partial | Image operations and descriptor responses are supported; image mounts and the network additions remain gaps. |
+| 1.49 | Platform-specific image inspect and firewall backend info | Partial | JSON-encoded OCI platform selection and `manifests` conflicts are enforced; `FirewallBackend` is absent. |
+| 1.50 | Platform-selective image deletion and discovered-device info | Partial | Repeated JSON platform deletion preserves unselected variants; `DiscoveredDevices` is absent. |
 | 1.50 | Removal of deprecated image-config fields | Supported | Cengine's image configuration already omits the removed runtime-only fields. |
 | 1.51 | Image summary container usage count | Supported | v1.44-v1.50 report `-1`; v1.51+ calculate the number of containers using each image. |
 | 1.52 | Event legacy-field removal and container/image response omissions | Supported | Responses branch at v1.52 while older API requests retain their legacy shape. |
 | 1.52 | Container summary health and stats OS type | Supported | v1.52+ responses include `Health` and `os_type`. |
-| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Partial | Base and verbose `/system/df` are implemented; multi-platform image and IPAM additions remain gaps. |
-| 1.53 | NRI info, JSONL event negotiation, and image identity | Partial | Event streams negotiate `application/jsonl`; `NRI` and image `Identity` remain gaps. |
-| 1.54 | Image-list identity and endpoint MAC application | Gap | The `identity` option and endpoint `MacAddress` are ignored. |
-| 1.55 | Image attestations and per-device blkio updates | Gap | `GET /images/{name}/attestations` and the five blkio device arrays are not implemented. |
+| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Partial | Repeated image selectors, event negotiation, and disk usage are supported; IPAM status remains a gap. |
+| 1.53 | NRI info, JSONL event negotiation, and image identity | Partial | Event streams and trusted pull/push origin identity are supported; `NRI` remains absent. |
+| 1.54 | Image-list identity and endpoint MAC application | Partial | `identity=true` implies manifest summaries and returns trusted origin data; endpoint `MacAddress` remains a gap. |
+| 1.55 | Image attestations and per-device blkio updates | Partial | Attached in-toto statements support platform/type filters and statement opt-in; the five blkio device arrays remain a gap. |
 
 Status values are **✅ Pass**, **❌ Known fail**, and **⬜ Not assessed**. Intent
 values are **Support**, **Intentional gap**, and **Undecided**.
@@ -154,6 +154,14 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `IMG-013` | `test_build_image_via_api_client` | ❌ Known fail | Intentional gap | Direct build is intentionally unsupported. |
 | `IMG-014` | `test_push_error` | ✅ Pass | Support | Push streams registry failures in Docker's response shape. |
 | `IMG-015` | `test_authenticated_push_round_trip` | ✅ Pass | Support | **cengine-owned.** Basic-auth push, removal, pull-back, and execution use a pinned local registry. |
+| `IMG-016` | `test_multi_platform_manifest_summary_preserves_local_variants` | ✅ Pass | Support | **cengine-owned.** OCI index targets expose locally available arm64 and amd64 manifest summaries without flattening the graph. |
+| `IMG-017` | `test_platform_specific_inspect_and_missing_platform` | ✅ Pass | Support | **cengine-owned.** JSON OCI platform selection returns the requested variant and a missing platform returns NotFound. |
+| `IMG-018` | `test_multi_platform_save_and_load_round_trip` | ✅ Pass | Support | **cengine-owned.** Repeated save/load platform selectors preserve both selected variants in the OCI archive round trip. |
+| `IMG-019` | `test_platform_selective_delete_retains_other_variant` | ✅ Pass | Support | **cengine-owned.** Forced platform deletion removes selected content while the other variant remains inspectable. |
+| `IMG-020` | `test_container_reports_selected_image_manifest_descriptor` | ✅ Pass | Support | **cengine-owned.** Container list and inspect identify the graph root and selected platform manifest. |
+| `IMG-021` | `test_image_identity_records_trusted_pull_origin` | ✅ Pass | Support | **cengine-owned.** Inspect and identity-enabled list responses report daemon-recorded pull origins. |
+| `IMG-022` | `test_image_attestations_support_filters_and_statement_opt_in` | ✅ Pass | Support | **cengine-owned.** Attestation metadata avoids reading statements until opted in and supports predicate filtering. |
+| `IMG-023` | `test_manifest_options_reject_conflicts_and_preserve_identity_after_retag` | ✅ Pass | Support | **cengine-owned.** Inspect rejects conflicting selectors, and retagging cannot manufacture trusted identity origins. |
 
 ## System
 
@@ -254,3 +262,4 @@ builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
 | `ORC-001` | `test_container_lifecycle_matches_reference_docker` | ✅ Pass | Support | With `DOCKER_REFERENCE_HOST`, compares normalized create/inspect/filter/conflict/stop behavior to a real Docker Engine. |
+| `ORC-002` | `test_image_metadata_matches_reference_docker` | ✅ Pass | Support | With a multi-platform reference image store, compares descriptor, manifest-summary, identity, and selected-platform response shapes. |

@@ -272,6 +272,7 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Names: [String]
     public let Image: String
     public let ImageID: String
+    public let ImageManifestDescriptor: OCIDescriptor?
     public let Command: String
     public let Created: Int64
     public let State: String
@@ -282,7 +283,8 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Health: HealthSummary?
 
     public init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
-        Id = record.id; Names = ["/\(record.name)"]; Image = record.image; ImageID = ""
+        Id = record.id; Names = ["/\(record.name)"]; Image = record.image; ImageID = record.imageID
+        ImageManifestDescriptor = version >= .init(major: 1, minor: 48) ? record.imageManifestDescriptor : nil
         Command = record.processArguments.joined(separator: " "); Created = Int64(record.createdAt.timeIntervalSince1970)
         State = record.phase.rawValue
         Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
@@ -421,12 +423,31 @@ public struct ImageSummaryResponse: Encodable, Sendable {
     public let ParentId: String; public let Containers: Int
     public let Created: Int64; public let Size: Int64; public let SharedSize: Int64
     public let Labels: [String: String]
-    public init(_ image: ImageRecord, containers: Int = -1) {
-        Id = image.id
+    public let Descriptor: OCIDescriptor?
+    public let Manifests: [ImageManifestSummaryResponse]?
+    public init(
+        _ image: ImageRecord,
+        containers: Int = -1,
+        containerRecords: [ContainerRecord] = [],
+        includeDescriptor: Bool = true,
+        includeManifests: Bool = false,
+        includeIdentity: Bool = false
+    ) {
+        Id = image.preferredManifest?.imageID ?? image.id
         RepoTags = image.references.filter { !$0.contains("@") }.map(dockerDisplayReference)
         RepoDigests = image.references.filter { $0.contains("@") }.map(dockerDisplayReference)
         ParentId = ""; Containers = containers
         Created = Int64(image.createdAt.timeIntervalSince1970); Size = image.size; SharedSize = 0; Labels = [:]
+        Descriptor = includeDescriptor ? image.targetDescriptor : nil
+        Manifests = includeManifests ? image.manifests.map { manifest in
+            ImageManifestSummaryResponse(
+                manifest,
+                containers: containerRecords.filter {
+                    $0.imageManifestDescriptor?.digest == manifest.descriptor.digest
+                }.map(\.id),
+                identity: includeIdentity ? image.identity : nil
+            )
+        } : nil
     }
 }
 
@@ -435,33 +456,140 @@ public struct ImageInspectResponse: Encodable, Sendable {
     public let Created: String; public let Architecture: String; public let Os: String; public let Size: Int64
     public let Config: ConfigResponse
     public let RootFS: RootFSResponse
+    public let Descriptor: OCIDescriptor?
+    public let Manifests: [ImageManifestSummaryResponse]?
+    public let Identity: ImageIdentityResponse?
     public struct ConfigResponse: Encodable, Sendable {
         public let Env: [String]?
-        public let Cmd: [String]? = nil
-        public let Entrypoint: [String]? = nil
+        public let Cmd: [String]?
+        public let Entrypoint: [String]?
         public let WorkingDir: String?
         public let User: String?
         public let Labels: [String: String]?
         public let ExposedPorts: [String: EmptyObject]?
         public let Volumes: [String: EmptyObject]?
-        init(omitEmpty: Bool) {
-            Env = omitEmpty ? nil : []
-            WorkingDir = omitEmpty ? nil : ""
-            User = omitEmpty ? nil : ""
-            Labels = omitEmpty ? nil : [:]
-            ExposedPorts = omitEmpty ? nil : [:]
-            Volumes = omitEmpty ? nil : [:]
+        init(_ configuration: ImageConfigurationRecord?, omitEmpty: Bool) {
+            Env = configuration?.environment ?? (omitEmpty ? nil : [])
+            Cmd = configuration?.command
+            Entrypoint = configuration?.entrypoint
+            WorkingDir = configuration?.workingDirectory ?? (omitEmpty ? nil : "")
+            User = configuration?.user ?? (omitEmpty ? nil : "")
+            Labels = configuration?.labels ?? (omitEmpty ? nil : [:])
+            ExposedPorts = configuration?.exposedPorts.map { Dictionary(uniqueKeysWithValues: $0.map { ($0, EmptyObject()) }) }
+                ?? (omitEmpty ? nil : [:])
+            Volumes = configuration?.volumes.map { Dictionary(uniqueKeysWithValues: $0.map { ($0, EmptyObject()) }) }
+                ?? (omitEmpty ? nil : [:])
         }
     }
-    public struct RootFSResponse: Encodable, Sendable { public let `Type` = "layers"; public let Layers: [String] = [] }
+    public struct RootFSResponse: Encodable, Sendable {
+        public let `Type` = "layers"
+        public let Layers: [String]
+    }
     public struct EmptyObject: Encodable, Sendable {}
-    public init(_ image: ImageRecord, version: DockerAPIVersion = .maximum) {
-        Id = image.id
+    public init(
+        _ image: ImageRecord,
+        selectedManifest: ImageManifestRecord? = nil,
+        includeManifests: Bool = false,
+        version: DockerAPIVersion = .maximum
+    ) {
+        let selected = selectedManifest ?? image.preferredManifest
+        Id = selected?.imageID ?? image.id
         RepoTags = image.references.filter { !$0.contains("@") }.map(dockerDisplayReference)
         RepoDigests = image.references.filter { $0.contains("@") }.map(dockerDisplayReference)
-        Created = ISO8601DateFormatter().string(from: image.createdAt)
-        Architecture = image.architecture; Os = image.os; Size = image.size
-        Config = .init(omitEmpty: version >= .init(major: 1, minor: 52)); RootFS = .init()
+        Created = ISO8601DateFormatter().string(from: selected?.createdAt ?? image.createdAt)
+        Architecture = selected?.platform?.architecture ?? image.architecture
+        Os = selected?.platform?.os ?? image.os
+        Size = selected?.contentSize ?? image.size
+        Config = .init(selected?.configuration, omitEmpty: version >= .init(major: 1, minor: 52))
+        RootFS = .init(Layers: selected?.configuration?.rootFSDiffIDs ?? [])
+        Descriptor = version >= .init(major: 1, minor: 48) ? image.targetDescriptor : nil
+        Manifests = version >= .init(major: 1, minor: 48) && includeManifests
+            ? image.manifests.map { ImageManifestSummaryResponse($0) }
+            : nil
+        Identity = version >= .init(major: 1, minor: 53) ? image.identity.map(ImageIdentityResponse.init) : nil
+    }
+}
+
+public struct ImageIdentityResponse: Encodable, Sendable {
+    public struct PullIdentity: Encodable, Sendable { public let Repository: String }
+    public let Pull: [PullIdentity]
+
+    public init(_ identity: ImageIdentityRecord) {
+        Pull = identity.pullRepositories.map(PullIdentity.init)
+    }
+}
+
+public struct ImageManifestSummaryResponse: Encodable, Sendable {
+    public struct SizeResponse: Encodable, Sendable { public let Content: Int64; public let Total: Int64 }
+    public struct ImageDataResponse: Encodable, Sendable {
+        public struct SizeResponse: Encodable, Sendable { public let Unpacked: Int64 }
+        public let Platform: OCIPlatform
+        public let Identity: ImageIdentityResponse?
+        public let Containers: [String]
+        public let Size: SizeResponse
+    }
+    public struct AttestationDataResponse: Encodable, Sendable { public let `For`: String }
+
+    public let ID: String
+    public let Descriptor: OCIDescriptor
+    public let Available: Bool
+    public let Size: SizeResponse
+    public let Kind: String
+    public let ImageData: ImageDataResponse?
+    public let AttestationData: AttestationDataResponse?
+
+    public init(
+        _ manifest: ImageManifestRecord,
+        containers: [String] = [],
+        identity: ImageIdentityRecord? = nil
+    ) {
+        ID = manifest.descriptor.digest
+        Descriptor = manifest.descriptor
+        Available = manifest.available
+        Size = .init(Content: manifest.contentSize, Total: manifest.contentSize)
+        Kind = manifest.kind.rawValue
+        ImageData = manifest.kind == .image ? manifest.platform.map {
+            .init(Platform: $0, Identity: identity.map(ImageIdentityResponse.init), Containers: containers, Size: .init(Unpacked: 0))
+        } : nil
+        AttestationData = manifest.kind == .attestation ? manifest.attestationFor.map { .init(For: $0) } : nil
+    }
+}
+
+public enum JSONValue: Codable, Sendable {
+    case object([String: JSONValue]), array([JSONValue]), string(String), number(Double), bool(Bool), null
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let value = try? container.decode([String: JSONValue].self) { self = .object(value) }
+        else if let value = try? container.decode([JSONValue].self) { self = .array(value) }
+        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else { self = .string(try container.decode(String.self)) }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .object(let value): try container.encode(value)
+        case .array(let value): try container.encode(value)
+        case .string(let value): try container.encode(value)
+        case .number(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .null: try container.encodeNil()
+        }
+    }
+}
+
+public struct AttestationStatementResponse: Encodable, Sendable {
+    public let Descriptor: OCIDescriptor
+    public let PredicateType: String
+    public let Statement: JSONValue?
+
+    public init(_ value: ImageAttestationRecord) throws {
+        Descriptor = value.descriptor
+        PredicateType = value.predicateType
+        Statement = try value.statement.map { try JSONDecoder().decode(JSONValue.self, from: $0) }
     }
 }
 

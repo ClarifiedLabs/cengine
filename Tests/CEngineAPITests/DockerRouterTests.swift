@@ -196,6 +196,136 @@ private actor ImageStoreBackend: ContainerBackend {
     func deletedReferences() -> [String] { deleted }
 }
 
+private func multiPlatformBackendImage() -> BackendImage {
+    let root = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.index.v1+json",
+        digest: "sha256:" + String(repeating: "1", count: 64),
+        size: 600
+    )
+    let arm = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        digest: "sha256:" + String(repeating: "2", count: 64),
+        size: 200,
+        platform: .init(architecture: "arm64", os: "linux")
+    )
+    let amd = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        digest: "sha256:" + String(repeating: "3", count: 64),
+        size: 220,
+        platform: .init(architecture: "amd64", os: "linux")
+    )
+    let attestation = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        digest: "sha256:" + String(repeating: "4", count: 64),
+        size: 100,
+        platform: .init(architecture: "unknown", os: "unknown"),
+        artifactType: "application/vnd.docker.attestation.manifest.v1+json"
+    )
+    let armImageID = "sha256:" + String(repeating: "a", count: 64)
+    let amdImageID = "sha256:" + String(repeating: "b", count: 64)
+    return BackendImage(
+        id: armImageID,
+        reference: "docker.io/library/example:multi",
+        createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+        size: 420,
+        architecture: "arm64",
+        os: "linux",
+        targetDescriptor: root,
+        manifests: [
+            .init(
+                descriptor: arm,
+                imageID: armImageID,
+                available: true,
+                kind: .image,
+                platform: arm.platform,
+                createdAt: Date(timeIntervalSince1970: 1_700_000_001),
+                contentSize: 200,
+                configuration: .init(environment: ["ARCH=arm64"], rootFSDiffIDs: ["sha256:arm-layer"])
+            ),
+            .init(
+                descriptor: amd,
+                imageID: amdImageID,
+                available: true,
+                kind: .image,
+                platform: amd.platform,
+                createdAt: Date(timeIntervalSince1970: 1_700_000_002),
+                contentSize: 220,
+                configuration: .init(environment: ["ARCH=amd64"], rootFSDiffIDs: ["sha256:amd-layer"])
+            ),
+            .init(
+                descriptor: attestation,
+                available: true,
+                kind: .attestation,
+                platform: attestation.platform,
+                contentSize: 100,
+                attestationFor: arm.digest
+            ),
+        ],
+        preferredManifestDigest: arm.digest,
+        identity: .init(pullRepositories: ["docker.io/library/example"])
+    )
+}
+
+private actor MultiPlatformImageBackend: ContainerBackend {
+    private var savedPlatforms: [OCIPlatform] = []
+    private var loadedPlatforms: [OCIPlatform] = []
+    private var deletedPlatforms: [OCIPlatform] = []
+    private var pushedPlatform: OCIPlatform?
+    private var attestationPlatform: OCIPlatform?
+    private var attestationTypes: [String] = []
+    private var includedStatement = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func listImages() async throws -> [BackendImage]? { [multiPlatformBackendImage()] }
+    func deleteImage(reference _: String) async throws {}
+    func deleteImage(reference _: String, platforms: [OCIPlatform]) async throws -> [String] {
+        deletedPlatforms = platforms
+        let image = multiPlatformBackendImage()
+        return platforms.compactMap { platform in
+            image.manifests.first { $0.kind == .image && $0.platform?.matches(platform) == true }?.descriptor.digest
+        }
+    }
+    func loadImages(fromOCILayout _: URL, platforms: [OCIPlatform]) async throws -> [BackendImage] {
+        loadedPlatforms = platforms
+        return [multiPlatformBackendImage()]
+    }
+    func saveImages(references _: [String], platforms: [OCIPlatform]) async throws -> Data {
+        savedPlatforms = platforms
+        return Data("archive".utf8)
+    }
+    func pushImage(reference _: String, platform: OCIPlatform?, credentials _: RegistryCredentials?) async throws {
+        pushedPlatform = platform
+    }
+    func imageHistory(reference _: String, platform _: OCIPlatform?) async throws -> [ImageHistoryEntry] { [] }
+    func imageAttestations(reference _: String, platform: OCIPlatform?, predicateTypes: [String], includeStatement: Bool) async throws -> [ImageAttestationRecord] {
+        attestationPlatform = platform
+        attestationTypes = predicateTypes
+        includedStatement = includeStatement
+        return [.init(
+            descriptor: OCIDescriptor(
+                mediaType: "application/vnd.in-toto+json",
+                digest: "sha256:" + String(repeating: "5", count: 64),
+                size: 20
+            ),
+            predicateType: "https://spdx.dev/Document",
+            statement: includeStatement ? Data(#"{"predicateType":"https://spdx.dev/Document"}"#.utf8) : nil
+        )]
+    }
+
+    func selections() -> (
+        saved: [OCIPlatform], loaded: [OCIPlatform], deleted: [OCIPlatform], pushed: OCIPlatform?,
+        attestation: OCIPlatform?, types: [String], statement: Bool
+    ) {
+        (savedPlatforms, loadedPlatforms, deletedPlatforms, pushedPlatform,
+         attestationPlatform, attestationTypes, includedStatement)
+    }
+}
+
 private actor RestartBackend: ContainerBackend {
     private var exitCode: Int32?
     private var starts = 0
@@ -1140,6 +1270,142 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(shortJSON["Config"] is [String: Any])
         let remove = await router.route(.init(method: .DELETE, uri: "/v1.44/images/docker.io/library/alpine:latest", body: Data()))
         #expect(remove.status == .ok)
+    }
+
+    @Test func multiPlatformImageMetadataIsVersionedAndPlatformSelectable() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = MultiPlatformImageBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        let legacy = await router.route(.init(
+            method: .GET,
+            uri: "/v1.46/images/json?manifests=true&identity=true"
+        ))
+        let legacyImage = try #require((JSONSerialization.jsonObject(with: legacy.body) as? [[String: Any]])?.first)
+        #expect(legacyImage["Descriptor"] == nil)
+        #expect(legacyImage["Manifests"] == nil)
+
+        let manifestsOnly = await router.route(.init(
+            method: .GET,
+            uri: "/v1.47/images/json?manifests=true"
+        ))
+        let v147 = try #require((JSONSerialization.jsonObject(with: manifestsOnly.body) as? [[String: Any]])?.first)
+        #expect(v147["Descriptor"] == nil)
+        #expect((v147["Manifests"] as? [[String: Any]])?.count == 3)
+
+        let identity = await router.route(.init(
+            method: .GET,
+            uri: "/v1.54/images/json?identity=true"
+        ))
+        let current = try #require((JSONSerialization.jsonObject(with: identity.body) as? [[String: Any]])?.first)
+        #expect((current["Descriptor"] as? [String: Any])?["digest"] as? String
+            == multiPlatformBackendImage().targetDescriptor?.digest)
+        let manifests = try #require(current["Manifests"] as? [[String: Any]])
+        let arm = try #require(manifests.first { ($0["ImageData"] as? [String: Any])?["Platform"] as? [String: String] == [
+            "architecture": "arm64", "os": "linux",
+        ] })
+        let imageData = try #require(arm["ImageData"] as? [String: Any])
+        let pull = try #require(((imageData["Identity"] as? [String: Any])?["Pull"] as? [[String: Any]])?.first)
+        #expect(pull["Repository"] as? String == "docker.io/library/example")
+
+        let platform = #"{"os":"linux","architecture":"amd64"}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let inspect = await router.route(.init(
+            method: .GET,
+            uri: "/v1.55/images/example:multi/json?platform=\(platform)"
+        ))
+        #expect(inspect.status == .ok)
+        let inspected = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(inspected["Architecture"] as? String == "amd64")
+        #expect((inspected["Config"] as? [String: Any])?["Env"] as? [String] == ["ARCH=amd64"])
+        #expect((inspected["RootFS"] as? [String: Any])?["Layers"] as? [String] == ["sha256:amd-layer"])
+        #expect(((inspected["Identity"] as? [String: Any])?["Pull"] as? [[String: Any]])?.count == 1)
+
+        let conflict = await router.route(.init(
+            method: .GET,
+            uri: "/v1.55/images/example:multi/json?manifests=true&platform=\(platform)"
+        ))
+        #expect(conflict.status == .badRequest)
+
+        let create = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/containers/create?name=amd-container&platform=linux%2Famd64",
+            body: Data(#"{"Image":"example:multi"}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let containers = await router.route(.init(method: .GET, uri: "/v1.55/containers/json?all=true"))
+        let container = try #require((JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]])?.first)
+        #expect(container["ImageID"] as? String == "sha256:" + String(repeating: "b", count: 64))
+        #expect((container["ImageManifestDescriptor"] as? [String: Any])?["digest"] as? String
+            == "sha256:" + String(repeating: "3", count: 64))
+    }
+
+    @Test func repeatedPlatformSelectorsDriveImageOperationsAndAttestations() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = MultiPlatformImageBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        func encoded(_ architecture: String) -> String {
+            #"{"os":"linux","architecture":"\#(architecture)"}"#
+                .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        }
+        let arm = encoded("arm64")
+        let amd = encoded("amd64")
+
+        let save = await router.route(.init(
+            method: .GET,
+            uri: "/v1.52/images/example:multi/get?platform=\(arm)&platform=\(amd)"
+        ))
+        #expect(save.status == .ok)
+        #expect(save.body == Data("archive".utf8))
+
+        let archive = OCIArchive.tar(entries: [("placeholder", Data())])
+        let load = await router.route(.init(
+            method: .POST,
+            uri: "/v1.52/images/load?platform=\(amd)&platform=\(arm)",
+            body: archive
+        ))
+        #expect(load.status == .ok)
+
+        let requiresForce = await router.route(.init(
+            method: .DELETE,
+            uri: "/v1.55/images/example:multi?platforms=\(arm)"
+        ))
+        #expect(requiresForce.status == .conflict)
+        let remove = await router.route(.init(
+            method: .DELETE,
+            uri: "/v1.55/images/example:multi?force=true&platforms=\(arm)&platforms=\(amd)"
+        ))
+        #expect(remove.status == .ok)
+        let removals = try #require(JSONSerialization.jsonObject(with: remove.body) as? [[String: Any]])
+        #expect(removals.count == 2)
+
+        let push = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/images/example:multi/push?platform=\(amd)"
+        ))
+        #expect(push.status == .ok)
+
+        let attestations = await router.route(.init(
+            method: .GET,
+            uri: "/v1.55/images/example:multi/attestations?platform=\(arm)&type=https%3A%2F%2Fspdx.dev%2FDocument&type=https%3A%2F%2Fslsa.dev%2Fprovenance%2Fv1&statement=true"
+        ))
+        #expect(attestations.status == .ok)
+        let statements = try #require(JSONSerialization.jsonObject(with: attestations.body) as? [[String: Any]])
+        #expect((statements.first?["Statement"] as? [String: Any])?["predicateType"] as? String
+            == "https://spdx.dev/Document")
+
+        let selections = await backend.selections()
+        #expect(selections.saved.map(\.architecture) == ["arm64", "amd64"])
+        #expect(selections.loaded.map(\.architecture) == ["amd64", "arm64"])
+        #expect(selections.deleted.map(\.architecture) == ["arm64", "amd64"])
+        #expect(selections.pushed?.architecture == "amd64")
+        #expect(selections.attestation?.architecture == "arm64")
+        #expect(selections.types == ["https://spdx.dev/Document", "https://slsa.dev/provenance/v1"])
+        #expect(selections.statement)
     }
 
     @Test func pullImageByDigestUsesDigestSeparator() async throws {

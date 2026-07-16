@@ -2,68 +2,57 @@ import CEngineCore
 import CryptoKit
 import Foundation
 
-public struct OCIDescriptor: Codable, Hashable, Sendable {
-    public var mediaType: String
-    public var digest: String
-    public var size: Int64
-    public var platform: OCIPlatform?
-    public var annotations: [String: String]?
-
-    public init(
-        mediaType: String,
-        digest: String,
-        size: Int64,
-        platform: OCIPlatform? = nil,
-        annotations: [String: String]? = nil
-    ) {
-        self.mediaType = mediaType
-        self.digest = digest
-        self.size = size
-        self.platform = platform
-        self.annotations = annotations
-    }
-}
-
-public struct OCIPlatform: Codable, Hashable, Sendable {
-    public var architecture: String
-    public var os: String
-    public var variant: String?
-
-    public init(architecture: String, os: String, variant: String? = nil) {
-        self.architecture = architecture
-        self.os = os
-        self.variant = variant
-    }
-
-    public init(_ value: String) throws {
-        let components = value.split(separator: "/").map(String.init)
-        guard components.count == 2 || components.count == 3 else {
-            throw EngineError(.badRequest, "invalid OCI platform \(value)")
-        }
-        os = components[0]
-        architecture = components[1]
-        variant = components.count == 3 ? components[2] : nil
-    }
-
-    func matches(_ other: OCIPlatform) -> Bool {
-        os == other.os && architecture == other.architecture &&
-            (other.variant == nil || variant == other.variant)
-    }
-}
-
 public struct OCIManifest: Codable, Sendable {
     public var schemaVersion: Int
     public var mediaType: String?
+    public var artifactType: String?
     public var config: OCIDescriptor
     public var layers: [OCIDescriptor]
+    public var subject: OCIDescriptor?
     public var annotations: [String: String]?
+
+    public init(
+        schemaVersion: Int,
+        mediaType: String?,
+        artifactType: String? = nil,
+        config: OCIDescriptor,
+        layers: [OCIDescriptor],
+        subject: OCIDescriptor? = nil,
+        annotations: [String: String]?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.mediaType = mediaType
+        self.artifactType = artifactType
+        self.config = config
+        self.layers = layers
+        self.subject = subject
+        self.annotations = annotations
+    }
 }
 
 public struct OCIIndex: Codable, Sendable {
     public var schemaVersion: Int
     public var mediaType: String?
+    public var artifactType: String?
     public var manifests: [OCIDescriptor]
+    public var subject: OCIDescriptor?
     public var annotations: [String: String]?
+
+    public init(
+        schemaVersion: Int,
+        mediaType: String?,
+        artifactType: String? = nil,
+        manifests: [OCIDescriptor],
+        subject: OCIDescriptor? = nil,
+        annotations: [String: String]?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.mediaType = mediaType
+        self.artifactType = artifactType
+        self.manifests = manifests
+        self.subject = subject
+        self.annotations = annotations
+    }
 }
 
 public struct OCIImageConfiguration: Codable, Sendable {
@@ -108,6 +97,8 @@ public struct OCIImageConfiguration: Codable, Sendable {
 
     public var architecture: String
     public var os: String
+    public var variant: String?
+    public var osVersion: String?
     public var created: String?
     public var config: Configuration?
     public var rootfs: RootFS
@@ -116,6 +107,7 @@ public struct OCIImageConfiguration: Codable, Sendable {
 
 public struct OCIStoredImage: Sendable {
     public let reference: String
+    public let rootDescriptor: OCIDescriptor
     public let manifestDescriptor: OCIDescriptor
     public let manifest: OCIManifest
     public let configuration: OCIImageConfiguration
@@ -130,18 +122,50 @@ public actor OCIContentStore {
         "application/vnd.oci.image.index.v1+json",
         "application/vnd.docker.distribution.manifest.list.v2+json",
     ]
+    public static let attestationManifestArtifactType = "application/vnd.docker.attestation.manifest.v1+json"
+    public static let attestationReferenceType = "attestation-manifest"
+    public static let attestationReferenceTypeAnnotation = "vnd.docker.reference.type"
+    public static let attestationReferenceDigestAnnotation = "vnd.docker.reference.digest"
+    public static let inTotoPredicateTypeAnnotation = "in-toto.io/predicate-type"
+    public static let hostPlatform = OCIPlatform(architecture: "arm64", os: "linux")
 
     private struct ReferenceIndex: Codable {
         var references: [String: OCIDescriptor] = [:]
+        var pullRepositories: [String: [String]] = [:]
+
+        enum CodingKeys: String, CodingKey { case references, pullRepositories }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            references = try values.decodeIfPresent([String: OCIDescriptor].self, forKey: .references) ?? [:]
+            pullRepositories = try values.decodeIfPresent([String: [String]].self, forKey: .pullRepositories) ?? [:]
+        }
     }
 
-    private struct DockerArchiveEntry: Decodable {
+    private struct DockerArchiveEntry: Codable {
         let config: String
         let repoTags: [String]?
+        let layers: [String]
+
+        init(config: String, repoTags: [String]?, layers: [String] = []) {
+            self.config = config
+            self.repoTags = repoTags
+            self.layers = layers
+        }
 
         enum CodingKeys: String, CodingKey {
             case config = "Config"
             case repoTags = "RepoTags"
+            case layers = "Layers"
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            config = try values.decode(String.self, forKey: .config)
+            repoTags = try values.decodeIfPresent([String].self, forKey: .repoTags)
+            layers = try values.decodeIfPresent([String].self, forKey: .layers) ?? []
         }
 
         var configDigest: String { "sha256:" + URL(filePath: config).lastPathComponent }
@@ -175,23 +199,26 @@ public actor OCIContentStore {
         var values: [BackendImage] = []
         for reference in index.references.keys.sorted() {
             guard let rootDescriptor = index.references[reference] else { continue }
-            let manifestDescriptor: OCIDescriptor
-            if Self.indexMediaTypes.contains(rootDescriptor.mediaType) {
-                let imageIndex = try decoder.decode(OCIIndex.self, from: data(for: rootDescriptor.digest))
-                guard let available = imageIndex.manifests.first(where: { contains($0.digest) }) else { continue }
-                manifestDescriptor = available
-            } else { manifestDescriptor = rootDescriptor }
-            let manifest = try decoder.decode(OCIManifest.self, from: data(for: manifestDescriptor.digest))
-            let configuration = try decoder.decode(OCIImageConfiguration.self, from: data(for: manifest.config.digest))
-            let size = ([manifest.config] + manifest.layers).reduce(Int64(0)) { $0 + max($1.size, 0) }
-            let created = configuration.created.flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date(timeIntervalSince1970: 0)
-            values.append(.init(id: manifestDescriptor.digest, reference: reference, createdAt: created, size: size, architecture: configuration.architecture, os: configuration.os))
+            let manifests = try manifestRecords(in: rootDescriptor)
+            guard let preferred = preferredManifest(in: manifests) else { continue }
+            values.append(.init(
+                id: preferred.imageID ?? rootDescriptor.digest,
+                reference: reference,
+                createdAt: preferred.createdAt ?? Date(timeIntervalSince1970: 0),
+                size: preferred.contentSize,
+                architecture: preferred.platform?.architecture ?? "arm64",
+                os: preferred.platform?.os ?? "linux",
+                targetDescriptor: rootDescriptor,
+                manifests: manifests,
+                preferredManifestDigest: preferred.descriptor.digest,
+                identity: identity(for: rootDescriptor)
+            ))
         }
         return values
     }
 
     public func descriptor(for reference: String) -> OCIDescriptor? {
-        index.references[ImageReference.normalized(reference)]
+        try? rootDescriptor(for: reference)
     }
 
     public func contains(_ digest: String) -> Bool {
@@ -227,6 +254,16 @@ public actor OCIContentStore {
         return data
     }
 
+    private func data(for descriptor: OCIDescriptor) throws -> Data {
+        if let embedded = descriptor.data {
+            guard Self.digest(embedded) == descriptor.digest else {
+                throw EngineError(.badRequest, "embedded OCI content \(descriptor.digest) failed verification")
+            }
+            return embedded
+        }
+        return try data(for: descriptor.digest)
+    }
+
     public func tag(_ descriptor: OCIDescriptor, as reference: String) throws {
         guard contains(descriptor.digest) else {
             throw EngineError(.notFound, "OCI content \(descriptor.digest) not found")
@@ -237,7 +274,8 @@ public actor OCIContentStore {
 
     public func remove(reference: String) throws {
         let normalized = ImageReference.normalized(reference)
-        var removed = index.references.removeValue(forKey: normalized) != nil
+        let removedRoot = index.references.removeValue(forKey: normalized)
+        var removed = removedRoot != nil
         if !removed && reference.hasPrefix("sha256:") {
             let previousCount = index.references.count
             index.references = index.references.filter { $0.value.digest != reference }
@@ -246,31 +284,38 @@ public actor OCIContentStore {
         guard removed else {
             throw EngineError(.notFound, "image \(reference) not found")
         }
+        let retainedRoots = Set(index.references.values.map(\.digest))
+        if let digest = removedRoot?.digest, !retainedRoots.contains(digest) {
+            index.pullRepositories.removeValue(forKey: digest)
+        }
+        index.pullRepositories = index.pullRepositories.filter { retainedRoots.contains($0.key) }
         try saveIndex()
     }
 
     public func image(reference: String, platform: String) throws -> OCIStoredImage {
+        try image(reference: reference, platform: OCIPlatform(platform))
+    }
+
+    public func image(reference: String, platform: OCIPlatform? = nil) throws -> OCIStoredImage {
         let normalized = ImageReference.normalized(reference)
-        guard let rootDescriptor = index.references[normalized] else {
-            throw EngineError(.notFound, "image \(normalized) not found")
-        }
-        let selectedPlatform = try OCIPlatform(platform)
-        let manifestDescriptor: OCIDescriptor
-        if Self.indexMediaTypes.contains(rootDescriptor.mediaType) {
-            let imageIndex = try decoder.decode(OCIIndex.self, from: data(for: rootDescriptor.digest))
-            guard let selected = imageIndex.manifests.first(where: { descriptor in
-                descriptor.platform.map { $0.matches(selectedPlatform) } ?? false
-            }) else {
-                throw EngineError(.notFound, "image \(normalized) has no \(platform) manifest")
-            }
-            manifestDescriptor = selected
+        let rootDescriptor = try rootDescriptor(for: reference)
+        let records = try manifestRecords(in: rootDescriptor).filter { $0.kind == .image && $0.available }
+        let selectedRecord: ImageManifestRecord?
+        if let platform {
+            selectedRecord = records.first { $0.platform?.matches(platform) == true }
         } else {
-            manifestDescriptor = rootDescriptor
+            selectedRecord = preferredManifest(in: records)
         }
+        guard let selectedRecord else {
+            let suffix = platform.map { " has no \($0.description) manifest" } ?? " has no locally available manifest"
+            throw EngineError(.notFound, "image \(normalized)\(suffix)")
+        }
+        let manifestDescriptor = selectedRecord.descriptor
         let manifest = try decoder.decode(OCIManifest.self, from: data(for: manifestDescriptor.digest))
         let configuration = try decoder.decode(OCIImageConfiguration.self, from: data(for: manifest.config.digest))
         return OCIStoredImage(
             reference: normalized,
+            rootDescriptor: rootDescriptor,
             manifestDescriptor: manifestDescriptor,
             manifest: manifest,
             configuration: configuration
@@ -285,33 +330,41 @@ public actor OCIContentStore {
     ) async throws -> OCIStoredImage {
         let parsed = try OCIRegistryReference(reference)
         let client = OCIRegistryClient(reference: parsed, credentials: credentials)
-        let root = try await client.fetchManifest(parsed.selector)
-        let rootDescriptor = try put(root.data, mediaType: root.mediaType, expectedDigest: root.digest)
-        var manifestDescriptor = rootDescriptor
-        var manifestData = root.data
-        if Self.indexMediaTypes.contains(root.mediaType) {
-            let requested = try OCIPlatform(platform)
-            let imageIndex = try decoder.decode(OCIIndex.self, from: root.data)
-            guard let selected = imageIndex.manifests.first(where: { $0.platform?.matches(requested) == true }) else {
-                throw EngineError(.notFound, "image \(parsed.normalized) has no \(platform) manifest")
-            }
-            let selectedManifest = try await client.fetchManifest(selected.digest)
-            manifestDescriptor = try put(
-                selectedManifest.data,
-                mediaType: selectedManifest.mediaType,
-                expectedDigest: selected.digest
-            )
-            manifestData = selectedManifest.data
+        let rootResponse = try await client.fetchManifest(parsed.selector)
+        let rootDescriptor = try put(
+            rootResponse.data,
+            mediaType: rootResponse.mediaType,
+            expectedDigest: rootResponse.digest
+        )
+        try await downloadIndexNodes(rootDescriptor, contents: rootResponse.data, client: client)
+        let requested = try OCIPlatform(platform)
+        let leaves = try leafDescriptors(in: rootDescriptor)
+        guard let selected = leaves.first(where: {
+            !isAttestationDescriptor($0) && $0.platform?.matches(requested) == true
+        }) ?? (leaves.count == 1 && !Self.indexMediaTypes.contains(rootDescriptor.mediaType) ? leaves[0] : nil) else {
+            throw EngineError(.notFound, "image \(parsed.normalized) has no \(platform) manifest")
         }
-        let manifest = try decoder.decode(OCIManifest.self, from: manifestData)
-        let descriptors = [manifest.config] + manifest.layers
+        let selectedManifest = try await downloadManifestGraph(selected, client: client)
+        let configurationData = try data(for: selectedManifest.config.digest)
+        let configuration = try decoder.decode(OCIImageConfiguration.self, from: configurationData)
+        guard OCIPlatform(
+            architecture: configuration.architecture,
+            os: configuration.os,
+            variant: configuration.variant,
+            osVersion: configuration.osVersion
+        ).matches(requested) else {
+            throw EngineError(.notFound, "image \(parsed.normalized) has no \(platform) manifest")
+        }
+        let attestationDescriptors = leaves.filter {
+            attestationTarget(for: $0) == selected.digest
+        }
+        for descriptor in attestationDescriptors {
+            _ = try await downloadManifestGraph(descriptor, client: client)
+        }
+        let descriptors = [selectedManifest.config] + selectedManifest.layers
         var completedBytes: Int64 = 0
         let totalBytes = descriptors.reduce(Int64(0)) { $0 + max($1.size, 0) }
         for (index, descriptor) in descriptors.enumerated() {
-            if !contains(descriptor.digest) {
-                let blob = try await client.fetchBlob(descriptor.digest)
-                _ = try put(blob, mediaType: descriptor.mediaType, expectedDigest: descriptor.digest)
-            }
             completedBytes += max(descriptor.size, 0)
             await progress(.init(
                 completedItems: index + 1,
@@ -321,23 +374,52 @@ public actor OCIContentStore {
             ))
         }
         try tag(rootDescriptor, as: parsed.normalized)
+        try recordPullRepository("\(parsed.registry)/\(parsed.repository)", for: rootDescriptor)
         return try image(reference: parsed.normalized, platform: platform)
     }
 
-    public func push(reference: String, platform: String, credentials: RegistryCredentials?) async throws {
+    public func push(reference: String, platform: OCIPlatform?, credentials: RegistryCredentials?) async throws {
         let parsed = try OCIRegistryReference(reference)
-        let image = try image(reference: reference, platform: platform)
         let client = OCIRegistryClient(reference: parsed, credentials: credentials)
-        for descriptor in [image.manifest.config] + image.manifest.layers {
-            if try await client.blobExists(descriptor.digest) == false {
-                try await client.pushBlob(data(for: descriptor.digest), digest: descriptor.digest)
+        let rootDescriptor = try rootDescriptor(for: reference)
+        if let platform {
+            let selected = try image(reference: reference, platform: platform)
+            try await pushManifestGraph(selected.manifestDescriptor, client: client)
+            try await client.pushManifest(
+                data(for: selected.manifestDescriptor.digest),
+                mediaType: selected.manifestDescriptor.mediaType,
+                selector: parsed.selector
+            )
+        } else {
+            let available = try leafDescriptors(in: rootDescriptor).filter(isGraphAvailable)
+            for descriptor in available { try await pushManifestGraph(descriptor, client: client) }
+            if Self.indexMediaTypes.contains(rootDescriptor.mediaType) {
+                let original = try decoder.decode(OCIIndex.self, from: data(for: rootDescriptor.digest))
+                let filtered = OCIIndex(
+                    schemaVersion: original.schemaVersion,
+                    mediaType: original.mediaType,
+                    artifactType: original.artifactType,
+                    manifests: available,
+                    subject: original.subject,
+                    annotations: original.annotations
+                )
+                try await client.pushManifest(
+                    encoder.encode(filtered),
+                    mediaType: rootDescriptor.mediaType,
+                    selector: parsed.selector
+                )
+            } else {
+                try await client.pushManifest(
+                    data(for: rootDescriptor.digest),
+                    mediaType: rootDescriptor.mediaType,
+                    selector: parsed.selector
+                )
             }
         }
-        let manifestData = try data(for: image.manifestDescriptor.digest)
-        try await client.pushManifest(manifestData, mediaType: image.manifestDescriptor.mediaType, selector: parsed.selector)
+        try recordPullRepository("\(parsed.registry)/\(parsed.repository)", for: rootDescriptor)
     }
 
-    public func history(reference: String, platform: String) throws -> [ImageHistoryEntry] {
+    public func history(reference: String, platform: OCIPlatform?) throws -> [ImageHistoryEntry] {
         let value = try image(reference: reference, platform: platform)
         return (value.configuration.history ?? []).map {
             let date = $0.created.flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date(timeIntervalSince1970: 0)
@@ -345,7 +427,7 @@ public actor OCIContentStore {
         }
     }
 
-    public func importLayout(_ directory: URL) throws -> [BackendImage] {
+    public func importLayout(_ directory: URL, platforms: [OCIPlatform] = []) throws -> [BackendImage] {
         let indexData = try Data(contentsOf: directory.appending(path: "index.json"))
         let layoutIndex = try decoder.decode(OCIIndex.self, from: indexData)
         let archiveURL = directory.appending(path: "manifest.json")
@@ -355,14 +437,40 @@ public actor OCIContentStore {
         )) ?? []
         var references = Set<String>()
         for descriptor in layoutIndex.manifests {
+            let leaves = try layoutLeafDescriptors(in: descriptor, directory: directory)
+            let presentLeaves = leaves.filter { layoutContains($0, directory: directory) }
+            let runnable = try presentLeaves.filter { descriptor in
+                try !isLayoutAttestation(descriptor, directory: directory)
+            }
+            let selectedImages: [OCIDescriptor]
+            if platforms.isEmpty {
+                selectedImages = runnable
+            } else {
+                selectedImages = try platforms.map { platform in
+                    guard let selected = try runnable.first(where: {
+                        try layoutPlatform(for: $0, directory: directory)?.matches(platform) == true
+                    }) else {
+                        throw EngineError(.notFound, "image archive has no \(platform.description) manifest")
+                    }
+                    return selected
+                }
+            }
+            let selectedImageDigests = Set(selectedImages.map(\.digest))
+            let selectedAttestations = try presentLeaves.filter {
+                guard let target = try layoutAttestationTarget(for: $0, directory: directory) else { return false }
+                return selectedImageDigests.contains(target)
+            }
+            let selected = Set((selectedImages + selectedAttestations).map(\.digest))
             var seen = Set<String>()
-            try importDescriptor(descriptor, from: directory, seen: &seen)
+            try importDescriptor(descriptor, selectedLeaves: selected, from: directory, seen: &seen)
             var descriptorReferences: [String] = []
             if let reference = descriptor.annotations?["org.opencontainers.image.ref.name"]
                 ?? descriptor.annotations?["io.containerd.image.name"] {
                 descriptorReferences.append(reference)
             }
-            let configurations = try configurationDigests(in: descriptor)
+            let configurations = try Set(selectedImages.map {
+                try decoder.decode(OCIManifest.self, from: layoutData(for: $0, directory: directory)).config.digest
+            })
             descriptorReferences.append(contentsOf: archiveEntries.compactMap { entry in
                 configurations.contains(entry.configDigest) ? entry.repoTags : nil
             }.flatMap { $0 })
@@ -376,59 +484,491 @@ public actor OCIContentStore {
         return all.filter { references.contains($0.reference) }
     }
 
-    private func configurationDigests(in descriptor: OCIDescriptor) throws -> Set<String> {
-        if Self.indexMediaTypes.contains(descriptor.mediaType) {
-            let value = try decoder.decode(OCIIndex.self, from: data(for: descriptor.digest))
-            return try value.manifests.reduce(into: Set<String>()) { result, child in
-                result.formUnion(try configurationDigests(in: child))
-            }
-        }
-        guard Self.manifestMediaTypes.contains(descriptor.mediaType) else { return [] }
-        let value = try decoder.decode(OCIManifest.self, from: data(for: descriptor.digest))
-        return [value.config.digest]
-    }
-
-    public func exportLayout(references requested: [String], platform: String) throws -> Data {
+    public func exportLayout(references requested: [String], platforms: [OCIPlatform] = []) throws -> Data {
         let names = requested.isEmpty ? references() : requested.map(ImageReference.normalized)
         var roots: [OCIDescriptor] = []
         var digests = Set<String>()
+        var generatedBlobs: [String: Data] = [:]
+        var archiveEntries: [DockerArchiveEntry] = []
         for name in names {
-            var descriptor = try image(reference: name, platform: platform).manifestDescriptor
-            var annotations = descriptor.annotations ?? [:]
+            let rootDescriptor = try rootDescriptor(for: name)
+            let runnable = try manifestRecords(in: rootDescriptor).filter { $0.kind == .image && $0.available }
+            let selectedImages: [ImageManifestRecord]
+            if platforms.isEmpty {
+                selectedImages = runnable
+            } else {
+                selectedImages = try platforms.map { platform in
+                    guard let selected = runnable.first(where: { $0.platform?.matches(platform) == true }) else {
+                        throw EngineError(.notFound, "image \(name) has no \(platform.description) manifest")
+                    }
+                    return selected
+                }
+            }
+            let selectedImageDigests = Set(selectedImages.map { $0.descriptor.digest })
+            let selectedAttestations = try manifestRecords(in: rootDescriptor).filter {
+                $0.kind == .attestation && $0.available && $0.attestationFor.map(selectedImageDigests.contains) == true
+            }
+            let selectedLeaves = Set((selectedImages + selectedAttestations).map { $0.descriptor.digest })
+            let selectedRecords = selectedImages + selectedAttestations
+            let descriptor: OCIDescriptor
+            if Self.indexMediaTypes.contains(rootDescriptor.mediaType) {
+                let original = try decoder.decode(OCIIndex.self, from: data(for: rootDescriptor.digest))
+                let filtered = OCIIndex(
+                    schemaVersion: original.schemaVersion,
+                    mediaType: original.mediaType,
+                    artifactType: original.artifactType,
+                    manifests: selectedRecords.map(\.descriptor),
+                    subject: original.subject,
+                    annotations: original.annotations
+                )
+                let contents = try encoder.encode(filtered)
+                descriptor = OCIDescriptor(
+                    mediaType: rootDescriptor.mediaType,
+                    digest: Self.digest(contents),
+                    size: Int64(contents.count),
+                    artifactType: rootDescriptor.artifactType
+                )
+                generatedBlobs[descriptor.digest] = contents
+                digests.insert(descriptor.digest)
+                for record in selectedRecords {
+                    try collect(record.descriptor, selectedLeaves: [record.descriptor.digest], into: &digests)
+                }
+            } else {
+                descriptor = rootDescriptor
+                try collect(descriptor, selectedLeaves: selectedLeaves, into: &digests)
+            }
+            var annotatedDescriptor = descriptor
+            var annotations = annotatedDescriptor.annotations ?? [:]
             annotations["org.opencontainers.image.ref.name"] = name
-            descriptor.annotations = annotations
-            roots.append(descriptor)
-            try collect(descriptor, into: &digests)
+            annotations["io.containerd.image.name"] = name
+            annotatedDescriptor.annotations = annotations
+            roots.append(annotatedDescriptor)
+            archiveEntries.append(contentsOf: try selectedImages.map { record in
+                let manifest = try decoder.decode(OCIManifest.self, from: data(for: record.descriptor.digest))
+                return DockerArchiveEntry(
+                    config: "blobs/sha256/\(manifest.config.digest.dropFirst(7))",
+                    repoTags: [name],
+                    layers: manifest.layers.map { "blobs/sha256/\($0.digest.dropFirst(7))" }
+                )
+            })
         }
         let layout = try encoder.encode(["imageLayoutVersion": "1.0.0"])
         let layoutIndex = try encoder.encode(OCIIndex(schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: roots, annotations: nil))
-        var entries: [(String, Data)] = [("oci-layout", layout), ("index.json", layoutIndex)]
-        for digest in digests.sorted() { entries.append(("blobs/sha256/" + String(digest.dropFirst(7)), try data(for: digest))) }
+        var entries: [(String, Data)] = [
+            ("oci-layout", layout),
+            ("index.json", layoutIndex),
+            ("manifest.json", try encoder.encode(archiveEntries)),
+        ]
+        for digest in digests.sorted() {
+            entries.append((
+                "blobs/sha256/" + String(digest.dropFirst(7)),
+                try generatedBlobs[digest] ?? data(for: digest)
+            ))
+        }
         return OCIArchive.tar(entries: entries)
     }
 
-    private func importDescriptor(_ descriptor: OCIDescriptor, from directory: URL, seen: inout Set<String>) throws {
+    private func importDescriptor(
+        _ descriptor: OCIDescriptor,
+        selectedLeaves: Set<String>,
+        from directory: URL,
+        seen: inout Set<String>
+    ) throws {
         guard seen.insert(descriptor.digest).inserted else { return }
+        if !Self.indexMediaTypes.contains(descriptor.mediaType), !selectedLeaves.contains(descriptor.digest) { return }
         let source = directory.appending(path: "blobs/sha256/" + String(descriptor.digest.dropFirst(7)))
         let contents = try Data(contentsOf: source)
         _ = try put(contents, mediaType: descriptor.mediaType, expectedDigest: descriptor.digest)
         if Self.indexMediaTypes.contains(descriptor.mediaType) {
-            for child in try decoder.decode(OCIIndex.self, from: contents).manifests { try importDescriptor(child, from: directory, seen: &seen) }
+            for child in try decoder.decode(OCIIndex.self, from: contents).manifests {
+                try importDescriptor(child, selectedLeaves: selectedLeaves, from: directory, seen: &seen)
+            }
         } else if Self.manifestMediaTypes.contains(descriptor.mediaType) {
             let manifest = try decoder.decode(OCIManifest.self, from: contents)
-            for child in [manifest.config] + manifest.layers { try importDescriptor(child, from: directory, seen: &seen) }
+            for child in [manifest.config] + manifest.layers {
+                try importDescriptor(child, selectedLeaves: [child.digest], from: directory, seen: &seen)
+            }
         }
     }
 
-    private func collect(_ descriptor: OCIDescriptor, into digests: inout Set<String>) throws {
+    private func collect(_ descriptor: OCIDescriptor, selectedLeaves: Set<String>, into digests: inout Set<String>) throws {
         guard digests.insert(descriptor.digest).inserted else { return }
         let contents = try data(for: descriptor.digest)
         if Self.indexMediaTypes.contains(descriptor.mediaType) {
-            for child in try decoder.decode(OCIIndex.self, from: contents).manifests { try collect(child, into: &digests) }
+            for child in try decoder.decode(OCIIndex.self, from: contents).manifests {
+                if Self.indexMediaTypes.contains(child.mediaType) || selectedLeaves.contains(child.digest) {
+                    try collect(child, selectedLeaves: selectedLeaves, into: &digests)
+                }
+            }
         } else if Self.manifestMediaTypes.contains(descriptor.mediaType) {
             let manifest = try decoder.decode(OCIManifest.self, from: contents)
-            for child in [manifest.config] + manifest.layers { try collect(child, into: &digests) }
+            for child in [manifest.config] + manifest.layers {
+                guard contains(child.digest) else { continue }
+                try collect(child, selectedLeaves: [child.digest], into: &digests)
+            }
         }
+    }
+
+    public func remove(reference: String, platforms: [OCIPlatform]) throws -> [String] {
+        guard !platforms.isEmpty else {
+            let descriptor = try rootDescriptor(for: reference)
+            try remove(reference: reference)
+            return [descriptor.digest]
+        }
+        let rootDescriptor = try rootDescriptor(for: reference)
+        let records = try manifestRecords(in: rootDescriptor)
+        var selected: [ImageManifestRecord] = []
+        for platform in platforms {
+            guard let record = records.first(where: {
+                $0.kind == .image && $0.available && $0.platform?.matches(platform) == true
+            }) else {
+                throw EngineError(.notFound, "image \(reference) has no \(platform.description) manifest")
+            }
+            selected.append(record)
+        }
+        let selectedDigests = Set(selected.map { $0.descriptor.digest })
+        let attached = records.filter {
+            $0.kind == .attestation && $0.attestationFor.map(selectedDigests.contains) == true
+        }
+        var candidates = Set<String>()
+        for record in selected + attached {
+            try collectPresentDigests(record.descriptor, into: &candidates)
+        }
+        var protected = Set<String>()
+        for record in records where !selectedDigests.contains(record.descriptor.digest)
+            && !(record.kind == .attestation && attached.contains(where: { $0.descriptor.digest == record.descriptor.digest })) {
+            try collectPresentDigests(record.descriptor, into: &protected)
+        }
+        candidates.subtract(protected)
+        candidates.remove(rootDescriptor.digest)
+        for digest in candidates {
+            try? FileManager.default.removeItem(at: blobURL(for: digest))
+        }
+        return selected.map { $0.descriptor.digest }
+    }
+
+    public func attestations(
+        reference: String,
+        platform: OCIPlatform?,
+        predicateTypes: [String],
+        includeStatement: Bool
+    ) throws -> [ImageAttestationRecord] {
+        let image = try image(reference: reference, platform: platform)
+        let rootDescriptor = image.rootDescriptor
+        let records = try manifestRecords(in: rootDescriptor).filter {
+            $0.kind == .attestation && $0.attestationFor == image.manifestDescriptor.digest
+        }
+        var result: [ImageAttestationRecord] = []
+        for record in records where contains(record.descriptor.digest) {
+            let manifest = try decoder.decode(OCIManifest.self, from: data(for: record.descriptor.digest))
+            for layer in manifest.layers {
+                guard let predicate = layer.annotations?[Self.inTotoPredicateTypeAnnotation],
+                      predicateTypes.isEmpty || predicateTypes.contains(predicate) else { continue }
+                let statement: Data?
+                if includeStatement {
+                    let value = try data(for: layer.digest)
+                    _ = try JSONSerialization.jsonObject(with: value)
+                    statement = value
+                } else {
+                    statement = nil
+                }
+                result.append(.init(descriptor: layer, predicateType: predicate, statement: statement))
+            }
+        }
+        return result
+    }
+
+    private func rootDescriptor(for reference: String) throws -> OCIDescriptor {
+        let normalized = ImageReference.normalized(reference)
+        if let descriptor = index.references[normalized] { return descriptor }
+        let candidate = reference.lowercased()
+        let matches = index.references.values.filter { descriptor in
+            descriptor.digest == candidate || descriptor.digest.hasPrefix(candidate)
+        }
+        if let descriptor = matches.first { return descriptor }
+        for descriptor in index.references.values {
+            if (try? graphContains(descriptor, digestPrefix: candidate)) == true { return descriptor }
+        }
+        throw EngineError(.notFound, "image \(reference) not found")
+    }
+
+    private func graphContains(_ descriptor: OCIDescriptor, digestPrefix: String) throws -> Bool {
+        if descriptor.digest.hasPrefix(digestPrefix) { return true }
+        guard contains(descriptor.digest) else { return false }
+        if Self.indexMediaTypes.contains(descriptor.mediaType) {
+            return try decoder.decode(OCIIndex.self, from: data(for: descriptor.digest)).manifests.contains {
+                (try? graphContains($0, digestPrefix: digestPrefix)) == true
+            }
+        }
+        if Self.manifestMediaTypes.contains(descriptor.mediaType) {
+            let manifest = try decoder.decode(OCIManifest.self, from: data(for: descriptor.digest))
+            return ([manifest.config] + manifest.layers).contains { $0.digest.hasPrefix(digestPrefix) }
+        }
+        return false
+    }
+
+    private func identity(for descriptor: OCIDescriptor) -> ImageIdentityRecord? {
+        guard let repositories = index.pullRepositories[descriptor.digest], !repositories.isEmpty else { return nil }
+        return .init(pullRepositories: repositories.sorted())
+    }
+
+    private func recordPullRepository(_ repository: String, for descriptor: OCIDescriptor) throws {
+        var values = Set(index.pullRepositories[descriptor.digest] ?? [])
+        values.insert(repository)
+        index.pullRepositories[descriptor.digest] = values.sorted()
+        try saveIndex()
+    }
+
+    private func leafDescriptors(in descriptor: OCIDescriptor) throws -> [OCIDescriptor] {
+        guard Self.indexMediaTypes.contains(descriptor.mediaType) else { return [descriptor] }
+        guard contains(descriptor.digest) else { return [] }
+        let value = try decoder.decode(OCIIndex.self, from: data(for: descriptor.digest))
+        return try value.manifests.flatMap { child in
+            Self.indexMediaTypes.contains(child.mediaType) ? try leafDescriptors(in: child) : [child]
+        }
+    }
+
+    private func manifestRecords(in rootDescriptor: OCIDescriptor) throws -> [ImageManifestRecord] {
+        try leafDescriptors(in: rootDescriptor).map(manifestRecord).sorted {
+            ($0.platform?.description ?? "~", $0.descriptor.digest) <
+                ($1.platform?.description ?? "~", $1.descriptor.digest)
+        }
+    }
+
+    private func manifestRecord(_ descriptor: OCIDescriptor) throws -> ImageManifestRecord {
+        let annotatedTarget = attestationTarget(for: descriptor)
+        guard contains(descriptor.digest), Self.manifestMediaTypes.contains(descriptor.mediaType) else {
+            let kind: ImageManifestKind
+            if annotatedTarget != nil || isAttestationDescriptor(descriptor) {
+                kind = .attestation
+            } else if descriptor.platform != nil || Self.manifestMediaTypes.contains(descriptor.mediaType) {
+                kind = .image
+            } else {
+                kind = .unknown
+            }
+            return .init(
+                descriptor: descriptor,
+                available: false,
+                kind: kind,
+                platform: descriptor.platform,
+                contentSize: contains(descriptor.digest) ? max(descriptor.size, 0) : 0,
+                attestationFor: annotatedTarget
+            )
+        }
+        let manifest = try decoder.decode(OCIManifest.self, from: data(for: descriptor.digest))
+        let target = annotatedTarget ?? manifest.subject?.digest
+        let isAttestation = target != nil && (
+            isAttestationDescriptor(descriptor) || manifest.artifactType == Self.attestationManifestArtifactType
+        )
+        let children = [manifest.config] + manifest.layers
+        let available = children.allSatisfy { contains($0.digest) }
+        let contentSize = max(descriptor.size, 0) + children.reduce(Int64(0)) {
+            $0 + (contains($1.digest) ? max($1.size, 0) : 0)
+        }
+        if isAttestation {
+            return .init(
+                descriptor: descriptor,
+                available: available,
+                kind: .attestation,
+                platform: descriptor.platform,
+                contentSize: contentSize,
+                attestationFor: target
+            )
+        }
+        guard contains(manifest.config.digest),
+              let configuration = try? decoder.decode(OCIImageConfiguration.self, from: data(for: manifest.config.digest)),
+              !configuration.os.isEmpty, !configuration.architecture.isEmpty else {
+            return .init(
+                descriptor: descriptor,
+                available: available,
+                kind: .unknown,
+                platform: descriptor.platform,
+                contentSize: contentSize
+            )
+        }
+        let platform = descriptor.platform ?? OCIPlatform(
+            architecture: configuration.architecture,
+            os: configuration.os,
+            variant: configuration.variant,
+            osVersion: configuration.osVersion
+        )
+        let created = configuration.created.flatMap { ISO8601DateFormatter().date(from: $0) }
+        let history = (configuration.history ?? []).map { entry in
+            let date = entry.created.flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date(timeIntervalSince1970: 0)
+            return ImageHistoryEntry(
+                created: Int64(date.timeIntervalSince1970),
+                createdBy: entry.createdBy ?? "",
+                comment: entry.comment ?? "",
+                emptyLayer: entry.emptyLayer ?? false
+            )
+        }
+        return .init(
+            descriptor: descriptor,
+            imageID: manifest.config.digest,
+            available: available,
+            kind: .image,
+            platform: platform,
+            createdAt: created,
+            contentSize: contentSize,
+            configuration: .init(
+                environment: configuration.config?.environment,
+                command: configuration.config?.command,
+                entrypoint: configuration.config?.entrypoint,
+                workingDirectory: configuration.config?.workingDirectory,
+                user: configuration.config?.user,
+                labels: configuration.config?.labels,
+                exposedPorts: configuration.config?.exposedPorts.map { Array($0.keys).sorted() },
+                volumes: configuration.config?.volumes.map { Array($0.keys).sorted() },
+                rootFSDiffIDs: configuration.rootfs.diffIDs
+            ),
+            history: history
+        )
+    }
+
+    private func preferredManifest(in records: [ImageManifestRecord]) -> ImageManifestRecord? {
+        records.first {
+            $0.kind == .image && $0.available && $0.platform?.matches(Self.hostPlatform) == true
+        } ?? records.first { $0.kind == .image && $0.available }
+    }
+
+    private func isAttestationDescriptor(_ descriptor: OCIDescriptor) -> Bool {
+        descriptor.annotations?[Self.attestationReferenceTypeAnnotation] == Self.attestationReferenceType ||
+            descriptor.artifactType == Self.attestationManifestArtifactType ||
+            (descriptor.platform?.os == "unknown" && descriptor.platform?.architecture == "unknown")
+    }
+
+    private func attestationTarget(for descriptor: OCIDescriptor) -> String? {
+        descriptor.annotations?[Self.attestationReferenceDigestAnnotation]
+    }
+
+    private func isGraphAvailable(_ descriptor: OCIDescriptor) -> Bool {
+        guard contains(descriptor.digest) else { return false }
+        if Self.indexMediaTypes.contains(descriptor.mediaType) {
+            guard let value = try? decoder.decode(OCIIndex.self, from: data(for: descriptor.digest)) else { return false }
+            return value.manifests.allSatisfy(isGraphAvailable)
+        }
+        if Self.manifestMediaTypes.contains(descriptor.mediaType) {
+            guard let value = try? decoder.decode(OCIManifest.self, from: data(for: descriptor.digest)) else { return false }
+            return ([value.config] + value.layers).allSatisfy { contains($0.digest) }
+        }
+        return true
+    }
+
+    private func collectPresentDigests(_ descriptor: OCIDescriptor, into values: inout Set<String>) throws {
+        guard contains(descriptor.digest), values.insert(descriptor.digest).inserted else { return }
+        if Self.indexMediaTypes.contains(descriptor.mediaType) {
+            for child in try decoder.decode(OCIIndex.self, from: data(for: descriptor.digest)).manifests {
+                try collectPresentDigests(child, into: &values)
+            }
+        } else if Self.manifestMediaTypes.contains(descriptor.mediaType) {
+            let manifest = try decoder.decode(OCIManifest.self, from: data(for: descriptor.digest))
+            for child in [manifest.config] + manifest.layers { try collectPresentDigests(child, into: &values) }
+        }
+    }
+
+    private func downloadIndexNodes(
+        _ descriptor: OCIDescriptor,
+        contents: Data? = nil,
+        client: OCIRegistryClient
+    ) async throws {
+        guard Self.indexMediaTypes.contains(descriptor.mediaType) else { return }
+        let valueData: Data
+        if let contents {
+            valueData = contents
+        } else if contains(descriptor.digest) {
+            valueData = try data(for: descriptor.digest)
+        } else {
+            let response = try await client.fetchManifest(descriptor.digest)
+            _ = try put(response.data, mediaType: response.mediaType, expectedDigest: descriptor.digest)
+            valueData = response.data
+        }
+        let value = try decoder.decode(OCIIndex.self, from: valueData)
+        for child in value.manifests where Self.indexMediaTypes.contains(child.mediaType) {
+            try await downloadIndexNodes(child, client: client)
+        }
+    }
+
+    private func downloadManifestGraph(_ descriptor: OCIDescriptor, client: OCIRegistryClient) async throws -> OCIManifest {
+        let contents: Data
+        if contains(descriptor.digest) {
+            contents = try data(for: descriptor.digest)
+        } else {
+            let response = try await client.fetchManifest(descriptor.digest)
+            _ = try put(response.data, mediaType: response.mediaType, expectedDigest: descriptor.digest)
+            contents = response.data
+        }
+        let manifest = try decoder.decode(OCIManifest.self, from: contents)
+        for child in [manifest.config] + manifest.layers where !contains(child.digest) {
+            let blob = try await client.fetchBlob(child.digest)
+            _ = try put(blob, mediaType: child.mediaType, expectedDigest: child.digest)
+        }
+        return manifest
+    }
+
+    private func pushManifestGraph(_ descriptor: OCIDescriptor, client: OCIRegistryClient) async throws {
+        let manifest = try decoder.decode(OCIManifest.self, from: data(for: descriptor.digest))
+        for child in [manifest.config] + manifest.layers {
+            if try await client.blobExists(child.digest) == false {
+                try await client.pushBlob(data(for: child.digest), digest: child.digest)
+            }
+        }
+        try await client.pushManifest(data(for: descriptor.digest), mediaType: descriptor.mediaType, selector: descriptor.digest)
+    }
+
+    private func layoutData(for descriptor: OCIDescriptor, directory: URL) throws -> Data {
+        if let embedded = descriptor.data {
+            guard Self.digest(embedded) == descriptor.digest else {
+                throw EngineError(.badRequest, "embedded OCI content \(descriptor.digest) failed verification")
+            }
+            return embedded
+        }
+        let source = directory.appending(path: "blobs/sha256/" + String(descriptor.digest.dropFirst(7)))
+        let contents = try Data(contentsOf: source)
+        guard Self.digest(contents) == descriptor.digest else {
+            throw EngineError(.badRequest, "OCI archive content \(descriptor.digest) failed verification")
+        }
+        return contents
+    }
+
+    private func layoutContains(_ descriptor: OCIDescriptor, directory: URL) -> Bool {
+        if descriptor.data != nil { return true }
+        return FileManager.default.fileExists(atPath: directory.appending(
+            path: "blobs/sha256/" + String(descriptor.digest.dropFirst(7))
+        ).path)
+    }
+
+    private func layoutLeafDescriptors(in descriptor: OCIDescriptor, directory: URL) throws -> [OCIDescriptor] {
+        guard Self.indexMediaTypes.contains(descriptor.mediaType) else { return [descriptor] }
+        let value = try decoder.decode(OCIIndex.self, from: layoutData(for: descriptor, directory: directory))
+        return try value.manifests.flatMap { try layoutLeafDescriptors(in: $0, directory: directory) }
+    }
+
+    private func layoutPlatform(for descriptor: OCIDescriptor, directory: URL) throws -> OCIPlatform? {
+        if let platform = descriptor.platform { return platform }
+        guard Self.manifestMediaTypes.contains(descriptor.mediaType) else { return nil }
+        let manifest = try decoder.decode(OCIManifest.self, from: layoutData(for: descriptor, directory: directory))
+        let config = try decoder.decode(OCIImageConfiguration.self, from: layoutData(for: manifest.config, directory: directory))
+        return OCIPlatform(
+            architecture: config.architecture,
+            os: config.os,
+            variant: config.variant,
+            osVersion: config.osVersion
+        )
+    }
+
+    private func isLayoutAttestation(_ descriptor: OCIDescriptor, directory: URL) throws -> Bool {
+        if isAttestationDescriptor(descriptor) { return true }
+        guard Self.manifestMediaTypes.contains(descriptor.mediaType) else { return false }
+        let manifest = try decoder.decode(OCIManifest.self, from: layoutData(for: descriptor, directory: directory))
+        return manifest.artifactType == Self.attestationManifestArtifactType && manifest.subject != nil
+    }
+
+    private func layoutAttestationTarget(for descriptor: OCIDescriptor, directory: URL) throws -> String? {
+        if let annotated = attestationTarget(for: descriptor) { return annotated }
+        guard Self.manifestMediaTypes.contains(descriptor.mediaType) else { return nil }
+        let manifest = try decoder.decode(OCIManifest.self, from: layoutData(for: descriptor, directory: directory))
+        guard manifest.artifactType == Self.attestationManifestArtifactType else { return nil }
+        return manifest.subject?.digest
     }
 
     public func prune() throws -> [String] {

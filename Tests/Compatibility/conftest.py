@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import random
@@ -29,6 +30,8 @@ DEFAULT_CONTAINER_INITRAMFS = pathlib.Path.home() / "Library/Application Support
 DEFAULT_STORAGE_INITRAMFS = pathlib.Path.home() / "Library/Application Support/cengine/assets/storage-initramfs.cpio.gz"
 DEFAULT_IMAGE = "alpine:latest"
 DEFAULT_IMAGE_SOURCE = "mirror.gcr.io/library/alpine:latest"
+MULTI_PLATFORM_IMAGE_SOURCE = "mirror.gcr.io/library/alpine:latest"
+MULTI_PLATFORM_FIXTURES = ["linux/arm64", "linux/amd64"]
 FIXTURE_IMAGES = [
     (
         "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
@@ -62,6 +65,13 @@ def fixture_image_seeds() -> list[tuple[str, str]]:
         DEFAULT_IMAGE_SOURCE if image == DEFAULT_IMAGE else image,
     )
     return [(image, source)] + FIXTURE_IMAGES
+
+
+def image_cache_seeds() -> list[tuple[str, str]]:
+    return fixture_image_seeds() + [
+        (f"{MULTI_PLATFORM_IMAGE_SOURCE}#{platform}", MULTI_PLATFORM_IMAGE_SOURCE)
+        for platform in MULTI_PLATFORM_FIXTURES
+    ]
 
 
 def expected_git_commit(binary: pathlib.Path) -> str:
@@ -260,7 +270,7 @@ def daemon(request: pytest.FixtureRequest, image_cache: pathlib.Path) -> Daemon:
 
 @pytest.fixture(scope="session")
 def image_cache():
-    key = compatibility_image_cache_key(fixture_image_seeds())
+    key = compatibility_image_cache_key(image_cache_seeds())
     root = REPO_ROOT / ".build" / f"compat-image-cache-{key}"
     root.mkdir(parents=True, exist_ok=True)
     yield root
@@ -289,6 +299,20 @@ def client(daemon: Daemon, image_cache: pathlib.Path) -> docker.DockerClient:
         if seed_source != target:
             value.api.tag(pulled.id, repository=target)
         value.images.get(target)
+    for platform in MULTI_PLATFORM_FIXTURES:
+        encoded = {"os": platform.split("/")[0], "architecture": platform.split("/")[1]}
+        response = value.api._get(
+            value.api._url("/images/{0}/json", MULTI_PLATFORM_IMAGE_SOURCE),
+            params={"platform": json.dumps(encoded, separators=(",", ":"))},
+        )
+        if response.status_code == 200:
+            continue
+        messages = list(value.api.pull(
+            MULTI_PLATFORM_IMAGE_SOURCE, platform=platform, stream=True, decode=True,
+        ))
+        errors = [message for message in messages if message.get("error")]
+        if errors:
+            pytest.fail(f"could not seed {MULTI_PLATFORM_IMAGE_SOURCE} for {platform}: {errors}")
     cached_content = image_cache / "content"
     if not cached_content.exists():
         temporary = image_cache / "content.tmp"

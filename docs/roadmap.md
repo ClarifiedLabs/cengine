@@ -15,33 +15,25 @@ Buildx builder, and daemon recovery path are implemented. The raw virtualization
 migration is complete; there is no remaining Apple Containerization migration
 phase.
 
+## Recently completed
+
+### Multi-platform and OCI image behavior
+
+The image store now preserves OCI graph roots and all locally available
+platform manifests instead of flattening an index to one variant. Docker API
+v1.47-v1.55 behavior includes versioned manifest/descriptor responses, platform
+selection for inspect, history, load, save, push, and delete, selected container
+manifest descriptors, trusted pull/push origin identity, and attached in-toto
+attestations. Identity intentionally omits build and signature claims because
+cengine does not have verified evidence for either.
+
+The VM-backed compatibility suite covers successful and missing platform
+selection, multi-platform archive round trips, selective deletion, identity,
+attestations, and optional differential response-shape comparison.
+
 ## Compatibility priorities
 
-### 1. Complete multi-platform and OCI image behavior
-
-The largest concentrated API gap is modern image behavior across API
-v1.47-v1.55. Complete the platform-aware and OCI-facing operations used by
-current Docker clients before filling isolated informational fields.
-
-Prioritize:
-
-- Image-list manifest summaries and OCI descriptor/manifest responses.
-- Platform selectors for image inspect, history, load, save, push, and delete.
-- Multi-platform image archive load and save without collapsing the stored
-  variants.
-- Image identities and attestations after the underlying manifest behavior is
-  in place.
-
-Completion criteria:
-
-- Each accepted option changes behavior rather than being silently ignored.
-- Multi-platform operations preserve and return the requested platform.
-- Compatibility contracts cover both a successful selection and a missing
-  platform.
-- Response shapes match a reference Docker Engine or documented Docker API
-  semantics at the negotiated API version.
-
-### 2. Complete modern network endpoint and IPAM semantics
+### 1. Complete modern network endpoint and IPAM semantics
 
 Close the remaining network behavior gaps that affect how clients create and
 inspect endpoints. These include endpoint sysctls, explicit IPv4 controls,
@@ -57,7 +49,7 @@ Completion criteria:
 - SCTP is either implemented and tested end to end or recorded as an intentional
   compatibility gap.
 
-### 3. Close remaining client-visible API gaps
+### 2. Close remaining client-visible API gaps
 
 Use the API v1.46-v1.55 assessment table in
 [Docker compatibility](docker-compatibility.md#api-version-envelope) as the
@@ -77,7 +69,7 @@ Completion criteria for each accepted gap:
 - A deliberately unsupported behavior returns a clear error and is recorded as
   an intentional gap rather than being silently accepted.
 
-### 4. Harden compatibility under sustained use
+### 3. Harden compatibility under sustained use
 
 Current black-box gaps include higher-volume concurrent container lifecycle
 stress and broader differential-oracle sampling. Use these tests to find and fix

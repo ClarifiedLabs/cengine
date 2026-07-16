@@ -202,6 +202,15 @@ public actor EngineRuntime {
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
         }
+        if let image = try? image(record.image) {
+            if let platform = try? OCIPlatform(record.platform) {
+                let selected = image.manifests.first {
+                    $0.kind == .image && $0.available && $0.platform?.matches(platform) == true
+                }
+                record.imageID = selected?.imageID ?? image.id
+                record.imageManifestDescriptor = selected?.descriptor
+            }
+        }
         snapshot.containers.append(record)
         try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
@@ -493,7 +502,6 @@ public actor EngineRuntime {
     public func pullImage(_ reference: String, platform: String = "linux/arm64",
                           credentials: RegistryCredentials? = nil,
                           progress: @escaping ImagePullProgressHandler = { _ in }) async throws -> ImageRecord {
-        if let existing = snapshot.images.first(where: { $0.references.contains(reference) }) { return existing }
         try await backend.pullImage(reference, platform: platform, credentials: credentials, progress: progress)
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
@@ -519,22 +527,44 @@ public actor EngineRuntime {
         return image
     }
 
-    public func imageHistory(_ identifier: String) async throws -> (ImageRecord, [ImageHistoryEntry]) {
+    public func imageHistory(_ identifier: String, platform: OCIPlatform? = nil) async throws -> (ImageRecord, [ImageHistoryEntry]) {
         let image = try image(identifier)
         guard let reference = image.references.first else { return (image, []) }
-        return (image, try await backend.imageHistory(
-            reference: reference, platform: "\(image.os)/\(image.architecture)"
-        ))
+        return (image, try await backend.imageHistory(reference: reference, platform: platform))
     }
 
-    public func removeImage(_ identifier: String, force: Bool) async throws {
+    @discardableResult
+    public func removeImage(_ identifier: String, force: Bool, platforms: [OCIPlatform] = []) async throws -> [String] {
         let image = try image(identifier)
-        guard force || !snapshot.containers.contains(where: { image.references.contains($0.image) }) else {
+        guard force || !snapshot.containers.contains(where: {
+            $0.imageID == image.id || image.references.contains($0.image) || image.references.contains(ImageReference.normalized($0.image))
+        }) else {
             throw EngineError(.conflict, "conflict: image is being used by a container")
         }
-        for reference in image.references { try await backend.deleteImage(reference: reference) }
-        snapshot.images.removeAll { $0.id == image.id }
+        let reference = image.references.first(where: {
+            $0 == identifier || $0 == ImageReference.normalized(identifier)
+        }) ?? identifier
+        let removed: [String]
+        if platforms.isEmpty {
+            for storedReference in image.references { try await backend.deleteImage(reference: storedReference) }
+            removed = [image.id]
+        } else {
+            removed = try await backend.deleteImage(reference: reference, platforms: platforms)
+        }
+        if let backendImages = try await backend.listImages() {
+            snapshot.images = Self.imageRecords(from: backendImages)
+        } else if platforms.isEmpty {
+            snapshot.images.removeAll { $0.id == image.id }
+        } else if let index = snapshot.images.firstIndex(where: { $0.id == image.id }) {
+            for manifest in snapshot.images[index].manifests.indices where removed.contains(snapshot.images[index].manifests[manifest].descriptor.digest) {
+                snapshot.images[index].manifests[manifest].available = false
+            }
+            snapshot.images[index].preferredManifestDigest = snapshot.images[index].manifests.first {
+                $0.kind == .image && $0.available
+            }?.descriptor.digest
+        }
         try await persist()
+        return removed
     }
 
     public func tagImage(_ identifier: String, reference: String) async throws {
@@ -551,19 +581,33 @@ public actor EngineRuntime {
         try await persist()
     }
 
-    public func pushImage(_ identifier: String, credentials: RegistryCredentials?) async throws {
+    public func pushImage(_ identifier: String, platform: OCIPlatform? = nil, credentials: RegistryCredentials?) async throws {
         let image = try image(identifier)
         let normalized = ImageReference.normalized(identifier)
         let reference = image.references.first(where: { $0 == identifier || $0 == normalized }) ?? normalized
-        try await backend.pushImage(
-            reference: reference, platform: "\(image.os)/\(image.architecture)", credentials: credentials
-        )
+        try await backend.pushImage(reference: reference, platform: platform, credentials: credentials)
     }
 
-    public func saveImage(_ identifier: String) async throws -> Data {
+    public func saveImage(_ identifier: String, platforms: [OCIPlatform] = []) async throws -> Data {
+        _ = try image(identifier)
+        return try await backend.saveImages(references: [ImageReference.normalized(identifier)], platforms: platforms)
+    }
+
+    public func imageAttestations(
+        _ identifier: String,
+        platform: OCIPlatform?,
+        predicateTypes: [String],
+        includeStatement: Bool
+    ) async throws -> [ImageAttestationRecord] {
         let image = try image(identifier)
-        return try await backend.saveImages(
-            references: [ImageReference.normalized(identifier)], platform: "\(image.os)/\(image.architecture)"
+        let normalized = ImageReference.normalized(identifier)
+        let reference = image.references.first(where: { $0 == identifier || $0 == normalized })
+            ?? image.references.first ?? normalized
+        return try await backend.imageAttestations(
+            reference: reference,
+            platform: platform,
+            predicateTypes: predicateTypes,
+            includeStatement: includeStatement
         )
     }
 
@@ -975,9 +1019,19 @@ public actor EngineRuntime {
 
     private static func imageRecords(from images: [BackendImage]) -> [ImageRecord] {
         Dictionary(grouping: images, by: \ .id).map { id, values in
-            ImageRecord(id: id, references: values.map(\ .reference).sorted(), createdAt: Date(),
-                        size: values.map(\ .size).max() ?? 0,
-                        architecture: values.first?.architecture ?? "arm64", os: values.first?.os ?? "linux")
+            let preferred = values.first(where: { $0.preferredManifestDigest != nil }) ?? values[0]
+            return ImageRecord(
+                id: id,
+                references: Array(Set(values.map(\ .reference))).sorted(),
+                createdAt: values.map(\ .createdAt).min() ?? Date(timeIntervalSince1970: 0),
+                size: values.map(\ .size).max() ?? 0,
+                architecture: preferred.architecture,
+                os: preferred.os,
+                targetDescriptor: preferred.targetDescriptor,
+                manifests: preferred.manifests,
+                preferredManifestDigest: preferred.preferredManifestDigest,
+                identity: preferred.identity
+            )
         }.sorted { $0.references.first ?? "" < $1.references.first ?? "" }
     }
 

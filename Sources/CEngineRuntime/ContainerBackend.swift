@@ -54,11 +54,15 @@ public protocol ContainerBackend: Sendable {
                 ownership: [ArchiveOwnership]) async throws
     func copyOut(_ container: ContainerRecord, source: String, destinationDirectory: URL) async throws
     func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage]
+    func loadImages(fromOCILayout directory: URL, platforms: [OCIPlatform]) async throws -> [BackendImage]
     func listImages() async throws -> [BackendImage]?
     func deleteImage(reference: String) async throws
+    func deleteImage(reference: String, platforms: [OCIPlatform]) async throws -> [String]
     func tagImage(existing: String, new: String) async throws
     func pushImage(reference: String, platform: String, credentials: RegistryCredentials?) async throws
+    func pushImage(reference: String, platform: OCIPlatform?, credentials: RegistryCredentials?) async throws
     func saveImages(references: [String], platform: String) async throws -> Data
+    func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
@@ -72,6 +76,8 @@ public protocol ContainerBackend: Sendable {
     func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery
     func pullImage(_ reference: String, platform: String, credentials: RegistryCredentials?, progress: @escaping ImagePullProgressHandler) async throws
     func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry]
+    func imageHistory(reference: String, platform: OCIPlatform?) async throws -> [ImageHistoryEntry]
+    func imageAttestations(reference: String, platform: OCIPlatform?, predicateTypes: [String], includeStatement: Bool) async throws -> [ImageAttestationRecord]
     func updateNetworkRecords(_ containers: [ContainerRecord]) async throws
     func restoreNetworks(_ networks: [NetworkRecord]) async throws -> [NetworkRecord]
     func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord
@@ -109,16 +115,35 @@ public extension ContainerBackend {
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
         throw EngineError(.unsupported, "image import is unavailable for this backend")
     }
+    func loadImages(fromOCILayout directory: URL, platforms: [OCIPlatform]) async throws -> [BackendImage] {
+        guard platforms.isEmpty else {
+            throw EngineError(.unsupported, "selective image import is unavailable for this backend")
+        }
+        return try await loadImages(fromOCILayout: directory)
+    }
     func listImages() async throws -> [BackendImage]? { nil }
     func deleteImage(reference _: String) async throws {}
+    func deleteImage(reference: String, platforms: [OCIPlatform]) async throws -> [String] {
+        guard platforms.isEmpty else {
+            throw EngineError(.unsupported, "selective image removal is unavailable for this backend")
+        }
+        try await deleteImage(reference: reference)
+        return []
+    }
     func tagImage(existing _: String, new _: String) async throws {
         throw EngineError(.unsupported, "image tagging is unavailable for this backend")
     }
     func pushImage(reference _: String, platform _: String, credentials _: RegistryCredentials?) async throws {
         throw EngineError(.unsupported, "image push is unavailable for this backend")
     }
+    func pushImage(reference: String, platform: OCIPlatform?, credentials: RegistryCredentials?) async throws {
+        try await pushImage(reference: reference, platform: platform?.description ?? "linux/arm64", credentials: credentials)
+    }
     func saveImages(references _: [String], platform _: String) async throws -> Data {
         throw EngineError(.unsupported, "image export is unavailable for this backend")
+    }
+    func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data {
+        try await saveImages(references: references, platform: platforms.first?.description ?? "linux/arm64")
     }
     func pause(_: ContainerRecord) async throws { throw EngineError(.unsupported, "pause is unavailable for this backend") }
     func resume(_: ContainerRecord) async throws { throw EngineError(.unsupported, "unpause is unavailable for this backend") }
@@ -147,6 +172,12 @@ public extension ContainerBackend {
         await progress(.init(completedItems: 1, totalItems: 1))
     }
     func imageHistory(reference _: String, platform _: String) async throws -> [ImageHistoryEntry] { [] }
+    func imageHistory(reference: String, platform: OCIPlatform?) async throws -> [ImageHistoryEntry] {
+        try await imageHistory(reference: reference, platform: platform?.description ?? "linux/arm64")
+    }
+    func imageAttestations(reference _: String, platform _: OCIPlatform?, predicateTypes _: [String], includeStatement _: Bool) async throws -> [ImageAttestationRecord] {
+        throw EngineError(.unsupported, "image attestations are unavailable for this backend")
+    }
     func updateNetworkRecords(_: [ContainerRecord]) async throws {}
     func restoreNetworks(_ networks: [NetworkRecord]) async throws -> [NetworkRecord] { networks }
     func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {

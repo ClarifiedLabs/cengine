@@ -132,6 +132,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ = try await store.prune()
     }
 
+    public func deleteImage(reference: String, platforms: [OCIPlatform]) async throws -> [String] {
+        let removed = try await store.remove(reference: reference, platforms: platforms)
+        _ = try await store.prune()
+        return removed
+    }
+
     public func tagImage(existing: String, new: String) async throws {
         guard let descriptor = await store.descriptor(for: existing) else { throw EngineError(.notFound, "image \(existing) not found") }
         try await store.tag(descriptor, as: new)
@@ -139,16 +145,41 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage] { try await store.importLayout(directory) }
 
+    public func loadImages(fromOCILayout directory: URL, platforms: [OCIPlatform]) async throws -> [BackendImage] {
+        try await store.importLayout(directory, platforms: platforms)
+    }
+
     public func saveImages(references: [String], platform: String) async throws -> Data {
-        try await store.exportLayout(references: references, platform: platform)
+        try await store.exportLayout(references: references, platforms: [try OCIPlatform(platform)])
+    }
+
+    public func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data {
+        try await store.exportLayout(references: references, platforms: platforms)
     }
 
     public func pushImage(reference: String, platform: String, credentials: RegistryCredentials?) async throws {
+        try await store.push(reference: reference, platform: try OCIPlatform(platform), credentials: credentials)
+    }
+
+    public func pushImage(reference: String, platform: OCIPlatform?, credentials: RegistryCredentials?) async throws {
         try await store.push(reference: reference, platform: platform, credentials: credentials)
     }
 
     public func imageHistory(reference: String, platform: String) async throws -> [ImageHistoryEntry] {
+        try await store.history(reference: reference, platform: try OCIPlatform(platform))
+    }
+
+    public func imageHistory(reference: String, platform: OCIPlatform?) async throws -> [ImageHistoryEntry] {
         try await store.history(reference: reference, platform: platform)
+    }
+
+    public func imageAttestations(reference: String, platform: OCIPlatform?, predicateTypes: [String], includeStatement: Bool) async throws -> [ImageAttestationRecord] {
+        try await store.attestations(
+            reference: reference,
+            platform: platform,
+            predicateTypes: predicateTypes,
+            includeStatement: includeStatement
+        )
     }
 
     public func prepare(_ container: ContainerRecord) async throws {

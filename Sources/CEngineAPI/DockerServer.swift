@@ -182,7 +182,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 
     private static func logOptions(_ target: DockerRequestTarget) -> DockerLogOptions {
-        let query = Dictionary(uniqueKeysWithValues: (target.components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+        let query = Dictionary(grouping: target.components.queryItems ?? [], by: \.name)
+            .compactMapValues { $0.first?.value ?? "" }
         return .init(
             stdout: query["stdout"].map { $0 == "1" || $0 == "true" } ?? true,
             stderr: query["stderr"].map { $0 == "1" || $0 == "true" } ?? true,
@@ -195,7 +196,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
 
     private func startEvents(target: DockerRequestTarget, requestHeaders: HTTPHeaders, channel: Channel) {
         let filters = Self.eventFilters(target)
-        let query = Dictionary(uniqueKeysWithValues: (target.components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+        let query = Dictionary(grouping: target.components.queryItems ?? [], by: \.name)
+            .compactMapValues { $0.first?.value ?? "" }
         let since = query["since"].flatMap(parseDockerTimestamp)
         let until = query["until"].flatMap(parseDockerTimestamp)
         let jsonl = target.version >= .init(major: 1, minor: 53)
