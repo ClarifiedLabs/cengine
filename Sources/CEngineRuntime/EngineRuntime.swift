@@ -194,6 +194,7 @@ public actor EngineRuntime {
            let network = snapshot.networks.first(where: { $0.name == "default" }) {
             record.networks = [.init(networkID: network.id)]
         }
+        record = try normalizingEndpointMacAddresses(record)
         record = try allocatingEndpointAddresses(to: record)
         try await persistEndpointAllocationCursors()
         try validateEndpoints(record)
@@ -678,7 +679,7 @@ public actor EngineRuntime {
 
     public func connectNetwork(_ networkIdentifier: String, container containerIdentifier: String,
                                aliases: [String] = [], ipv4Address: String? = nil,
-                               ipv6Address: String? = nil) async throws {
+                               ipv6Address: String? = nil, macAddress: String? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
@@ -688,10 +689,12 @@ public actor EngineRuntime {
         try validateStaticEndpointModes(
             network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
         )
+        let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
         let previous = snapshot.containers[index]
         snapshot.containers[index].networks.append(.init(
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
-            ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil
+            ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil,
+            macAddress: normalizedMac
         ))
         snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
         try await persistEndpointAllocationCursors()
@@ -801,9 +804,33 @@ public actor EngineRuntime {
                     if endpoint.ipv6AddressIsStatic, endpoint.ipv6Address == existing.ipv6Address {
                         throw EngineError(.conflict, "IPv6 address \(endpoint.ipv6Address ?? "") is already allocated")
                     }
+                    if let mac = endpoint.macAddress, mac == existing.macAddress {
+                        throw EngineError(.conflict, "MAC address \(mac) is already in use on this network")
+                    }
                 }
             }
         }
+    }
+
+    /// Normalizes an explicitly requested endpoint MAC to canonical lowercase
+    /// form, rejecting malformed, broadcast, and multicast/group addresses.
+    private static func normalizeMacAddress(_ value: String) throws -> String {
+        guard let normalized = EndpointMacAddress.normalized(value) else {
+            throw EngineError(.badRequest, "invalid MAC address \(value)")
+        }
+        return normalized
+    }
+
+    /// Normalizes any requested endpoint MACs on a container record before
+    /// persistence so stored records, inspect output, and guest configuration
+    /// all use the same canonical form.
+    private func normalizingEndpointMacAddresses(_ input: ContainerRecord) throws -> ContainerRecord {
+        var record = input
+        for index in record.networks.indices {
+            guard let requested = record.networks[index].macAddress else { continue }
+            record.networks[index].macAddress = try Self.normalizeMacAddress(requested)
+        }
+        return record
     }
 
     private func allocatingEndpointAddresses(to input: ContainerRecord) throws -> ContainerRecord {

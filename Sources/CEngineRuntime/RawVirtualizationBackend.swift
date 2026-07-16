@@ -938,7 +938,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 networkID: endpoint.networkID,
                 vlan: vlan,
                 name: "eth\(index)",
-                macAddress: Self.macAddress(container.id + endpoint.networkID),
+                macAddress: endpoint.macAddress ?? Self.endpointMacAddress(container: container.id, network: endpoint.networkID),
                 addresses: addresses,
                 gateways: gateways,
                 dns: network.internalNetwork ? [] : [network.gateway].filter { !$0.isEmpty },
@@ -1056,9 +1056,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private static func macAddress(_ id: String) -> String {
-        let digest = SHA256.hash(data: Data(id.utf8))
-        var bytes = Array(digest.prefix(4)); while bytes.count < 4 { bytes.append(0) }
-        return String(format: "02:ce:%02x:%02x:%02x:%02x", bytes[0], bytes[1], bytes[2], bytes[3])
+        EndpointMacAddress.generated(seed: id)
+    }
+
+    /// Deterministic MAC for a container's endpoint on a given network, shared
+    /// with the Docker inspect surface so reported and applied MACs never diverge.
+    static func endpointMacAddress(container: String, network: String) -> String {
+        EndpointMacAddress.generated(seed: container + network)
     }
 
     private static func withPrefix(_ address: String, from subnet: String) -> String {

@@ -166,7 +166,8 @@ public struct DockerRouter: Sendable {
                 record.networks.append(.init(
                     networkID: network.id, aliases: endpoint?.Aliases ?? [],
                     ipv4Address: requestedIPv4, ipv6Address: requestedIPv6,
-                    ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil
+                    ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil,
+                    macAddress: nonEmpty(endpoint?.MacAddress)
                 ))
             }
             if record.networkDisabled == true, !record.networks.isEmpty {
@@ -343,7 +344,8 @@ public struct DockerRouter: Sendable {
             try await runtime.connectNetwork(
                 id, container: input.Container, aliases: input.EndpointConfig?.Aliases ?? [],
                 ipv4Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv4Address) ?? nonEmpty(input.EndpointConfig?.IPAddress),
-                ipv6Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv6Address) ?? nonEmpty(input.EndpointConfig?.GlobalIPv6Address)
+                ipv6Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv6Address) ?? nonEmpty(input.EndpointConfig?.GlobalIPv6Address),
+                macAddress: nonEmpty(input.EndpointConfig?.MacAddress)
             )
             return APIResponse(status: .ok)
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/disconnect"):
@@ -882,7 +884,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
                 IPv6Gateway: network?.ipv6Gateway ?? "",
                 GlobalIPv6Address: endpoint.ipv6Address ?? "",
                 GlobalIPv6PrefixLen: network?.ipv6Subnet.split(separator: "/").last.flatMap { Int($0) } ?? 0,
-                MacAddress: "", DNSNames: dnsNames
+                MacAddress: endpoint.macAddress
+                    ?? EndpointMacAddress.generated(seed: record.id + endpoint.networkID),
+                DNSNames: dnsNames
             )
         }
         let ports = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {

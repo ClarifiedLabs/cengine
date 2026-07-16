@@ -637,6 +637,82 @@ def test_creating_container_preserves_existing_network_connectivity(client: dock
     assert code == 0
 
 
+@pytest.mark.compat("NET-014")
+def test_explicit_endpoint_mac_address_is_applied_and_survives_recovery(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    network = client.networks.create(f"compat-mac-{suffix}")
+    mac = "02:42:ac:11:00:42"
+    container = client.containers.create(
+        IMAGE, command="top", name=f"mac-{suffix}", network=network.name,
+        networking_config={
+            network.name: client.api.create_endpoint_config(mac_address=mac),
+        },
+    )
+    container.start(); container.reload()
+    assert container.attrs["NetworkSettings"]["Networks"][network.name]["MacAddress"] == mac
+    code, address = container.exec_run(["cat", "/sys/class/net/eth0/address"])
+    assert (code, address.strip()) == (0, mac.encode())
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(container.name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"container with explicit MAC did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        assert value.attrs["NetworkSettings"]["Networks"][network.name]["MacAddress"] == mac
+        code, address = value.exec_run(["cat", "/sys/class/net/eth0/address"])
+        assert (code, address.strip()) == (0, mac.encode())
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("NET-015")
+def test_invalid_and_duplicate_endpoint_mac_addresses_are_rejected(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    network = client.networks.create(f"compat-mac-invalid-{suffix}")
+    with pytest.raises(errors.APIError) as malformed:
+        client.containers.create(
+            IMAGE, command="top", network=network.name,
+            networking_config={network.name: client.api.create_endpoint_config(mac_address="not-a-mac")},
+        )
+    assert malformed.value.response.status_code == 400
+    with pytest.raises(errors.APIError) as multicast:
+        client.containers.create(
+            IMAGE, command="top", network=network.name,
+            networking_config={network.name: client.api.create_endpoint_config(mac_address="03:42:ac:11:00:02")},
+        )
+    assert multicast.value.response.status_code == 400
+
+    mac = "02:42:ac:11:00:55"
+    client.containers.create(
+        IMAGE, command="top", network=network.name,
+        networking_config={network.name: client.api.create_endpoint_config(mac_address=mac)},
+    )
+    with pytest.raises(errors.APIError) as duplicate:
+        client.containers.create(
+            IMAGE, command="top", network=network.name,
+            networking_config={network.name: client.api.create_endpoint_config(mac_address=mac)},
+        )
+    assert duplicate.value.response.status_code == 409
+
+    other = client.networks.create(f"compat-mac-connect-{suffix}")
+    connected = client.containers.create(IMAGE, command="top")
+    connect_mac = "02:42:ac:11:00:56"
+    other.connect(connected, mac_address=connect_mac)
+    connected.reload()
+    assert connected.attrs["NetworkSettings"]["Networks"][other.name]["MacAddress"] == connect_mac
+    collision = client.containers.create(IMAGE, command="top")
+    with pytest.raises(errors.APIError) as duplicate_connect:
+        other.connect(collision, mac_address=connect_mac)
+    assert duplicate_connect.value.response.status_code == 409
+
+
 @pytest.mark.compat("CTR-034")
 def test_network_none_has_only_loopback(client: docker.DockerClient):
     container = client.containers.create(IMAGE, command="top", network_mode="none")

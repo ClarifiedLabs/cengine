@@ -36,9 +36,11 @@ attestations, and optional differential response-shape comparison.
 ### 1. Complete modern network endpoint and IPAM semantics
 
 Close the remaining network behavior gaps that affect how clients create and
-inspect endpoints. These include endpoint sysctls, explicit IPv4 controls,
-gateway priority, IPAM status, and endpoint MAC address application. Make an
-explicit support decision for SCTP rather than leaving it unassessed.
+inspect endpoints. Endpoint MAC address application is complete: an explicit
+`MacAddress` is decoded, validated, applied in the guest, inspected, and
+preserved across recovery (`NET-014`, `NET-015`). The remaining gaps are
+endpoint sysctls, explicit IPv4 controls, gateway priority, and IPAM status.
+Make an explicit support decision for SCTP rather than leaving it unassessed.
 
 Completion criteria:
 

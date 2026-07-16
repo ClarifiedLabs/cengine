@@ -50,12 +50,17 @@ public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
     public var ipv6Address: String?
     public var ipv4AddressIsStatic: Bool
     public var ipv6AddressIsStatic: Bool
+    /// An explicitly requested endpoint MAC address in canonical lowercase
+    /// colon-separated form, or `nil` when the backend assigns one automatically.
+    /// Optional so snapshots persisted before MAC support decode successfully.
+    public var macAddress: String?
 
     public init(networkID: String, aliases: [String] = [], ipv4Address: String? = nil, ipv6Address: String? = nil,
-                ipv4AddressIsStatic: Bool = false, ipv6AddressIsStatic: Bool = false) {
+                ipv4AddressIsStatic: Bool = false, ipv6AddressIsStatic: Bool = false, macAddress: String? = nil) {
         self.networkID = networkID; self.aliases = aliases
         self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
         self.ipv4AddressIsStatic = ipv4AddressIsStatic; self.ipv6AddressIsStatic = ipv6AddressIsStatic
+        self.macAddress = macAddress
     }
 }
 

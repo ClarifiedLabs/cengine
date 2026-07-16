@@ -142,6 +142,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Aliases: [String]?
         public var IPAddress: String?
         public var GlobalIPv6Address: String?
+        public var MacAddress: String?
         public var IPAMConfig: EndpointIPAMRequest?
     }
     public struct EndpointIPAMRequest: Decodable, Sendable {

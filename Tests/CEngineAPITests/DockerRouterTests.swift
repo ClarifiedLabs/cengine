@@ -1049,6 +1049,100 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((pruneJSON["NetworksDeleted"] as? [String])?.isEmpty == true)
     }
 
+    @Test func explicitEndpointMacIsAcceptedNormalizedAndReturnedByInspect() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"macnet"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=explicit-mac",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"macnet":{"MacAddress":"02:42:AC:11:00:02"}}}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/explicit-mac/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let settings = try #require(object["NetworkSettings"] as? [String: Any])
+        let networks = try #require(settings["Networks"] as? [String: Any])
+        let endpoint = try #require(networks["macnet"] as? [String: Any])
+        #expect(endpoint["MacAddress"] as? String == "02:42:ac:11:00:02")
+    }
+
+    @Test func connectEndpointMacIsAcceptedAndReturnedByInspect() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"macnet"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=connect-mac", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/macnet/connect",
+            body: Data(#"{"Container":"connect-mac","EndpointConfig":{"MacAddress":"02:42:ac:11:00:09"}}"#.utf8)
+        ))
+        #expect(connect.status == .ok)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/connect-mac/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let settings = try #require(object["NetworkSettings"] as? [String: Any])
+        let networks = try #require(settings["Networks"] as? [String: Any])
+        let endpoint = try #require(networks["macnet"] as? [String: Any])
+        #expect(endpoint["MacAddress"] as? String == "02:42:ac:11:00:09")
+    }
+
+    @Test func endpointWithoutExplicitMacReportsDeterministicGeneratedMac() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=auto-mac", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/auto-mac/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let settings = try #require(object["NetworkSettings"] as? [String: Any])
+        let networks = try #require(settings["Networks"] as? [String: Any])
+        let endpoint = try #require(networks["default"] as? [String: Any])
+        let mac = try #require(endpoint["MacAddress"] as? String)
+        #expect(!mac.isEmpty)
+        #expect(mac.hasPrefix("02:ce:"))
+        // Inspecting again yields the same generated MAC.
+        let again = await router.route(.init(method: .GET, uri: "/v1.55/containers/auto-mac/json"))
+        let againObject = try #require(JSONSerialization.jsonObject(with: again.body) as? [String: Any])
+        let againNetworks = try #require((againObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])
+        let againEndpoint = try #require(againNetworks["default"] as? [String: Any])
+        #expect(againEndpoint["MacAddress"] as? String == mac)
+    }
+
+    @Test func invalidAndDuplicateEndpointMacsAreRejected() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"macnet"}"#.utf8)
+        ))
+        let malformed = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=bad-mac",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"macnet":{"MacAddress":"nope"}}}}"#.utf8)
+        ))
+        #expect(malformed.status == .badRequest)
+        let multicast = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=multicast-mac",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"macnet":{"MacAddress":"03:42:ac:11:00:02"}}}}"#.utf8)
+        ))
+        #expect(multicast.status == .badRequest)
+
+        let first = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=dup-first",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"macnet":{"MacAddress":"02:42:ac:11:00:02"}}}}"#.utf8)
+        ))
+        #expect(first.status == .created)
+        let duplicate = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=dup-second",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"macnet":{"MacAddress":"02:42:AC:11:00:02"}}}}"#.utf8)
+        ))
+        #expect(duplicate.status == .conflict)
+    }
+
     @Test func containerCreateAcceptsNullNetworkEndpointSettings() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
