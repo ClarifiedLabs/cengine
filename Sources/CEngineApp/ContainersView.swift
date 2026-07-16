@@ -30,6 +30,7 @@ struct ContainersView: View {
                         systemImage: "shippingbox",
                         description: Text(searchText.isEmpty ? "Containers created through Docker or Compose will appear here." : "Try a different search.")
                     )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     Table(rows, selection: $selection, sortOrder: $sortOrder) {
                         TableColumn("Name", value: \ContainerSummary.name)

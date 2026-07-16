@@ -217,6 +217,35 @@ import Testing
         #expect(resourceSplitView.frame.height == 700)
     }
 
+    @Test func emptyContainersViewKeepsHeaderAtTop() throws {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let model = AppModel(
+            home: home,
+            serviceRegistrationRevision: nil
+        )
+        let root = NavigationSplitView {
+            Text("Sidebar")
+                .navigationSplitViewColumnWidth(180)
+        } detail: {
+            ContainersView(selection: .constant(nil))
+        }
+            .environmentObject(model)
+            .frame(width: 1_000, height: 700)
+        let hostingView = NSHostingView(rootView: root)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 1_000, height: 700)
+        hostingView.layoutSubtreeIfNeeded()
+
+        let splitViews = allSplitViews(in: hostingView)
+        #expect(splitViews.count == 2)
+        let resourceSplitView = try #require(splitViews.last)
+        #expect(resourceSplitView.frame.height == 700)
+        let listPane = try #require(resourceSplitView.subviews.first)
+        let refreshButton = try #require(allButtons(in: listPane).first)
+        let buttonFrame = refreshButton.convert(refreshButton.bounds, to: resourceSplitView)
+        #expect(buttonFrame.midY < resourceSplitView.bounds.height / 4)
+    }
+
     private static let responses: [String: Data] = [
         "/v1.55/version": Data("""
         {"Version":"0.1.0","ApiVersion":"1.55","GitCommit":"abc123","BuildTime":"2026-07-14T10:00:00Z","Os":"linux","Arch":"arm64","KernelVersion":"6.18"}
@@ -240,6 +269,11 @@ import Testing
         {"Id":"container-1","Name":"/web","Created":"2026-07-14T10:00:00Z","Path":"server","Args":[],"Image":"demo:latest","State":{"Status":"exited","Running":false,"Paused":false,"OOMKilled":false,"Dead":false,"ExitCode":0,"Error":"","StartedAt":"2026-07-14T10:00:01Z","FinishedAt":"2026-07-14T10:00:02Z"},"Config":{"Hostname":"web","User":"","Tty":false,"Env":[],"Cmd":["server"],"Image":"demo:latest","WorkingDir":"/","Labels":{}},"RestartCount":0,"NetworkSettings":{"Networks":{}},"HostConfig":{"Memory":1073741824,"NanoCpus":4000000000,"AutoRemove":false,"Privileged":false,"ReadonlyRootfs":false,"Init":false,"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"NetworkMode":"default"},"Mounts":[{"Type":"volume","Name":"data","Source":"data","Destination":"/data","Driver":"local","RW":true}]}
         """.utf8),
     ]
+}
+
+@MainActor private func allButtons(in view: NSView) -> [NSButton] {
+    let current = (view as? NSButton).map { [$0] } ?? []
+    return current + view.subviews.flatMap(allButtons)
 }
 
 @MainActor private func allSplitViews(in view: NSView) -> [NSSplitView] {
