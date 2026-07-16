@@ -139,11 +139,14 @@ private final class DaemonLock {
             return
         }
         let paths = EnginePaths()
+        let finishDaemonLog: (@Sendable () -> Void)?
         do {
-            try DaemonLog.redirectStandardStreams(to: paths.logs.appending(path: "daemon.log"))
+            finishDaemonLog = try DaemonLog.redirectStandardStreams(to: paths.logs.appending(path: "daemon.log"))
         } catch {
+            finishDaemonLog = nil
             FileHandle.standardError.write(Data("cengine: could not open daemon log: \(error.localizedDescription)\n".utf8))
         }
+        defer { finishDaemonLog?() }
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
         let runner = Task { try await runManagedService(paths: paths) }

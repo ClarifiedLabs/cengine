@@ -210,4 +210,18 @@ import Testing
         let contents = try String(contentsOf: log, encoding: .utf8)
         #expect(contents == "first\nsecond\n")
     }
+
+    @Test func timestampedLinesPreservePartialMessages() {
+        var buffer = TimestampedLineBuffer()
+
+        let partial = buffer.append(Data("first".utf8)) { "2026-07-16T12:00:00.000Z" }
+        #expect(String(decoding: partial, as: UTF8.self) == "2026-07-16T12:00:00.000Z first")
+
+        let complete = buffer.append(Data(" line\nsecond line\nthird".utf8)) { "2026-07-16T12:00:01.234Z" }
+        #expect(String(decoding: complete, as: UTF8.self) == """
+         line
+        2026-07-16T12:00:01.234Z second line
+        2026-07-16T12:00:01.234Z third
+        """)
+    }
 }
