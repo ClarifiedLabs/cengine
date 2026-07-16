@@ -14,12 +14,19 @@ runner owns the complete lifecycle so every run begins from a known state.
 3. Stop compatibility daemons and VM shims owned by this cengine binary, remove their
    temporary engine roots, and assert that both processes and roots are gone.
 4. Rebuild the macOS runtime and Linux guest initramfs from the current checkout.
-5. Validate the exact pinned guest kernel and sign the test binary.
+5. Validate the exact pinned guest kernel, build the `test-compat` Xcode scheme,
+   sign the test binary, and select the privileged networking helper. A normal
+   local run uses the freshly built helper: the scheme embeds
+   `dev.cengine.network-helper.test-compat` into both the daemon and helper, and
+   the runner bootstraps a temporary root-owned LaunchDaemon for that service.
+   Set `CENGINE_COMPAT_NETWORK_HELPER=installed` to force the installed
+   `/Applications/cengine.app` helper.
 6. Delete and recreate the Python virtual environment from the pinned requirements.
 7. Let the pytest harness create a unique engine root and Docker configuration for the
    run, then execute the requested tests.
 8. On success, failure, or interruption, stop all owned processes, remove temporary
-   roots, assert the state is clean, and release the lock.
+   roots, remove any temporary local networking helper, assert the state is clean,
+   and release the lock.
 
 Compiler intermediates and the pinned kernel build are caches, not runtime state. They
 remain between runs; Xcode dependency tracking rebuilds changed sources, guest assets

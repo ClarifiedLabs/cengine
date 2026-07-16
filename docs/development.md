@@ -50,9 +50,16 @@ and VM set. Fixture images are fetched once into a versioned immutable seed
 content store under `.build` and APFS-cloned into each root, avoiding external registry state without
 sharing mutable engine metadata. Pytest stops all VM shims owned by that root before removing it,
 including when a test fails; it does not reuse a daemon or repair resources
-left by a preceding test. The command uses
-the guest assets installed by the managed service or `cengine system install`;
-override them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and
+left by a preceding test. The command builds the `test-compat` Xcode scheme,
+which embeds the compatibility helper Mach service name
+`dev.cengine.network-helper.test-compat` into both the daemon and
+`cengine-network-helper`. By default the runner signs that freshly built helper,
+bootstraps a temporary root-owned LaunchDaemon for the embedded service name,
+and removes the helper during cleanup. That local helper bootstrap may prompt
+for administrator authorization. Set `CENGINE_COMPAT_NETWORK_HELPER=installed`
+to force the `/Applications/cengine.app` helper instead, or set
+`CENGINE_NETWORK_HELPER_PATH` to test an explicit helper binary. The command uses the guest assets built under `.build/guest`; override
+them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and
 `CENGINE_STORAGE_INITRAMFS`, or override the daemon and fixture image with
 `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`.
 Set `CENGINE_TEST_IMAGE_SOURCE` when the fixture tag should be seeded from a

@@ -2,10 +2,36 @@ import Foundation
 import Darwin
 
 public enum PrivilegedPortProtocol {
-    public static let serviceName = "dev.cengine.network-helper"
+    public static let defaultServiceName = "dev.cengine.network-helper"
+    public static let testCompatServiceName = "dev.cengine.network-helper.test-compat"
+    public static let serviceNameInfoKey = "CEngineNetworkHelperServiceName"
+    public static let serviceNameEnvironmentKey = "CENGINE_NETWORK_HELPER_SERVICE_NAME"
+    public static var serviceName: String {
+        serviceName(
+            configured: Bundle.main.object(forInfoDictionaryKey: serviceNameInfoKey) as? String,
+            environment: ProcessInfo.processInfo.environment
+        )
+    }
     public static let version: Int64 = 4
     public static let engineIdentifier = "dev.cengine.engine"
     public static let helperIdentifier = "dev.cengine.network-helper"
+
+    public static func serviceName(environment: [String: String]) -> String {
+        serviceName(configured: nil, environment: environment)
+    }
+
+    public static func serviceName(configured: String?, environment: [String: String]) -> String {
+        if let configured = normalized(environment[serviceNameEnvironmentKey]) { return configured }
+        if let configured = normalized(configured) { return configured }
+        return defaultServiceName
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let configured = value?.trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty else {
+            return nil
+        }
+        return configured
+    }
 }
 
 public final class RetainedOpaquePointer: @unchecked Sendable {

@@ -21,6 +21,28 @@ import Testing
         #expect(state.releases == 1)
     }
 
+    @Test func testCompatBuildCanEmbedHelperServiceName() {
+        let key = PrivilegedPortProtocol.serviceNameEnvironmentKey
+
+        #expect(PrivilegedPortProtocol.defaultServiceName == "dev.cengine.network-helper")
+        #expect(PrivilegedPortProtocol.testCompatServiceName == "dev.cengine.network-helper.test-compat")
+        #expect(PrivilegedPortProtocol.serviceName(environment: [:]) == PrivilegedPortProtocol.defaultServiceName)
+        #expect(
+            PrivilegedPortProtocol.serviceName(configured: " \n\t ", environment: [:])
+                == PrivilegedPortProtocol.defaultServiceName
+        )
+        #expect(
+            PrivilegedPortProtocol.serviceName(configured: PrivilegedPortProtocol.testCompatServiceName, environment: [:])
+                == PrivilegedPortProtocol.testCompatServiceName
+        )
+        #expect(
+            PrivilegedPortProtocol.serviceName(
+                configured: PrivilegedPortProtocol.testCompatServiceName,
+                environment: [key: "dev.cengine.network-helper"]
+            ) == PrivilegedPortProtocol.defaultServiceName
+        )
+    }
+
     @Test func staticVMNetRequestDisablesDHCPAcrossProtocolEncoding() throws {
         let request = PrivilegedVMNetRequest(
             id: "bridge",

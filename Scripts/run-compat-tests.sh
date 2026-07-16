@@ -2,9 +2,18 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=Scripts/compat-network-helper.sh
+. "$ROOT/Scripts/compat-network-helper.sh"
 MODE=${1:-suite}
 shift || true
-BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/Debug/cengine"}
+BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/test-compat/cengine"}
+XCODEBUILD=${XCODEBUILD:-xcodebuild}
+XCODE_PROJECT=${XCODE_PROJECT:-cengine.xcodeproj}
+XCODE_DERIVED_DATA=${XCODE_DERIVED_DATA:-.build/xcode-derived}
+XCODE_SOURCE_PACKAGES=${XCODE_SOURCE_PACKAGES:-.build/xcode-source-packages}
+XCODE_COMPAT_SCHEME=${XCODE_COMPAT_SCHEME:-test-compat}
+XCODE_COMPAT_CONFIGURATION=${XCODE_COMPAT_CONFIGURATION:-test-compat}
+XCODE_COMMON_FLAGS=${XCODE_COMMON_FLAGS:-"-skipPackagePluginValidation -skipMacroValidation ENABLE_CODE_COVERAGE=NO CLANG_COVERAGE_MAPPING=NO"}
 RESET="python3 $ROOT/Scripts/reset-compat-runtime.py --binary $BINARY"
 LOCK=${CENGINE_COMPAT_LOCK:-"${TMPDIR:-/tmp}/cengine-compat-run.lock"}
 
@@ -34,6 +43,7 @@ cleanup() {
     trap - EXIT HUP INT TERM
     stage "cleanup"
     $RESET || status=$?
+    compat_network_helper_cleanup_local || status=$?
     rm -rf "$LOCK"
     exit "$status"
 }
@@ -48,11 +58,23 @@ stage "preflight reset"
 $RESET
 
 stage "rebuild runtime and guest assets"
-make -C "$ROOT" --no-print-directory build guest-initramfs
+make -C "$ROOT" --no-print-directory guest-initramfs
+"$XCODEBUILD" -project "$ROOT/$XCODE_PROJECT" -scheme "$XCODE_COMPAT_SCHEME" \
+    -configuration "$XCODE_COMPAT_CONFIGURATION" -derivedDataPath "$ROOT/$XCODE_DERIVED_DATA" \
+    -clonedSourcePackagesDirPath "$ROOT/$XCODE_SOURCE_PACKAGES" \
+    $XCODE_COMMON_FLAGS CENGINE_GIT_COMMIT="${CENGINE_GIT_COMMIT:-unknown}" \
+    CENGINE_BUILD_TIME="${CENGINE_BUILD_TIME:-}" build
 
 stage "validate immutable guest inputs"
 "$ROOT/Scripts/check-guest-kernel.sh"
 "$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
+HELPER=$(compat_network_helper_for_binary "$BINARY")
+if compat_network_helper_is_installed "$HELPER"; then
+    CENGINE_NETWORK_HELPER_SERVICE_NAME=$compat_network_helper_default_service_name
+    export CENGINE_NETWORK_HELPER_SERVICE_NAME
+else
+    compat_network_helper_bootstrap_local "$HELPER"
+fi
 
 stage "recreate test environment"
 rm -rf "$ROOT/.build/compat-venv"

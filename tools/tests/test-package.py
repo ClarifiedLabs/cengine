@@ -64,16 +64,17 @@ def main() -> None:
     for contents, label in ((script, "package-release.sh"), (build_script, "build-release.sh")):
         require_contains(contents, "require_uninstrumented", label)
         require_contains(contents, "__llvm_prf", label)
-    if project.count("CLANG_COVERAGE_MAPPING = NO") != 2 or project.count("ENABLE_CODE_COVERAGE = NO") != 2:
-        raise AssertionError("shared Debug and Release build settings must disable coverage instrumentation")
+    if project.count("CLANG_COVERAGE_MAPPING = NO") != 3 or project.count("ENABLE_CODE_COVERAGE = NO") != 3:
+        raise AssertionError("shared Debug, Release, and test-compat build settings must disable coverage instrumentation")
     require_contains(info_plist, "$(CENGINE_GIT_COMMIT)", "cengine-Info.plist")
     require_contains(info_plist, "$(CENGINE_BUILD_TIME)", "cengine-Info.plist")
     require_contains(info_plist, "$(CENGINE_TEAM_IDENTIFIER)", "cengine-Info.plist")
+    require_contains(info_plist, "$(CENGINE_NETWORK_HELPER_SERVICE_NAME)", "cengine-Info.plist")
     require_contains(project, 'INFOPLIST_FILE = "Configuration/cengine-Info.plist"', "project.pbxproj")
     require_contains(project, "Configuration/cengine-app-Info.plist", "project.pbxproj")
     require_contains(project, "Configuration/network-helper-Info.plist", "project.pbxproj")
     require_contains(project, 'LD_RUNPATH_SEARCH_PATHS = ""', "project.pbxproj")
-    if project.count("CREATE_INFOPLIST_SECTION_IN_BINARY = YES") != 4:
+    if project.count("CREATE_INFOPLIST_SECTION_IN_BINARY = YES") != 6:
         raise AssertionError("engine and network helper builds must embed metadata")
 
     with component_plist_path.open("rb") as component_plist_file:

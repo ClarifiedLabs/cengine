@@ -51,11 +51,12 @@ def main() -> None:
         "system install",
     ):
         require_absent(test, forbidden, "test.yml")
-    require_contains(
-        makefile,
-        'CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/Debug/cengine"',
-        "Makefile",
-    )
+    for needle in (
+        "XCODE_COMPAT_SCHEME ?= test-compat",
+        "XCODE_COMPAT_CONFIGURATION ?= test-compat",
+        'CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/$(XCODE_COMPAT_CONFIGURATION)/cengine"',
+    ):
+        require_contains(makefile, needle, "Makefile")
     for target in ("test-compat", "test-compat-soak", "test-compat-oracle"):
         require_contains(makefile, f"{target}:", "Makefile")
     for needle in (
@@ -73,8 +74,10 @@ def main() -> None:
     for needle in ("CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64", "-buildvcs=false"):
         require_contains(guest_builder, needle, "build-guest-assets.sh")
     compat_sign = read(REPO_ROOT / "Scripts/sign-compat-binary.sh")
+    compat_helper = read(REPO_ROOT / "Scripts/compat-network-helper.sh")
+    compat_scheme = read(REPO_ROOT / "cengine.xcodeproj/xcshareddata/xcschemes/test-compat.xcscheme")
     for needle in (
-        "/Applications/cengine.app/Contents/MacOS/cengine-network-helper",
+        "compat_network_helper_for_binary",
         "dev.cengine.engine",
         "Configuration/cengine.entitlements",
         "security find-identity -v -p codesigning",
@@ -83,6 +86,23 @@ def main() -> None:
         "-name '*.dylib'",
     ):
         require_contains(compat_sign, needle, "sign-compat-binary.sh")
+    for needle in (
+        "/Applications/cengine.app/Contents/MacOS/cengine-network-helper",
+        "CENGINE_COMPAT_NETWORK_HELPER",
+        "dev.cengine.network-helper.test-compat",
+        "CENGINE_NETWORK_HELPER_SERVICE_NAME",
+        "compat_network_helper_bootstrap_local",
+        "launchctl bootstrap system",
+        "compat_network_helper_cleanup_local",
+    ):
+        require_contains(compat_helper, needle, "compat-network-helper.sh")
+    for needle in (
+        '<Scheme',
+        'buildConfiguration = "test-compat"',
+        'BlueprintName = "cengine"',
+        'BlueprintName = "CEngineNetworkHelper"',
+    ):
+        require_contains(compat_scheme, needle, "test-compat.xcscheme")
 
 
 if __name__ == "__main__":

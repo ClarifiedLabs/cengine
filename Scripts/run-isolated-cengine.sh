@@ -2,6 +2,8 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=Scripts/compat-network-helper.sh
+. "$ROOT/Scripts/compat-network-helper.sh"
 BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/Debug/cengine"}
 KERNEL=${CENGINE_KERNEL:-"$ROOT/.build/guest/vmlinux"}
 CONTAINER_INITRAMFS=${CENGINE_CONTAINER_INITRAMFS:-"$ROOT/.build/guest/container-initramfs.cpio.gz"}
@@ -18,8 +20,6 @@ for asset in "$BINARY" "$KERNEL" "$CONTAINER_INITRAMFS" "$STORAGE_INITRAMFS"; do
         exit 2
     fi
 done
-
-"$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/cengine-compat-tool.XXXXXX")
 ENGINE_ROOT="$WORK/root"
@@ -42,6 +42,7 @@ cleanup() {
     fi
     python3 "$ROOT/Scripts/reset-compat-runtime.py" \
         --binary "$BINARY" --root "$ENGINE_ROOT" >/dev/null 2>&1 || true
+    compat_network_helper_cleanup_local || status=$?
     if [ "$status" -ne 0 ] && [ -f "$LOG" ]; then
         echo "cengine isolated daemon log (last 200 lines):" >&2
         tail -n 200 "$LOG" >&2
@@ -53,6 +54,16 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+"$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
+HELPER=$(compat_network_helper_for_binary "$BINARY")
+if compat_network_helper_is_installed "$HELPER"; then
+    CENGINE_NETWORK_HELPER_SERVICE_NAME=$compat_network_helper_default_service_name
+    export CENGINE_NETWORK_HELPER_SERVICE_NAME
+else
+    COMPAT_HELPER_SERVICE=$(compat_network_helper_dynamic_label)
+    compat_network_helper_bootstrap_local "$HELPER" "$COMPAT_HELPER_SERVICE" 1
+fi
 
 python3 "$ROOT/Scripts/reset-compat-runtime.py" \
     --binary "$BINARY" --root "$ENGINE_ROOT"

@@ -77,6 +77,10 @@ def main() -> None:
         assert not compatibility_root_owned_by(owned_root, pathlib.Path("/other/cengine"))
 
     makefile = (REPO_ROOT / "Makefile").read_text()
+    assert 'XCODE_COMPAT_SCHEME ?= test-compat' in makefile
+    assert 'XCODE_COMPAT_CONFIGURATION ?= test-compat' in makefile
+    assert 'XCODEBUILD="$(XCODEBUILD)"' in makefile
+    assert 'XCODE_DERIVED_DATA="$(XCODE_DERIVED_DATA)"' in makefile
     assert 'CENGINE_KERNEL="$(CENGINE_GUEST_OUTPUT)/vmlinux"' in makefile
     assert 'CENGINE_CONTAINER_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/container-initramfs.cpio.gz"' in makefile
     assert 'CENGINE_STORAGE_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/storage-initramfs.cpio.gz"' in makefile
@@ -129,7 +133,22 @@ def main() -> None:
     assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY" in runner
     assert 'stage "preflight reset"' in runner
     assert 'stage "rebuild runtime and guest assets"' in runner
+    assert 'XCODE_COMPAT_SCHEME=${XCODE_COMPAT_SCHEME:-test-compat}' in runner
+    assert '-scheme "$XCODE_COMPAT_SCHEME"' in runner
+    assert '-configuration "$XCODE_COMPAT_CONFIGURATION"' in runner
     assert 'stage "recreate test environment"' in runner
+    assert 'compat_network_helper_bootstrap_local "$HELPER"' in runner
+    assert 'compat_network_helper_cleanup_local || status=$?' in runner
+    assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME=$compat_network_helper_default_service_name' in runner
+
+    helper_lifecycle = (REPO_ROOT / "Scripts" / "compat-network-helper.sh").read_text()
+    assert 'compat_network_helper_installed_path="/Applications/cengine.app/Contents/MacOS/cengine-network-helper"' in helper_lifecycle
+    assert 'CENGINE_COMPAT_NETWORK_HELPER:-auto' in helper_lifecycle
+    assert 'compat_network_helper_test_compat_service_name="dev.cengine.network-helper.test-compat"' in helper_lifecycle
+    assert 'cengine-network-helper\\n' in helper_lifecycle
+    assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME' in helper_lifecycle
+    assert 'launchctl bootstrap system' in helper_lifecycle
+    assert 'launchctl bootout "system/$_cnh_label"' in helper_lifecycle
 
     reset = (REPO_ROOT / "Scripts" / "reset-compat-runtime.py").read_text()
     assert "binary.is_file()" not in reset
@@ -140,6 +159,8 @@ def main() -> None:
     assert 'mktemp -d "${TMPDIR:-/tmp}/cengine-compat-tool.XXXXXX"' in isolated
     assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY" in isolated
     assert 'trap cleanup EXIT' in isolated
+    assert 'compat_network_helper_bootstrap_local "$HELPER" "$COMPAT_HELPER_SERVICE" 1' in isolated
+    assert 'compat_network_helper_cleanup_local || status=$?' in isolated
     assert '--binary "$BINARY" --root "$ENGINE_ROOT"' in isolated
     assert isolated.index('--binary "$BINARY" --root "$ENGINE_ROOT"') < isolated.index('> "$WORK/.cengine-compat-owner"')
     assert 'CENGINE_ISOLATED_IMAGE_CACHE' in isolated
