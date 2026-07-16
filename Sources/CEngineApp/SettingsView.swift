@@ -9,6 +9,7 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("Settings").font(.largeTitle.bold())
+                engineService
                 containerDefaults
                 builderResources
                 networking
@@ -20,6 +21,56 @@ struct SettingsView: View {
         }
         .navigationTitle("Settings")
         .sheet(isPresented: $showingUninstall) { uninstallConfirmation }
+    }
+
+    private var engineService: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Engine Service")
+                    Spacer()
+                    StatusBadge(
+                        text: model.engineStatus,
+                        color: StatusBadge.color(for: model.engineStatus)
+                    )
+                }
+                Text("Controls the dev.cengine.engine launch agent. Disabling it prevents cengine from starting automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let state = model.engineServiceState, model.engineServiceEnabled {
+                    HStack(spacing: 5) {
+                        Text("Last reported \(state.phase.rawValue)")
+                        Text("·")
+                        Text(AppFormat.relative(state.updatedAt))
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                if model.engineStatus == "Failed", let message = model.engineServiceState?.message {
+                    InlineMessage(systemImage: "exclamationmark.circle.fill", text: message, color: .red)
+                }
+                HStack {
+                    Button("Enable") { Task { await model.enableEngineService() } }
+                        .disabled(model.engineServiceEnabled || model.isManagingEngineService)
+                        .accessibilityIdentifier("enable-engine-service")
+                    Button("Disable") { Task { await model.disableEngineService() } }
+                        .disabled(!model.engineServiceEnabled || model.isManagingEngineService)
+                        .accessibilityIdentifier("disable-engine-service")
+                    Button("Restart") { Task { await model.restartEngineService() } }
+                        .disabled(!model.canRestartEngineService)
+                        .accessibilityIdentifier("restart-engine-service")
+                    if let status = model.engineServiceActionStatus, !model.isManagingEngineService {
+                        Text(status).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(4)
+        } label: {
+            Label("Engine", systemImage: "gearshape.2")
+                .font(.headline)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var containerDefaults: some View {

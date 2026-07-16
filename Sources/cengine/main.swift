@@ -171,7 +171,7 @@ private final class DaemonLock {
                 return
             } catch {
                 if error is CancellationError || Task.isCancelled { throw CancellationError() }
-                let message = error.localizedDescription
+                let message = EngineError.message(for: error)
                 let permanent = isPermanentProvisioningError(error)
                 if permanent || attempt == retryDelays.count {
                     try? SystemManager.writeState(.failed, message: message, paths: paths)
@@ -186,6 +186,7 @@ private final class DaemonLock {
     }
 
     private static func isPermanentProvisioningError(_ error: Error) -> Bool {
+        if error is DecodingError { return true }
         guard let engine = error as? EngineError else { return false }
         if engine.message.localizedCaseInsensitiveContains("checksum") { return true }
         switch engine.code {
@@ -201,7 +202,7 @@ private final class DaemonLock {
             if await socketIsReachable(paths.socket.path) {
                 print("running")
             } else if let state = SystemManager.readState(paths: paths) {
-                let phase: SystemManager.ServicePhase = state.phase == .running ? .stopped : state.phase
+                let phase: EngineServicePhase = state.phase == .running ? .stopped : state.phase
                 print(phase.rawValue + (state.message.map { ": \($0)" } ?? ""))
             } else {
                 print("stopped")

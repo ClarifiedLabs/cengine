@@ -6,14 +6,6 @@ import Foundation
 enum SystemManager {
     static let label = "dev.cengine.engine"
 
-    enum ServicePhase: String, Codable { case starting, running, failed, stopped }
-
-    struct ServiceState: Codable {
-        let phase: ServicePhase
-        let message: String?
-        let updatedAt: Date
-    }
-
     static func install(paths: EnginePaths) async throws {
         try await prepare(paths: paths)
         try installLaunchAgent(paths: paths)
@@ -48,15 +40,14 @@ enum SystemManager {
         }
     }
 
-    static func writeState(_ phase: ServicePhase, message: String?, paths: EnginePaths) throws {
+    static func writeState(_ phase: EngineServicePhase, message: String?, paths: EnginePaths) throws {
         try paths.createDirectories()
-        let state = ServiceState(phase: phase, message: message, updatedAt: Date())
+        let state = EngineServiceState(phase: phase, message: message)
         try JSONEncoder().encode(state).write(to: paths.serviceState, options: .atomic)
     }
 
-    static func readState(paths: EnginePaths) -> ServiceState? {
-        guard let data = try? Data(contentsOf: paths.serviceState) else { return nil }
-        return try? JSONDecoder().decode(ServiceState.self, from: data)
+    static func readState(paths: EnginePaths) -> EngineServiceState? {
+        try? EngineServiceState.load(from: paths.serviceState)
     }
 
     private static var launchAgentURL: URL {

@@ -43,9 +43,9 @@ struct StatusBadge: View {
     static func color(for state: String) -> Color {
         switch state.lowercased() {
         case "running", "healthy": .green
-        case "paused", "starting": .orange
-        case "exited", "created": .secondary
-        case "dead", "unhealthy": .red
+        case "paused", "starting", "restarting": .orange
+        case "exited", "created", "stopped", "disabled": .secondary
+        case "dead", "unhealthy", "failed": .red
         default: .secondary
         }
     }

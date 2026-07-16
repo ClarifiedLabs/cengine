@@ -301,6 +301,27 @@ private final class DrainRendezvous: @unchecked Sendable {
         #expect(loaded[0].name == "web")
     }
 
+    @Test func atomicStoreReportsMissingRequiredFieldsWithTheirPath() async throws {
+        struct RequiredState: Codable, Sendable { let name: String }
+
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appending(path: "state.json")
+        try Data(#"{"schemaVersion":1,"value":{}}"#.utf8).write(to: url)
+        let store = AtomicStore<RequiredState>(url: url)
+
+        do {
+            _ = try await store.load(default: RequiredState(name: "fallback"))
+            Issue.record("expected incompatible state to fail")
+        } catch let error as EngineError {
+            #expect(error.message.contains(url.path))
+            #expect(error.message.contains("missing required field 'name' at value"))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
     @Test func defaultPathsAreUserScoped() {
         let home = URL(filePath: "/tmp/example-home", directoryHint: .isDirectory)
         let paths = EnginePaths(home: home)

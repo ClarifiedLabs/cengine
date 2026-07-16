@@ -23,9 +23,20 @@ public actor AtomicStore<Value: Codable & Sendable> {
 
     public func load(default defaultValue: @autoclosure () -> Value) throws -> Value {
         guard FileManager.default.fileExists(atPath: url.path) else { return defaultValue() }
-        let envelope = try decoder.decode(Envelope.self, from: Data(contentsOf: url))
+        let envelope: Envelope
+        do {
+            envelope = try decoder.decode(Envelope.self, from: Data(contentsOf: url))
+        } catch let error as DecodingError {
+            throw EngineError(
+                .conflict,
+                "state file at \(url.path) is incompatible: \(Self.describe(error))"
+            )
+        }
         guard envelope.schemaVersion == Self.schemaVersion else {
-            throw EngineError(.conflict, "unsupported state schema \(envelope.schemaVersion); run cengine system reset")
+            throw EngineError(
+                .conflict,
+                "state file at \(url.path) uses unsupported schema \(envelope.schemaVersion)"
+            )
         }
         return envelope.value
     }
@@ -44,5 +55,34 @@ public actor AtomicStore<Value: Codable & Sendable> {
         } else {
             try FileManager.default.moveItem(at: temporary, to: url)
         }
+    }
+
+    private static func describe(_ error: DecodingError) -> String {
+        switch error {
+        case .keyNotFound(let key, let context):
+            return "missing required field '\(key.stringValue)' at \(path(context.codingPath))"
+        case .valueNotFound(_, let context):
+            return "missing required value at \(path(context.codingPath))"
+        case .typeMismatch(_, let context):
+            return "invalid value at \(path(context.codingPath)): \(context.debugDescription)"
+        case .dataCorrupted(let context):
+            return "invalid data at \(path(context.codingPath)): \(context.debugDescription)"
+        @unknown default:
+            return String(describing: error)
+        }
+    }
+
+    private static func path(_ codingPath: [any CodingKey]) -> String {
+        guard !codingPath.isEmpty else { return "the document root" }
+        var result = ""
+        for key in codingPath {
+            if let index = key.intValue {
+                result += "[\(index)]"
+            } else {
+                if !result.isEmpty { result += "." }
+                result += key.stringValue
+            }
+        }
+        return result
     }
 }

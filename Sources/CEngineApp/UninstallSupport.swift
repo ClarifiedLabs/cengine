@@ -1,4 +1,5 @@
 import CEngineCore
+import Darwin
 import Dispatch
 import Foundation
 import ServiceManagement
@@ -6,6 +7,7 @@ import ServiceManagement
 /// The launchd services the app registers, shared by the in-app uninstall and
 /// the headless `--uninstall-support` mode the Homebrew cask invokes.
 enum CEngineServices {
+    static let engineLabel = "dev.cengine.engine"
     static let agentPlist = "dev.cengine.engine.plist"
     static let helperPlist = "dev.cengine.network-helper.plist"
 
@@ -14,6 +16,10 @@ enum CEngineServices {
     /// Register both absent and explicitly unregistered services.
     static func needsRegistration(_ status: SMAppService.Status) -> Bool {
         status == .notRegistered || status == .notFound
+    }
+
+    static func restartEngine(runLaunchctl: ([String]) throws -> Void = runLaunchctl) throws {
+        try runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(engineLabel)"])
     }
 
     /// Unregisters the network-helper daemon and then the engine agent,
@@ -31,6 +37,26 @@ enum CEngineServices {
             } catch {
                 FileHandle.standardError.write(Data("cengine uninstall: \(error.localizedDescription)\n".utf8))
             }
+        }
+    }
+
+    private static func runLaunchctl(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(filePath: "/bin/launchctl")
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let message = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0 else {
+            throw EngineError(
+                .internalError,
+                "launchctl \(arguments.joined(separator: " ")) failed"
+                    + (message.isEmpty ? "" : ": \(message)")
+            )
         }
     }
 }

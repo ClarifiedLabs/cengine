@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import NIOCore
 import ServiceManagement
@@ -17,6 +18,14 @@ import CEngineCore
     @Test func doesNotReregisterKnownServices() {
         #expect(!CEngineServices.needsRegistration(.enabled))
         #expect(!CEngineServices.needsRegistration(.requiresApproval))
+    }
+
+    @Test func restartKicksTheRegisteredUserAgent() throws {
+        var arguments: [String] = []
+
+        try CEngineServices.restartEngine { arguments = $0 }
+
+        #expect(arguments == ["kickstart", "-k", "gui/\(getuid())/dev.cengine.engine"])
     }
 
     @MainActor @Test func requiredNetworkingRegistersBeforeEngineAndOpensApprovalFromOnboarding() async {
@@ -49,16 +58,18 @@ import CEngineCore
     }
 
     @MainActor @Test func enabledNetworkingRegistersEngineService() async {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
-        let model = AppModel(agent: agent, helper: helper, serviceRegistrationRevision: nil)
+        let model = AppModel(home: home, agent: agent, helper: helper, serviceRegistrationRevision: nil)
         defer { model.setActive(false) }
 
         await model.start()
 
         #expect(helper.registerCount == 0)
         #expect(agent.registerCount == 1)
-        #expect(model.engineStatus == "Running")
+        #expect(model.engineStatus == "Starting…")
     }
 
     @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() async {
@@ -134,6 +145,60 @@ import CEngineCore
         #expect(agent.registerCount == 0)
         #expect(helper.registerCount == 0)
     }
+
+    @MainActor @Test func explicitlyDisabledEngineIsNotReregisteredByRefresh() async {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            home: home,
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults
+        )
+
+        await model.disableEngineService()
+        await model.refresh()
+
+        #expect(agent.unregisterCount == 1)
+        #expect(agent.registerCount == 0)
+        #expect(model.engineStatus == "Disabled")
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey) == false)
+
+        await model.enableEngineService()
+
+        #expect(agent.registerCount == 1)
+        #expect(model.engineStatus == "Starting…")
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
+    }
+
+    @MainActor @Test func restartUsesLaunchctlController() async {
+        let recorder = RestartRecorder()
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: nil,
+            restartRegisteredEngine: { await recorder.record() }
+        )
+
+        await model.restartEngineService()
+
+        #expect(await recorder.count == 1)
+        #expect(model.engineStatus == "Starting…")
+        #expect(model.engineServiceActionStatus == "Restart requested")
+    }
+}
+
+private actor RestartRecorder {
+    private(set) var count = 0
+    func record() { count += 1 }
 }
 
 @MainActor private final class MockAppService: AppService {
@@ -208,6 +273,39 @@ import CEngineCore
         #expect(!AppModel.isEngineUnavailable(DashboardError("Docker API returned HTTP 500"), socketPath: url.path))
         #expect(!AppModel.isEngineUnavailable(IOError(errnoCode: EPIPE, reason: "write"), socketPath: url.path))
     }
+
+    @MainActor @Test func failedServiceStateIsSurfacedWhenSocketIsMissing() async throws {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let paths = EnginePaths(home: home)
+        try paths.createDirectories()
+        let state = EngineServiceState(
+            phase: .failed,
+            message: "state file is incompatible: missing required field 'imageID'",
+            updatedAt: Date()
+        )
+        try JSONEncoder().encode(state).write(to: paths.serviceState)
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            home: home,
+            agent: agent,
+            helper: helper,
+            client: UnavailableEngineClient(),
+            serviceRegistrationRevision: nil
+        )
+
+        await model.refresh()
+
+        #expect(model.engineStatus == "Failed")
+        #expect(model.refreshError == "Engine failed to start: state file is incompatible: missing required field 'imageID'")
+        #expect(model.engineServiceState?.phase == .failed)
+    }
+}
+
+private actor UnavailableEngineClient: AppEngineClient {
+    func get(_: String) async throws -> Data { throw DashboardError("unavailable") }
+    func post(_: String, body _: Data) async throws -> Data { throw DashboardError("unavailable") }
 }
 
 @MainActor @Suite struct OnboardingViewTests {

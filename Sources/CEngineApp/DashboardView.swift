@@ -20,9 +20,9 @@ struct DashboardView: View {
                     recentContainers(snapshot)
                 } else {
                     ContentUnavailableView(
-                        "Engine is starting",
-                        systemImage: "gearshape.2",
-                        description: Text("Resource information will appear when the cengine service is ready.")
+                        unavailableTitle,
+                        systemImage: unavailableSystemImage,
+                        description: Text(unavailableDescription)
                     )
                     .frame(maxWidth: .infinity, minHeight: 280)
                 }
@@ -87,7 +87,51 @@ struct DashboardView: View {
             }
         }
         if let refreshError = model.refreshError {
-            InlineMessage(systemImage: "exclamationmark.circle.fill", text: refreshError, color: .red)
+            GroupBox {
+                HStack(alignment: .center, spacing: 14) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.red)
+                    Text(refreshError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    if model.engineStatus == "Failed", model.engineServiceEnabled {
+                        Button("Restart Engine") { Task { await model.restartEngineService() } }
+                            .disabled(model.isManagingEngineService)
+                    } else {
+                        Button("Open Settings") { navigation.section = .settings }
+                    }
+                }
+                .padding(3)
+            }
+        }
+    }
+
+    private var unavailableTitle: String {
+        switch model.engineStatus {
+        case "Failed": "Engine failed to start"
+        case "Disabled": "Engine is disabled"
+        case "Stopped": "Engine is stopped"
+        default: "Engine is starting"
+        }
+    }
+
+    private var unavailableSystemImage: String {
+        switch model.engineStatus {
+        case "Failed": "exclamationmark.triangle"
+        case "Disabled", "Stopped": "stop.circle"
+        default: "gearshape.2"
+        }
+    }
+
+    private var unavailableDescription: String {
+        switch model.engineStatus {
+        case "Failed": "Review the failure above, then restart the engine when the problem is corrected."
+        case "Disabled": "Enable the engine service in Settings to use cengine."
+        case "Stopped": "Restart the engine service in Settings to continue."
+        default: "Resource information will appear when the cengine service is ready."
         }
     }
 

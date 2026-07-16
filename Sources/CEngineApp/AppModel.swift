@@ -17,6 +17,10 @@ extension SMAppService: AppService {}
     @Published var helperStatus = "Disabled"
     @Published var error: String?
     @Published var refreshError: String?
+    @Published private(set) var engineServiceEnabled: Bool
+    @Published private(set) var engineServiceState: EngineServiceState?
+    @Published private(set) var isManagingEngineService = false
+    @Published var engineServiceActionStatus: String?
     @Published private(set) var snapshot: EngineSnapshot?
     @Published private(set) var snapshotIsStale = false
     @Published private(set) var isRefreshing = false
@@ -44,6 +48,9 @@ extension SMAppService: AppService {}
     var images: [ImageSummary] { snapshot?.images ?? [] }
     var networks: [NetworkSummary] { snapshot?.networks ?? [] }
     var volumes: [VolumeSummary] { snapshot?.volumes ?? [] }
+    var canRestartEngineService: Bool {
+        engineServiceEnabled && agent.status == .enabled && !isManagingEngineService
+    }
 
     var containerSettingsValidationMessage: String? {
         Self.validationMessage(
@@ -73,11 +80,13 @@ extension SMAppService: AppService {}
     private let openLoginItemsSettings: () -> Void
     private let client: any AppEngineClient
     private let socketPath: String
+    private let serviceStateURL: URL
     private let builderSettingsURL: URL
     private let containerSettingsURL: URL
     private let serviceRegistrationRevision: String?
     private let serviceRegistrationDefaults: UserDefaults
     private let waitForServiceUnregistration: () async throws -> Void
+    private let restartRegisteredEngine: @Sendable () async throws -> Void
     private var refreshTask: Task<Void, Never>?
     private var previousStats: [String: ContainerStatsSample] = [:]
     private var savedBuilderCPUs: Int
@@ -86,6 +95,8 @@ extension SMAppService: AppService {}
     private var savedContainerMemoryGiB: Int
 
     static let serviceRegistrationRevisionKey = "serviceRegistrationRevision"
+    static let engineServiceEnabledKey = "engineServiceEnabled"
+    private static let serviceFailurePrefix = "Engine failed to start: "
 
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -97,6 +108,9 @@ extension SMAppService: AppService {}
         waitForServiceUnregistration: @escaping () async throws -> Void = {
             try await Task.sleep(for: .seconds(2))
         },
+        restartRegisteredEngine: @escaping @Sendable () async throws -> Void = {
+            try await Task.detached { try CEngineServices.restartEngine() }.value
+        },
         openLoginItemsSettings: @escaping () -> Void = { SMAppService.openSystemSettingsLoginItems() }
     ) {
         self.agent = agent
@@ -104,12 +118,16 @@ extension SMAppService: AppService {}
         self.openLoginItemsSettings = openLoginItemsSettings
         let paths = EnginePaths(home: home)
         socketPath = paths.socket.path
+        serviceStateURL = paths.serviceState
         builderSettingsURL = paths.builderSettings
         containerSettingsURL = paths.containerSettings
         self.client = client ?? DockerSocketClient(socketPath: paths.socket.path)
         self.serviceRegistrationRevision = serviceRegistrationRevision
         self.serviceRegistrationDefaults = serviceRegistrationDefaults
         self.waitForServiceUnregistration = waitForServiceUnregistration
+        self.restartRegisteredEngine = restartRegisteredEngine
+        engineServiceEnabled = serviceRegistrationDefaults.object(forKey: Self.engineServiceEnabledKey) as? Bool ?? true
+        engineServiceState = try? EngineServiceState.load(from: paths.serviceState)
         let builderSettings = (try? BuilderSettings.load(from: builderSettingsURL)) ?? .default
         builderCPUs = builderSettings.cpus
         builderMemoryGiB = builderSettings.memoryGiB
@@ -121,6 +139,7 @@ extension SMAppService: AppService {}
         savedContainerCPUs = containerSettings.cpus
         savedContainerMemoryGiB = containerSettings.memoryGiB
         showOnboarding = !UserDefaults.standard.bool(forKey: "completedOnboarding")
+        if !engineServiceEnabled { engineStatus = "Disabled" }
     }
 
     func start() async {
@@ -176,6 +195,69 @@ extension SMAppService: AppService {}
 
     func openNetworkingApproval() {
         openLoginItemsSettings()
+    }
+
+    func enableEngineService() async {
+        guard !isManagingEngineService else { return }
+        isManagingEngineService = true
+        engineServiceActionStatus = "Enabling…"
+        engineServiceEnabled = true
+        serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
+        defer { isManagingEngineService = false }
+        do {
+            try registerRequiredNetworking()
+            try registerEngineIfNetworkingIsReady()
+            engineServiceActionStatus = helper.status == .enabled ? "Enabled" : "Waiting for networking approval"
+            refreshError = nil
+        } catch {
+            engineServiceActionStatus = "Could not enable"
+            self.error = "Could not enable the cengine engine service: \(error.localizedDescription)"
+        }
+        updateServiceStatus()
+    }
+
+    func disableEngineService() async {
+        guard !isManagingEngineService else { return }
+        isManagingEngineService = true
+        engineServiceActionStatus = "Disabling…"
+        engineServiceEnabled = false
+        serviceRegistrationDefaults.set(false, forKey: Self.engineServiceEnabledKey)
+        defer { isManagingEngineService = false }
+        do {
+            if !CEngineServices.needsRegistration(agent.status) {
+                try await agent.unregister()
+            }
+            engineServiceActionStatus = "Disabled"
+            snapshotIsStale = snapshot != nil
+        } catch {
+            engineServiceEnabled = true
+            serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
+            engineServiceActionStatus = "Could not disable"
+            self.error = "Could not disable the cengine engine service: \(error.localizedDescription)"
+        }
+        updateServiceStatus()
+    }
+
+    func restartEngineService() async {
+        guard !isManagingEngineService else { return }
+        guard engineServiceEnabled, agent.status == .enabled else {
+            error = "Enable the cengine engine service before restarting it."
+            return
+        }
+        isManagingEngineService = true
+        engineServiceActionStatus = "Restarting…"
+        engineStatus = "Restarting…"
+        refreshError = nil
+        defer { isManagingEngineService = false }
+        do {
+            try await restartRegisteredEngine()
+            engineServiceActionStatus = "Restart requested"
+            engineStatus = "Starting…"
+        } catch {
+            engineServiceActionStatus = "Could not restart"
+            self.error = "Could not restart the cengine engine service: \(error.localizedDescription)"
+            updateServiceStatus()
+        }
     }
 
     func applyBuilderSettings() async {
@@ -261,14 +343,19 @@ extension SMAppService: AppService {}
                 imageLayerBytes: diskUsage.LayersSize,
                 refreshedAt: Date()
             )
+            engineStatus = "Running"
+            engineServiceState = try? EngineServiceState.load(from: serviceStateURL)
             snapshotIsStale = false
             refreshError = nil
             pruneCaches(for: containers, images: images)
         } catch {
             snapshotIsStale = snapshot != nil
             if Self.isEngineUnavailable(error, socketPath: socketPath) {
-                engineStatus = "Starting…"
-                refreshError = nil
+                updateServiceStatus()
+                if engineStatus == "Running" {
+                    engineStatus = "Starting…"
+                    refreshError = "The engine service is registered, but its Docker socket is unavailable."
+                }
             } else {
                 refreshError = "Engine data is unavailable: \(error.localizedDescription)"
             }
@@ -426,9 +513,42 @@ extension SMAppService: AppService {}
     }
 
     private func updateServiceStatus() {
-        engineStatus = Self.label(agent.status)
         helperStatus = Self.label(helper.status)
         helperNeedsApproval = helper.status == .requiresApproval
+        engineServiceState = try? EngineServiceState.load(from: serviceStateURL)
+        guard engineServiceEnabled else {
+            engineStatus = "Disabled"
+            refreshError = nil
+            return
+        }
+        guard agent.status == .enabled else {
+            engineStatus = Self.label(agent.status)
+            clearReportedServiceFailure()
+            return
+        }
+        guard let engineServiceState else {
+            engineStatus = "Starting…"
+            clearReportedServiceFailure()
+            return
+        }
+        switch engineServiceState.phase {
+        case .starting:
+            engineStatus = "Starting…"
+            clearReportedServiceFailure()
+        case .running:
+            engineStatus = "Running"
+            clearReportedServiceFailure()
+        case .failed:
+            engineStatus = "Failed"
+            refreshError = Self.serviceFailurePrefix + (engineServiceState.message ?? "No failure details were reported.")
+        case .stopped:
+            engineStatus = "Stopped"
+            clearReportedServiceFailure()
+        }
+    }
+
+    private func clearReportedServiceFailure() {
+        if refreshError?.hasPrefix(Self.serviceFailurePrefix) == true { refreshError = nil }
     }
 
     private func registerRequiredNetworking() throws {
@@ -459,7 +579,10 @@ extension SMAppService: AppService {}
     }
 
     private func registerEngineIfNetworkingIsReady() throws {
-        guard helper.status == .enabled, CEngineServices.needsRegistration(agent.status) else { return }
+        guard engineServiceEnabled,
+              helper.status == .enabled,
+              CEngineServices.needsRegistration(agent.status)
+        else { return }
         try agent.register()
     }
 
