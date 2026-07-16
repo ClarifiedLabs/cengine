@@ -62,22 +62,29 @@ scripts:
 1. Update the kernel inputs under `Configuration/`, build with
    `make kernel-build`, and run the relevant compatibility tests locally.
 2. Commit those changes and ensure the commit is on an up-to-date `main`.
-3. Create the kernel release, supplying the tag suffix without `kernel-v`:
+3. Create the kernel release:
 
 ```bash
-make release COMPONENT=kernel VERSION=6.18.35-2 AUTOPUSH=1
+make release COMPONENT=kernel AUTOPUSH=1
 ```
 
-The helper updates `Configuration/kernel-release` to
-`kernel-v6.18.35-2`, creates a conventional release commit when that value
-changes, creates the matching annotated tag, and pushes the commit and tag.
-Kernel versions must be explicit `X.Y.Z` or `X.Y.Z-N` values; the application
-`patch`, `minor`, and `major` shortcuts are intentionally unsupported because a
-kernel release can include a source version and a rebuild revision. Preview the
-operation without changing files, commits, tags, or remotes with:
+When `VERSION` is omitted, the helper reads `Configuration/kernel-version`,
+examines matching local and `origin` tags, and selects one revision above the
+highest existing `kernel-v<source-version>-N` tag. For example, Linux `6.18.35`
+uses `kernel-v6.18.35-1` when no matching tag exists, then
+`kernel-v6.18.35-2` for the next release. The helper updates
+`Configuration/kernel-release`, creates a conventional release commit when that
+value changes, creates the matching annotated tag, and pushes the commit and
+tag.
+
+Use `VERSION=6.18.35-2` to choose an explicit tag suffix without `kernel-v`.
+The application `patch`, `minor`, and `major` shortcuts remain unsupported for
+kernel releases because they are ambiguous between a new Linux source version
+and a cengine rebuild revision. Preview automatic resolution without changing
+files, commits, tags, or remotes with:
 
 ```bash
-make release COMPONENT=kernel VERSION=6.18.35-2 DRY_RUN=1
+make release COMPONENT=kernel DRY_RUN=1
 ```
 
 The tagged commit must be on `main`. Wait for `kernel-release.yml` to publish the

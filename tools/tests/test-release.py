@@ -39,6 +39,12 @@ def write_kernel_release(root: pathlib.Path, tag: str = "kernel-v0.0.1") -> None
     path.write_text(f"{tag}\n")
 
 
+def write_kernel_source_version(root: pathlib.Path, version: str = "6.18.35") -> None:
+    path = root / release_tool.KERNEL_SOURCE_VERSION_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{version}\n")
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -49,6 +55,7 @@ class ReleaseTests(unittest.TestCase):
         git(self.root, "config", "user.email", "release@example.com")
         write_project(self.root)
         write_kernel_release(self.root)
+        write_kernel_source_version(self.root)
         git(self.root, "add", ".")
         git(self.root, "commit", "-m", "chore: initialize")
 
@@ -82,6 +89,30 @@ class ReleaseTests(unittest.TestCase):
     def test_rejects_v_prefix(self) -> None:
         with self.assertRaisesRegex(release_tool.ReleaseError, "must not start"):
             release_tool.resolve_version(self.root, "v1.0.0")
+
+    def test_automatic_kernel_release_starts_at_revision_one(self) -> None:
+        self.assertEqual(release_tool.next_kernel_release_version(self.root), "6.18.35-1")
+
+    def test_automatic_kernel_release_uses_highest_local_and_origin_revision(self) -> None:
+        git(self.root, "tag", "-a", "kernel-v6.18.35-1", "-m", "kernel-v6.18.35-1")
+        git(self.root, "tag", "-a", "kernel-v6.18.36-99", "-m", "unrelated")
+        with tempfile.TemporaryDirectory() as temporary:
+            remote = pathlib.Path(temporary) / "origin.git"
+            remote.mkdir()
+            git(remote, "init", "--bare")
+            git(self.root, "remote", "add", "origin", str(remote))
+            git(self.root, "tag", "-a", "kernel-v6.18.35-3", "-m", "kernel-v6.18.35-3")
+            git(self.root, "push", "origin", "kernel-v6.18.35-3")
+            git(self.root, "tag", "-d", "kernel-v6.18.35-3")
+            self.assertEqual(release_tool.next_kernel_release_version(self.root), "6.18.35-4")
+
+    def test_automatic_kernel_release_updates_config_and_creates_tag(self) -> None:
+        release_tool.create_kernel_release(self.root, None, False, False)
+        self.assertEqual(
+            (self.root / release_tool.KERNEL_RELEASE_FILE).read_text(),
+            "kernel-v6.18.35-1\n",
+        )
+        self.assertEqual(git(self.root, "tag", "-l", "kernel-v6.18.35-1"), "kernel-v6.18.35-1")
 
     def test_kernel_release_updates_config_and_creates_tag(self) -> None:
         release_tool.create_kernel_release(self.root, "6.18.35-2", False, False)

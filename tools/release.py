@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 PROJECT_FILE = pathlib.Path("cengine.xcodeproj/project.pbxproj")
 KERNEL_RELEASE_FILE = pathlib.Path("Configuration/kernel-release")
+KERNEL_SOURCE_VERSION_FILE = pathlib.Path("Configuration/kernel-version")
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 KERNEL_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[1-9]\d*)?$")
 MARKETING_VERSION_RE = re.compile(r"(MARKETING_VERSION = )\d+\.\d+\.\d+(;)")
@@ -80,6 +81,18 @@ def configured_kernel_release(root: pathlib.Path) -> str:
     return tag
 
 
+def configured_kernel_source_version(root: pathlib.Path) -> str:
+    path = root / KERNEL_SOURCE_VERSION_FILE
+    if not path.exists():
+        raise ReleaseError(f"missing kernel version file: {KERNEL_SOURCE_VERSION_FILE}")
+    version = path.read_text().strip()
+    if not SEMVER_RE.match(version):
+        raise ReleaseError(
+            f"invalid kernel version in {KERNEL_SOURCE_VERSION_FILE}: {version!r}; expected X.Y.Z"
+        )
+    return version
+
+
 def project_version(root: pathlib.Path) -> str:
     path = root / PROJECT_FILE
     if not path.exists():
@@ -126,8 +139,39 @@ def resolve_kernel_version(version_arg: str) -> str:
     return version_arg
 
 
-def build_kernel_plan(root: pathlib.Path, version_arg: str) -> ReleasePlan:
-    new_version = resolve_kernel_version(version_arg)
+def kernel_release_tags(root: pathlib.Path, source_version: str) -> set[str]:
+    pattern = f"kernel-v{source_version}-*"
+    tags = set(git_output(root, "tag", "-l", pattern).splitlines())
+    if "origin" not in git_output(root, "remote").splitlines():
+        return tags
+    try:
+        remote = git_output(root, "ls-remote", "--tags", "--refs", "origin", f"refs/tags/{pattern}")
+    except subprocess.CalledProcessError as error:
+        raise ReleaseError("could not inspect kernel release tags on origin") from error
+    for line in remote.splitlines():
+        _, separator, ref = line.partition("\t")
+        if separator and ref.startswith("refs/tags/"):
+            tags.add(ref.removeprefix("refs/tags/"))
+    return tags
+
+
+def next_kernel_release_version(root: pathlib.Path) -> str:
+    source_version = configured_kernel_source_version(root)
+    tag_re = re.compile(rf"^kernel-v{re.escape(source_version)}-([1-9]\d*)$")
+    revisions = [
+        int(match.group(1))
+        for tag in kernel_release_tags(root, source_version)
+        if (match := tag_re.match(tag))
+    ]
+    return f"{source_version}-{max(revisions, default=0) + 1}"
+
+
+def build_kernel_plan(root: pathlib.Path, version_arg: str | None) -> ReleasePlan:
+    new_version = (
+        resolve_kernel_version(version_arg)
+        if version_arg is not None
+        else next_kernel_release_version(root)
+    )
     tag = f"kernel-v{new_version}"
     if git_output(root, "tag", "-l", tag).strip():
         raise ReleaseError(f"tag already exists: {tag}")
@@ -214,7 +258,7 @@ def create_release(root: pathlib.Path, version_arg: str, dry_run: bool, push: bo
         print(f"Pushed tag: {plan.tag}")
 
 
-def create_kernel_release(root: pathlib.Path, version_arg: str, dry_run: bool, push: bool) -> None:
+def create_kernel_release(root: pathlib.Path, version_arg: str | None, dry_run: bool, push: bool) -> None:
     plan = build_kernel_plan(root, version_arg)
     print(f"Bumping cengine kernel: {plan.current_version} -> {plan.tag}")
     print(f"Kernel release file: {KERNEL_RELEASE_FILE} -> {plan.tag}")
@@ -261,7 +305,7 @@ def main() -> int:
     list_parser.add_argument("--component", choices=("cengine", "kernel"), default="cengine")
     release_parser = subparsers.add_parser("release")
     release_parser.add_argument("--component", choices=("cengine", "kernel"), default="cengine")
-    release_parser.add_argument("--version", required=True)
+    release_parser.add_argument("--version")
     release_parser.add_argument("--dry-run", action="store_true")
     release_parser.add_argument("--push", action="store_true")
     args = parser.parse_args()
@@ -274,6 +318,8 @@ def main() -> int:
             print(f"  {tag or '(no tags)'}")
         elif args.component == "kernel":
             create_kernel_release(root, args.version, args.dry_run, args.push)
+        elif args.version is None:
+            raise ReleaseError("VERSION is required for cengine releases")
         else:
             create_release(root, args.version, args.dry_run, args.push)
     except ReleaseError as error:

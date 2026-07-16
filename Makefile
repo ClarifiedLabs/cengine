@@ -49,7 +49,7 @@ help:
 		'make test-compat-reset-system  Also restart vmnet system state after a helper crash' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
 		'make package       Build a local unsigned PKG release artifact' \
-		'make release       Create a release tag (COMPONENT=cengine|kernel VERSION=...)' \
+		'make release       Create a release tag (VERSION optional for COMPONENT=kernel)' \
 		'make release-list  List the current release tag (COMPONENT=cengine|kernel)' \
 		'make test-release  Run release tooling regression checks' \
 		'make clean         Remove build artifacts'
@@ -117,15 +117,16 @@ release-list:
 	@$(RELEASE) list --component "$(COMPONENT)"
 
 release:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "VERSION is required. Use X.Y.Z, patch, minor, or major for cengine; use X.Y.Z or X.Y.Z-N for kernel."; \
+	@if [ -z "$(VERSION)" ] && [ "$(COMPONENT)" != "kernel" ]; then \
+		echo "VERSION is required for cengine releases. Use X.Y.Z, patch, minor, or major."; \
 		exit 2; \
 	fi
 	@if [ -z "$(SKIP_TESTS)" ]; then \
 		echo "Running release regression tests..."; \
 		$(MAKE) --no-print-directory test-release; \
 	fi
-	@args=(release --component "$(COMPONENT)" --version "$(VERSION)"); \
+	@args=(release --component "$(COMPONENT)"); \
+	if [ -n "$(VERSION)" ]; then args+=(--version "$(VERSION)"); fi; \
 	if [ -n "$(DRY_RUN)" ]; then args+=(--dry-run); fi; \
 	if [ "$(AUTOPUSH)" = "1" ]; then args+=(--push); fi; \
 	$(RELEASE) "$${args[@]}"

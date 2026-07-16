@@ -62,6 +62,8 @@ def main() -> None:
         "COMPONENT ?= cengine",
         'list --component "$(COMPONENT)"',
         'release --component "$(COMPONENT)"',
+        '[ "$(COMPONENT)" != "kernel" ]',
+        'if [ -n "$(VERSION)" ]; then args+=(--version "$(VERSION)"); fi',
     ):
         require_contains(makefile, needle, "Makefile")
     if makefile.count("$(CENGINE_COMPAT_ENV)") != 3:
