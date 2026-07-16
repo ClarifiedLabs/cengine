@@ -183,6 +183,7 @@ public actor EngineRuntime {
             ?? (pendingContainerIDs.contains(record.id) ? record.id : nil) {
             throw Self.containerNameConflict(name: record.name, conflictingID: conflictingID)
         }
+        try Self.validatePortProtocols(record.ports)
         pendingContainerNames[record.name] = record.id
         pendingContainerIDs.insert(record.id)
         defer {
@@ -679,7 +680,8 @@ public actor EngineRuntime {
 
     public func connectNetwork(_ networkIdentifier: String, container containerIdentifier: String,
                                aliases: [String] = [], ipv4Address: String? = nil,
-                               ipv6Address: String? = nil, macAddress: String? = nil) async throws {
+                               ipv6Address: String? = nil, macAddress: String? = nil,
+                               gatewayPriority: Int? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
@@ -694,7 +696,7 @@ public actor EngineRuntime {
         snapshot.containers[index].networks.append(.init(
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
             ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil,
-            macAddress: normalizedMac
+            macAddress: normalizedMac, gatewayPriority: gatewayPriority
         ))
         snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
         try await persistEndpointAllocationCursors()
@@ -808,6 +810,24 @@ public actor EngineRuntime {
                         throw EngineError(.conflict, "MAC address \(mac) is already in use on this network")
                     }
                 }
+            }
+        }
+    }
+
+    /// The transport protocols cengine can publish to the host. SCTP is an
+    /// intentional compatibility gap: the vmnet-backed port forwarder only bridges
+    /// TCP and UDP, so an SCTP publish is rejected explicitly rather than being
+    /// silently accepted and never forwarded.
+    private static let supportedPortProtocols: Set<String> = ["tcp", "udp"]
+
+    /// Rejects published ports whose protocol cengine cannot forward, so an
+    /// unsupported request fails at create time instead of starting a container
+    /// whose published port would never receive traffic.
+    private static func validatePortProtocols(_ ports: [PortBinding]) throws {
+        for port in ports {
+            let proto = port.proto.lowercased()
+            guard supportedPortProtocols.contains(proto) else {
+                throw EngineError(.badRequest, "unsupported port protocol \(port.proto); cengine publishes only tcp and udp")
             }
         }
     }

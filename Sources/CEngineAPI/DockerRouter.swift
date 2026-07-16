@@ -167,7 +167,8 @@ public struct DockerRouter: Sendable {
                     networkID: network.id, aliases: endpoint?.Aliases ?? [],
                     ipv4Address: requestedIPv4, ipv6Address: requestedIPv6,
                     ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil,
-                    macAddress: nonEmpty(endpoint?.MacAddress)
+                    macAddress: nonEmpty(endpoint?.MacAddress),
+                    gatewayPriority: endpoint?.GwPriority
                 ))
             }
             if record.networkDisabled == true, !record.networks.isEmpty {
@@ -345,7 +346,8 @@ public struct DockerRouter: Sendable {
                 id, container: input.Container, aliases: input.EndpointConfig?.Aliases ?? [],
                 ipv4Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv4Address) ?? nonEmpty(input.EndpointConfig?.IPAddress),
                 ipv6Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv6Address) ?? nonEmpty(input.EndpointConfig?.GlobalIPv6Address),
-                macAddress: nonEmpty(input.EndpointConfig?.MacAddress)
+                macAddress: nonEmpty(input.EndpointConfig?.MacAddress),
+                gatewayPriority: input.EndpointConfig?.GwPriority
             )
             return APIResponse(status: .ok)
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/disconnect"):
@@ -828,7 +830,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let NetworkID: String; let EndpointID: String; let Gateway: String
         let IPAddress: String; let IPPrefixLen: Int; let IPv6Gateway: String
         let GlobalIPv6Address: String; let GlobalIPv6PrefixLen: Int; let MacAddress: String
-        let DNSNames: [String]
+        let GwPriority: Int?; let DNSNames: [String]
     }
 
     init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
@@ -886,6 +888,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
                 GlobalIPv6PrefixLen: network?.ipv6Subnet.split(separator: "/").last.flatMap { Int($0) } ?? 0,
                 MacAddress: endpoint.macAddress
                     ?? EndpointMacAddress.generated(seed: record.id + endpoint.networkID),
+                GwPriority: version >= .init(major: 1, minor: 48) ? endpoint.gatewayPriority ?? 0 : nil,
                 DNSNames: dnsNames
             )
         }

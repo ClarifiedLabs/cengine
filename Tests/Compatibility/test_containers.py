@@ -713,6 +713,75 @@ def test_invalid_and_duplicate_endpoint_mac_addresses_are_rejected(client: docke
     assert duplicate_connect.value.response.status_code == 409
 
 
+def _connect_with_gateway_priority(client, network_id, container_id, priority, alias):
+    # docker-py 7.2.0 has no gw_priority argument, so post the endpoint directly.
+    response = client.api._post_json(
+        client.api._url("/networks/{0}/connect", network_id),
+        data={
+            "Container": container_id,
+            "EndpointConfig": {"Aliases": [alias], "GwPriority": priority},
+        },
+    )
+    client.api._raise_for_status(response)
+
+
+@pytest.mark.compat("NET-016")
+def test_gateway_priority_selects_default_route_and_survives_recovery(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    low = client.networks.create(f"compat-gw-low-{suffix}")
+    high = client.networks.create(f"compat-gw-high-{suffix}")
+    container = client.containers.create(IMAGE, command="top", name=f"gw-{suffix}")
+    _connect_with_gateway_priority(client, low.id, container.id, 10, "low")
+    _connect_with_gateway_priority(client, high.id, container.id, 100, "high")
+    container.start(); container.reload()
+
+    networks = container.attrs["NetworkSettings"]["Networks"]
+    assert networks[high.name]["GwPriority"] == 100
+    assert networks[low.name]["GwPriority"] == 10
+    high_gateway = _gateway(high)
+    low_gateway = _gateway(low)
+
+    def default_route() -> bytes:
+        code, output = container.exec_run(["sh", "-c", "ip route show default"])
+        assert code == 0, output
+        return output
+
+    assert high_gateway.encode() in default_route()
+    assert low_gateway.encode() not in default_route()
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(container.name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        assert value.attrs["NetworkSettings"]["Networks"][high.name]["GwPriority"] == 100
+        code, output = value.exec_run(["sh", "-c", "ip route show default"])
+        assert code == 0 and high_gateway.encode() in output
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("NET-017")
+def test_publishing_sctp_port_is_rejected_as_intentional_gap(client: docker.DockerClient):
+    with pytest.raises(errors.APIError) as caught:
+        client.containers.create(IMAGE, command="top", ports={"132/sctp": ("127.0.0.1", None)})
+    assert caught.value.response.status_code == 400
+    # TCP and UDP publishing on the same container still succeeds.
+    container = client.containers.create(
+        IMAGE, command="top", ports={"80/tcp": ("127.0.0.1", None), "90/udp": ("127.0.0.1", None)},
+    )
+    container.start(); container.reload()
+    published = container.attrs["NetworkSettings"]["Ports"]
+    assert published["80/tcp"] and published["90/udp"]
+
+
 @pytest.mark.compat("CTR-034")
 def test_network_none_has_only_loopback(client: docker.DockerClient):
     container = client.containers.create(IMAGE, command="top", network_mode="none")

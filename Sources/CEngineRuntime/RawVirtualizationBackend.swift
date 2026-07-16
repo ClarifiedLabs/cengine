@@ -926,14 +926,32 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private func networkEndpoints(_ container: ContainerRecord) -> [GuestProtocol.NetworkEndpoint] {
-        container.networks.enumerated().compactMap { index, endpoint in
+        // Docker gives a multi-homed container a single default gateway, chosen by
+        // endpoint gateway priority (ties broken lexicographically by network
+        // name). Selecting across every endpoint means a single-network container
+        // always keeps its only network's gateway.
+        let defaultGatewayNetworkID = EndpointGatewayPriority.defaultGatewayNetworkID(
+            among: container.networks.compactMap { endpoint in
+                guard let network = networks[endpoint.networkID] else { return nil }
+                return .init(
+                    networkID: endpoint.networkID,
+                    priority: endpoint.gatewayPriority ?? 0,
+                    networkName: network.name
+                )
+            }
+        )
+        return container.networks.enumerated().compactMap { index, endpoint in
             guard let network = networks[endpoint.networkID], let vlan = networkVLANs[endpoint.networkID] else { return nil }
             var addresses: [String] = []
             if let address = endpoint.ipv4Address, !address.isEmpty { addresses.append(Self.withPrefix(address, from: network.subnet)) }
             if let address = endpoint.ipv6Address, !address.isEmpty { addresses.append(Self.withPrefix(address, from: network.ipv6Subnet)) }
             var gateways: [String] = []
-            if endpoint.ipv4Address != nil, !network.gateway.isEmpty { gateways.append(network.gateway) }
-            if endpoint.ipv6Address != nil, !network.ipv6Gateway.isEmpty { gateways.append(network.ipv6Gateway) }
+            // Only the winning endpoint installs default routes; the others keep
+            // their addresses and DNS but do not compete for the default gateway.
+            if endpoint.networkID == defaultGatewayNetworkID {
+                if endpoint.ipv4Address != nil, !network.gateway.isEmpty { gateways.append(network.gateway) }
+                if endpoint.ipv6Address != nil, !network.ipv6Gateway.isEmpty { gateways.append(network.ipv6Gateway) }
+            }
             return .init(
                 networkID: endpoint.networkID,
                 vlan: vlan,

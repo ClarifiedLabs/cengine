@@ -28,7 +28,7 @@ digests.
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
 | Container lifecycle and inspect | `CTR-001`–`CTR-046`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-046`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
-| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-015`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP is not assessed. |
+| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-017`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP publishing is an intentional gap covered by `NET-017`. Endpoint sysctls, explicit IPv4 controls, and IPAM status remain gaps. |
 | Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, and authenticated registry round trips are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
@@ -56,7 +56,7 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
 | 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Tmpfs size/mode and platform-selective push are applied; the other additions remain gaps. |
 | 1.47 | Image-list manifest summaries | Supported | `manifests=true` returns available, missing, image, and attestation manifest summaries. |
-| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Partial | Image operations and descriptor responses are supported; image mounts and the network additions remain gaps. |
+| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Partial | Image operations, descriptor responses, and endpoint gateway priority (`NET-016`) are supported; image mounts and explicit IPv4 control remain gaps. |
 | 1.49 | Platform-specific image inspect and firewall backend info | Partial | JSON-encoded OCI platform selection and `manifests` conflicts are enforced; `FirewallBackend` is absent. |
 | 1.50 | Platform-selective image deletion and discovered-device info | Partial | Repeated JSON platform deletion preserves unselected variants; `DiscoveredDevices` is absent. |
 | 1.50 | Removal of deprecated image-config fields | Supported | Cengine's image configuration already omits the removed runtime-only fields. |
@@ -65,7 +65,7 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | 1.52 | Container summary health and stats OS type | Supported | v1.52+ responses include `Health` and `os_type`. |
 | 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Partial | Repeated image selectors, event negotiation, and disk usage are supported; IPAM status remains a gap. |
 | 1.53 | NRI info, JSONL event negotiation, and image identity | Partial | Event streams and trusted pull/push origin identity are supported; `NRI` remains absent. |
-| 1.54 | Image-list identity and endpoint MAC application | Partial | `identity=true` implies manifest summaries and returns trusted origin data; explicit endpoint `MacAddress` is decoded, validated, applied in the guest, and inspected (`NET-014`, `NET-015`); endpoint sysctls remain a gap. |
+| 1.54 | Image-list identity and endpoint MAC application | Partial | `identity=true` implies manifest summaries and returns trusted origin data; explicit endpoint `MacAddress` is decoded, validated, applied in the guest, and inspected (`NET-014`, `NET-015`); endpoint sysctls remain a gap. Endpoint gateway priority is supported (`NET-016`, API 1.48). |
 | 1.55 | Image attestations and per-device blkio updates | Partial | Attached in-toto statements support platform/type filters and statement opt-in; the five blkio device arrays remain a gap. |
 
 Status values are **✅ Pass**, **❌ Known fail**, and **⬜ Not assessed**. Intent
@@ -197,6 +197,8 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `NET-013` | `test_creating_container_preserves_existing_network_connectivity` | ✅ Pass | Support | **cengine-owned.** Replacing a running container's fabric bridge preserves its gateway, DNS, and Internet path. |
 | `NET-014` | `test_explicit_endpoint_mac_address_is_applied_and_survives_recovery` | ✅ Pass | Support | **cengine-owned.** An explicit endpoint `MacAddress` is applied to the guest interface, returned by inspect, and preserved across daemon recovery. |
 | `NET-015` | `test_invalid_and_duplicate_endpoint_mac_addresses_are_rejected` | ✅ Pass | Support | **cengine-owned.** Malformed or multicast MAC addresses fail with 400 and a duplicate explicit MAC on the same network fails with 409. |
+| `NET-016` | `test_gateway_priority_selects_default_route_and_survives_recovery` | ✅ Pass | Support | **cengine-owned.** A multi-network container installs its default route from the highest-priority endpoint (`GwPriority`), reports the value in inspect, and preserves the selection across daemon recovery. |
+| `NET-017` | `test_publishing_sctp_port_is_rejected_as_intentional_gap` | ✅ Pass | Intentional gap | **cengine-owned.** Publishing an `sctp` port fails with 400 because the vmnet port forwarder bridges only TCP and UDP; TCP and UDP publishing on the same request still succeed. |
 | `VOL-001` | `test_volume_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
 | `VOL-002` | `test_empty_named_volume_copies_image_directory` | ✅ Pass | Support | **cengine-owned.** Empty named volumes receive image directory contents. |
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |

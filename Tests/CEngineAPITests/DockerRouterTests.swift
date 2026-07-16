@@ -1143,6 +1143,91 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(duplicate.status == .conflict)
     }
 
+    @Test func explicitGatewayPriorityIsAcceptedAndReturnedByInspect() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"prionet"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=priority",
+            body: Data(#"{"Image":"debian","NetworkingConfig":{"EndpointsConfig":{"prionet":{"GwPriority":75}}}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/priority/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let settings = try #require(object["NetworkSettings"] as? [String: Any])
+        let networks = try #require(settings["Networks"] as? [String: Any])
+        let endpoint = try #require(networks["prionet"] as? [String: Any])
+        #expect(endpoint["GwPriority"] as? Int == 75)
+
+        let legacyInspect = await router.route(.init(method: .GET, uri: "/v1.47/containers/priority/json"))
+        let legacyObject = try #require(JSONSerialization.jsonObject(with: legacyInspect.body) as? [String: Any])
+        let legacyNetworks = try #require((legacyObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])
+        let legacyEndpoint = try #require(legacyNetworks["prionet"] as? [String: Any])
+        #expect(legacyEndpoint["GwPriority"] == nil)
+    }
+
+    @Test func endpointWithoutExplicitGatewayPriorityReportsZero() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=default-priority", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/default-priority/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let networks = try #require((object["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])
+        let endpoint = try #require(networks["default"] as? [String: Any])
+        #expect(endpoint["GwPriority"] as? Int == 0)
+    }
+
+    @Test func connectGatewayPriorityIsAcceptedAndReturnedByInspect() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"prionet"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=connect-priority", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/prionet/connect",
+            body: Data(#"{"Container":"connect-priority","EndpointConfig":{"GwPriority":-5}}"#.utf8)
+        ))
+        #expect(connect.status == .ok)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/connect-priority/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let networks = try #require((object["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])
+        let endpoint = try #require(networks["prionet"] as? [String: Any])
+        #expect(endpoint["GwPriority"] as? Int == -5)
+    }
+
+    @Test func publishingSCTPPortIsRejected() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=sctp",
+            body: Data(#"{"Image":"debian","HostConfig":{"PortBindings":{"132/sctp":[{"HostPort":"8080"}]}}}"#.utf8)
+        ))
+        #expect(create.status == .badRequest)
+    }
+
+    @Test func duplicateContainerNameWithSCTPPortStillReturnsConflict() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=same-name", body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(first.status == .created)
+        let duplicate = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=same-name",
+            body: Data(#"{"Image":"debian","HostConfig":{"PortBindings":{"132/sctp":[{"HostPort":"8080"}]}}}"#.utf8)
+        ))
+        #expect(duplicate.status == .conflict)
+    }
+
     @Test func containerCreateAcceptsNullNetworkEndpointSettings() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

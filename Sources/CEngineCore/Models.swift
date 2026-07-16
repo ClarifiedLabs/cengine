@@ -54,13 +54,20 @@ public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
     /// colon-separated form, or `nil` when the backend assigns one automatically.
     /// Optional so snapshots persisted before MAC support decode successfully.
     public var macAddress: String?
+    /// The endpoint's gateway priority. The endpoint with the highest priority
+    /// provides the container's default gateway; ties break lexicographically by
+    /// network name. `nil` means the client did not request one (treated as 0),
+    /// so snapshots persisted before gateway-priority support decode successfully.
+    public var gatewayPriority: Int?
 
     public init(networkID: String, aliases: [String] = [], ipv4Address: String? = nil, ipv6Address: String? = nil,
-                ipv4AddressIsStatic: Bool = false, ipv6AddressIsStatic: Bool = false, macAddress: String? = nil) {
+                ipv4AddressIsStatic: Bool = false, ipv6AddressIsStatic: Bool = false, macAddress: String? = nil,
+                gatewayPriority: Int? = nil) {
         self.networkID = networkID; self.aliases = aliases
         self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
         self.ipv4AddressIsStatic = ipv4AddressIsStatic; self.ipv6AddressIsStatic = ipv6AddressIsStatic
         self.macAddress = macAddress
+        self.gatewayPriority = gatewayPriority
     }
 }
 

@@ -36,20 +36,33 @@ attestations, and optional differential response-shape comparison.
 ### 1. Complete modern network endpoint and IPAM semantics
 
 Close the remaining network behavior gaps that affect how clients create and
-inspect endpoints. Endpoint MAC address application is complete: an explicit
-`MacAddress` is decoded, validated, applied in the guest, inspected, and
-preserved across recovery (`NET-014`, `NET-015`). The remaining gaps are
-endpoint sysctls, explicit IPv4 controls, gateway priority, and IPAM status.
-Make an explicit support decision for SCTP rather than leaving it unassessed.
+inspect endpoints. The following sub-items are complete:
+
+- Endpoint MAC address application: an explicit `MacAddress` is decoded,
+  validated, applied in the guest, inspected, and preserved across recovery
+  (`NET-014`, `NET-015`).
+- Endpoint gateway priority: `GwPriority` is decoded on create and connect,
+  used to select the single default-gateway endpoint for multi-network
+  containers, inspected, and preserved across recovery (`NET-016`).
+- SCTP has an explicit support decision: publishing an `sctp` port is rejected
+  with 400 and recorded as an intentional gap because the vmnet port forwarder
+  bridges only TCP and UDP (`NET-017`).
+
+The remaining gaps are endpoint sysctls, explicit IPv4 controls (`EnableIPv4`
+and endpoint IPv4 enable/disable), and IPAM status.
 
 Completion criteria:
 
 - Accepted endpoint settings are applied in the guest and survive inspect and
-  daemon recovery.
+  daemon recovery. *(Done for MAC address and gateway priority.)*
 - Invalid or unsupported settings fail explicitly instead of being ignored.
-- Multi-network containers select routes according to gateway priority.
+  *(Done for MAC address and SCTP publishing.)*
+- Multi-network containers select routes according to gateway priority. *(Done:
+  `NET-016`.)*
 - SCTP is either implemented and tested end to end or recorded as an intentional
-  compatibility gap.
+  compatibility gap. *(Done: recorded as an intentional gap, `NET-017`.)*
+- Endpoint sysctls, explicit IPv4 controls, and IPAM status are still
+  outstanding.
 
 ### 2. Close remaining client-visible API gaps
 
