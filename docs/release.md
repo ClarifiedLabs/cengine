@@ -7,7 +7,15 @@ Homebrew Cask in `ClarifiedLabs/homebrew-tap`.
 
 `test.yml` runs for `main`, `release-ci`, pull requests, and manual dispatch.
 `release.yml` runs for `release-ci`, `v*.*.*` tags, and manual dispatch. It waits
-for a successful test run for the same commit before packaging.
+for a successful test run for the same commit before packaging. Normal guest
+asset builds fetch the dedicated, checksum-verified kernel release rather than
+compiling a kernel as part of every application release.
+
+`kernel-release.yml` builds the kernel from its pinned source on Linux ARM64.
+Manual dispatch uploads workflow artifacts without publishing. Pushing the
+configured `kernel-v*` tag creates a dedicated GitHub Release containing
+`cengine-kernel-arm64`, `kernel-input.sha256`, and `SHA256SUMS`; an existing
+kernel release is never overwritten.
 
 `release-ci` exercises the full signing and notarization paths and uploads the
 guest assets and signed package as workflow artifacts. It does not create a
@@ -38,7 +46,50 @@ git push origin HEAD:release-ci
 The resulting `cengine-<version>.pkg` must pass nested signature inspection,
 stapler validation, and Gatekeeper assessment.
 
-## Create a Release
+## Publish a Kernel Release
+
+`Configuration/kernel-release` is the source of truth for the kernel release
+consumed by `make kernel`, normal guest asset builds, and application release
+CI. It is the only supported kernel release-tag setting and contains the
+complete GitHub tag, such as `kernel-v6.18.35-2`. Use
+`make release-list COMPONENT=kernel` to print the configured value. Change and
+commit this file, together with any corresponding kernel inputs, to select a
+different published release.
+
+When changing the kernel version, commit, build image, config fragment, or build
+scripts:
+
+1. Update the kernel inputs under `Configuration/`, build with
+   `make kernel-build`, and run the relevant compatibility tests locally.
+2. Commit those changes and ensure the commit is on an up-to-date `main`.
+3. Create the kernel release, supplying the tag suffix without `kernel-v`:
+
+```bash
+make release COMPONENT=kernel VERSION=6.18.35-2 AUTOPUSH=1
+```
+
+The helper updates `Configuration/kernel-release` to
+`kernel-v6.18.35-2`, creates a conventional release commit when that value
+changes, creates the matching annotated tag, and pushes the commit and tag.
+Kernel versions must be explicit `X.Y.Z` or `X.Y.Z-N` values; the application
+`patch`, `minor`, and `major` shortcuts are intentionally unsupported because a
+kernel release can include a source version and a rebuild revision. Preview the
+operation without changing files, commits, tags, or remotes with:
+
+```bash
+make release COMPONENT=kernel VERSION=6.18.35-2 DRY_RUN=1
+```
+
+The tagged commit must be on `main`. Wait for `kernel-release.yml` to publish the
+assets before relying on `make kernel` or starting an application release. Use
+`CENGINE_LOCAL_KERNEL=/path/to/Image make guest-assets` while testing an
+unpublished kernel, or `CENGINE_KERNEL_MODE=build make guest-assets` to rebuild
+from the configured source.
+
+## Create an Application Release
+
+The application is the default release component, so the existing commands are
+unchanged (`COMPONENT=cengine` may be supplied explicitly):
 
 ```bash
 make release VERSION=patch

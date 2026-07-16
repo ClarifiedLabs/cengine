@@ -6,6 +6,7 @@ entrypoints are:
 ```bash
 make build
 make guest-assets
+make kernel-build
 make test
 make test-guest
 make test-compat
@@ -19,16 +20,23 @@ make test-release
 
 `make test` first checks compatibility-harness environment isolation, then runs
 `CEngineCoreTests` and `CEngineAPITests` through the shared `cengine` scheme.
-`make guest-assets` builds the exact pinned Linux kernel, static Go guest
-services, static `mke2fs`, both deterministic initramfs files, and checksums.
-On Linux ARM64, including release CI, the kernel and `mke2fs` toolchains run
-through Docker Buildx, while the guest services use a checksum-pinned Linux Go
-toolchain. The kernel builder uses `CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default:
-`default`).
-On macOS, the kernel build runs inside an isolated cengine container using an
-installed or explicitly configured bootstrap kernel. This keeps release asset
-production independent of Virtualization.framework while preserving local
-cengine dogfooding.
+`make guest-assets` fetches the checksum-verified kernel release named by
+`Configuration/kernel-release`, builds the static Go guest services and static
+`mke2fs`, packs both deterministic initramfs files, and writes boot-asset
+checksums. Set `CENGINE_LOCAL_KERNEL=/path/to/Image` to prepare guest assets with
+a local ARM64 kernel instead.
+
+`make kernel-build` is the explicit source-build path for kernel development. It
+builds the exact Linux commit and cengine config recorded under `Configuration/`
+and leaves the result in `.build/guest/vmlinux`; a following `make guest-assets`
+reuses it because its kernel input stamp is current. Use
+`CENGINE_KERNEL_MODE=build make guest-assets` to combine those steps. On Linux
+ARM64, including kernel release CI, the kernel and `mke2fs` toolchains run through
+Docker Buildx. The builder uses
+`CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default: `default`). On macOS, the source
+build runs inside an isolated cengine container using an installed or explicitly
+configured `CENGINE_BOOTSTRAP_KERNEL`. Normal builds do not need that bootstrap
+because they fetch the dedicated kernel release.
 `make dist-cli` runs the tests and stages `dist/cengine` plus `dist/share/cengine`.
 `make package` creates `dist/cengine-<marketing-version>.pkg` for local
 release-artifact testing, using `MARKETING_VERSION` from the Xcode project.

@@ -33,6 +33,12 @@ def write_project(root: pathlib.Path, version: str = "0.0.1") -> None:
     path.write_text(f"MARKETING_VERSION = {version};\nMARKETING_VERSION = {version};\n")
 
 
+def write_kernel_release(root: pathlib.Path, tag: str = "kernel-v0.0.1") -> None:
+    path = root / release_tool.KERNEL_RELEASE_FILE
+    path.parent.mkdir(parents=True)
+    path.write_text(f"{tag}\n")
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -42,6 +48,7 @@ class ReleaseTests(unittest.TestCase):
         git(self.root, "config", "user.name", "Release Test")
         git(self.root, "config", "user.email", "release@example.com")
         write_project(self.root)
+        write_kernel_release(self.root)
         git(self.root, "add", ".")
         git(self.root, "commit", "-m", "chore: initialize")
 
@@ -75,6 +82,36 @@ class ReleaseTests(unittest.TestCase):
     def test_rejects_v_prefix(self) -> None:
         with self.assertRaisesRegex(release_tool.ReleaseError, "must not start"):
             release_tool.resolve_version(self.root, "v1.0.0")
+
+    def test_kernel_release_updates_config_and_creates_tag(self) -> None:
+        release_tool.create_kernel_release(self.root, "6.18.35-2", False, False)
+        self.assertEqual(
+            (self.root / release_tool.KERNEL_RELEASE_FILE).read_text(),
+            "kernel-v6.18.35-2\n",
+        )
+        self.assertEqual(git(self.root, "tag", "-l", "kernel-v6.18.35-2"), "kernel-v6.18.35-2")
+        self.assertEqual(
+            git(self.root, "log", "-1", "--pretty=%s"),
+            "chore(release): bump kernel to kernel-v6.18.35-2",
+        )
+
+    def test_kernel_release_dry_run_changes_nothing(self) -> None:
+        original = (self.root / release_tool.KERNEL_RELEASE_FILE).read_text()
+        release_tool.create_kernel_release(self.root, "1.2.3", True, False)
+        self.assertEqual((self.root / release_tool.KERNEL_RELEASE_FILE).read_text(), original)
+        self.assertEqual(git(self.root, "tag", "-l", "kernel-v1.2.3"), "")
+
+    def test_kernel_release_can_tag_configured_version_without_commit(self) -> None:
+        original_commit = git(self.root, "rev-parse", "HEAD")
+        release_tool.create_kernel_release(self.root, "0.0.1", False, False)
+        self.assertEqual(git(self.root, "rev-parse", "HEAD"), original_commit)
+        self.assertEqual(git(self.root, "tag", "-l", "kernel-v0.0.1"), "kernel-v0.0.1")
+
+    def test_kernel_release_requires_explicit_unprefixed_version(self) -> None:
+        for version in ("patch", "minor", "major", "v1.2.3", "kernel-v1.2.3", "1.2"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(release_tool.ReleaseError, "kernel VERSION"):
+                    release_tool.resolve_kernel_version(version)
 
 
 if __name__ == "__main__":

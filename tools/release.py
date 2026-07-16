@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create cengine release version commits and annotated tags."""
+"""Create cengine application or kernel release commits and annotated tags."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from dataclasses import dataclass
 
 
 PROJECT_FILE = pathlib.Path("cengine.xcodeproj/project.pbxproj")
+KERNEL_RELEASE_FILE = pathlib.Path("Configuration/kernel-release")
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+KERNEL_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[1-9]\d*)?$")
 MARKETING_VERSION_RE = re.compile(r"(MARKETING_VERSION = )\d+\.\d+\.\d+(;)")
 MARKETING_VERSION_VALUE_RE = re.compile(r"MARKETING_VERSION = (\d+\.\d+\.\d+);")
 
@@ -64,6 +66,20 @@ def current_version(root: pathlib.Path) -> str:
     return output.strip().splitlines()[0] if output.strip() else ""
 
 
+def configured_kernel_release(root: pathlib.Path) -> str:
+    path = root / KERNEL_RELEASE_FILE
+    if not path.exists():
+        raise ReleaseError(f"missing kernel release file: {KERNEL_RELEASE_FILE}")
+    tag = path.read_text().strip()
+    prefix = "kernel-v"
+    if not tag.startswith(prefix) or not KERNEL_VERSION_RE.match(tag[len(prefix):]):
+        raise ReleaseError(
+            f"invalid kernel release in {KERNEL_RELEASE_FILE}: {tag!r}; "
+            "expected kernel-vX.Y.Z or kernel-vX.Y.Z-N"
+        )
+    return tag
+
+
 def project_version(root: pathlib.Path) -> str:
     path = root / PROJECT_FILE
     if not path.exists():
@@ -100,6 +116,28 @@ def build_plan(root: pathlib.Path, version_arg: str) -> ReleasePlan:
     return ReleasePlan(current_version=current_version(root) or "v0.0.0", new_version=new_version, tag=tag)
 
 
+def resolve_kernel_version(version_arg: str) -> str:
+    if version_arg.startswith(("v", "kernel-v")):
+        raise ReleaseError(
+            "kernel VERSION must not include a tag prefix; use X.Y.Z or X.Y.Z-N"
+        )
+    if not KERNEL_VERSION_RE.match(version_arg):
+        raise ReleaseError("kernel VERSION must be an explicit X.Y.Z or X.Y.Z-N")
+    return version_arg
+
+
+def build_kernel_plan(root: pathlib.Path, version_arg: str) -> ReleasePlan:
+    new_version = resolve_kernel_version(version_arg)
+    tag = f"kernel-v{new_version}"
+    if git_output(root, "tag", "-l", tag).strip():
+        raise ReleaseError(f"tag already exists: {tag}")
+    return ReleasePlan(
+        current_version=configured_kernel_release(root),
+        new_version=new_version,
+        tag=tag,
+    )
+
+
 def ensure_clean_worktree(root: pathlib.Path) -> None:
     if git_output(root, "status", "--porcelain").strip():
         raise ReleaseError("working directory is not clean; commit or stash changes first")
@@ -126,6 +164,19 @@ def update_marketing_version(root: pathlib.Path, version: str) -> int:
     count, _, updated = marketing_version_update(root, version)
     (root / PROJECT_FILE).write_text(updated)
     return count
+
+
+def kernel_release_update(root: pathlib.Path, version: str) -> tuple[bool, str]:
+    path = root / KERNEL_RELEASE_FILE
+    original = path.read_text()
+    updated = f"kernel-v{version}\n"
+    return updated != original, updated
+
+
+def update_kernel_release(root: pathlib.Path, version: str) -> bool:
+    changed, updated = kernel_release_update(root, version)
+    (root / KERNEL_RELEASE_FILE).write_text(updated)
+    return changed
 
 
 def create_release(root: pathlib.Path, version_arg: str, dry_run: bool, push: bool) -> None:
@@ -163,11 +214,53 @@ def create_release(root: pathlib.Path, version_arg: str, dry_run: bool, push: bo
         print(f"Pushed tag: {plan.tag}")
 
 
+def create_kernel_release(root: pathlib.Path, version_arg: str, dry_run: bool, push: bool) -> None:
+    plan = build_kernel_plan(root, version_arg)
+    print(f"Bumping cengine kernel: {plan.current_version} -> {plan.tag}")
+    print(f"Kernel release file: {KERNEL_RELEASE_FILE} -> {plan.tag}")
+    print(f"Tag: {plan.tag}")
+    if dry_run:
+        changed, _ = kernel_release_update(root, plan.new_version)
+        print("[dry-run] No files, commits, tags, or remotes were changed.")
+        print(
+            f"[dry-run] Would {'update' if changed else 'leave unchanged'} "
+            f"{KERNEL_RELEASE_FILE}."
+        )
+        print(f"[dry-run] Would create annotated tag: {plan.tag}")
+        return
+
+    ensure_clean_worktree(root)
+    changed = update_kernel_release(root, plan.new_version)
+    git(root, "add", str(KERNEL_RELEASE_FILE))
+    committed = False
+    try:
+        git(root, "diff", "--cached", "--quiet")
+    except subprocess.CalledProcessError as error:
+        if error.returncode != 1:
+            raise
+        git(root, "commit", "-m", f"chore(release): bump kernel to {plan.tag}")
+        committed = True
+        print(f"Committed {KERNEL_RELEASE_FILE} update.")
+    if changed != committed:
+        raise ReleaseError(f"failed to stage {KERNEL_RELEASE_FILE} update")
+    if push:
+        if committed:
+            git(root, "push")
+        ensure_head_on_origin_main(root)
+    git(root, "tag", "-a", plan.tag, "-m", f"cengine kernel {plan.new_version}")
+    print(f"Created tag: {plan.tag}")
+    if push:
+        git(root, "push", "origin", plan.tag)
+        print(f"Pushed tag: {plan.tag}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Release cengine to GitHub Releases.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("list")
+    list_parser = subparsers.add_parser("list")
+    list_parser.add_argument("--component", choices=("cengine", "kernel"), default="cengine")
     release_parser = subparsers.add_parser("release")
+    release_parser.add_argument("--component", choices=("cengine", "kernel"), default="cengine")
     release_parser.add_argument("--version", required=True)
     release_parser.add_argument("--dry-run", action="store_true")
     release_parser.add_argument("--push", action="store_true")
@@ -175,8 +268,12 @@ def main() -> int:
     try:
         root = repo_root()
         if args.command == "list":
-            print("Current release tag:\n")
-            print(f"  {current_version(root) or '(no tags)'}")
+            label = "kernel release" if args.component == "kernel" else "release"
+            tag = configured_kernel_release(root) if args.component == "kernel" else current_version(root)
+            print(f"Current {label} tag:\n")
+            print(f"  {tag or '(no tags)'}")
+        elif args.component == "kernel":
+            create_kernel_release(root, args.version, args.dry_run, args.push)
         else:
             create_release(root, args.version, args.dry_run, args.push)
     except ReleaseError as error:

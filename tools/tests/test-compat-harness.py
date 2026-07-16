@@ -84,7 +84,7 @@ def main() -> None:
     assert "test-compat-reset-system:" in makefile
     assert "Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)" in makefile
     assert "CENGINE_HOST_OS ?= $(shell uname -s)" in makefile
-    assert "ifeq ($(CENGINE_HOST_OS),Darwin)\nkernel: build\nendif" in makefile
+    assert "ifeq ($(CENGINE_HOST_OS),Darwin)\nkernel-build: build\nendif" in makefile
     assert "ifeq ($(CENGINE_HOST_OS),Darwin)\ntest-guest: build guest-initramfs\nendif" in makefile
 
     linux_guest_dry_run = subprocess.run(
@@ -106,8 +106,19 @@ def main() -> None:
         text=True,
     ).stdout
     assert "xcodebuild" not in linux_guest_assets_dry_run
-    assert "./Scripts/build-kernel.sh" in linux_guest_assets_dry_run
+    assert "./Scripts/fetch-kernel.sh" in linux_guest_assets_dry_run
+    assert "./Scripts/build-kernel.sh" not in linux_guest_assets_dry_run
     assert "./Scripts/build-guest-assets.sh" in linux_guest_assets_dry_run
+
+    linux_local_kernel_dry_run = subprocess.run(
+        ["make", "--no-print-directory", "-n", "CENGINE_HOST_OS=Linux", "CENGINE_KERNEL_MODE=build", "kernel"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "./Scripts/build-kernel.sh" in linux_local_kernel_dry_run
+    assert "./Scripts/fetch-kernel.sh" not in linux_local_kernel_dry_run
 
     runner = (REPO_ROOT / "Scripts" / "run-compat-tests.sh").read_text()
     assert runner.index("$RESET") < runner.index("make -C")
@@ -134,9 +145,15 @@ def main() -> None:
     assert 'CENGINE_ISOLATED_IMAGE_CACHE' in isolated
     assert '/bin/cp -cR "$IMAGE_CACHE/content" "$ENGINE_ROOT/content"' in isolated
 
+    kernel_fetcher = (REPO_ROOT / "Scripts" / "fetch-kernel.sh").read_text()
     kernel_builder = (REPO_ROOT / "Scripts" / "build-kernel.sh").read_text()
     linux_kernel_builder = (REPO_ROOT / "Scripts" / "build-kernel-linux.sh").read_text()
     guest_tests = (REPO_ROOT / "Scripts" / "test-guest.sh").read_text()
+    assert 'Configuration/kernel-release' in kernel_fetcher
+    assert 'CENGINE_KERNEL_RELEASE_TAG' not in kernel_fetcher
+    assert 'CENGINE_LOCAL_KERNEL' in kernel_fetcher
+    assert 'shasum -a 256 -c SHA256SUMS' in kernel_fetcher
+    assert 'kernel-input-sha256.sh' in kernel_fetcher
     assert "docker buildx" not in kernel_builder
     assert "docker buildx" not in guest_tests
     assert '"$ROOT/Scripts/build-kernel-linux.sh"' in kernel_builder
@@ -152,7 +169,7 @@ def main() -> None:
     assert 'go test ./...' in guest_tests
 
     kernel_check = (REPO_ROOT / "Scripts" / "check-guest-kernel.sh").read_text()
-    assert '"$ROOT/Configuration/kernel-commit"' in kernel_check
+    assert '"$ROOT/Scripts/kernel-input-sha256.sh"' in kernel_check
     assert '"$ROOT/Scripts/build-kernel.sh"' not in kernel_check
 
     conftest = (REPO_ROOT / "Tests" / "Compatibility" / "conftest.py").read_text()

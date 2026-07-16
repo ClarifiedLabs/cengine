@@ -81,7 +81,8 @@ without any uplink.
 
 `make guest-assets` produces `.build/guest/` containing:
 
-- `vmlinux`, built from the exact commit recorded by `Scripts/build-kernel.sh`;
+- `vmlinux`, fetched from the dedicated release in
+  `Configuration/kernel-release` or supplied through `CENGINE_LOCAL_KERNEL`;
 - `container-initramfs.cpio.gz` with the static `cengine-init` supervisor;
 - `storage-initramfs.cpio.gz` with the static storage service;
 - a pinned, statically linked arm64 `mke2fs`; and

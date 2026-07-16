@@ -8,7 +8,7 @@ CACHE=${CENGINE_GUEST_CACHE:-"$ROOT/.build/guest-cache"}
 SOURCE=${KERNEL_SOURCE:-"$CACHE/linux-$VERSION"}
 OUTPUT=${CENGINE_GUEST_OUTPUT:-"$ROOT/.build/guest"}
 BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/Debug/cengine"}
-IMAGE=${CENGINE_KERNEL_BUILD_IMAGE:-debian:trixie-slim}
+IMAGE=${CENGINE_KERNEL_BUILD_IMAGE:-$(tr -d '[:space:]' < "$ROOT/Configuration/kernel-build-image")}
 JOBS=${CENGINE_KERNEL_BUILD_JOBS:-4}
 CPUS=${CENGINE_KERNEL_BUILD_CPUS:-4}
 MEMORY=${CENGINE_KERNEL_BUILD_MEMORY:-8g}
@@ -83,8 +83,5 @@ case "$HOST_OS" in
         ;;
 esac
 
-cat "$ROOT/Configuration/kernel-version" \
-    "$ROOT/Configuration/kernel-commit" \
-    "$ROOT/Configuration/cengine-kernel.fragment" \
-    | shasum -a 256 | awk '{print $1}' > "$OUTPUT/kernel-input.sha256"
+"$ROOT/Scripts/kernel-input-sha256.sh" > "$OUTPUT/kernel-input.sha256"
 echo "Built pinned Linux $VERSION ($COMMIT) at $OUTPUT/vmlinux"

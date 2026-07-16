@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 VERSION=$(tr -d '[:space:]' < "$ROOT/Configuration/kernel-version")
 SOURCE=${KERNEL_SOURCE:-"$ROOT/.build/guest-cache/linux-$VERSION"}
 OUTPUT=${CENGINE_GUEST_OUTPUT:-"$ROOT/.build/guest"}
-IMAGE=${CENGINE_KERNEL_BUILD_IMAGE:-debian:trixie-slim}
+IMAGE=${CENGINE_KERNEL_BUILD_IMAGE:-$(tr -d '[:space:]' < "$ROOT/Configuration/kernel-build-image")}
 JOBS=${CENGINE_KERNEL_BUILD_JOBS:-4}
 CACHE=${CENGINE_GUEST_CACHE:-"$ROOT/.build/guest-cache"}
 DOCKER_CONTEXT=${CENGINE_TOOLCHAIN_DOCKER_CONTEXT:-default}
@@ -20,6 +20,7 @@ mkdir -p "$OUTPUT" "$EMPTY_CONTEXT"
 docker --context "$DOCKER_CONTEXT" buildx build \
     --progress plain \
     --platform linux/arm64 \
+    --build-arg "CENGINE_KERNEL_BUILD_IMAGE=$IMAGE" \
     --build-arg "CENGINE_KERNEL_BUILD_JOBS=$JOBS" \
     --build-context "kernel=$SOURCE" \
     --build-context "config=$ROOT/Configuration" \
@@ -28,8 +29,9 @@ docker --context "$DOCKER_CONTEXT" buildx build \
     --file - \
     "$EMPTY_CONTEXT" <<'EOF'
 # syntax=docker/dockerfile:1.7
+ARG CENGINE_KERNEL_BUILD_IMAGE
 ARG CENGINE_KERNEL_BUILD_JOBS
-FROM debian:trixie-slim AS build
+FROM ${CENGINE_KERNEL_BUILD_IMAGE} AS build
 ARG CENGINE_KERNEL_BUILD_JOBS
 COPY --from=kernel / /linux
 COPY --from=config /cengine-kernel.fragment /fragment

@@ -5,13 +5,14 @@ from _checks import REPO_ROOT, read, require_absent, require_contains
 def main() -> None:
     test = read(REPO_ROOT / ".github/workflows/test.yml")
     release = read(REPO_ROOT / ".github/workflows/release.yml")
+    kernel_release = read(REPO_ROOT / ".github/workflows/kernel-release.yml")
     makefile = read(REPO_ROOT / "Makefile")
     engine_entitlements = read(REPO_ROOT / "Configuration/cengine.entitlements")
     for needle in ("- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: macos-26", "make test"):
         require_contains(test, needle, "test.yml")
     for needle in (
         "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
-        "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default",
+        "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default", "CENGINE_KERNEL_MODE: release",
         "docker --context default buildx version",
         "needs: [require-tests, guest-assets]",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
@@ -23,6 +24,15 @@ def main() -> None:
         require_contains(release, needle, "release.yml")
     for forbidden in ("draft: true", "--draft", "TestFlight"):
         require_absent(release, forbidden, "release.yml")
+    require_absent(release, "make kernel-build", "release.yml")
+    for needle in (
+        "kernel-v*", "runs-on: ubuntu-24.04-arm", "make kernel-build CENGINE_HOST_OS=Linux",
+        "Configuration/kernel-release", "Scripts/kernel-input-sha256.sh",
+        "cengine-kernel-arm64", "kernel-input.sha256", "SHA256SUMS",
+        "gh release create", "--verify-tag",
+    ):
+        require_contains(kernel_release, needle, "kernel-release.yml")
+    require_absent(kernel_release, "--clobber", "kernel-release.yml")
     require_contains(
         release,
         'installed="/Applications/cengine.app/Contents/MacOS/cengine-engine"',
@@ -48,6 +58,12 @@ def main() -> None:
     )
     for target in ("test-compat", "test-compat-soak", "test-compat-oracle"):
         require_contains(makefile, f"{target}:", "Makefile")
+    for needle in (
+        "COMPONENT ?= cengine",
+        'list --component "$(COMPONENT)"',
+        'release --component "$(COMPONENT)"',
+    ):
+        require_contains(makefile, needle, "Makefile")
     if makefile.count("$(CENGINE_COMPAT_ENV)") != 3:
         raise AssertionError("all compatibility test targets must pass isolated runtime assets")
     guest_builder = read(REPO_ROOT / "Scripts/build-guest-assets.sh")

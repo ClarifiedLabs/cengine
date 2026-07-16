@@ -1,0 +1,78 @@
+name: kernel-release
+
+on:
+  push:
+    tags:
+      - kernel-v*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build cengine Linux kernel
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      DOCKER_CONTEXT: default
+      OUTPUT: dist/kernel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Verify configured kernel release
+        run: |
+          set -euo pipefail
+          configured="$(tr -d '[:space:]' < Configuration/kernel-release)"
+          [[ "$configured" == kernel-v* ]]
+          if [[ "$GITHUB_REF" == refs/tags/kernel-v* ]]; then
+            [[ "$GITHUB_REF_NAME" == "$configured" ]]
+            git fetch origin main
+            git merge-base --is-ancestor "$(git rev-parse "$GITHUB_SHA^{commit}")" origin/main
+          fi
+      - name: Require Docker Buildx
+        run: docker --context default buildx version
+      - name: Build pinned kernel from source
+        run: make kernel-build CENGINE_HOST_OS=Linux
+      - name: Prepare kernel release assets
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT"
+          install -m 0644 .build/guest/vmlinux "$OUTPUT/cengine-kernel-arm64"
+          install -m 0644 .build/guest/kernel-input.sha256 "$OUTPUT/kernel-input.sha256"
+          expected="$(Scripts/kernel-input-sha256.sh)"
+          [[ "$(tr -d '[:space:]' < "$OUTPUT/kernel-input.sha256")" == "$expected" ]]
+          (cd "$OUTPUT" && sha256sum cengine-kernel-arm64 kernel-input.sha256 > SHA256SUMS)
+          file "$OUTPUT/cengine-kernel-arm64" | grep -q 'Linux kernel ARM64 boot executable Image'
+      - name: Upload kernel workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cengine-kernel-${{ github.sha }}
+          path: |
+            dist/kernel/cengine-kernel-arm64
+            dist/kernel/kernel-input.sha256
+            dist/kernel/SHA256SUMS
+          if-no-files-found: error
+      - name: Create kernel GitHub release
+        if: startsWith(github.ref, 'refs/tags/kernel-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "kernel release $GITHUB_REF_NAME already exists and will not be replaced" >&2
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < Configuration/kernel-version)"
+          commit="$(tr -d '[:space:]' < Configuration/kernel-commit)"
+          gh release create "$GITHUB_REF_NAME" \
+            "$OUTPUT/cengine-kernel-arm64" \
+            "$OUTPUT/kernel-input.sha256" \
+            "$OUTPUT/SHA256SUMS" \
+            --title "cengine kernel $version" \
+            --notes "Pinned cengine ARM64 guest kernel built from Linux $version commit $commit." \
+            --verify-tag

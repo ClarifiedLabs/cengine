@@ -1,3 +1,7 @@
+import hashlib
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -36,7 +40,9 @@ class GuestBuildScriptTests(unittest.TestCase):
     def test_kernel_build_includes_virtiofs_in_the_guest_kernel(self) -> None:
         config = (ROOT / "Configuration" / "cengine-kernel.fragment").read_text()
         compiler = (ROOT / "Scripts" / "compile-kernel-in-guest.sh").read_text()
+        image = (ROOT / "Configuration" / "kernel-build-image").read_text().strip()
 
+        self.assertRegex(image, r"^debian:trixie-slim@sha256:[0-9a-f]{64}$")
         self.assertIn("CONFIG_FUSE_FS=y", config)
         self.assertIn("CONFIG_VIRTIO_FS=y", config)
         self.assertIn("grep -qx 'CONFIG_VIRTIO_FS=y' /build/.config", compiler)
@@ -48,6 +54,67 @@ class GuestBuildScriptTests(unittest.TestCase):
         self.assertIn('--platform linux/arm64', builder)
         self.assertIn('compile-kernel-in-guest.sh', builder)
         self.assertNotIn('run-isolated-cengine.sh', builder)
+
+    def test_kernel_release_fetch_verifies_checksums_and_build_inputs(self) -> None:
+        expected_input = subprocess.run(
+            [str(ROOT / "Scripts" / "kernel-input-sha256.sh")],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "release"
+            output = root / "output"
+            release.mkdir()
+            assets = {
+                "cengine-kernel-arm64": b"test ARM64 kernel\n",
+                "kernel-input.sha256": f"{expected_input}\n".encode(),
+            }
+            for name, data in assets.items():
+                (release / name).write_bytes(data)
+            (release / "SHA256SUMS").write_text("".join(
+                f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in assets.items()
+            ))
+            environment = os.environ.copy()
+            environment.update({
+                "CENGINE_GUEST_OUTPUT": str(output),
+                "CENGINE_GUEST_CACHE": str(root / "cache"),
+                "CENGINE_KERNEL_RELEASE_BASE_URL": release.as_uri(),
+            })
+            subprocess.run(
+                [str(ROOT / "Scripts" / "fetch-kernel.sh")],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual((output / "vmlinux").read_bytes(), assets["cengine-kernel-arm64"])
+            self.assertEqual((output / "kernel-input.sha256").read_text().strip(), expected_input)
+
+    def test_local_kernel_override_is_installed_without_a_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local = root / "Image"
+            output = root / "output"
+            local.write_bytes(b"local ARM64 kernel\n")
+            environment = os.environ.copy()
+            environment.update({
+                "CENGINE_GUEST_OUTPUT": str(output),
+                "CENGINE_GUEST_CACHE": str(root / "cache"),
+                "CENGINE_LOCAL_KERNEL": str(local),
+            })
+            subprocess.run(
+                [str(ROOT / "Scripts" / "fetch-kernel.sh")],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual((output / "vmlinux").read_bytes(), local.read_bytes())
 
 
 if __name__ == "__main__":
