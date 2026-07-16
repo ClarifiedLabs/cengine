@@ -1,7 +1,16 @@
 #!/bin/sh
 set -eu
 
-jobs=${1:-1}
+jobs=${1:-auto}
+if [ "$jobs" = auto ]; then
+    jobs=$(getconf _NPROCESSORS_ONLN)
+fi
+case "$jobs" in
+    ''|*[!0-9]*|0)
+        echo "kernel build job count must be a positive integer or auto" >&2
+        exit 2
+        ;;
+esac
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get -o APT::Sandbox::User=root update

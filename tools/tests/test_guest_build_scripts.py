@@ -47,13 +47,76 @@ class GuestBuildScriptTests(unittest.TestCase):
         self.assertIn("CONFIG_VIRTIO_FS=y", config)
         self.assertIn("grep -qx 'CONFIG_VIRTIO_FS=y' /build/.config", compiler)
 
-    def test_linux_kernel_build_uses_buildx_without_cengine_virtualization(self) -> None:
+    def test_kernel_build_uses_buildx_without_cengine_virtualization(self) -> None:
         builder = (ROOT / "Scripts" / "build-kernel-linux.sh").read_text()
 
-        self.assertIn('docker --context "$DOCKER_CONTEXT" buildx build', builder)
+        self.assertIn('docker_cli "$@"', builder)
         self.assertIn('--platform linux/arm64', builder)
         self.assertIn('compile-kernel-in-guest.sh', builder)
         self.assertNotIn('run-isolated-cengine.sh', builder)
+
+    def test_kernel_build_honors_standard_docker_context_and_resource_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "linux"
+            output = root / "output"
+            cache = root / "cache"
+            binary = root / "bin"
+            arguments = root / "docker-arguments"
+            source.mkdir()
+            binary.mkdir()
+            (source / "Makefile").write_text("all:\n")
+            docker = binary / "docker"
+            docker.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in *\"buildx version\"*) exit 0;; esac\n"
+                "printf '%s\\n' \"$@\" > \"$CENGINE_TEST_DOCKER_ARGUMENTS\"\n"
+            )
+            docker.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({
+                "PATH": f"{binary}:{environment['PATH']}",
+                "KERNEL_SOURCE": str(source),
+                "CENGINE_GUEST_OUTPUT": str(output),
+                "CENGINE_GUEST_CACHE": str(cache),
+                "CENGINE_TEST_DOCKER_ARGUMENTS": str(arguments),
+            })
+
+            subprocess.run(
+                [str(ROOT / "Scripts" / "build-kernel-linux.sh")],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            default_arguments = arguments.read_text().splitlines()
+            self.assertEqual(default_arguments[:2], ["buildx", "build"])
+            self.assertNotIn("--context", default_arguments)
+            self.assertIn("CENGINE_KERNEL_BUILD_JOBS=auto", default_arguments)
+            self.assertNotIn("--resource", default_arguments)
+
+            environment.update({
+                "CENGINE_TOOLCHAIN_DOCKER_CONTEXT": "developer-context",
+                "CENGINE_KERNEL_BUILD_CPUS": "8",
+                "CENGINE_KERNEL_BUILD_MEMORY": "16g",
+            })
+            subprocess.run(
+                [str(ROOT / "Scripts" / "build-kernel-linux.sh")],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            limited_arguments = arguments.read_text().splitlines()
+            self.assertEqual(
+                limited_arguments[:4],
+                ["--context", "developer-context", "buildx", "build"],
+            )
+            self.assertIn("CENGINE_KERNEL_BUILD_JOBS=8", limited_arguments)
+            self.assertIn("cpu-quota=800000", limited_arguments)
+            self.assertIn("memory=16g", limited_arguments)
 
     def test_kernel_release_fetch_verifies_checksums_and_build_inputs(self) -> None:
         expected_input = subprocess.run(

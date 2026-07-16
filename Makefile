@@ -82,10 +82,6 @@ kernel:
 	@exit 2
 endif
 
-ifeq ($(CENGINE_HOST_OS),Darwin)
-kernel-build: build
-endif
-
 kernel-build:
 	./Scripts/build-kernel.sh
 

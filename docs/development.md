@@ -31,12 +31,22 @@ builds the exact Linux commit and cengine config recorded under `Configuration/`
 and leaves the result in `.build/guest/vmlinux`; a following `make guest-assets`
 reuses it because its kernel input stamp is current. Use
 `CENGINE_KERNEL_MODE=build make guest-assets` to combine those steps. On Linux
-ARM64, including kernel release CI, the kernel and `mke2fs` toolchains run through
-Docker Buildx. The builder uses
-`CENGINE_TOOLCHAIN_DOCKER_CONTEXT` (default: `default`). On macOS, the source
-build runs inside an isolated cengine container using an installed or explicitly
-configured `CENGINE_BOOTSTRAP_KERNEL`. Normal builds do not need that bootstrap
-because they fetch the dedicated kernel release.
+and macOS, the kernel toolchain runs through Docker Buildx using the context and
+builder already selected by the Docker CLI. Set
+`CENGINE_TOOLCHAIN_DOCKER_CONTEXT` to use an explicit context. The Docker daemon
+and Buildx builder must be configured before the build; kernel builds never
+install a privileged cengine networking helper or request administrator access.
+The compile defaults to the CPU count visible inside the build container and
+uses the builder's configured memory. Set `CENGINE_KERNEL_BUILD_JOBS`, or set
+`CENGINE_KERNEL_BUILD_CPUS` and `CENGINE_KERNEL_BUILD_MEMORY` to apply explicit
+Buildx CPU and memory limits, for example:
+
+```sh
+CENGINE_KERNEL_BUILD_CPUS=8 CENGINE_KERNEL_BUILD_MEMORY=16g make kernel-build
+```
+
+Kernel release CI uses the same Buildx path on Linux ARM64. Normal builds fetch
+the dedicated kernel release instead of compiling from source.
 `make dist-cli` runs the tests and stages `dist/cengine` plus `dist/share/cengine`.
 `make package` creates `dist/cengine-<marketing-version>.pkg` for local
 release-artifact testing, using `MARKETING_VERSION` from the Xcode project.

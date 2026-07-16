@@ -88,7 +88,7 @@ def main() -> None:
     assert "test-compat-reset-system:" in makefile
     assert "Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)" in makefile
     assert "CENGINE_HOST_OS ?= $(shell uname -s)" in makefile
-    assert "ifeq ($(CENGINE_HOST_OS),Darwin)\nkernel-build: build\nendif" in makefile
+    assert "kernel-build: build" not in makefile
     assert "ifeq ($(CENGINE_HOST_OS),Darwin)\ntest-guest: build guest-initramfs\nendif" in makefile
 
     linux_guest_dry_run = subprocess.run(
@@ -123,6 +123,16 @@ def main() -> None:
     ).stdout
     assert "./Scripts/build-kernel.sh" in linux_local_kernel_dry_run
     assert "./Scripts/fetch-kernel.sh" not in linux_local_kernel_dry_run
+
+    darwin_local_kernel_dry_run = subprocess.run(
+        ["make", "--no-print-directory", "-n", "CENGINE_HOST_OS=Darwin", "kernel-build"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "xcodebuild" not in darwin_local_kernel_dry_run
+    assert "./Scripts/build-kernel.sh" in darwin_local_kernel_dry_run
 
     runner = (REPO_ROOT / "Scripts" / "run-compat-tests.sh").read_text()
     assert runner.index("$RESET") < runner.index("make -C")
@@ -178,12 +188,17 @@ def main() -> None:
     assert "docker buildx" not in kernel_builder
     assert "docker buildx" not in guest_tests
     assert '"$ROOT/Scripts/build-kernel-linux.sh"' in kernel_builder
-    assert 'docker --context "$DOCKER_CONTEXT" buildx build' in linux_kernel_builder
+    assert 'docker_cli "$@"' in linux_kernel_builder
+    assert 'docker --context "$DOCKER_CONTEXT" "$@"' in linux_kernel_builder
+    assert 'CENGINE_KERNEL_BUILD_CPUS' in linux_kernel_builder
+    assert 'CENGINE_KERNEL_BUILD_MEMORY' in linux_kernel_builder
+    assert '--resource "cpu-quota=$((CPUS * 100000))"' in linux_kernel_builder
+    assert '--resource "memory=$MEMORY"' in linux_kernel_builder
     assert '"$ROOT/Scripts/run-isolated-cengine.sh"' not in linux_kernel_builder
     assert "compile-kernel-in-guest.sh" in linux_kernel_builder
-    assert "CENGINE_KERNEL_BUILD_CPUS" in kernel_builder
-    assert "CENGINE_KERNEL_BUILD_MEMORY" in kernel_builder
-    assert '"$ROOT/Scripts/run-isolated-cengine.sh"' in kernel_builder
+    assert 'Linux|Darwin)' in kernel_builder
+    assert '"$ROOT/Scripts/run-isolated-cengine.sh"' not in kernel_builder
+    assert 'CENGINE_BOOTSTRAP_KERNEL' not in kernel_builder
     assert '"$ROOT/Scripts/run-isolated-cengine.sh"' in guest_tests
     assert "command -v go" in guest_tests
     assert 'cd "$ROOT/Guest"' in guest_tests
