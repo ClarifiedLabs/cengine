@@ -175,7 +175,10 @@ private actor ImageStoreBackend: ContainerBackend {
     private var references = ["docker.io/library/existing:latest"]
     private var deleted: [String] = []
     func pullImage(_ reference: String, platform _: String) async throws { references.append(reference) }
-    func prepare(_: ContainerRecord) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        let reference = ImageReference.normalized(container.image)
+        if !references.contains(reference) { references.append(reference) }
+    }
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
@@ -1171,6 +1174,27 @@ private actor AuthImageBackend: ContainerBackend {
         try await runtime.removeImage("docker.io/library/new:latest", force: false)
         #expect(await backend.deletedReferences() == ["docker.io/library/new:latest"])
         #expect(await runtime.listImages().map(\.references) == [["docker.io/library/existing:latest"]])
+    }
+
+    @Test func imagePulledWhileCreatingContainerAppearsInImageList() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ImageStoreBackend()
+        let router = DockerRouter(
+            runtime: try await EngineRuntime(root: root, backend: backend),
+            root: root
+        )
+
+        let create = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/create?name=implicit-pull",
+            body: Data(#"{"Image":"debian"}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        let list = await router.route(.init(method: .GET, uri: "/v1.44/images/json"))
+        let images = try #require(JSONSerialization.jsonObject(with: list.body) as? [[String: Any]])
+        #expect(images.contains { ($0["RepoTags"] as? [String])?.contains("debian:latest") == true })
     }
 
     @Test func loadImportsDockerArchiveAndMakesImageVisible() async throws {

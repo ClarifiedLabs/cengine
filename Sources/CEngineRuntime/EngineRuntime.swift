@@ -199,6 +199,9 @@ public actor EngineRuntime {
         try validateEndpoints(record)
         pendingContainers[record.id] = record
         try await backend.prepare(record)
+        if let backendImages = try await backend.listImages() {
+            snapshot.images = Self.imageRecords(from: backendImages)
+        }
         snapshot.containers.append(record)
         try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
