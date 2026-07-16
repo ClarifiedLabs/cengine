@@ -238,14 +238,20 @@ public actor RawVirtualizationBackend: ContainerBackend {
         do {
             var active = container
             if !container.ports.isEmpty {
-                guard let ipv4 = container.networks.compactMap(\.ipv4Address).first else {
-                    throw EngineError(.conflict, "published ports require an IPv4 container endpoint")
+                let hasIPv4 = container.networks.contains { $0.ipv4Address != nil }
+                guard hasIPv4 || container.networks.contains(where: { $0.ipv6Address != nil }) else {
+                    throw EngineError(.conflict, "published ports require a container network endpoint")
                 }
                 active.ports = try await portForwarder.start(
                     containerID: container.id,
-                    guestIPv4Address: ipv4,
-                    guestIPv6Address: container.networks.compactMap(\.ipv6Address).first,
-                    bindings: container.ports
+                    bindings: container.ports,
+                    connect: { binding in
+                        try await shim.startPortStream(
+                            transport: binding.proto.lowercased(),
+                            port: binding.containerPort,
+                            ipv6: !hasIPv4
+                        )
+                    }
                 )
             }
             activeContainers[container.id] = active
@@ -678,14 +684,23 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ = try ensureIO(container, preservingExistingFiles: true)
         var active = container
         if !container.ports.isEmpty {
-            guard let ipv4 = container.networks.compactMap(\.ipv4Address).first else {
-                throw EngineError(.conflict, "published ports require an IPv4 container endpoint")
+            guard let shim = shims[container.id] else {
+                throw EngineError(.notFound, "container VM shim is unavailable")
+            }
+            let hasIPv4 = container.networks.contains { $0.ipv4Address != nil }
+            guard hasIPv4 || container.networks.contains(where: { $0.ipv6Address != nil }) else {
+                throw EngineError(.conflict, "published ports require a container network endpoint")
             }
             active.ports = try await portForwarder.start(
                 containerID: container.id,
-                guestIPv4Address: ipv4,
-                guestIPv6Address: container.networks.compactMap(\.ipv6Address).first,
-                bindings: container.ports
+                bindings: container.ports,
+                connect: { binding in
+                    try await shim.startPortStream(
+                        transport: binding.proto.lowercased(),
+                        port: binding.containerPort,
+                        ipv6: !hasIPv4
+                    )
+                }
             )
         }
         knownContainers[container.id] = active

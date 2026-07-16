@@ -1,9 +1,11 @@
 #if os(macOS)
 import CEngineCore
+import Darwin
 import Foundation
 import NIOCore
 import NIOPosix
-@preconcurrency import Network
+
+typealias PortStreamConnector = @Sendable (PortBinding) async throws -> CInt
 
 final class PortForwarder: @unchecked Sendable {
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -11,22 +13,23 @@ final class PortForwarder: @unchecked Sendable {
     private let lock = NSLock()
     private var listeners: [String: [Channel]] = [:]
 
-    func start(containerID: String, guestIPv4Address: String, guestIPv6Address: String?,
-               bindings: [PortBinding]) async throws -> [PortBinding] {
+    func start(
+        containerID: String,
+        bindings: [PortBinding],
+        connect: @escaping PortStreamConnector
+    ) async throws -> [PortBinding] {
         var started: [Channel] = []
         var resolved: [PortBinding] = []
         do {
             for binding in bindings {
-                let wantsIPv6 = binding.hostIP.contains(":")
-                guard !wantsIPv6 || guestIPv6Address != nil else {
-                    throw EngineError(.unsupported, "IPv6 port publishing requires an IPv6 container endpoint")
-                }
-                let guestAddress = wantsIPv6 ? guestIPv6Address! : guestIPv4Address
                 if binding.proto.lowercased() == "udp" {
-                    let guest = try SocketAddress(ipAddress: guestAddress, port: Int(binding.containerPort))
                     let bootstrap = DatagramBootstrap(group: group)
                         .channelInitializer { channel in
-                            channel.pipeline.addHandler(UDPInboundHandler(guest: guest, listener: channel))
+                            channel.pipeline.addHandler(UDPInboundHandler(
+                                binding: binding,
+                                listener: channel,
+                                connect: connect
+                            ))
                         }
                     let channel: Channel
                     do {
@@ -48,15 +51,22 @@ final class PortForwarder: @unchecked Sendable {
                     .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                     .childChannelOption(ChannelOptions.autoRead, value: false)
                     .childChannelInitializer { [group] inbound in
-                        ClientBootstrap(group: group)
-                            .connect(host: guestAddress, port: Int(binding.containerPort))
-                            .flatMap { outbound in
-                                inbound.pipeline.addHandler(RelayHandler(peer: outbound)).and(
+                        inbound.eventLoop.makeFutureWithTask {
+                            let descriptor = try await connect(binding)
+                            let outbound = try await ClientBootstrap(group: group)
+                                .channelOption(ChannelOptions.autoRead, value: false)
+                                .withConnectedSocket(descriptor).get()
+                            do {
+                                _ = try await inbound.pipeline.addHandler(RelayHandler(peer: outbound)).and(
                                     outbound.pipeline.addHandler(RelayHandler(peer: inbound))
-                                ).flatMap { _ in
-                                    inbound.setOption(ChannelOptions.autoRead, value: true)
-                                }
+                                ).get()
+                                try await inbound.setOption(ChannelOptions.autoRead, value: true).get()
+                                try await outbound.setOption(ChannelOptions.autoRead, value: true).get()
+                            } catch {
+                                outbound.close(promise: nil)
+                                throw error
                             }
+                        }
                     }
                 let channel: Channel
                 do {
@@ -118,63 +128,178 @@ final class PortForwarder: @unchecked Sendable {
 
 private final class UDPInboundHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
-    private let guest: SocketAddress; private let listener: Channel
-    private let queue = DispatchQueue(label: "dev.cengine.udp-forwarder")
-    private var connections: [String: NWConnection] = [:]
-    init(guest: SocketAddress, listener: Channel) { self.guest = guest; self.listener = listener }
+    private let binding: PortBinding
+    private let listener: Channel
+    private let connect: PortStreamConnector
+    private var connections: [String: UDPStreamRelay] = [:]
+
+    init(binding: PortBinding, listener: Channel, connect: @escaping PortStreamConnector) {
+        self.binding = binding
+        self.listener = listener
+        self.connect = connect
+    }
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var datagram = unwrapInboundIn(data)
         let key = String(describing: datagram.remoteAddress)
         let payload = Data(datagram.data.readBytes(length: datagram.data.readableBytes) ?? [])
-        if let connection = connections[key] {
-            connection.send(content: payload, completion: .contentProcessed { _ in })
+        let connection: UDPStreamRelay
+        if let existing = connections[key] {
+            connection = existing
+        } else {
+            let id = UUID()
+            connection = UDPStreamRelay(
+                id: id,
+                binding: binding,
+                client: datagram.remoteAddress,
+                listener: listener,
+                connect: connect,
+                completion: { [self, listener] in
+                    listener.eventLoop.execute {
+                        guard self.connections[key]?.id == id else { return }
+                        self.connections.removeValue(forKey: key)
+                    }
+                }
+            )
+            connections[key] = connection
+        }
+        connection.send(payload)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        connections.values.forEach { $0.stop() }
+        connections.removeAll()
+        context.fireChannelInactive()
+    }
+}
+
+private final class UDPStreamRelay: @unchecked Sendable {
+    let id: UUID
+
+    private let binding: PortBinding
+    private let client: SocketAddress
+    private let listener: Channel
+    private let connect: PortStreamConnector
+    private let completion: @Sendable () -> Void
+    private let queue: DispatchQueue
+    private var file: FileHandle?
+    private var pending: [Data] = []
+    private var buffer = Data()
+    private var closed = false
+
+    init(
+        id: UUID,
+        binding: PortBinding,
+        client: SocketAddress,
+        listener: Channel,
+        connect: @escaping PortStreamConnector,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        self.id = id
+        self.binding = binding
+        self.client = client
+        self.listener = listener
+        self.connect = connect
+        self.completion = completion
+        queue = DispatchQueue(label: "dev.cengine.udp-forwarder.\(id.uuidString)")
+        Task { [weak self] in await self?.open() }
+    }
+
+    func send(_ payload: Data) {
+        queue.async { [weak self] in self?.writeOrQueue(payload) }
+    }
+
+    func stop() {
+        queue.async { [weak self] in self?.finish() }
+    }
+
+    private func open() async {
+        do {
+            let descriptor = try await connect(binding)
+            queue.async { [weak self] in self?.activate(descriptor) }
+        } catch {
+            queue.async { [weak self] in self?.finish() }
+        }
+    }
+
+    private func activate(_ descriptor: CInt) {
+        guard !closed else { Darwin.close(descriptor); return }
+        let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        self.file = file
+        file.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            self?.queue.async { [weak self] in
+                guard !data.isEmpty else { self?.finish(); return }
+                self?.consume(data)
+            }
+        }
+        let values = pending
+        pending.removeAll(keepingCapacity: true)
+        for payload in values { writeOrQueue(payload) }
+    }
+
+    private func writeOrQueue(_ payload: Data) {
+        guard !closed else { return }
+        guard let file else {
+            if pending.count < 256 { pending.append(payload) }
             return
         }
-        guard let port = NWEndpoint.Port(rawValue: UInt16(guest.port ?? 0)) else { return }
-        let connection = NWConnection(host: NWEndpoint.Host(guest.ipAddress ?? ""), port: port, using: .udp)
-        connections[key] = connection
-        let client = datagram.remoteAddress
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                connection.send(content: payload, completion: .contentProcessed { _ in })
-                self.receive(on: connection, for: client)
-            case .failed, .cancelled: self.connections.removeValue(forKey: key)
-            default: break
+        guard payload.count <= 65_535 else { return }
+        var size = UInt32(payload.count).bigEndian
+        do {
+            try file.write(contentsOf: Data(bytes: &size, count: 4) + payload)
+        } catch {
+            finish()
+        }
+    }
+
+    private func consume(_ data: Data) {
+        buffer.append(data)
+        while buffer.count >= 4 {
+            let size = buffer.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            guard size <= 65_535 else { finish(); return }
+            guard buffer.count >= Int(size) + 4 else { return }
+            let payload = buffer.subdata(in: 4..<(Int(size) + 4))
+            buffer.removeSubrange(0..<(Int(size) + 4))
+            listener.eventLoop.execute { [listener, client] in
+                var value = listener.allocator.buffer(capacity: payload.count)
+                value.writeBytes(payload)
+                listener.writeAndFlush(AddressedEnvelope(remoteAddress: client, data: value), promise: nil)
             }
         }
-        connection.start(queue: queue)
     }
-    func channelInactive(context: ChannelHandlerContext) {
-        connections.values.forEach { $0.cancel() }; connections.removeAll(); context.fireChannelInactive()
-    }
-    private func receive(on connection: NWConnection, for client: SocketAddress) {
-        connection.receiveMessage { [weak self] content, _, _, error in
-            guard let self else { return }
-            if let content {
-                self.listener.eventLoop.execute {
-                    var buffer = self.listener.allocator.buffer(capacity: content.count); buffer.writeBytes(content)
-                    self.listener.writeAndFlush(AddressedEnvelope(remoteAddress: client, data: buffer), promise: nil)
-                }
-            }
-            if error == nil { self.receive(on: connection, for: client) }
-        }
+
+    private func finish() {
+        guard !closed else { return }
+        closed = true
+        file?.readabilityHandler = nil
+        try? file?.close()
+        file = nil
+        pending.removeAll()
+        buffer.removeAll()
+        completion()
     }
 }
 
 private final class RelayHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private let peer: Channel
+    private var pendingWrite: EventLoopFuture<Void>?
 
     init(peer: Channel) { self.peer = peer }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        peer.writeAndFlush(unwrapInboundIn(data), promise: nil)
+        let promise = peer.eventLoop.makePromise(of: Void.self)
+        peer.writeAndFlush(unwrapInboundIn(data), promise: promise)
+        pendingWrite = promise.futureResult
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        peer.close(promise: nil)
+        if let pendingWrite {
+            pendingWrite.whenComplete { [peer] _ in peer.close(promise: nil) }
+        } else {
+            peer.close(promise: nil)
+        }
         context.fireChannelInactive()
     }
 

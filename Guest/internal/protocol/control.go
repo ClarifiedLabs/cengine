@@ -9,11 +9,12 @@ import (
 )
 
 const (
-	Version             = 2
+	Version             = 3
 	ControlPort         = 4100
 	FileSystemPort      = 4101
 	RootFSContentPort   = 4102
 	ExecIOPort          = 4103
+	PortProxyPort       = 4104
 	SocketProxyPortBase = 4200
 	MaxControlFrame     = 16 << 20
 	MaxFileSystemIO     = 4 << 20

@@ -9,6 +9,17 @@ public final class VMShimClient: @unchecked Sendable {
     public struct GuestCall: Codable, Sendable { public var operation: String; public var payload: Data }
     public struct RootFSRequest: Codable, Sendable { public var contentStorePath: String; public var layers: [OCIDescriptor] }
     public struct ExecStreamRequest: Codable, Sendable { public var id: String }
+    public struct PortStreamRequest: Codable, Sendable {
+        public var transport: String
+        public var port: UInt16
+        public var ipv6: Bool
+
+        public init(transport: String, port: UInt16, ipv6: Bool) {
+            self.transport = transport
+            self.port = port
+            self.ipv6 = ipv6
+        }
+    }
 
     public let specification: VMShimProtocol.Specification
 
@@ -47,7 +58,14 @@ public final class VMShimClient: @unchecked Sendable {
     public func shutdown() async throws -> VMShimProtocol.Status { try await request(.shutdown, response: VMShimProtocol.Status.self) }
 
     public func startExecStream(id: String) async throws -> CInt {
-        try await runBlocking { [self] in try requestExecStream(id: id) }
+        try await upgradedStream(.startExecStream, payload: ExecStreamRequest(id: id))
+    }
+
+    public func startPortStream(transport: String, port: UInt16, ipv6: Bool) async throws -> CInt {
+        try await upgradedStream(
+            .startPortStream,
+            payload: PortStreamRequest(transport: transport, port: port, ipv6: ipv6)
+        )
     }
 
     public func guest<Payload: Encodable, Response: Decodable>(operation: String, payload: Payload, response: Response.Type) async throws -> Response {
@@ -109,14 +127,27 @@ public final class VMShimClient: @unchecked Sendable {
         return payload
     }
 
-    private func requestExecStream(id: String) throws -> CInt {
+    private func upgradedStream<Payload: Encodable & Sendable>(
+        _ operation: VMShimProtocol.Operation,
+        payload: Payload
+    ) async throws -> CInt {
+        let payloadData = try JSONEncoder().encode(payload)
+        return try await runBlocking { [self] in
+            try requestUpgradedStream(operation, payloadData: payloadData)
+        }
+    }
+
+    private func requestUpgradedStream(
+        _ operation: VMShimProtocol.Operation,
+        payloadData: Data
+    ) throws -> CInt {
         let descriptor = try UnixSocket.connect(path: specification.socketPath)
         do {
             let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
             let envelope = VMShimProtocol.Envelope(
                 token: specification.token,
-                operation: .startExecStream,
-                payload: try JSONEncoder().encode(ExecStreamRequest(id: id))
+                operation: operation,
+                payload: payloadData
             )
             try file.write(contentsOf: VMShimProtocol.encode(envelope))
             let reply = try VMShimProtocol.decode(try readFrame(file))

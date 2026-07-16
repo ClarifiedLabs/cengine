@@ -63,9 +63,15 @@ import Foundation
             let decoded = try VMShimProtocol.decode(try readFrame(file))
             request = decoded
             guard decoded.token == specification.token else { throw EngineError(.unauthorized, "invalid VM shim token") }
-            if decoded.operation == .startExecStream {
+            switch decoded.operation {
+            case .startExecStream:
                 try await startExecStream(decoded, local: file)
                 return
+            case .startPortStream:
+                try await startPortStream(decoded, local: file)
+                return
+            default:
+                break
             }
             let payload = try await perform(decoded)
             try file.write(contentsOf: VMShimProtocol.encode(.init(id: decoded.id, token: specification.token, operation: decoded.operation, payload: payload)))
@@ -114,8 +120,8 @@ import Foundation
             let store = try OCIContentStore(root: URL(filePath: value.contentStorePath))
             try await RootFSContentStreamer(store: store).prepare(machine: machine, layers: value.layers)
             return try JSONEncoder().encode(Empty())
-        case .startExecStream:
-            throw EngineError(.internalError, "exec streams must be upgraded before dispatch")
+        case .startExecStream, .startPortStream:
+            throw EngineError(.internalError, "streams must be upgraded before dispatch")
         case .configureNetwork:
             struct Configuration: Decodable { let vlans: [UInt16] }
             guard let payload = request.payload else { throw EngineError(.badRequest, "network configuration has no payload") }
@@ -366,6 +372,60 @@ import Foundation
                 throw error
             }
             relay.startLeftToRight()
+        } catch {
+            try? setup.close()
+            streamConnection.connection.close()
+            throw error
+        }
+    }
+
+    private func startPortStream(_ request: VMShimProtocol.Envelope, local: FileHandle) async throws {
+        guard let payload = request.payload else {
+            throw EngineError(.badRequest, "port stream request has no payload")
+        }
+        guard let machine else { throw EngineError(.conflict, "VM guest control is unavailable") }
+        let value = try JSONDecoder().decode(VMShimClient.PortStreamRequest.self, from: payload)
+        guard ["tcp", "udp"].contains(value.transport), value.port != 0 else {
+            throw EngineError(.badRequest, "invalid port stream target")
+        }
+
+        let connection = try await machine.connect(toPort: GuestProtocol.portProxyPort)
+        let streamConnection = SendableVirtioSocketConnection(connection)
+        let target = FileHandle(fileDescriptor: connection.fileDescriptor, closeOnDealloc: false)
+        let setupDescriptor = Darwin.dup(connection.fileDescriptor)
+        guard setupDescriptor >= 0 else {
+            streamConnection.connection.close()
+            throw EngineError(.internalError, "duplicate port stream descriptor: \(String(cString: strerror(errno)))")
+        }
+        let setup = FileHandle(fileDescriptor: setupDescriptor, closeOnDealloc: true)
+        do {
+            let guestRequest = GuestProtocol.Envelope(operation: "start-port-stream", payload: payload)
+            try setup.write(contentsOf: GuestProtocol.encode(guestRequest))
+            let guestReply = try GuestProtocol.decode(try readFrame(setup))
+            guard guestReply.id == guestRequest.id else {
+                throw EngineError(.internalError, "guest port stream response id mismatch")
+            }
+            if let failure = guestReply.error {
+                throw EngineError(.internalError, "guest port proxy \(failure.code): \(failure.message)")
+            }
+            try setup.close()
+
+            try local.write(contentsOf: VMShimProtocol.encode(.init(
+                id: request.id,
+                token: specification.token,
+                operation: request.operation,
+                payload: try JSONEncoder().encode(Empty())
+            )))
+
+            let id = UUID()
+            let relay = BidirectionalDescriptorRelay(
+                left: local,
+                right: target,
+                close: { try? local.close(); streamConnection.connection.close() },
+                completion: { [weak self] in Task { @MainActor in self?.serviceRelays.removeValue(forKey: id) } }
+            )
+            serviceRelays[id] = relay
+            relay.start()
         } catch {
             try? setup.close()
             streamConnection.connection.close()

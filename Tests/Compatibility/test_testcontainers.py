@@ -43,6 +43,32 @@ def _wait_for_ryuk_port(container) -> tuple[str, int]:
     pytest.fail(f"Ryuk did not publish port 8080 while {last_state}")
 
 
+def _wait_for_ryuk_filter(container, host: str, port: int, value: str) -> socket.socket:
+    deadline = time.monotonic() + 15
+    last_error = "connection was not attempted"
+    while time.monotonic() < deadline:
+        connection = None
+        try:
+            connection = socket.create_connection((host, port), timeout=2)
+            connection.sendall((value + "\n").encode())
+            acknowledgement = connection.recv(4)
+            if acknowledgement == b"ACK\n":
+                return connection
+            last_error = f"unexpected acknowledgement {acknowledgement!r}"
+        except OSError as error:
+            last_error = str(error)
+        if connection is not None:
+            connection.close()
+        container.reload()
+        if container.status == "exited":
+            pytest.fail(f"Ryuk exited before acknowledging the cleanup filter:\n{_container_logs(container)}")
+        time.sleep(0.1)
+    pytest.fail(
+        f"Ryuk did not acknowledge the cleanup filter ({last_error}):\n"
+        + _container_logs(container)
+    )
+
+
 def _assert_ryuk_reaps(client: docker.DockerClient, daemon, *, privileged: bool) -> None:
     token = uuid.uuid4().hex
     label = f"dev.cengine.compat.ryuk={token}"
@@ -63,13 +89,7 @@ def _assert_ryuk_reaps(client: docker.DockerClient, daemon, *, privileged: bool)
     try:
         reaper.start()
         host, port = _wait_for_ryuk_port(reaper)
-        with socket.create_connection((host, port), timeout=2) as connection:
-            connection.sendall(f"label={label}\n".encode())
-            try:
-                acknowledgement = connection.recv(4)
-            except TimeoutError:
-                pytest.fail(f"Ryuk did not acknowledge the cleanup filter:\n{_container_logs(reaper)}")
-            assert acknowledgement == b"ACK\n", _container_logs(reaper)
+        with _wait_for_ryuk_filter(reaper, host, port, f"label={label}"):
             target = client.containers.run(
                 "alpine:latest", ["sh", "-c", "sleep 300"], detach=True,
                 labels={"dev.cengine.compat.ryuk": token},
@@ -158,10 +178,8 @@ def test_ryuk_keeps_multiple_control_connections_open(client: docker.DockerClien
         reaper.start()
         host, port = _wait_for_ryuk_port(reaper)
         for index in range(4):
-            connection = socket.create_connection((host, port), timeout=2)
             ordered = filters if index % 2 == 0 else list(reversed(filters))
-            connection.sendall(("&".join(ordered) + "\n").encode())
-            assert connection.recv(4) == b"ACK\n", _container_logs(reaper)
+            connection = _wait_for_ryuk_filter(reaper, host, port, "&".join(ordered))
             connections.append(connection)
 
         target = client.containers.run(

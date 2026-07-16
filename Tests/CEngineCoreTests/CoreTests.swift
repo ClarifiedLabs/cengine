@@ -187,9 +187,8 @@ private final class DrainRendezvous: @unchecked Sendable {
         defer { forwarder.stopAll() }
         let ports = try await forwarder.start(
             containerID: UUID().uuidString,
-            guestIPv4Address: "127.0.0.1",
-            guestIPv6Address: nil,
-            bindings: [.init(hostIP: "127.0.0.1", hostPort: 0, containerPort: 9)]
+            bindings: [.init(hostIP: "127.0.0.1", hostPort: 0, containerPort: 9)],
+            connect: { _ in throw EngineError(.internalError, "unexpected connection") }
         )
         #expect(ports.count == 1)
         #expect(ports.first?.hostPort != 0)

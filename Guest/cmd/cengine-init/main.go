@@ -3,14 +3,17 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 
 	"dev.cengine/guest/internal/boot"
 	guestnetwork "dev.cengine/guest/internal/network"
@@ -100,6 +103,12 @@ func main() {
 	}
 	defer execListener.Close()
 	go state.serveExecIO(execListener)
+	portListener, err := vsock.Listen(protocol.PortProxyPort)
+	if err != nil {
+		log.Fatalf("listen on port proxy vsock: %v", err)
+	}
+	defer portListener.Close()
+	go state.servePortProxy(portListener)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -108,6 +117,146 @@ func main() {
 		}
 		go state.serve(connection)
 	}
+}
+
+func (state *controlServer) servePortProxy(listener net.Listener) {
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			log.Printf("accept port proxy connection: %v", err)
+			continue
+		}
+		go state.handlePortProxy(connection)
+	}
+}
+
+func (state *controlServer) handlePortProxy(connection net.Conn) {
+	defer connection.Close()
+	request, err := protocol.ReadEnvelope(connection)
+	if err != nil {
+		return
+	}
+	response := protocol.Envelope{ID: request.ID, Operation: request.Operation}
+	if request.Operation != "start-port-stream" {
+		response.Error = &protocol.Error{Code: "unsupported", Message: "unsupported port proxy operation"}
+		_ = protocol.WriteEnvelope(connection, response)
+		return
+	}
+	var value struct {
+		Transport string `json:"transport"`
+		Port      uint16 `json:"port"`
+		IPv6      bool   `json:"ipv6"`
+	}
+	if err := json.Unmarshal(request.Payload, &value); err != nil {
+		response.Error = &protocol.Error{Code: "invalid_request", Message: err.Error()}
+		_ = protocol.WriteEnvelope(connection, response)
+		return
+	}
+	target, err := state.process.DialPublishedPort(value.Transport, value.Port, value.IPv6)
+	if err != nil {
+		response.Error = &protocol.Error{Code: "connect", Message: err.Error()}
+		_ = protocol.WriteEnvelope(connection, response)
+		return
+	}
+	defer target.Close()
+	response.Payload = json.RawMessage(`{"status":"connected"}`)
+	if err := protocol.WriteEnvelope(connection, response); err != nil {
+		return
+	}
+	if value.Transport == "udp" {
+		relayPortDatagrams(connection, target)
+		return
+	}
+	relayPortStream(connection, target)
+}
+
+func relayPortStream(left, right net.Conn) {
+	var group sync.WaitGroup
+	var closeOnce sync.Once
+	closeBoth := func() {
+		_ = left.Close()
+		_ = right.Close()
+	}
+	group.Add(2)
+	forward := func(destination, source net.Conn) {
+		defer group.Done()
+		defer closeOnce.Do(closeBoth)
+		_, _ = io.Copy(destination, source)
+	}
+	go forward(right, left)
+	go forward(left, right)
+	group.Wait()
+}
+
+func relayPortDatagrams(stream, datagrams net.Conn) {
+	var group sync.WaitGroup
+	var closeOnce sync.Once
+	closeBoth := func() {
+		_ = stream.Close()
+		_ = datagrams.Close()
+	}
+	group.Add(2)
+	go func() {
+		defer group.Done()
+		defer closeOnce.Do(closeBoth)
+		for {
+			payload, err := readPortDatagram(stream)
+			if err != nil {
+				return
+			}
+			if _, err := datagrams.Write(payload); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer group.Done()
+		defer closeOnce.Do(closeBoth)
+		buffer := make([]byte, 65_535)
+		for {
+			count, err := datagrams.Read(buffer)
+			if err != nil {
+				return
+			}
+			if err := writePortDatagram(stream, buffer[:count]); err != nil {
+				return
+			}
+		}
+	}()
+	group.Wait()
+}
+
+func readPortDatagram(reader io.Reader) ([]byte, error) {
+	var size uint32
+	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
+		return nil, err
+	}
+	if size > 65_535 {
+		return nil, fmt.Errorf("invalid port datagram size %d", size)
+	}
+	payload := make([]byte, size)
+	_, err := io.ReadFull(reader, payload)
+	return payload, err
+}
+
+func writePortDatagram(writer io.Writer, payload []byte) error {
+	if len(payload) > 65_535 {
+		return fmt.Errorf("port datagram is too large: %d", len(payload))
+	}
+	if err := binary.Write(writer, binary.BigEndian, uint32(len(payload))); err != nil {
+		return err
+	}
+	for len(payload) > 0 {
+		count, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[count:]
+	}
+	return nil
 }
 
 func (state *controlServer) serveExecIO(listener net.Listener) {
