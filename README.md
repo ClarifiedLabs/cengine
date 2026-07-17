@@ -20,11 +20,13 @@ Install the signed cengine app and CLI with Homebrew:
 brew install --cask clarifiedlabs/tap/cengine
 ```
 
-Open `/Applications/cengine.app`. On first launch, cengine registers its required
-VM networking service for administrator approval. Once approved, it enables the
-per-user engine service, installs the bundled cengine kernel and guest initramfs
-assets, initializes its runtime, and configures the Docker context and Buildx
-builder when Docker CLI is available.
+Homebrew launches `/Applications/cengine.app` after installation and upgrades,
+so the installed engine starts without a separate manual step. On first launch,
+cengine registers its required VM networking service for administrator approval.
+Once approved, it enables the per-user engine service, installs the bundled
+cengine kernel and guest initramfs assets, initializes its runtime, and configures
+the Docker context and Buildx builder when Docker CLI is available. If the app
+cannot launch automatically (for example, in a headless session), open it with:
 
 ```sh
 open /Applications/cengine.app
@@ -149,17 +151,28 @@ docker context use default
 
 Use **Uninstall cengine…** in the app to remove services, Docker integration,
 the app, and CLI while preserving images and container data by default. Homebrew
-users can instead run:
+provides the same non-destructive uninstall:
 
 ```sh
 brew uninstall --cask cengine
 ```
 
-which also unregisters the background services and removes the `cengine` Docker
-context and `cengine-builder` Buildx builder. Add `--zap` to delete images,
-containers, and logs as well. Dragging only the app to Trash is not a complete
-uninstall because macOS does not invoke package or `SMAppService` cleanup hooks
-for ordinary app bundles.
+It unregisters the background services and removes the `cengine` Docker context
+and `cengine-builder` Buildx builder, but preserves all VM disks and engine data
+for a later reinstall. To uninstall **and** remove containers, images, volumes,
+downloaded guest assets, runtime files, logs, and app preferences, use the
+explicit destructive form:
+
+```sh
+brew uninstall --cask --zap cengine
+```
+
+Homebrew moves the user data to Trash; empty Trash to reclaim its disk space.
+For a direct PKG install, the app's uninstall confirmation provides the same
+full cleanup with **Delete all cengine data**; the in-app option deletes the data
+permanently rather than moving it to Trash. Dragging only the app to Trash is
+not a complete uninstall because macOS does not invoke package or `SMAppService`
+cleanup hooks for ordinary app bundles.
 
 The app reports service state and daemon errors; transient provisioning failures
 are retried twice. The daemon logs to

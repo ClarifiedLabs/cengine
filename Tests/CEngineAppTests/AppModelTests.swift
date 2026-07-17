@@ -201,6 +201,43 @@ private actor RestartRecorder {
     func record() { count += 1 }
 }
 
+@Suite struct UserDataPurgeTests {
+    @Test func removesEngineResourcesLogsAndAppState() throws {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let suiteName = "UserDataPurgeTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let expectedRelativePaths = [
+            ".cengine",
+            "Library/Application Support/cengine",
+            "Library/Caches/dev.cengine.app",
+            "Library/Logs/cengine",
+            "Library/Preferences/dev.cengine.app.plist",
+            "Library/Saved Application State/dev.cengine.app.savedState",
+        ]
+        #expect(CEngineUserData.relativePaths == expectedRelativePaths)
+
+        let locations = CEngineUserData.locations(home: home)
+        for location in locations {
+            try FileManager.default.createDirectory(at: location, withIntermediateDirectories: true)
+            try Data("owned by cengine".utf8).write(to: location.appending(path: "marker"))
+        }
+        defaults.set(true, forKey: "completedOnboarding")
+
+        try CEngineUserData.removeAll(
+            home: home,
+            defaults: defaults,
+            preferencesDomain: suiteName
+        )
+
+        #expect(locations.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(defaults.object(forKey: "completedOnboarding") == nil)
+    }
+}
+
 @MainActor private final class MockAppService: AppService {
     var status: SMAppService.Status
     let statusAfterRegistration: SMAppService.Status

@@ -231,8 +231,10 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Uninstall cengine?").font(.title2.bold())
             Text("Services, Docker integration, the app, and CLI will be removed.")
-            Toggle("Delete containers, images, and volumes", isOn: $deleteData)
-            Text(deleteData ? "Engine data will be permanently deleted." : "Engine data will be preserved.")
+            Toggle("Delete all cengine data", isOn: $deleteData)
+            Text(deleteData
+                ? "Containers, images, volumes, VM disks, logs, and settings will be permanently deleted."
+                : "Engine data, logs, and settings will be preserved.")
                 .font(.caption)
                 .foregroundStyle(deleteData ? .red : .secondary)
             HStack {

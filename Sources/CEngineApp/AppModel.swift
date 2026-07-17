@@ -485,18 +485,20 @@ extension SMAppService: AppService {}
     }
 
     func uninstall(deleteData: Bool) async {
+        guard let package = Bundle.main.url(forResource: "cengine-uninstall", withExtension: "pkg") else {
+            error = "The signed cengine uninstaller is missing."
+            return
+        }
         refreshTask?.cancel()
         await CEngineServices.teardownServices()
         DockerIntegration.remove()
         if deleteData {
-            try? FileManager.default.removeItem(at: FileManager.default.homeDirectoryForCurrentUser
-                .appending(path: "Library/Application Support/cengine"))
-            try? FileManager.default.removeItem(at: FileManager.default.homeDirectoryForCurrentUser
-                .appending(path: ".cengine"))
-        }
-        guard let package = Bundle.main.url(forResource: "cengine-uninstall", withExtension: "pkg") else {
-            error = "The signed cengine uninstaller is missing."
-            return
+            do {
+                try CEngineUserData.removeAll()
+            } catch {
+                self.error = "cengine was stopped, but uninstall did not continue because some data could not be deleted: \(error.localizedDescription)"
+                return
+            }
         }
         NSWorkspace.shared.open(package)
         NSApplication.shared.terminate(nil)

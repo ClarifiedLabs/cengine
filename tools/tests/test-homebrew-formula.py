@@ -28,6 +28,10 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn("depends_on macos: :tahoe", cask)
             self.assertNotIn('depends_on macos: ">= :tahoe"', cask)
             self.assertIn('pkg "cengine-1.2.3.pkg"', cask)
+            self.assertIn("postflight do", cask)
+            self.assertIn('system_command "/usr/bin/open"', cask)
+            self.assertIn('args: ["/Applications/cengine.app"]', cask)
+            self.assertIn("must_succeed: false", cask)
             self.assertIn("early_script:", cask)
             self.assertIn('executable: "/bin/sh"', cask)
             self.assertIn('if [ -x "$1" ]; then "$1" --uninstall-support; fi', cask)
@@ -40,6 +44,16 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn('pkgutil: "dev.cengine.app.pkg"', cask)
             self.assertIn('"/Applications/cengine.app"', cask)
             self.assertIn('"/usr/local/bin/cengine"', cask)
+            for path in [
+                "~/.cengine",
+                "~/Library/Application Support/cengine",
+                "~/Library/Caches/dev.cengine.app",
+                "~/Library/Logs/cengine",
+                "~/Library/Preferences/dev.cengine.app.plist",
+                "~/Library/Saved Application State/dev.cengine.app.savedState",
+            ]:
+                self.assertIn(f'"{path}"', cask)
+            self.assertIn("brew uninstall --cask --zap cengine", cask)
             self.assertFalse((root / "Formula/cengine.rb").exists())
 
     def test_uninstall_script_skips_missing_app_executable(self) -> None:

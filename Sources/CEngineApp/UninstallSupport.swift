@@ -61,6 +61,47 @@ enum CEngineServices {
     }
 }
 
+enum CEngineUserData {
+    static let appIdentifier = "dev.cengine.app"
+    static let relativePaths = [
+        ".cengine",
+        "Library/Application Support/cengine",
+        "Library/Caches/dev.cengine.app",
+        "Library/Logs/cengine",
+        "Library/Preferences/dev.cengine.app.plist",
+        "Library/Saved Application State/dev.cengine.app.savedState",
+    ]
+
+    static func locations(home: URL) -> [URL] {
+        relativePaths.map { home.appending(path: $0) }
+    }
+
+    /// Permanently removes all per-user engine resources and app state. Unlike
+    /// Homebrew's zap, which moves these paths to Trash, the in-app purge is
+    /// intentionally irreversible after the user confirms it.
+    static func removeAll(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        fileManager: FileManager = .default,
+        defaults: UserDefaults = .standard,
+        preferencesDomain: String = appIdentifier
+    ) throws {
+        var failures: [(URL, Error)] = []
+        for location in locations(home: home) where fileManager.fileExists(atPath: location.path) {
+            do {
+                try fileManager.removeItem(at: location)
+            } catch {
+                failures.append((location, error))
+            }
+        }
+        defaults.removePersistentDomain(forName: preferencesDomain)
+        guard failures.isEmpty else {
+            let details = failures.map { "\($0.0.path): \($0.1.localizedDescription)" }
+                .joined(separator: "; ")
+            throw EngineError(.internalError, "could not delete all cengine data: \(details)")
+        }
+    }
+}
+
 enum UninstallSupport {
     /// Headless teardown for `brew uninstall --cask cengine`: unregister both
     /// launchd services and drop the Docker integration, then exit. User data is
