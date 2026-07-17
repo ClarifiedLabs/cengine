@@ -23,9 +23,23 @@ mkdir -p /build
 make -C /linux O=/build ARCH=arm64 defconfig
 /linux/scripts/kconfig/merge_config.sh -m -O /build /build/.config /fragment
 make -C /linux O=/build ARCH=arm64 olddefconfig
-grep -qx 'CONFIG_FUSE_FS=y' /build/.config
-grep -qx 'CONFIG_VIRTIO_FS=y' /build/.config
-grep -qx 'CONFIG_NFS_FS=y' /build/.config
-grep -qx 'CONFIG_NFS_V3=y' /build/.config
+while IFS= read -r requested; do
+    case "$requested" in
+        CONFIG_*=y)
+            if ! grep -Fqx "$requested" /build/.config; then
+                echo "kernel option did not resolve as built-in: $requested" >&2
+                exit 1
+            fi
+            ;;
+        CONFIG_*=n)
+            option=${requested#CONFIG_}
+            option=${option%=n}
+            if ! grep -Fqx "# CONFIG_$option is not set" /build/.config; then
+                echo "kernel option did not resolve as disabled: $requested" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done < /fragment
 make -C /linux O=/build ARCH=arm64 -j"$jobs" Image
 cp /build/arch/arm64/boot/Image /output/vmlinux.next

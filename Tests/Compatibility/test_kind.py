@@ -74,6 +74,42 @@ def wait_for_control_plane_ready(
     return f"control-plane did not become Ready within {timeout}s; last result: {last_result}"
 
 
+def wait_for_cluster_network_ready(
+    client: docker.DockerClient, name: str, timeout: int = 180,
+) -> str | None:
+    node = client.containers.get(f"{name}-control-plane")
+    deadline = time.monotonic() + timeout
+    last_result = "network readiness command has not run"
+    command = [
+        "sh", "-c",
+        "ready=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system "
+        "get pods -l k8s-app=kube-dns "
+        "-o=jsonpath='{.items[*].status.conditions[?(@.type==\"Ready\")].status}'); "
+        "case \"$ready\" in '') exit 1;; *False*) exit 1;; esac; "
+        "service_ip=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf "
+        "get service kubernetes -o=jsonpath='{.spec.clusterIP}'); "
+        "status=$(curl --connect-timeout 2 --max-time 3 -ksS -o /dev/null "
+        "-w '%{http_code}' https://$service_ip:443/livez) || exit 1; "
+        "test \"$status\" != 000",
+    ]
+    while time.monotonic() < deadline:
+        try:
+            exit_code, output = node.exec_run(command)
+            if exit_code == 0:
+                return None
+            rendered_output = (
+                output.decode(errors="replace") if isinstance(output, bytes) else str(output)
+            )
+            last_result = f"exit {exit_code}: {rendered_output}"
+        except docker.errors.APIError as error:
+            last_result = f"Docker API error: {error}"
+        time.sleep(0.5)
+    return (
+        f"pod and service networking did not become ready within {timeout}s; "
+        f"last result: {last_result}"
+    )
+
+
 @pytest.mark.compat("KND-001")
 def test_kind_create_cluster(daemon, client: docker.DockerClient):
     name = f"cengine-{uuid.uuid4().hex[:8]}"
@@ -94,6 +130,8 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
             failure = f"kind create cluster failed:\n{result.stdout}"
         else:
             failure = wait_for_control_plane_ready(client, name)
+            if failure is None:
+                failure = wait_for_cluster_network_ready(client, name)
         if failure is not None:
             diagnostics = []
             for container in client.containers.list(all=True):
@@ -113,6 +151,9 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
                                 "systemctl status containerd --no-pager 2>&1 || true; "
                                 "printf '\nCONTAINERD JOURNAL\n'; "
                                 "journalctl -b -u containerd --no-pager 2>&1 || true; "
+                                "printf '\nKUBERNETES WORKLOADS\n'; "
+                                "kubectl --kubeconfig=/etc/kubernetes/admin.conf "
+                                "get pods -A -o wide 2>&1 || true; "
                                 "printf '\nCONTAINERD PLUGINS\n'; "
                                 "ctr plugins ls 2>&1 || true; "
                                 "printf '\nCONTAINERD CONFIG\n'; "

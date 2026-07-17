@@ -37,15 +37,36 @@ class GuestBuildScriptTests(unittest.TestCase):
         self.assertIn('make -C misc -j"$(nproc)" mke2fs.static', script)
         self.assertIn('install -m 0755 misc/mke2fs.static /mke2fs', script)
 
-    def test_kernel_build_includes_virtiofs_in_the_guest_kernel(self) -> None:
+    def test_kernel_build_includes_required_runtime_features_as_builtins(self) -> None:
         config = (ROOT / "Configuration" / "cengine-kernel.fragment").read_text()
         compiler = (ROOT / "Scripts" / "compile-kernel-in-guest.sh").read_text()
         image = (ROOT / "Configuration" / "kernel-build-image").read_text().strip()
+        settings = set(config.splitlines())
+        required = {
+            "CONFIG_FUSE_FS=y",
+            "CONFIG_VIRTIO_FS=y",
+            "CONFIG_OVERLAY_FS=y",
+            "CONFIG_VETH=y",
+            "CONFIG_BRIDGE_NETFILTER=y",
+            "CONFIG_NF_TABLES=y",
+            "CONFIG_NFT_NUMGEN=y",
+            "CONFIG_NFT_COMPAT=y",
+            "CONFIG_NFT_MASQ=y",
+            "CONFIG_NFT_NAT=y",
+            "CONFIG_NETFILTER_XTABLES=y",
+            "CONFIG_IP_NF_IPTABLES=y",
+            "CONFIG_IP6_NF_IPTABLES=y",
+            "CONFIG_IP_VS=y",
+            "CONFIG_VXLAN=y",
+            "CONFIG_MACVLAN=y",
+            "CONFIG_IPVLAN=y",
+        }
 
         self.assertRegex(image, r"^debian:trixie-slim@sha256:[0-9a-f]{64}$")
-        self.assertIn("CONFIG_FUSE_FS=y", config)
-        self.assertIn("CONFIG_VIRTIO_FS=y", config)
-        self.assertIn("grep -qx 'CONFIG_VIRTIO_FS=y' /build/.config", compiler)
+        self.assertTrue(required <= settings, required - settings)
+        self.assertFalse(any(line.endswith("=m") for line in settings))
+        self.assertIn('done < /fragment', compiler)
+        self.assertIn('kernel option did not resolve as built-in', compiler)
 
     def test_kernel_build_uses_buildx_without_cengine_virtualization(self) -> None:
         builder = (ROOT / "Scripts" / "build-kernel-linux.sh").read_text()
