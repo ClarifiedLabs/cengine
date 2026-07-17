@@ -22,6 +22,7 @@ private struct OwnedHelperVMNetUplink {
 @main enum CEngineNetworkHelper {
     private static let uplinkLock = NSLock()
     nonisolated(unsafe) private static var uplinks: [String: OwnedHelperVMNetUplink] = [:]
+    nonisolated(unsafe) private static var isTerminating = false
 
     static func main() {
         guard geteuid() == 0 else {
@@ -50,8 +51,19 @@ private struct OwnedHelperVMNetUplink {
             }
             xpc_connection_activate(peer)
         }
+        signal(SIGTERM, SIG_IGN)
+        let terminationSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        terminationSource.setEventHandler {
+            guard beginTermination() else { return }
+            Task {
+                await stopAllUplinks()
+                exit(0)
+            }
+        }
+        terminationSource.resume()
+
         xpc_connection_activate(listener)
-        dispatchMain()
+        withExtendedLifetime(terminationSource) { dispatchMain() }
     }
 
     private static func handle(
@@ -89,18 +101,18 @@ private struct OwnedHelperVMNetUplink {
                 Task {
                     do {
                         let previous = uplinkLock.withLock { () -> HelperVMNetUplink? in
-                            guard !session.isClosed else { return nil }
+                            guard !isTerminating, !session.isClosed else { return nil }
                             guard let previous = uplinks.removeValue(forKey: request.id) else { return nil }
                             previous.owner.networkIDs.remove(request.id)
                             return previous.uplink
                         }
                         await previous?.stop()
-                        guard !uplinkLock.withLock({ session.isClosed }) else {
+                        guard !uplinkLock.withLock({ isTerminating || session.isClosed }) else {
                             throw EngineError(.internalError, "vmnet client disconnected")
                         }
                         let (uplink, clientDescriptor) = try await HelperVMNetUplink.start(request: request)
                         let registration = uplinkLock.withLock { () -> (Bool, HelperVMNetUplink?) in
-                            guard !session.isClosed else { return (false, nil) }
+                            guard !isTerminating, !session.isClosed else { return (false, nil) }
                             let displaced = uplinks.removeValue(forKey: request.id)
                             displaced?.owner.networkIDs.remove(request.id)
                             uplinks[request.id] = OwnedHelperVMNetUplink(owner: session, uplink: uplink)
@@ -148,6 +160,32 @@ private struct OwnedHelperVMNetUplink {
             setError(error, reply: reply)
         }
         xpc_connection_send_message(peer, reply)
+    }
+
+    private static func beginTermination() -> Bool {
+        uplinkLock.withLock {
+            guard !isTerminating else { return false }
+            isTerminating = true
+            return true
+        }
+    }
+
+    private static func stopAllUplinks() async {
+        let active = uplinkLock.withLock { () -> [HelperVMNetUplink] in
+            let values = uplinks.values.map(\.uplink)
+            let sessions = uplinks.values.map(\.owner)
+            for session in sessions {
+                session.isClosed = true
+                session.networkIDs.removeAll()
+            }
+            uplinks.removeAll()
+            return values
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for uplink in active {
+                group.addTask { await uplink.stop() }
+            }
+        }
     }
 
     private static func stopUplinks(for session: HelperPeerSession) async {
@@ -281,47 +319,7 @@ private final class HelperVMNetUplink: @unchecked Sendable {
     private var stopTask: Task<Void, Never>?
 
     static func start(request: PrivilegedVMNetRequest) async throws -> (HelperVMNetUplink, CInt) {
-        var status = vmnet_return_t.VMNET_SUCCESS
-        let mode = request.internalNetwork ? vmnet_mode_t.VMNET_HOST_MODE : vmnet_mode_t.VMNET_SHARED_MODE
-        guard let configuration = vmnet_network_configuration_create(mode, &status), status == .VMNET_SUCCESS else {
-            throw failure("create vmnet configuration", status)
-        }
-        let configurationOwner = RetainedOpaquePointer(configuration, release: releaseCFObject)
-        defer { withExtendedLifetime(configurationOwner) {} }
-        if !request.dhcpEnabled {
-            vmnet_network_configuration_disable_dhcp(configuration)
-        }
-        let (_, mask) = try ipv4Subnet(request.subnet)
-        var subnetValue = try ipv4Gateway(request.gateway, in: request.subnet)
-        var maskValue = mask
-        guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
-            throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
-        }
-        if !request.ipv6Subnet.isEmpty {
-            let (prefix, prefixLength) = try ipv6Prefix(request.ipv6Subnet)
-            var prefixValue = prefix
-            guard vmnet_network_configuration_set_ipv6_prefix(configuration, &prefixValue, prefixLength) == .VMNET_SUCCESS else {
-                throw EngineError(.badRequest, "vmnet rejected IPv6 prefix \(request.ipv6Subnet)")
-            }
-        }
-        for port in request.internalNetwork ? [] : request.ports {
-            var address = in_addr()
-            guard inet_pton(AF_INET, port.internalAddress, &address) == 1 else {
-                throw EngineError(.badRequest, "invalid port-forward address \(port.internalAddress)")
-            }
-            let proto = port.proto.lowercased() == "udp" ? UInt8(IPPROTO_UDP) : UInt8(IPPROTO_TCP)
-            let result = withUnsafePointer(to: &address) {
-                vmnet_network_configuration_add_port_forwarding_rule(
-                    configuration, proto, sa_family_t(AF_INET),
-                    port.internalPort, port.externalPort, $0
-                )
-            }
-            guard result == .VMNET_SUCCESS else { throw failure("configure vmnet port forwarding", result) }
-        }
-        guard let networkObject = vmnet_network_create(configuration, &status), status == .VMNET_SUCCESS else {
-            throw failure("reserve vmnet network", status)
-        }
-        let networkOwner = RetainedOpaquePointer(networkObject, release: releaseCFObject)
+        let networkOwner = try createNetwork(request: request)
         let descriptor = xpc_dictionary_create(nil, nil, 0)
         // A cengine uplink is a VLAN trunk carrying many container MAC addresses,
         // not a single VM interface using a vmnet-assigned address.
@@ -333,7 +331,7 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         var reference: interface_ref?
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                reference = vmnet_interface_start_with_network(networkObject, descriptor, queue) { status, _ in
+                reference = vmnet_interface_start_with_network(networkOwner.value, descriptor, queue) { status, _ in
                     if status == .VMNET_SUCCESS { continuation.resume() }
                     else { continuation.resume(throwing: failure("start vmnet interface", status)) }
                 }
@@ -378,6 +376,50 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         )
         value.startReading()
         return (value, sockets[1])
+    }
+
+    private static func createNetwork(request: PrivilegedVMNetRequest) throws -> RetainedOpaquePointer {
+        var status = vmnet_return_t.VMNET_SUCCESS
+        let mode = request.internalNetwork ? vmnet_mode_t.VMNET_HOST_MODE : vmnet_mode_t.VMNET_SHARED_MODE
+        guard let configuration = vmnet_network_configuration_create(mode, &status), status == .VMNET_SUCCESS else {
+            throw failure("create vmnet configuration", status)
+        }
+        let configurationOwner = RetainedOpaquePointer(configuration, release: releaseCFObject)
+        defer { withExtendedLifetime(configurationOwner) {} }
+        if !request.dhcpEnabled {
+            vmnet_network_configuration_disable_dhcp(configuration)
+        }
+        let (_, mask) = try ipv4Subnet(request.subnet)
+        var subnetValue = try ipv4Gateway(request.gateway, in: request.subnet)
+        var maskValue = mask
+        guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
+            throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
+        }
+        if !request.ipv6Subnet.isEmpty {
+            let (prefix, prefixLength) = try ipv6Prefix(request.ipv6Subnet)
+            var prefixValue = prefix
+            guard vmnet_network_configuration_set_ipv6_prefix(configuration, &prefixValue, prefixLength) == .VMNET_SUCCESS else {
+                throw EngineError(.badRequest, "vmnet rejected IPv6 prefix \(request.ipv6Subnet)")
+            }
+        }
+        for port in request.internalNetwork ? [] : request.ports {
+            var address = in_addr()
+            guard inet_pton(AF_INET, port.internalAddress, &address) == 1 else {
+                throw EngineError(.badRequest, "invalid port-forward address \(port.internalAddress)")
+            }
+            let proto = port.proto.lowercased() == "udp" ? UInt8(IPPROTO_UDP) : UInt8(IPPROTO_TCP)
+            let result = withUnsafePointer(to: &address) {
+                vmnet_network_configuration_add_port_forwarding_rule(
+                    configuration, proto, sa_family_t(AF_INET),
+                    port.internalPort, port.externalPort, $0
+                )
+            }
+            guard result == .VMNET_SUCCESS else { throw failure("configure vmnet port forwarding", result) }
+        }
+        guard let network = vmnet_network_create(configuration, &status), status == .VMNET_SUCCESS else {
+            throw failure("reserve vmnet network", status)
+        }
+        return RetainedOpaquePointer(network, release: releaseCFObject)
     }
 
     private init(

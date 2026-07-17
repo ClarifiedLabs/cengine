@@ -230,6 +230,7 @@ builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 | `BLD-002` | `test_buildx_pull_succeeds_after_daemon_restart` | ✅ Pass | Support | **cengine-owned.** A recovered BuildKit VM regains carrier, DNS, and registry access for a fresh pull. |
 | `BLD-003` | `test_buildx_overlay_worker_has_large_state_volume` | ✅ Pass | Support | **cengine-owned.** Parallel stages use overlayfs on a 512 GiB sparse block-backed state volume. |
 | `BLD-004` | `test_buildx_relaunches_missing_stopped_container_shim` | ✅ Pass | Support | **cengine-owned.** A stopped BuildKit container relaunches its missing VM shim after a daemon replacement without losing its writable root. |
+| `BLD-005` | `test_buildx_recovers_uplink_after_network_helper_restart` | ✅ Pass | Support | **cengine-owned.** A running BuildKit VM automatically recreates its vmnet uplink after the privileged networking helper restarts. |
 
 ## Daemon recovery
 

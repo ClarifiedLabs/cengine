@@ -33,6 +33,35 @@ def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.
     return result
 
 
+def restart_compatibility_network_helper() -> None:
+    label = os.environ.get("CENGINE_COMPAT_BOOTSTRAPPED_NETWORK_HELPER_LABEL")
+    control_root_value = os.environ.get("CENGINE_COMPAT_NETWORK_HELPER_CONTROL_ROOT")
+    if not label or not control_root_value:
+        pytest.skip("helper restart requires the isolated compatibility networking helper")
+
+    control_root = pathlib.Path(control_root_value)
+    request_id = uuid.uuid4().hex
+    request = control_root / "requests" / f"restart-{request_id}"
+    response = control_root / "status" / f"restart-{request_id}.status"
+    output = control_root / "status" / f"restart-{request_id}.output"
+    request.touch(exist_ok=False)
+
+    deadline = time.monotonic() + 120
+    while not response.is_file():
+        if not control_root.is_dir():
+            pytest.fail("privileged compatibility networking helper session exited during restart")
+        if time.monotonic() >= deadline:
+            pytest.fail("timed out waiting for compatibility networking helper restart")
+        time.sleep(0.1)
+
+    restart_output = output.read_text(errors="replace") if output.is_file() else ""
+    try:
+        status = int(response.read_text().strip())
+    except ValueError:
+        pytest.fail(f"invalid compatibility networking helper restart status:\n{restart_output}")
+    assert status == 0, f"could not restart compatibility networking helper:\n{restart_output}"
+
+
 @pytest.mark.compat("BLD-001")
 def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClient):
     suffix = uuid.uuid4().hex[:8]
@@ -119,6 +148,61 @@ def test_buildx_pull_succeeds_after_daemon_restart(daemon, client: docker.Docker
             if time.monotonic() >= deadline:
                 pytest.fail(f"buildkit did not recover after daemon restart: {buildkit.attrs['State']}")
             time.sleep(0.2)
+
+        result = buildx(
+            "build", "--builder", builder, "--pull", "--no-cache", "--load",
+            "--tag", tag, str(BUILD_CONTEXT), docker_host=docker_host,
+        )
+        assert "ERROR" not in result.stdout
+        assert client.containers.run(tag, remove=True).strip() == b"cengine-buildx-ok"
+    finally:
+        subprocess.run(
+            ["docker", "buildx", "rm", "--force", builder], cwd=REPO_ROOT,
+            env=docker_environment(docker_host), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=60,
+        )
+
+
+@pytest.mark.compat("BLD-005")
+def test_buildx_recovers_uplink_after_network_helper_restart(
+    daemon, client: docker.DockerClient
+):
+    suffix = uuid.uuid4().hex[:8]
+    builder = f"compat-helper-recovery-builder-{suffix}"
+    tag = f"compat-helper-recovery-buildx:{suffix}"
+    docker_host = f"unix://{daemon.socket}"
+    try:
+        buildx(
+            "create", "--name", builder, "--driver", "docker-container",
+            "--driver-opt", f"image={BUILDKIT_IMAGE}",
+            "--driver-opt", "memory=4294967296",
+            "--buildkitd-config", str(BUILDKIT_CONFIG),
+            "--buildkitd-flags", "--oci-worker-snapshotter=overlayfs",
+            docker_host, docker_host=docker_host,
+        )
+        buildx("inspect", "--builder", builder, "--bootstrap", docker_host=docker_host)
+        buildkit = client.containers.get(f"buildx_buildkit_{builder}0")
+        initial = buildkit.exec_run(["nslookup", "mirror.gcr.io"])
+        assert initial.exit_code == 0, initial.output.decode(errors="replace")
+
+        restart_compatibility_network_helper()
+
+        deadline = time.monotonic() + 30
+        output = b"uplink did not recover"
+        while time.monotonic() < deadline:
+            probe = buildkit.exec_run(["nslookup", "mirror.gcr.io"])
+            output = probe.output
+            if probe.exit_code == 0:
+                break
+            time.sleep(0.2)
+        else:
+            shim_log = daemon.root / "infrastructure" / "shim.log"
+            shim_output = shim_log.read_text(errors="replace") if shim_log.is_file() else "unavailable"
+            pytest.fail(
+                "BuildKit DNS did not recover after helper restart:\n"
+                f"{output.decode(errors='replace')}\n"
+                f"Infrastructure shim log:\n{shim_output}"
+            )
 
         result = buildx(
             "build", "--builder", builder, "--pull", "--no-cache", "--load",

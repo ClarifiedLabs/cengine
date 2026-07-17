@@ -11,7 +11,8 @@ public actor TrunkNetworkFabric {
     private struct Endpoint {
         let file: FileHandle
         var vlans: Set<UInt16>
-        let registration: UUID?
+        let registration: UUID
+        let onDisconnect: (@Sendable () -> Void)?
     }
 
     private struct LearnedAddress: Hashable {
@@ -30,40 +31,58 @@ public actor TrunkNetworkFabric {
 
     public init() {}
 
-    public func register(_ id: EndpointID, file: FileHandle, vlans: Set<UInt16> = []) {
-        register(id, file: file, vlans: vlans, registration: nil)
+    public func register(
+        _ id: EndpointID,
+        file: FileHandle,
+        vlans: Set<UInt16> = [],
+        onDisconnect: (@Sendable () -> Void)? = nil
+    ) {
+        register(id, file: file, vlans: vlans, registration: UUID(), onDisconnect: onDisconnect)
     }
 
-    func register(_ id: EndpointID, file: FileHandle, vlans: Set<UInt16>, registration: UUID) {
-        register(id, file: file, vlans: vlans, registration: Optional(registration))
-    }
-
-    private func register(_ id: EndpointID, file: FileHandle, vlans: Set<UInt16>, registration: UUID?) {
+    func register(
+        _ id: EndpointID,
+        file: FileHandle,
+        vlans: Set<UInt16>,
+        registration: UUID,
+        onDisconnect: (@Sendable () -> Void)? = nil
+    ) {
         unregister(id)
-        endpoints[id] = Endpoint(file: file, vlans: vlans, registration: registration)
+        endpoints[id] = Endpoint(
+            file: file,
+            vlans: vlans,
+            registration: registration,
+            onDisconnect: onDisconnect
+        )
         file.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else {
-                Task { await self?.unregister(id, registration: registration) }
+                Task { await self?.unregisterDisconnected(id, registration: registration) }
                 return
             }
-            Task { await self?.receive(data, from: id) }
+            Task { await self?.receive(data, from: id, registration: registration) }
         }
     }
 
     public func unregister(_ id: EndpointID) {
-        unregister(id, registration: nil)
+        unregister(id, registration: nil, notifyDisconnect: false)
     }
 
     func unregister(_ id: EndpointID, registration: UUID) {
-        unregister(id, registration: Optional(registration))
+        unregister(id, registration: registration, notifyDisconnect: false)
     }
 
-    private func unregister(_ id: EndpointID, registration: UUID?) {
+    private func unregisterDisconnected(_ id: EndpointID, registration: UUID) {
+        unregister(id, registration: registration, notifyDisconnect: true)
+    }
+
+    private func unregister(_ id: EndpointID, registration: UUID?, notifyDisconnect: Bool) {
         if let registration, endpoints[id]?.registration != registration { return }
+        let onDisconnect = endpoints[id]?.onDisconnect
         endpoints[id]?.file.readabilityHandler = nil
         endpoints.removeValue(forKey: id)
         learned = learned.filter { $0.value != id }
+        if notifyDisconnect { onDisconnect?() }
     }
 
     public func connect(_ id: EndpointID, vlan: UInt16) throws {
@@ -79,8 +98,9 @@ public actor TrunkNetworkFabric {
 
     public func memberships(_ id: EndpointID) -> Set<UInt16> { endpoints[id]?.vlans ?? [] }
 
-    private func receive(_ data: Data, from sourceID: EndpointID) {
-        guard let frame = VLANFrame(data), endpoints[sourceID]?.vlans.contains(frame.vlan) == true else { return }
+    private func receive(_ data: Data, from sourceID: EndpointID, registration: UUID) {
+        guard endpoints[sourceID]?.registration == registration,
+              let frame = VLANFrame(data), endpoints[sourceID]?.vlans.contains(frame.vlan) == true else { return }
         learned[.init(vlan: frame.vlan, address: frame.source)] = sourceID
         let recipients: [EndpointID]
         if !frame.destination.isBroadcast, !frame.destination.isMulticast,
@@ -97,7 +117,8 @@ public actor TrunkNetworkFabric {
             catch {
                 if Self.isTransientPacketWriteError(error) { continue }
                 FileHandle.standardError.write(Data("network fabric write to \(recipient.rawValue) failed (\(data.count) bytes): \(error)\n".utf8))
-                unregister(recipient)
+                guard let registration = endpoints[recipient]?.registration else { continue }
+                unregisterDisconnected(recipient, registration: registration)
             }
         }
     }

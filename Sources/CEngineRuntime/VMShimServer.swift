@@ -9,6 +9,11 @@ import Foundation
         let bridge: NetworkStreamBridge
     }
 
+    private struct UplinkRecovery {
+        let generation: UUID
+        let task: Task<Void, Never>
+    }
+
     private let specification: VMShimProtocol.Specification
     private var machine: RawContainerVirtualMachine?
     private var state: VMShimProtocol.State = .created
@@ -24,6 +29,7 @@ import Foundation
     private var networkBridges: [String: NetworkBridgeRegistration] = [:]
     private var activeVLANs: [UInt16]
     private var uplinks: [String: VMNetUplink] = [:]
+    private var uplinkRecoveries: [String: UplinkRecovery] = [:]
     private var fabricNetworks: [String: VMShimClient.FabricNetwork] = [:]
 
     public init(specification: VMShimProtocol.Specification) {
@@ -297,6 +303,7 @@ import Foundation
     private func configureFabric(_ values: [VMShimClient.FabricNetwork]) async throws {
         let desired = Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) })
         for id in Set(fabricNetworks.keys).union(desired.keys) where fabricNetworks[id] != desired[id] {
+            await cancelUplinkRecovery(id: id)
             if let existing = uplinks.removeValue(forKey: id) {
                 await fabric.unregister(.init("uplink-\(id)")); await existing.stop()
             }
@@ -305,9 +312,91 @@ import Foundation
             fabricNetworks[id] = network
             if network.isolated { continue }
             let uplink = try await VMNetUplink.start(network: network)
-            uplinks[id] = uplink
-            await fabric.register(.init("uplink-\(id)"), file: uplink.fabricFileHandle, vlans: [network.vlan])
+            await installUplink(uplink, network: network)
         }
+    }
+
+    private func installUplink(_ uplink: VMNetUplink, network: VMShimClient.FabricNetwork) async {
+        let registration = UUID()
+        let onDisconnect: @Sendable () -> Void = { [weak self, weak uplink] in
+            Task { @MainActor [weak self, weak uplink] in
+                guard let self, let uplink else { return }
+                self.uplinkDisconnected(
+                    id: network.id,
+                    uplink: uplink,
+                    registration: registration
+                )
+            }
+        }
+        uplinks[network.id] = uplink
+        uplink.setDisconnectHandler(onDisconnect)
+        await fabric.register(
+            .init("uplink-\(network.id)"),
+            file: uplink.fabricFileHandle,
+            vlans: [network.vlan],
+            registration: registration,
+            onDisconnect: onDisconnect
+        )
+    }
+
+    private func uplinkDisconnected(id: String, uplink: VMNetUplink, registration: UUID) {
+        guard uplinks[id] === uplink else { return }
+        uplinks.removeValue(forKey: id)
+        FileHandle.standardError.write(Data("vmnet uplink \(id) disconnected; recreating it\n".utf8))
+        let fabric = self.fabric
+        Task {
+            await fabric.unregister(.init("uplink-\(id)"), registration: registration)
+            await uplink.stop()
+        }
+
+        uplinkRecoveries.removeValue(forKey: id)?.task.cancel()
+        let generation = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.recoverUplink(id: id, generation: generation)
+        }
+        uplinkRecoveries[id] = .init(generation: generation, task: task)
+    }
+
+    private func recoverUplink(id: String, generation: UUID) async {
+        var failures = 0
+        defer {
+            if uplinkRecoveries[id]?.generation == generation {
+                uplinkRecoveries.removeValue(forKey: id)
+            }
+        }
+
+        while !Task.isCancelled, uplinkRecoveries[id]?.generation == generation,
+              uplinks[id] == nil, let network = fabricNetworks[id], !network.isolated {
+            do {
+                let replacement = try await VMNetUplink.start(network: network)
+                guard !Task.isCancelled,
+                      uplinkRecoveries[id]?.generation == generation,
+                      uplinks[id] == nil,
+                      fabricNetworks[id] == network else {
+                    await replacement.stop()
+                    return
+                }
+                await installUplink(replacement, network: network)
+                FileHandle.standardError.write(Data("vmnet uplink \(id) restored\n".utf8))
+                return
+            } catch {
+                guard !Task.isCancelled, uplinkRecoveries[id]?.generation == generation else { return }
+                failures += 1
+                if failures == 1 {
+                    FileHandle.standardError.write(Data("vmnet uplink \(id) recovery failed; retrying: \(error)\n".utf8))
+                }
+                let delayMilliseconds = min(100 * (1 << min(failures, 5)), 5_000)
+                do { try await Task.sleep(for: .milliseconds(delayMilliseconds)) }
+                catch { return }
+            }
+        }
+    }
+
+    private func cancelUplinkRecovery(id: String) async {
+        guard let recovery = uplinkRecoveries.removeValue(forKey: id) else { return }
+        recovery.task.cancel()
+        await recovery.task.value
     }
 
     private func acceptStorageClient(_ descriptor: Int32) async {

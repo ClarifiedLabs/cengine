@@ -5,6 +5,14 @@ import Testing
 @testable import CEngineRuntime
 
 @Suite struct VMNetUplinkTests {
+    private final class EventState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        var count: Int { lock.withLock { value } }
+        func record() { lock.withLock { value += 1 } }
+    }
+
     @Test func vlanTagRoundTripsWithoutChangingEthernetFrame() {
         let frame = Data([0,1,2,3,4,5,6,7,8,9,10,11,0x08,0x00,0x45,0,0,20])
         let tagged = VMNetUplink.tag(frame, vlan: 4094)
@@ -41,6 +49,29 @@ import Testing
         #expect(last.subnet == "10.255.253.0/24")
         #expect(last.gateway == "10.255.253.1")
         #expect(RawVirtualizationBackend.nextAvailableVLAN(used: Set(1...4093)) == nil)
+    }
+
+    @Test func uplinkDisconnectBeforeHandlerIsDeliveredExactlyOnce() {
+        let events = VMNetUplinkEvents()
+        let state = EventState()
+
+        events.disconnect()
+        events.setDisconnectHandler { state.record() }
+        events.setDisconnectHandler { state.record() }
+        events.disconnect()
+
+        #expect(state.count == 1)
+    }
+
+    @Test func intentionalUplinkCancellationSuppressesDisconnect() {
+        let events = VMNetUplinkEvents()
+        let state = EventState()
+
+        events.setDisconnectHandler { state.record() }
+        events.cancel()
+        events.disconnect()
+
+        #expect(state.count == 0)
     }
 
     @Test func unavailablePrivilegedNetworkingHelperHasBoundedDeadline() async {

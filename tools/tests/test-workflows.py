@@ -94,8 +94,12 @@ def main() -> None:
         "compat_network_helper_bootstrap_local",
         "launchctl bootstrap system",
         "compat_network_helper_cleanup_local",
+        "/usr/bin/osascript -",
+        "with administrator privileges",
     ):
         require_contains(compat_helper, needle, "compat-network-helper.sh")
+    if compat_helper.count("with administrator privileges") != 1:
+        raise AssertionError("compatibility helper lifecycle must use one administrator session")
     for needle in (
         '<Scheme',
         'buildConfiguration = "test-compat"',

@@ -4,6 +4,14 @@ import Testing
 @testable import CEngineRuntime
 
 @Suite struct TrunkNetworkFabricTests {
+    private final class DisconnectState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        var count: Int { lock.withLock { value } }
+        func record() { lock.withLock { value += 1 } }
+    }
+
     @Test func vlanFrameParsesTaggedEthernetHeader() {
         let bytes: [UInt8] = [
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -30,6 +38,46 @@ import Testing
         #expect(TrunkNetworkFabric.isTransientPacketWriteError(nested))
         #expect(TrunkNetworkFabric.isTransientPacketWriteError(POSIXError(.EAGAIN)))
         #expect(!TrunkNetworkFabric.isTransientPacketWriteError(POSIXError(.EPIPE)))
+    }
+
+    @Test func peerClosureUnregistersEndpointAndReportsDisconnect() async throws {
+        let fabric = TrunkNetworkFabric()
+        let id = TrunkNetworkFabric.EndpointID("uplink")
+        let trunk = try RawPacketTrunk()
+        let sender = try RawPacketTrunk()
+        let state = DisconnectState()
+
+        await fabric.register(id, file: trunk.fabricFileHandle, vlans: [1]) { state.record() }
+        await fabric.register(.init("sender"), file: sender.fabricFileHandle, vlans: [1])
+        try trunk.virtualMachineFileHandle.close()
+        let frame = Data([
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x81, 0x00, 0x00, 0x01,
+            0x08, 0x00,
+        ])
+        try sender.virtualMachineFileHandle.write(contentsOf: frame)
+
+        for _ in 0..<100 where state.count == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(state.count == 1)
+        #expect(await fabric.memberships(id).isEmpty)
+    }
+
+    @Test func intentionalUnregisterDoesNotReportDisconnect() async throws {
+        let fabric = TrunkNetworkFabric()
+        let id = TrunkNetworkFabric.EndpointID("uplink")
+        let trunk = try RawPacketTrunk()
+        let state = DisconnectState()
+
+        await fabric.register(id, file: trunk.fabricFileHandle, vlans: [1]) { state.record() }
+        await fabric.unregister(id)
+        try trunk.virtualMachineFileHandle.close()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(state.count == 0)
     }
 
     @Test func staleRegistrationCannotUnregisterReplacementEndpoint() async throws {

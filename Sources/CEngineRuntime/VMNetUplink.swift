@@ -9,6 +9,7 @@ final class VMNetUplink: @unchecked Sendable {
 
     private let networkID: String
     private let connection: xpc_connection_t
+    private let events: VMNetUplinkEvents
     private let lock = NSLock()
     private var stopped = false
 
@@ -32,18 +33,33 @@ final class VMNetUplink: @unchecked Sendable {
         )
         let serviceName = PrivilegedPortProtocol.serviceName
         let teamIdentifier = Bundle.main.object(forInfoDictionaryKey: "CEngineTeamIdentifier") as? String ?? ""
-        let transport = try await requestUplink(request, serviceName: serviceName, teamIdentifier: teamIdentifier)
+        let transport = try await requestUplink(
+            request,
+            serviceName: serviceName,
+            teamIdentifier: teamIdentifier
+        )
         return VMNetUplink(
             networkID: request.id,
             descriptor: transport.descriptor,
-            connection: transport.connection
+            connection: transport.connection,
+            events: transport.events
         )
     }
 
-    private init(networkID: String, descriptor: CInt, connection: xpc_connection_t) {
+    private init(
+        networkID: String,
+        descriptor: CInt,
+        connection: xpc_connection_t,
+        events: VMNetUplinkEvents
+    ) {
         self.networkID = networkID
         self.connection = connection
+        self.events = events
         fabricFileHandle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    func setDisconnectHandler(_ handler: @escaping @Sendable () -> Void) {
+        events.setDisconnectHandler(handler)
     }
 
     func stop() async {
@@ -52,6 +68,7 @@ final class VMNetUplink: @unchecked Sendable {
             stopped = true
             return true
         }) else { return }
+        events.cancel()
         try? fabricFileHandle.close()
 
         let message = xpc_dictionary_create(nil, nil, 0)
@@ -74,6 +91,7 @@ final class VMNetUplink: @unchecked Sendable {
         let encoded = try JSONEncoder().encode(request)
         return try await awaitUplinkReply(timeout: .seconds(5)) { reply in
             let connection = xpc_connection_create_mach_service(serviceName, nil, 0)
+            let events = VMNetUplinkEvents()
             reply.attach(connection)
             let requirement = signingRequirement(identifier: PrivilegedPortProtocol.helperIdentifier, teamIdentifier: teamIdentifier)
             let status = requirement.withCString {
@@ -85,7 +103,9 @@ final class VMNetUplink: @unchecked Sendable {
                 )))
                 return
             }
-            xpc_connection_set_event_handler(connection) { _ in }
+            xpc_connection_set_event_handler(connection) { event in
+                if xpc_get_type(event) == XPC_TYPE_ERROR { events.disconnect() }
+            }
             xpc_connection_activate(connection)
             let message = xpc_dictionary_create(nil, nil, 0)
             xpc_dictionary_set_int64(message, "version", PrivilegedPortProtocol.version)
@@ -120,7 +140,11 @@ final class VMNetUplink: @unchecked Sendable {
                     reply.finish(.failure(EngineError(.internalError, "privileged networking helper returned an invalid packet socket")))
                     return
                 }
-                reply.finish(.success(.init(descriptor: descriptor, connection: connection)))
+                reply.finish(.success(.init(
+                    descriptor: descriptor,
+                    connection: connection,
+                    events: events
+                )))
             }
         }
     }
@@ -168,6 +192,47 @@ final class VMNetUplink: @unchecked Sendable {
 struct VMNetUplinkTransport: @unchecked Sendable {
     let descriptor: CInt
     let connection: xpc_connection_t
+    let events: VMNetUplinkEvents
+}
+
+final class VMNetUplinkEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var disconnectHandler: (@Sendable () -> Void)?
+    private var isDisconnected = false
+    private var didDeliverDisconnect = false
+    private var isCancelled = false
+
+    func setDisconnectHandler(_ handler: @escaping @Sendable () -> Void) {
+        let notify = lock.withLock { () -> Bool in
+            guard !isCancelled, !didDeliverDisconnect else { return false }
+            if isDisconnected {
+                didDeliverDisconnect = true
+                return true
+            }
+            disconnectHandler = handler
+            return false
+        }
+        if notify { handler() }
+    }
+
+    func disconnect() {
+        let handler = lock.withLock { () -> (@Sendable () -> Void)? in
+            guard !isCancelled, !isDisconnected, !didDeliverDisconnect else { return nil }
+            isDisconnected = true
+            guard let disconnectHandler else { return nil }
+            didDeliverDisconnect = true
+            self.disconnectHandler = nil
+            return disconnectHandler
+        }
+        handler?()
+    }
+
+    func cancel() {
+        lock.withLock {
+            isCancelled = true
+            disconnectHandler = nil
+        }
+    }
 }
 
 final class VMNetUplinkReply: @unchecked Sendable {

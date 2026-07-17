@@ -158,7 +158,22 @@ def main() -> None:
     assert 'cengine-network-helper\\n' in helper_lifecycle
     assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME' in helper_lifecycle
     assert 'launchctl bootstrap system' in helper_lifecycle
-    assert 'launchctl bootout "system/$_cnh_label"' in helper_lifecycle
+    assert 'launchctl bootout "system/$label"' in helper_lifecycle
+    assert 'launchctl kill SIGTERM "system/$label"' in helper_lifecycle
+    assert 'launchctl kickstart "system/$label"' in helper_lifecycle
+    assert 'launchctl kickstart -k "system/$label"' not in helper_lifecycle
+    assert helper_lifecycle.count("/usr/bin/osascript -") == 1
+    assert helper_lifecycle.count("with administrator privileges") == 1
+    assert '"$request_root"/restart-*' in helper_lifecycle
+    assert ': > "$_cnh_control_root/requests/stop"' in helper_lifecycle
+    assert "/usr/bin/sudo" not in helper_lifecycle
+
+    buildx_test = (REPO_ROOT / "Tests" / "Compatibility" / "test_buildx.py").read_text()
+    assert "CENGINE_COMPAT_NETWORK_HELPER_CONTROL_ROOT" in buildx_test
+    assert 'f"restart-{request_id}"' in buildx_test
+    assert "/usr/bin/osascript" not in buildx_test
+    assert "with administrator privileges" not in buildx_test
+    assert "/usr/bin/sudo" not in buildx_test
 
     reset = (REPO_ROOT / "Scripts" / "reset-compat-runtime.py").read_text()
     assert "binary.is_file()" not in reset
