@@ -144,6 +144,13 @@ reconnects control sockets and does not stop workloads. Runtime sockets
 remain under `~/.cengine/run`, and daemon logs are under
 `~/Library/Logs/cengine`.
 
+To exercise pressure-aware ballooning manually, start one or more containers,
+run `sudo memory_pressure -S -l warn`, and inspect each container's
+`~/Library/Application Support/cengine/containers/<id>/shim.log`. The first
+warning or critical transition logs guest availability and the selected balloon
+target; returning to normal logs restoration to the VM maximum. Stop the
+`memory_pressure` process after observing both transitions.
+
 ## Implementation scope
 
 This repository is an experimental engine rather than a complete

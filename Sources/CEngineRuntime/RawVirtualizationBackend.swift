@@ -484,7 +484,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 "requested CPU limit of \(container.cpus) exceeds running VM capacity of \(shim.specification.cpus); stop the container before increasing its VM capacity"
             )
         }
-        guard container.memoryBytes <= shim.specification.memoryBytes else {
+        let requiredMemoryBytes = try VirtualMachineMemory.capacity(forHardLimit: container.memoryBytes)
+        guard requiredMemoryBytes <= shim.specification.memoryBytes else {
             throw EngineError(
                 .conflict,
                 "requested memory limit of \(container.memoryBytes) bytes exceeds running VM capacity of \(shim.specification.memoryBytes) bytes; stop the container before increasing its VM capacity"
@@ -759,7 +760,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             rootDiskPath: directory.appending(path: "root.ext4").path,
             volumeDisks: volumeDisks,
             cpus: max(container.cpus, 1),
-            memoryBytes: max(container.memoryBytes, 256 * 1_024 * 1_024),
+            memoryBytes: try VirtualMachineMemory.capacity(forHardLimit: container.memoryBytes),
             macAddress: Self.macAddress(container.id),
             bindShares: container.mounts.enumerated().compactMap { index, mount in
                 guard mount.kind == .bind, let source = bindSources[index],

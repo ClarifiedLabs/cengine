@@ -336,7 +336,7 @@ def test_top_and_update(client: docker.DockerClient, top):
     code, limits = top.exec_run([
         "sh", "-c", "cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/cpu.max",
     ])
-    assert code == 0
+    assert code == 0, limits
     code, updated_boot_id = top.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
     assert code == 0
     assert top.attrs["HostConfig"]["Memory"] == 64 * 1024 * 1024

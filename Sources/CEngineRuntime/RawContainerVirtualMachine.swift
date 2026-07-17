@@ -1,5 +1,6 @@
 #if os(macOS)
 import CEngineCore
+import Dispatch
 import Foundation
 @preconcurrency import Virtualization
 
@@ -10,6 +11,9 @@ import Foundation
     public private(set) var stopError: Error?
 
     private let machine: VZVirtualMachine
+    private let maximumMemoryBytes: UInt64
+    private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
+    private var memoryPressureState = MemoryBalloonPressureState()
 
     public init(configuration: RawVirtualMachineConfiguration) throws {
         identifier = configuration.id
@@ -28,7 +32,9 @@ import Foundation
             bindShares: configuration.bindShares,
             kernelArguments: configuration.kernelArguments
         )
-        machine = VZVirtualMachine(configuration: try value.makeVirtualizationConfiguration())
+        let virtualizationConfiguration = try value.makeVirtualizationConfiguration()
+        maximumMemoryBytes = virtualizationConfiguration.memorySize
+        machine = VZVirtualMachine(configuration: virtualizationConfiguration)
         super.init()
         machine.delegate = self
     }
@@ -42,6 +48,7 @@ import Foundation
                 let guest = GuestControlConnection(connection: SendableVirtioSocketConnection(connection))
                 try await guest.ping()
                 control = guest
+                startMemoryPressureMonitoring()
                 return
             } catch {
                 lastError = error
@@ -119,16 +126,95 @@ import Foundation
     }
 
     public func forceStop() async throws {
+        stopMemoryPressureMonitoring()
         control = nil
         guard machine.canStop else { return }
         try await machine.stop()
     }
 
-    public func guestDidStop(_ virtualMachine: VZVirtualMachine) {}
+    public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        stopMemoryPressureMonitoring()
+        control = nil
+    }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
         stopError = error
+        stopMemoryPressureMonitoring()
         control = nil
+    }
+
+    private func startMemoryPressureMonitoring() {
+        guard memoryPressureSource == nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.normal, .warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self, weak source] in
+            guard let self, let event = source?.data else { return }
+            Task { @MainActor in
+                await self.handleMemoryPressure(event)
+            }
+        }
+        memoryPressureSource = source
+        source.resume()
+    }
+
+    private func stopMemoryPressureMonitoring() {
+        memoryPressureSource?.cancel()
+        memoryPressureSource = nil
+        memoryPressureState = MemoryBalloonPressureState()
+    }
+
+    private func handleMemoryPressure(_ event: DispatchSource.MemoryPressureEvent) async {
+        let constrained = event.contains(.warning) || event.contains(.critical)
+        guard constrained || event.contains(.normal) else { return }
+        let level = event.contains(.critical) ? "critical" : (event.contains(.warning) ? "warning" : "normal")
+        let action = memoryPressureState.transition(toConstrained: constrained)
+        guard action != .none else { return }
+        guard let balloon = machine.memoryBalloonDevices.first as? VZVirtioTraditionalMemoryBalloonDevice else {
+            logMemoryBalloon("pressure=\(level) ignored: VM has no memory balloon device")
+            return
+        }
+
+        switch action {
+        case .none:
+            return
+        case .restore:
+            balloon.targetVirtualMachineMemorySize = maximumMemoryBytes
+            logMemoryBalloon("pressure=normal target=\(maximumMemoryBytes) maximum=\(maximumMemoryBytes)")
+        case let .reclaim(generation):
+            guard machine.state == .running, let control else {
+                logMemoryBalloon("pressure=\(level) reclaim skipped: guest is not running")
+                return
+            }
+            do {
+                struct Empty: Codable {}
+                let status: GuestProtocol.MemoryStatus = try await control.request(
+                    operation: "prepare-memory-reclaim",
+                    payload: Empty(),
+                    response: GuestProtocol.MemoryStatus.self
+                )
+                guard memoryPressureState.isCurrent(generation: generation, constrained: true) else { return }
+                let maximum = maximumMemoryBytes
+                let available = min(status.availableBytes, status.totalBytes)
+                let target = MemoryBalloonPolicy.targetBytes(
+                    maximumBytes: maximum,
+                    availableBytes: available,
+                    minimumBytes: VZVirtualMachineConfiguration.minimumAllowedMemorySize
+                )
+                balloon.targetVirtualMachineMemorySize = target
+                logMemoryBalloon(
+                    "pressure=\(level) total=\(status.totalBytes) available=\(available) reclaimed=\(maximum - target) target=\(target) maximum=\(maximum)"
+                )
+            } catch {
+                guard memoryPressureState.isCurrent(generation: generation, constrained: true) else { return }
+                logMemoryBalloon("pressure=\(level) reclaim failed open: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func logMemoryBalloon(_ message: String) {
+        FileHandle.standardError.write(Data("vm \(identifier) memory balloon: \(message)\n".utf8))
     }
 }
 

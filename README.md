@@ -76,8 +76,11 @@ docker --context cengine buildx build --builder cengine-builder --load .
 Builds are supported through cengine's managed Buildx builder. Use
 `docker buildx build`; cengine does not implement Docker Engine's legacy
 `/build` API. The managed `cengine-builder` uses BuildKit's overlayfs
-snapshotter on a directly attached ext4 volume. Its builder VM defaults to 4
-CPUs, 4 GiB of memory, a 64 GiB root filesystem, and a separate 512 GiB sparse
+snapshotter on a directly attached ext4 volume. On first use, its resources are
+selected from the host: half the CPUs (minimum 4 where available, maximum 8)
+and 4 GiB, 6 GiB, or 8 GiB of memory on hosts with less than 16 GiB, 16–23 GiB,
+or at least 24 GiB, respectively. Saved settings remain explicit overrides.
+The builder also has a 64 GiB root filesystem and a separate 512 GiB sparse
 BuildKit state volume. View or change the CPU and memory settings from the app's
 Settings page or with the CLI:
 
@@ -100,7 +103,9 @@ cengine container resources --cpus 2 --memory 2g
 ```
 
 Explicit Docker or Compose CPU and memory limits take precedence over these
-defaults. Existing containers are not changed.
+defaults. Existing containers are not changed. A memory value is the workload's
+hard cgroup limit, matching Docker semantics; cengine adds a small, separate VM
+allowance for its guest kernel and supervisor.
 
 For tools that create containers without exposing resource flags, run the tool
 through a temporary cengine resource scope:

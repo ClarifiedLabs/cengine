@@ -26,8 +26,8 @@ digests.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-046`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
-| Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-046`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-047`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
+| Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-047`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-017`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP publishing is an intentional gap covered by `NET-017`. Endpoint sysctls, explicit IPv4 controls, and IPAM status remain gaps. |
 | Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, and authenticated registry round trips are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
@@ -125,6 +125,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-044` | `test_attached_exec_flushes_short_output_before_eof` | ✅ Pass | Support | **cengine-owned.** Short attached exec output is flushed before EOF, including rapid consecutive execs and clients that keep attached stdin open. |
 | `CTR-045` | `test_unprivileged_standard_devices_are_world_accessible` | ✅ Pass | Support | **cengine-owned.** Standard character devices retain mode `0666` and are usable after the workload drops root privileges. |
 | `CTR-046` | `test_concurrent_vm_starts_remain_responsive` | ✅ Pass | Support | **cengine-owned.** Twelve concurrent container creates and starts leave every running guest responsive to exec without starving shim control I/O. |
+| `CTR-047` | `test_container_memory_limit_is_separate_from_vm_capacity` | ✅ Pass | Support | **cengine-owned.** The Docker memory value remains the workload cgroup hard limit while the per-container VM includes separate guest overhead. |
 
 ## Testcontainers
 

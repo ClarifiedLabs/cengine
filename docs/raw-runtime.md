@@ -16,6 +16,22 @@ Containerization and does not run a shared Linux VM containing Docker.
   disk. Start boots a fresh guest from that disk and launches the workload as PID
   1 in new PID, mount, IPC, UTS, network, and cgroup namespaces.
 
+## CPU and memory
+
+Docker CPU and memory settings are workload hard limits. The guest cgroup uses
+the requested memory value unchanged, while the per-container VM capacity adds
+5% plus 64 MiB for the guest kernel and cengine supervisor (with a 256 MiB VM
+minimum). CPU quota remains the requested whole-CPU count.
+
+Each container shim monitors macOS memory pressure. On the first warning or
+critical event in a pressure cycle, it asks the guest to compact memory and
+report `MemAvailable`, then inflates the virtio balloon only for availability
+above a 512 MiB–1 GiB safety cushion. A normal event restores the VM to its full
+capacity and rearms reclamation. Repeated pressure events do not cause repeated
+compaction, and paused or unreachable guests fail open. The infrastructure
+storage VM is excluded because it uses the infrastructure start path rather
+than container guest control.
+
 ## Images and disks
 
 OCI manifests, indexes, configs, and blobs live in a content-addressed native

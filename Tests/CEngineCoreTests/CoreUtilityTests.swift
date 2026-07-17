@@ -27,7 +27,7 @@ import Testing
     }
 
     @Test func builderArgumentsProvisionRecommendedResources() {
-        let arguments = DockerIntegration.createBuilderArguments(.default)
+        let arguments = DockerIntegration.createBuilderArguments(.init(cpus: 4, memoryGiB: 4))
 
         #expect(arguments.contains("memory=4294967296"))
         #expect(arguments.contains("cpu-period=100000"))
@@ -38,12 +38,12 @@ import Testing
     @Test func builderInspectionMustMatchEveryManagedResource() {
         let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
 
-        #expect(DockerIntegration.builder(inspection, matches: .default))
+        #expect(DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 6, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 8)))
         #expect(!DockerIntegration.builder(
             inspection.replacingOccurrences(of: "overlayfs", with: "native"),
-            matches: .default
+            matches: .init(cpus: 4, memoryGiB: 4)
         ))
     }
 
@@ -51,7 +51,7 @@ import Testing
         let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
         var commands: [[String]] = []
 
-        try DockerIntegration.configureBuilder(.default) { arguments in
+        try DockerIntegration.configureBuilder(.init(cpus: 4, memoryGiB: 4)) { arguments in
             commands.append(arguments)
             return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
         }
@@ -111,10 +111,11 @@ import Testing
 }
 
 @Suite struct BuilderSettingsTests {
-    @Test func defaultsAreFourCPUsAndFourGiB() {
-        #expect(BuilderSettings.default.cpus == 4)
-        #expect(BuilderSettings.default.memoryGiB == 4)
-        #expect(BuilderSettings.default.memoryBytes == 4_294_967_296)
+    @Test func recommendationsScaleWithHostResources() {
+        #expect(BuilderSettings.recommended(hostCPUs: 8, hostMemoryBytes: 15 * VirtualMachineMemory.gibibyte) == .init(cpus: 4, memoryGiB: 4))
+        #expect(BuilderSettings.recommended(hostCPUs: 12, hostMemoryBytes: 16 * VirtualMachineMemory.gibibyte) == .init(cpus: 6, memoryGiB: 6))
+        #expect(BuilderSettings.recommended(hostCPUs: 20, hostMemoryBytes: 24 * VirtualMachineMemory.gibibyte) == .init(cpus: 8, memoryGiB: 8))
+        #expect(BuilderSettings.recommended(hostCPUs: 2, hostMemoryBytes: 8 * VirtualMachineMemory.gibibyte) == .init(cpus: 2, memoryGiB: 4))
     }
 
     @Test func settingsRoundTripThroughSharedFile() throws {
@@ -135,6 +136,44 @@ import Testing
         #expect(throws: EngineError.self) {
             try BuilderSettings(cpus: 4, memoryGiB: 17).validate(maximumCPUs: 8, maximumMemoryGiB: 16)
         }
+    }
+}
+
+@Suite struct VirtualMachineMemoryTests {
+    @Test func capacityAddsGuestReserveWithoutChangingHardLimit() throws {
+        #expect(try VirtualMachineMemory.capacity(forHardLimit: 64 * VirtualMachineMemory.mebibyte) == 256 * VirtualMachineMemory.mebibyte)
+        #expect(try VirtualMachineMemory.capacity(forHardLimit: VirtualMachineMemory.gibibyte) == 1_140 * VirtualMachineMemory.mebibyte)
+        #expect(try VirtualMachineMemory.capacity(forHardLimit: 4 * VirtualMachineMemory.gibibyte) == 4_365 * VirtualMachineMemory.mebibyte)
+    }
+
+    @Test func maximumHardLimitAccountsForGuestReserve() {
+        #expect(VirtualMachineMemory.maximumHardLimitGiB(maximumCapacityBytes: 16 * VirtualMachineMemory.gibibyte) == 15)
+        #expect(VirtualMachineMemory.maximumHardLimitGiB(maximumCapacityBytes: 64 * VirtualMachineMemory.gibibyte) == 60)
+    }
+}
+
+@Suite struct MemoryBalloonPolicyTests {
+    @Test func reclaimsOnlyAvailabilityAboveTheCushion() {
+        #expect(MemoryBalloonPolicy.targetBytes(
+            maximumBytes: 8 * VirtualMachineMemory.gibibyte,
+            availableBytes: 4 * VirtualMachineMemory.gibibyte,
+            minimumBytes: 4 * VirtualMachineMemory.mebibyte
+        ) == 5 * VirtualMachineMemory.gibibyte)
+        #expect(MemoryBalloonPolicy.targetBytes(
+            maximumBytes: VirtualMachineMemory.gibibyte,
+            availableBytes: 500 * VirtualMachineMemory.mebibyte,
+            minimumBytes: 4 * VirtualMachineMemory.mebibyte
+        ) == VirtualMachineMemory.gibibyte)
+    }
+
+    @Test func pressureTransitionsAreEdgeTriggeredAndGenerationChecked() {
+        var state = MemoryBalloonPressureState()
+        #expect(state.transition(toConstrained: true) == .reclaim(generation: 1))
+        #expect(state.transition(toConstrained: true) == .none)
+        #expect(state.isCurrent(generation: 1, constrained: true))
+        #expect(state.transition(toConstrained: false) == .restore(generation: 2))
+        #expect(!state.isCurrent(generation: 1, constrained: true))
+        #expect(state.transition(toConstrained: false) == .none)
     }
 }
 

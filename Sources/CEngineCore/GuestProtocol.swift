@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 3
+    public static let version: UInt32 = 4
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -114,6 +114,16 @@ public enum GuestProtocol {
         public var cpuPeriod: UInt64
         public var pids: Int64
         public init(memoryBytes: UInt64, cpuQuota: Int64, cpuPeriod: UInt64, pids: Int64) { self.memoryBytes = memoryBytes; self.cpuQuota = cpuQuota; self.cpuPeriod = cpuPeriod; self.pids = pids }
+    }
+
+    public struct MemoryStatus: Codable, Sendable, Equatable {
+        public var totalBytes: UInt64
+        public var availableBytes: UInt64
+
+        public init(totalBytes: UInt64, availableBytes: UInt64) {
+            self.totalBytes = totalBytes
+            self.availableBytes = availableBytes
+        }
     }
 
     public struct RootFSLayer: Codable, Sendable, Equatable {

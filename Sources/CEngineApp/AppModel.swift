@@ -42,7 +42,9 @@ extension SMAppService: AppService {}
     @Published var showOnboarding: Bool
 
     let maximumCPUs = ProcessInfo.processInfo.activeProcessorCount
-    let maximumMemoryGiB = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
+    let maximumMemoryGiB = VirtualMachineMemory.maximumHardLimitGiB(
+        maximumCapacityBytes: ProcessInfo.processInfo.physicalMemory
+    )
 
     var containers: [ContainerSummary] { snapshot?.containers ?? [] }
     var images: [ImageSummary] { snapshot?.images ?? [] }

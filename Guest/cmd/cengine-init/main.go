@@ -360,6 +360,12 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 	switch request.Operation {
 	case "ping":
 		return json.RawMessage(`{"status":"ready"}`), nil
+	case "prepare-memory-reclaim":
+		status, err := operations.PrepareMemoryReclaim()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(status)
 	case "prepare":
 		var spec protocol.WorkloadSpec
 		if err := json.Unmarshal(request.Payload, &spec); err != nil {

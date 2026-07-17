@@ -70,6 +70,25 @@ def test_concurrent_vm_starts_remain_responsive(daemon, client: docker.DockerCli
                 pass
 
 
+@pytest.mark.compat("CTR-047")
+def test_container_memory_limit_is_separate_from_vm_capacity(client: docker.DockerClient):
+    limit = 64 * 1024 * 1024
+    container = client.containers.run(
+        "alpine:latest", ["sh", "-c", "while :; do sleep 1; done"],
+        detach=True, mem_limit=limit,
+    )
+    code, output = container.exec_run([
+        "sh", "-c",
+        "cat /sys/fs/cgroup/memory.max; awk '/MemTotal:/ { print $2 * 1024 }' /proc/meminfo",
+    ])
+    assert code == 0
+    hard_limit, guest_total = (int(value) for value in output.splitlines())
+    container.reload()
+    assert container.attrs["HostConfig"]["Memory"] == limit
+    assert hard_limit == limit
+    assert guest_total > hard_limit
+
+
 @pytest.mark.compat("CTR-036")
 def test_exec_hijack_closes_after_process_exit(daemon, client: docker.DockerClient):
     container = client.containers.run(

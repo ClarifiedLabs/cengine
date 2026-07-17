@@ -1,7 +1,12 @@
 import Foundation
 
 public struct BuilderSettings: Codable, Equatable, Sendable {
-    public static let `default` = BuilderSettings(cpus: 4, memoryGiB: 4)
+    public static var `default`: BuilderSettings {
+        recommended(
+            hostCPUs: ProcessInfo.processInfo.activeProcessorCount,
+            hostMemoryBytes: ProcessInfo.processInfo.physicalMemory
+        )
+    }
 
     public var cpus: Int
     public var memoryGiB: Int
@@ -13,9 +18,21 @@ public struct BuilderSettings: Codable, Equatable, Sendable {
 
     public var memoryBytes: UInt64 { UInt64(memoryGiB) * 1_024 * 1_024 * 1_024 }
 
+    public static func recommended(hostCPUs: Int, hostMemoryBytes: UInt64) -> BuilderSettings {
+        let cpus = min(max(hostCPUs, 1), min(8, max(4, hostCPUs / 2)))
+        let hostMemoryGiB = Int(hostMemoryBytes / VirtualMachineMemory.gibibyte)
+        let desiredMemoryGiB = hostMemoryGiB >= 24 ? 8 : (hostMemoryGiB >= 16 ? 6 : 4)
+        let maximumMemoryGiB = VirtualMachineMemory.maximumHardLimitGiB(
+            maximumCapacityBytes: hostMemoryBytes
+        )
+        return BuilderSettings(cpus: cpus, memoryGiB: min(desiredMemoryGiB, maximumMemoryGiB))
+    }
+
     public func validate(
         maximumCPUs: Int = ProcessInfo.processInfo.activeProcessorCount,
-        maximumMemoryGiB: Int = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
+        maximumMemoryGiB: Int = VirtualMachineMemory.maximumHardLimitGiB(
+            maximumCapacityBytes: ProcessInfo.processInfo.physicalMemory
+        )
     ) throws {
         guard (1...maximumCPUs).contains(cpus) else {
             throw EngineError(.badRequest, "builder CPUs must be between 1 and \(maximumCPUs)")

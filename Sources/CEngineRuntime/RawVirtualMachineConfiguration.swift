@@ -70,6 +70,12 @@ public struct RawVirtualMachineConfiguration: Sendable {
     }
 
     @MainActor public func makeVirtualizationConfiguration() throws -> VZVirtualMachineConfiguration {
+        guard memoryBytes <= VZVirtualMachineConfiguration.maximumAllowedMemorySize else {
+            throw EngineError(
+                .badRequest,
+                "container memory limit plus guest overhead exceeds the maximum VM memory capacity"
+            )
+        }
         let configuration = VZVirtualMachineConfiguration()
         let bootLoader = VZLinuxBootLoader(kernelURL: kernel)
         bootLoader.initialRamdiskURL = initialRamdisk

@@ -16,7 +16,9 @@ public struct ContainerSettings: Codable, Equatable, Sendable {
 
     public func validate(
         maximumCPUs: Int = ProcessInfo.processInfo.activeProcessorCount,
-        maximumMemoryGiB: Int = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
+        maximumMemoryGiB: Int = VirtualMachineMemory.maximumHardLimitGiB(
+            maximumCapacityBytes: ProcessInfo.processInfo.physicalMemory
+        )
     ) throws {
         guard (1...maximumCPUs).contains(cpus) else {
             throw EngineError(.badRequest, "container CPUs must be between 1 and \(maximumCPUs)")
@@ -57,7 +59,9 @@ public struct ContainerResourceOverride: Codable, Equatable, Sendable {
 
     public func validate(
         maximumCPUs: Int = ProcessInfo.processInfo.activeProcessorCount,
-        maximumMemoryGiB: Int = max(1, Int(ProcessInfo.processInfo.physicalMemory / (1_024 * 1_024 * 1_024)))
+        maximumMemoryGiB: Int = VirtualMachineMemory.maximumHardLimitGiB(
+            maximumCapacityBytes: ProcessInfo.processInfo.physicalMemory
+        )
     ) throws {
         guard cpus != nil || memoryGiB != nil else {
             throw EngineError(.badRequest, "at least one container resource override is required")
