@@ -4,10 +4,10 @@ struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showingUninstall = false
     @State private var deleteData = false
-    private let onSectionWidthsChange: (([CGFloat]) -> Void)?
+    private let onSectionFramesChange: (([CGRect]) -> Void)?
 
-    init(onSectionWidthsChange: (([CGFloat]) -> Void)? = nil) {
-        self.onSectionWidthsChange = onSectionWidthsChange
+    init(onSectionFramesChange: (([CGRect]) -> Void)? = nil) {
+        self.onSectionFramesChange = onSectionFramesChange
     }
 
     var body: some View {
@@ -20,19 +20,18 @@ struct SettingsView: View {
                 networking
                 uninstall
             }
-            .onPreferenceChange(SettingsSectionWidthsKey.self) { widths in
-                onSectionWidthsChange?(widths)
+            .onPreferenceChange(SettingsSectionFramesKey.self) { frames in
+                onSectionFramesChange?(frames)
             }
-            .padding(24)
-            .frame(maxWidth: 760, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .appPageContent(maxWidth: AppLayout.settingsMaximumContentWidth)
         }
+        .coordinateSpace(.named("settings-view"))
         .navigationTitle("Settings")
         .sheet(isPresented: $showingUninstall) { uninstallConfirmation }
     }
 
     private var engineService: some View {
-        GroupBox {
+        SettingsSection("Engine", systemImage: "gearshape.2") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text("Engine Service")
@@ -73,32 +72,18 @@ struct SettingsView: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
-        } label: {
-            Label("Engine", systemImage: "gearshape.2")
-                .font(.headline)
         }
-        .reportSettingsSectionWidth()
-        .frame(maxWidth: .infinity)
     }
 
     private var containerDefaults: some View {
-        GroupBox {
+        SettingsSection("Container Defaults", systemImage: "shippingbox") {
             VStack(alignment: .leading, spacing: 14) {
-                NumericSettingField(
-                    label: "CPUs",
-                    value: $model.containerCPUs,
-                    range: 1...model.maximumCPUs,
-                    unit: "CPUs",
-                    accessibilityIdentifier: "container-cpus-field"
-                )
-                NumericSettingField(
-                    label: "Memory",
-                    value: $model.containerMemoryGiB,
-                    range: 1...model.maximumMemoryGiB,
-                    unit: "GiB",
-                    accessibilityIdentifier: "container-memory-field"
+                ResourceSettingsFields(
+                    cpus: $model.containerCPUs,
+                    memoryGiB: $model.containerMemoryGiB,
+                    maximumCPUs: model.maximumCPUs,
+                    maximumMemoryGiB: model.maximumMemoryGiB,
+                    accessibilityIdentifierPrefix: "container"
                 )
                 Text("Used for new containers when Docker or Compose does not specify resource limits. Existing containers are unchanged.")
                     .font(.caption)
@@ -116,32 +101,18 @@ struct SettingsView: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
-        } label: {
-            Label("Container Defaults", systemImage: "shippingbox")
-                .font(.headline)
         }
-        .reportSettingsSectionWidth()
-        .frame(maxWidth: .infinity)
     }
 
     private var builderResources: some View {
-        GroupBox {
+        SettingsSection("Builder Resources", systemImage: "hammer") {
             VStack(alignment: .leading, spacing: 14) {
-                NumericSettingField(
-                    label: "CPUs",
-                    value: $model.builderCPUs,
-                    range: 1...model.maximumCPUs,
-                    unit: "CPUs",
-                    accessibilityIdentifier: "builder-cpus-field"
-                )
-                NumericSettingField(
-                    label: "Memory",
-                    value: $model.builderMemoryGiB,
-                    range: 1...model.maximumMemoryGiB,
-                    unit: "GiB",
-                    accessibilityIdentifier: "builder-memory-field"
+                ResourceSettingsFields(
+                    cpus: $model.builderCPUs,
+                    memoryGiB: $model.builderMemoryGiB,
+                    maximumCPUs: model.maximumCPUs,
+                    maximumMemoryGiB: model.maximumMemoryGiB,
+                    accessibilityIdentifierPrefix: "builder"
                 )
                 Text("Applying resource changes recreates the managed builder VM while preserving its BuildKit cache.")
                     .font(.caption)
@@ -174,18 +145,11 @@ struct SettingsView: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
-        } label: {
-            Label("Builder Resources", systemImage: "hammer")
-                .font(.headline)
         }
-        .reportSettingsSectionWidth()
-        .frame(maxWidth: .infinity)
     }
 
     private var networking: some View {
-        GroupBox {
+        SettingsSection("Networking", systemImage: "network") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text("VM Networking")
@@ -211,18 +175,11 @@ struct SettingsView: View {
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
-        } label: {
-            Label("Networking", systemImage: "network")
-                .font(.headline)
         }
-        .reportSettingsSectionWidth()
-        .frame(maxWidth: .infinity)
     }
 
     private var uninstall: some View {
-        GroupBox {
+        SettingsSection("Uninstall", systemImage: "trash") {
             HStack(alignment: .center, spacing: 16) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Remove cengine from this Mac").fontWeight(.medium)
@@ -235,14 +192,7 @@ struct SettingsView: View {
                 Button("Uninstall cengine…", role: .destructive) { showingUninstall = true }
                     .accessibilityIdentifier("uninstall-cengine")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(4)
-        } label: {
-            Label("Uninstall", systemImage: "trash")
-                .font(.headline)
         }
-        .reportSettingsSectionWidth()
-        .frame(maxWidth: .infinity)
     }
 
     private var uninstallConfirmation: some View {
@@ -269,28 +219,81 @@ struct SettingsView: View {
     }
 }
 
-private struct SettingsSectionWidthsKey: PreferenceKey {
-    static let defaultValue: [CGFloat] = []
+private struct SettingsSection<Content: View>: View {
+    let title: String
+    let systemImage: String
+    @ViewBuilder let content: Content
 
-    static func reduce(value: inout [CGFloat], nextValue: () -> [CGFloat]) {
+    init(_ title: String, systemImage: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.systemImage = systemImage
+        self.content = content()
+    }
+
+    var body: some View {
+        GroupBox {
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(4)
+        } label: {
+            Label(title, systemImage: systemImage)
+                .labelStyle(AlignedIconLabelStyle())
+                .font(.headline)
+        }
+        .reportSettingsSectionFrame()
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct SettingsSectionFramesKey: PreferenceKey {
+    static let defaultValue: [CGRect] = []
+
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
         value.append(contentsOf: nextValue())
     }
 }
 
 private extension View {
-    func reportSettingsSectionWidth() -> some View {
+    func reportSettingsSectionFrame() -> some View {
         background {
             GeometryReader { geometry in
                 Color.clear.preference(
-                    key: SettingsSectionWidthsKey.self,
-                    value: [geometry.size.width]
+                    key: SettingsSectionFramesKey.self,
+                    value: [geometry.frame(in: .named("settings-view"))]
                 )
             }
         }
     }
 }
 
-struct NumericSettingField: View {
+struct ResourceSettingsFields: View {
+    @Binding var cpus: Int
+    @Binding var memoryGiB: Int
+    let maximumCPUs: Int
+    let maximumMemoryGiB: Int
+    let accessibilityIdentifierPrefix: String
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
+            NumericSettingField(
+                label: "CPUs",
+                value: $cpus,
+                range: 1...maximumCPUs,
+                unit: "CPUs",
+                accessibilityIdentifier: "\(accessibilityIdentifierPrefix)-cpus-field"
+            )
+            NumericSettingField(
+                label: "Memory",
+                value: $memoryGiB,
+                range: 1...maximumMemoryGiB,
+                unit: "GiB",
+                accessibilityIdentifier: "\(accessibilityIdentifierPrefix)-memory-field"
+            )
+        }
+    }
+}
+
+private struct NumericSettingField: View {
     let label: String
     @Binding var value: Int
     let range: ClosedRange<Int>
@@ -298,20 +301,19 @@ struct NumericSettingField: View {
     let accessibilityIdentifier: String
 
     var body: some View {
-        LabeledContent(label) {
-            HStack(spacing: 8) {
-                TextField(label, value: $value, format: .number)
-                    .labelsHidden()
-                    .multilineTextAlignment(.trailing)
-                    .monospacedDigit()
-                    .frame(width: 72)
-                    .accessibilityIdentifier(accessibilityIdentifier)
-                Text(unit)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .leading)
-                Stepper(label, value: $value, in: range)
-                    .labelsHidden()
-            }
+        GridRow(alignment: .center) {
+            Text(label)
+            TextField(label, value: $value, format: .number)
+                .labelsHidden()
+                .multilineTextAlignment(.trailing)
+                .monospacedDigit()
+                .frame(width: 72)
+                .accessibilityIdentifier(accessibilityIdentifier)
+            Text(unit)
+                .foregroundStyle(.secondary)
+                .frame(width: 36, alignment: .leading)
+            Stepper(label, value: $value, in: range)
+                .labelsHidden()
         }
     }
 }

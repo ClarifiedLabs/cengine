@@ -1,5 +1,36 @@
 import SwiftUI
 
+enum AppLayout {
+    static let minimumWindowWidth: CGFloat = 960
+    static let minimumWindowHeight: CGFloat = 600
+    static let sidebarWidth: CGFloat = 180
+    static let maximumSidebarWidth: CGFloat = 220
+    static let pagePadding: CGFloat = 24
+    static let dashboardMaximumContentWidth: CGFloat = 1_100
+    static let settingsMaximumContentWidth: CGFloat = 760
+}
+
+extension View {
+    func appPageContent(maxWidth: CGFloat) -> some View {
+        padding(AppLayout.pagePadding)
+            .frame(maxWidth: maxWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct AlignedIconLabelStyle: LabelStyle {
+    var iconWidth: CGFloat = 18
+    var spacing: CGFloat = 8
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: spacing) {
+            configuration.icon
+                .frame(width: iconWidth)
+            configuration.title
+        }
+    }
+}
+
 enum AppFormat {
     static func bytes(_ value: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: value, countStyle: .file)

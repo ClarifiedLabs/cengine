@@ -174,24 +174,80 @@ import Testing
         #expect(model.containerSettingsStatus == nil)
     }
 
-    @Test func settingsViewAlignsSectionsWithinMainWindowContentWidth() throws {
+    @Test func settingsViewLeftAlignsEqualWidthSections() throws {
         let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let model = AppModel(home: home, serviceRegistrationRevision: nil)
-        var sectionWidths: [CGFloat] = []
-        let root = SettingsView { sectionWidths = $0 }
+        var sectionFrames: [CGRect] = []
+        let root = SettingsView { sectionFrames = $0 }
             .environmentObject(model)
-            .frame(width: 700, height: 900)
+            .frame(width: 900, height: 900)
         let hostingView = NSHostingView(rootView: root)
-        hostingView.frame = NSRect(x: 0, y: 0, width: 700, height: 900)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 900, height: 900)
         hostingView.layoutSubtreeIfNeeded()
         hostingView.displayIfNeeded()
 
-        #expect(hostingView.fittingSize.width <= 700)
+        #expect(hostingView.fittingSize.width <= 900)
         #expect(hostingView.fittingSize.height <= 900)
-        #expect(sectionWidths.count == 5)
-        let firstSectionWidth = try #require(sectionWidths.first)
-        #expect(sectionWidths.allSatisfy { abs($0 - firstSectionWidth) < 1 })
+        #expect(sectionFrames.count == 5)
+        let firstSectionFrame = try #require(sectionFrames.first)
+        #expect(abs(firstSectionFrame.minX - AppLayout.pagePadding) < 1)
+        #expect(sectionFrames.allSatisfy { abs($0.minX - firstSectionFrame.minX) < 1 })
+        #expect(sectionFrames.allSatisfy { abs($0.width - firstSectionFrame.width) < 1 })
+    }
+
+    @Test func settingsResourceFieldsAlignEditableControls() throws {
+        let root = ResourceSettingsFields(
+            cpus: .constant(4),
+            memoryGiB: .constant(8),
+            maximumCPUs: 12,
+            maximumMemoryGiB: 32,
+            accessibilityIdentifierPrefix: "test"
+        )
+            .frame(width: 400, height: 120, alignment: .topLeading)
+        let hostingView = NSHostingView(rootView: root)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 400, height: 120)
+        hostingView.layoutSubtreeIfNeeded()
+        hostingView.displayIfNeeded()
+
+        let textFieldFrames = allTextFields(in: hostingView)
+            .filter(\.isEditable)
+            .map { $0.convert($0.bounds, to: hostingView) }
+        #expect(textFieldFrames.count == 2)
+        let firstTextFieldFrame = try #require(textFieldFrames.first)
+        #expect(textFieldFrames.allSatisfy { abs($0.minX - firstTextFieldFrame.minX) < 1 })
+
+        let stepperFrames = allSteppers(in: hostingView)
+            .map { $0.convert($0.bounds, to: hostingView) }
+        #expect(stepperFrames.count == 2)
+        let firstStepperFrame = try #require(stepperFrames.first)
+        #expect(stepperFrames.allSatisfy { abs($0.minX - firstStepperFrame.minX) < 1 })
+    }
+
+    @Test func sidebarWidthIsStableWhenResourceSearchIsVisible() throws {
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let model = AppModel(home: home, serviceRegistrationRevision: nil)
+        let navigation = SidebarLayoutTestNavigation()
+        let root = SidebarLayoutTestView(navigation: navigation)
+            .environmentObject(model)
+            .frame(width: 1_100, height: 720)
+        let hostingView = NSHostingView(rootView: root)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 1_100, height: 720)
+        hostingView.layoutSubtreeIfNeeded()
+        hostingView.displayIfNeeded()
+        let splitView = try #require(allSplitViews(in: hostingView).first)
+        let dashboardWidth = try #require(splitView.arrangedSubviews.first).frame.width
+
+        navigation.section = .containers
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        hostingView.layoutSubtreeIfNeeded()
+        hostingView.displayIfNeeded()
+        let containersWidth = try #require(splitView.arrangedSubviews.first).frame.width
+
+        #expect(dashboardWidth >= AppLayout.sidebarWidth)
+        #expect(dashboardWidth <= AppLayout.maximumSidebarWidth)
+        #expect(abs(containersWidth - dashboardWidth) < 1)
     }
 
     @Test func containersViewFillsAvailableHeightWithoutSelection() async throws {
@@ -274,6 +330,37 @@ import Testing
         {"Id":"container-1","Name":"/web","Created":"2026-07-14T10:00:00Z","Path":"server","Args":[],"Image":"demo:latest","State":{"Status":"exited","Running":false,"Paused":false,"OOMKilled":false,"Dead":false,"ExitCode":0,"Error":"","StartedAt":"2026-07-14T10:00:01Z","FinishedAt":"2026-07-14T10:00:02Z"},"Config":{"Hostname":"web","User":"","Tty":false,"Env":[],"Cmd":["server"],"Image":"demo:latest","WorkingDir":"/","Labels":{}},"RestartCount":0,"NetworkSettings":{"Networks":{}},"HostConfig":{"Memory":1073741824,"NanoCpus":4000000000,"AutoRemove":false,"Privileged":false,"ReadonlyRootfs":false,"Init":false,"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"NetworkMode":"default"},"Mounts":[{"Type":"volume","Name":"data","Source":"data","Destination":"/data","Driver":"local","RW":true}]}
         """.utf8),
     ]
+}
+
+@MainActor private final class SidebarLayoutTestNavigation: ObservableObject {
+    @Published var section: AppSection? = .dashboard
+}
+
+private struct SidebarLayoutTestView: View {
+    @ObservedObject var navigation: SidebarLayoutTestNavigation
+
+    var body: some View {
+        NavigationSplitView {
+            AppSidebar(selection: $navigation.section)
+        } detail: {
+            switch navigation.section {
+            case .containers:
+                ContainersView(selection: .constant(nil))
+            default:
+                DashboardView(navigation: AppNavigation())
+            }
+        }
+    }
+}
+
+@MainActor private func allTextFields(in view: NSView) -> [NSTextField] {
+    let current = (view as? NSTextField).map { [$0] } ?? []
+    return current + view.subviews.flatMap(allTextFields)
+}
+
+@MainActor private func allSteppers(in view: NSView) -> [NSStepper] {
+    let current = (view as? NSStepper).map { [$0] } ?? []
+    return current + view.subviews.flatMap(allSteppers)
 }
 
 @MainActor private func allButtons(in view: NSView) -> [NSButton] {

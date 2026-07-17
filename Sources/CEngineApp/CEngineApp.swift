@@ -8,7 +8,10 @@ struct CEngineApplication: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 920, minHeight: 600)
+                .frame(
+                    minWidth: AppLayout.minimumWindowWidth,
+                    minHeight: AppLayout.minimumWindowHeight
+                )
                 .task { await model.start() }
                 .sheet(isPresented: $model.showOnboarding) {
                     OnboardingView {
@@ -41,29 +44,7 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            VStack(spacing: 0) {
-                List(AppSection.resourceSections, selection: $navigation.section) { section in
-                    Label(section.title, systemImage: section.icon).tag(Optional(section))
-                }
-                Divider()
-                Button {
-                    navigation.section = .settings
-                } label: {
-                    Label("Settings", systemImage: "gearshape")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .background(
-                            navigation.section == .settings ? Color.accentColor.opacity(0.16) : .clear,
-                            in: RoundedRectangle(cornerRadius: 6)
-                        )
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 8)
-            }
-            .navigationSplitViewColumnWidth(min: 155, ideal: 180, max: 220)
+            AppSidebar(selection: $navigation.section)
         } detail: {
             switch navigation.section {
             case .dashboard, nil:
@@ -91,6 +72,50 @@ struct ContentView: View {
         } message: {
             Text(model.error ?? "")
         }
+    }
+}
+
+struct AppSidebar: View {
+    @Binding var selection: AppSection?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            List(AppSection.resourceSections, selection: $selection) { section in
+                AppSidebarLabel(section: section)
+                    .tag(Optional(section))
+            }
+            Divider()
+            Button {
+                selection = .settings
+            } label: {
+                AppSidebarLabel(section: .settings)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                    .background(
+                        selection == .settings ? Color.accentColor.opacity(0.16) : .clear,
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        }
+        .navigationSplitViewColumnWidth(
+            min: AppLayout.sidebarWidth,
+            ideal: AppLayout.sidebarWidth,
+            max: AppLayout.maximumSidebarWidth
+        )
+    }
+}
+
+private struct AppSidebarLabel: View {
+    let section: AppSection
+
+    var body: some View {
+        Label(section.title, systemImage: section.icon)
+            .labelStyle(AlignedIconLabelStyle())
     }
 }
 

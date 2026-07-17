@@ -27,9 +27,7 @@ struct DashboardView: View {
                     .frame(maxWidth: .infinity, minHeight: 280)
                 }
             }
-            .padding(24)
-            .frame(maxWidth: 1_100, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .appPageContent(maxWidth: AppLayout.dashboardMaximumContentWidth)
         }
         .navigationTitle("Dashboard")
     }
