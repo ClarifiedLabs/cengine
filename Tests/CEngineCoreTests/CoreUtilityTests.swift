@@ -3,6 +3,8 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct DockerIntegrationTests {
+    private enum TestError: Error { case commandFailed }
+
     @Test func executableSearchesInjectedPath() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -24,6 +26,247 @@ import Testing
         try Data().write(to: root.appending(path: name))
 
         #expect(DockerIntegration.executable(named: name, environment: ["PATH": root.path]) == nil)
+    }
+
+    @Test func persistedContextCommandsIgnoreTemporaryDockerOverrides() {
+        let environment = DockerIntegration.persistedContextEnvironment([
+            "PATH": "/opt/homebrew/bin",
+            "DOCKER_CONFIG": "/tmp/docker-config",
+            "DOCKER_CONTEXT": "temporary",
+            "DOCKER_HOST": "unix:///tmp/docker.sock",
+        ])
+
+        #expect(environment["PATH"] == "/opt/homebrew/bin")
+        #expect(environment["DOCKER_CONFIG"] == "/tmp/docker-config")
+        #expect(environment["DOCKER_CONTEXT"] == nil)
+        #expect(environment["DOCKER_HOST"] == nil)
+    }
+
+    @Test func removingActiveManagedContextRecordsItBeforeRemoval() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        var commands: [[String]] = []
+
+        let outcome = DockerIntegration.remove(recordingActiveContextTo: marker) { arguments in
+            commands.append(arguments)
+            if arguments == ["context", "show"] { return "cengine\n" }
+            if arguments == ["context", "rm", "-f", DockerIntegration.contextName] {
+                #expect(FileManager.default.fileExists(atPath: marker.path))
+            }
+            return ""
+        }
+
+        #expect(outcome == .completed)
+        #expect(try String(contentsOf: marker, encoding: .utf8) == "cengine\n")
+        #expect(commands == [
+            ["context", "show"],
+            ["buildx", "rm", "--force", DockerIntegration.builderName],
+            ["context", "rm", "-f", DockerIntegration.contextName],
+        ])
+    }
+
+    @Test func removingInactiveManagedContextClearsStaleMarker() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+
+        let outcome = DockerIntegration.remove(recordingActiveContextTo: marker) { arguments in
+            arguments == ["context", "show"] ? "default\n" : ""
+        }
+
+        #expect(outcome == .completed)
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func contextQueryFailureDoesNotRemoveContextOrMarker() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+        var commands: [[String]] = []
+
+        let outcome = DockerIntegration.remove(recordingActiveContextTo: marker) { arguments in
+            commands.append(arguments)
+            if arguments == ["context", "show"] { throw TestError.commandFailed }
+            return ""
+        }
+
+        guard case .contextRemovalSkipped = outcome else {
+            Issue.record("expected context removal to be skipped")
+            return
+        }
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        #expect(commands == [
+            ["context", "show"],
+            ["buildx", "rm", "--force", DockerIntegration.builderName],
+        ])
+    }
+
+    @Test func matchingContextRestoresSelectionAndClearsMarker() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        let expected = "unix://\(socket.path)"
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+        var commands: [[String]] = []
+
+        try DockerIntegration.configureContext(
+            socket: socket,
+            restoringActiveContextFrom: marker
+        ) { arguments in
+            commands.append(arguments)
+            return arguments.starts(with: ["context", "inspect"]) ? expected : ""
+        }
+
+        #expect(commands == [
+            ["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"],
+            ["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"],
+            ["context", "use", "cengine"],
+        ])
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func missingContextIsCreatedVerifiedAndRestored() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        let expected = "unix://\(socket.path)"
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+        var commands: [[String]] = []
+        var inspectionCount = 0
+
+        try DockerIntegration.configureContext(
+            socket: socket,
+            restoringActiveContextFrom: marker
+        ) { arguments in
+            commands.append(arguments)
+            if arguments.starts(with: ["context", "inspect"]) {
+                inspectionCount += 1
+                if inspectionCount == 1 { throw TestError.commandFailed }
+                return expected
+            }
+            return ""
+        }
+
+        #expect(commands == [
+            ["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"],
+            ["context", "rm", "-f", "cengine"],
+            [
+                "context", "create", "cengine", "--docker", "host=\(expected)",
+                "--description", "cengine (one container per VM)",
+            ],
+            ["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"],
+            ["context", "use", "cengine"],
+        ])
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func contextCreationFailureRetainsMarkerWithoutActivating() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+        var commands: [[String]] = []
+
+        #expect(throws: TestError.self) {
+            try DockerIntegration.configureContext(
+                socket: socket,
+                restoringActiveContextFrom: marker
+            ) { arguments in
+                commands.append(arguments)
+                if arguments.first == "context", arguments.dropFirst().first == "create" {
+                    throw TestError.commandFailed
+                }
+                if arguments.starts(with: ["context", "inspect"]) {
+                    throw TestError.commandFailed
+                }
+                return ""
+            }
+        }
+
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        #expect(!commands.contains(["context", "use", "cengine"]))
+    }
+
+    @Test func contextActivationFailureRetainsMarker() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        let expected = "unix://\(socket.path)"
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+
+        #expect(throws: TestError.self) {
+            try DockerIntegration.configureContext(
+                socket: socket,
+                restoringActiveContextFrom: marker
+            ) { arguments in
+                if arguments == ["context", "use", "cengine"] {
+                    throw TestError.commandFailed
+                }
+                return expected
+            }
+        }
+
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func unverifiedContextIsNeverActivatedAndRetainsMarker() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("cengine\n".utf8).write(to: marker)
+        var commands: [[String]] = []
+
+        #expect(throws: EngineError.self) {
+            try DockerIntegration.configureContext(
+                socket: socket,
+                restoringActiveContextFrom: marker
+            ) { arguments in
+                commands.append(arguments)
+                return arguments.starts(with: ["context", "inspect"])
+                    ? "unix:///tmp/wrong.sock"
+                    : ""
+            }
+        }
+
+        #expect(!commands.contains(["context", "use", "cengine"]))
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func invalidContextMarkerIsDiscardedWithoutActivation() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        let expected = "unix://\(socket.path)"
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("unexpected\n".utf8).write(to: marker)
+        var commands: [[String]] = []
+
+        try DockerIntegration.configureContext(
+            socket: socket,
+            restoringActiveContextFrom: marker
+        ) { arguments in
+            commands.append(arguments)
+            return expected
+        }
+
+        #expect(!commands.contains(["context", "use", "cengine"]))
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
     }
 
     @Test func builderArgumentsProvisionRecommendedResources() {

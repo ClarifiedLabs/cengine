@@ -29,6 +29,9 @@ import CEngineCore
     }
 
     @MainActor @Test func requiredNetworkingRegistersBeforeEngineAndOpensApprovalFromOnboarding() async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(
             status: .notFound,
@@ -40,6 +43,7 @@ import CEngineCore
             agent: agent,
             helper: helper,
             serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults,
             openLoginItemsSettings: { settingsOpenCount += 1 }
         )
         defer { model.setActive(false) }
@@ -55,14 +59,27 @@ import CEngineCore
 
         await model.completeOnboarding()
         #expect(settingsOpenCount == 1)
+        #expect(defaults.bool(forKey: AppPreferenceKeys.completedOnboarding))
+        #expect(defaults.bool(forKey: AppPreferenceKeys.engineServiceEnabled))
     }
 
     @MainActor @Test func enabledNetworkingRegistersEngineService() async {
         let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: home) }
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
-        let model = AppModel(home: home, agent: agent, helper: helper, serviceRegistrationRevision: nil)
+        let model = AppModel(
+            home: home,
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults
+        )
         defer { model.setActive(false) }
 
         await model.start()
@@ -70,6 +87,29 @@ import CEngineCore
         #expect(helper.registerCount == 0)
         #expect(agent.registerCount == 1)
         #expect(model.engineStatus == "Starting…")
+        #expect(defaults.bool(forKey: AppPreferenceKeys.engineServiceEnabled))
+    }
+
+    @MainActor @Test func disabledStartupRegistersNoServices() async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(false, forKey: AppPreferenceKeys.engineServiceEnabled)
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+
+        #expect(helper.registerCount == 0)
+        #expect(agent.registerCount == 0)
+        #expect(model.engineStatus == "Disabled")
     }
 
     @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() async {
@@ -225,7 +265,7 @@ private actor RestartRecorder {
             try FileManager.default.createDirectory(at: location, withIntermediateDirectories: true)
             try Data("owned by cengine".utf8).write(to: location.appending(path: "marker"))
         }
-        defaults.set(true, forKey: "completedOnboarding")
+        defaults.set(true, forKey: AppPreferenceKeys.completedOnboarding)
 
         try CEngineUserData.removeAll(
             home: home,
@@ -234,7 +274,7 @@ private actor RestartRecorder {
         )
 
         #expect(locations.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
-        #expect(defaults.object(forKey: "completedOnboarding") == nil)
+        #expect(defaults.object(forKey: AppPreferenceKeys.completedOnboarding) == nil)
     }
 }
 

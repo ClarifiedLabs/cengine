@@ -112,7 +112,12 @@ enum UninstallSupport {
         }
         Task {
             await CEngineServices.teardownServices()
-            DockerIntegration.remove()
+            let removal = DockerIntegration.remove(
+                recordingActiveContextTo: EnginePaths().activeContextMarker
+            )
+            if let warning = removal.warning {
+                FileHandle.standardError.write(Data("cengine uninstall: \(warning)\n".utf8))
+            }
             exit(0)
         }
         dispatchMain()

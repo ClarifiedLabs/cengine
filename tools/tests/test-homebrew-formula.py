@@ -30,7 +30,10 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn('pkg "cengine-1.2.3.pkg"', cask)
             self.assertIn("postflight do", cask)
             self.assertIn('system_command "/usr/bin/open"', cask)
-            self.assertIn('args: ["/Applications/cengine.app"]', cask)
+            self.assertIn(
+                'args: ["/Applications/cengine.app", "--args", "--opened-by-installer"]',
+                cask,
+            )
             self.assertIn("must_succeed: false", cask)
             self.assertIn("early_script:", cask)
             self.assertIn('executable: "/bin/sh"', cask)
@@ -53,6 +56,8 @@ class HomebrewFormulaTests(unittest.TestCase):
                 "~/Library/Saved Application State/dev.cengine.app.savedState",
             ]:
                 self.assertIn(f'"{path}"', cask)
+            self.assertIn("Open cengine after a fresh install", cask)
+            self.assertIn("restores an active cengine Docker context", cask)
             self.assertIn("brew uninstall --cask --zap cengine", cask)
             self.assertFalse((root / "Formula/cengine.rb").exists())
 

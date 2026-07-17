@@ -329,5 +329,6 @@ private final class DrainRendezvous: @unchecked Sendable {
         #expect(paths.lock.path == "/tmp/example-home/.cengine/run/docker.sock.lock")
         #expect(paths.serviceState.path == "/tmp/example-home/.cengine/run/service-state.json")
         #expect(paths.data.path.contains("Application Support/cengine"))
+        #expect(paths.activeContextMarker.path == "/tmp/example-home/Library/Application Support/cengine/active-docker-context")
     }
 }

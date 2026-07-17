@@ -125,10 +125,14 @@ Replace `X.Y.Z` with the Xcode project's current `MARKETING_VERSION`. The local
 package is intentionally unsigned; `pkgutil --check-signature` reports that
 state. CI produces the Developer ID signed, notarized, and stapled package.
 
-The Homebrew Cask opens `cengine.app` after installation and upgrades; the app
-registers the bundled engine LaunchAgent and offers the required privileged
-networking service for approval during onboarding. The postflight launch is
-non-fatal so package installation still works in headless sessions.
+The Homebrew Cask opens `cengine.app` with an installer-only argument after
+installation and upgrades. A fresh install exits before showing the app or
+registering services; the user opens cengine to begin onboarding. An upgrade or
+standard reinstall resumes an explicitly enabled engine, with preserved service
+state providing the one-time signal for upgrades from older releases. An active
+`cengine` Docker context is restored on the next managed engine start. The
+postflight launch is non-fatal so package installation still works in headless
+sessions.
 
 The PKG installs `/Applications/cengine.app` and `/usr/local/bin/cengine` and
 therefore requests administrator authorization. Homebrew installs the same PKG

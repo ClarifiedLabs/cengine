@@ -84,6 +84,26 @@ struct DashboardView: View {
                 .padding(3)
             }
         }
+        if model.isRunningEngineOutdated, let runningVersion = model.snapshot?.version.Version {
+            GroupBox {
+                HStack(alignment: .center, spacing: 14) {
+                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Finish updating cengine").font(.headline)
+                        Text("Engine \(runningVersion) is still running; app \(model.appVersion) is installed.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Restart Engine") { Task { await model.restartEngineService() } }
+                        .disabled(!model.canRestartEngineService)
+                        .accessibilityIdentifier("restart-outdated-engine")
+                }
+                .padding(3)
+            }
+        }
         if let refreshError = model.refreshError {
             GroupBox {
                 HStack(alignment: .center, spacing: 14) {

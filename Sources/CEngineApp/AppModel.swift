@@ -50,6 +50,10 @@ extension SMAppService: AppService {}
     var images: [ImageSummary] { snapshot?.images ?? [] }
     var networks: [NetworkSummary] { snapshot?.networks ?? [] }
     var volumes: [VolumeSummary] { snapshot?.volumes ?? [] }
+    var isRunningEngineOutdated: Bool {
+        guard let runningVersion = snapshot?.version.Version else { return false }
+        return Self.isVersion(runningVersion, olderThan: appVersion)
+    }
     var canRestartEngineService: Bool {
         engineServiceEnabled && agent.status == .enabled && !isManagingEngineService
     }
@@ -85,6 +89,8 @@ extension SMAppService: AppService {}
     private let serviceStateURL: URL
     private let builderSettingsURL: URL
     private let containerSettingsURL: URL
+    private let activeContextMarkerURL: URL
+    let appVersion: String
     private let serviceRegistrationRevision: String?
     private let serviceRegistrationDefaults: UserDefaults
     private let waitForServiceUnregistration: () async throws -> Void
@@ -97,7 +103,7 @@ extension SMAppService: AppService {}
     private var savedContainerMemoryGiB: Int
 
     static let serviceRegistrationRevisionKey = "serviceRegistrationRevision"
-    static let engineServiceEnabledKey = "engineServiceEnabled"
+    static let engineServiceEnabledKey = AppPreferenceKeys.engineServiceEnabled
     private static let serviceFailurePrefix = "Engine failed to start: "
 
     init(
@@ -105,6 +111,7 @@ extension SMAppService: AppService {}
         agent: any AppService = SMAppService.agent(plistName: CEngineServices.agentPlist),
         helper: any AppService = SMAppService.daemon(plistName: CEngineServices.helperPlist),
         client: (any AppEngineClient)? = nil,
+        appVersion: String = CEngineVersion.shortVersion(),
         serviceRegistrationRevision: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
         serviceRegistrationDefaults: UserDefaults = .standard,
         waitForServiceUnregistration: @escaping () async throws -> Void = {
@@ -123,7 +130,9 @@ extension SMAppService: AppService {}
         serviceStateURL = paths.serviceState
         builderSettingsURL = paths.builderSettings
         containerSettingsURL = paths.containerSettings
+        activeContextMarkerURL = paths.activeContextMarker
         self.client = client ?? DockerSocketClient(socketPath: paths.socket.path)
+        self.appVersion = appVersion
         self.serviceRegistrationRevision = serviceRegistrationRevision
         self.serviceRegistrationDefaults = serviceRegistrationDefaults
         self.waitForServiceUnregistration = waitForServiceUnregistration
@@ -140,15 +149,35 @@ extension SMAppService: AppService {}
         containerMemoryGiB = containerSettings.memoryGiB
         savedContainerCPUs = containerSettings.cpus
         savedContainerMemoryGiB = containerSettings.memoryGiB
-        showOnboarding = !UserDefaults.standard.bool(forKey: "completedOnboarding")
+        showOnboarding = !serviceRegistrationDefaults.bool(forKey: AppPreferenceKeys.completedOnboarding)
         if !engineServiceEnabled { engineStatus = "Disabled" }
+    }
+
+    static func isVersion(_ runningVersion: String, olderThan appVersion: String) -> Bool {
+        guard let runningComponents = releaseVersionComponents(runningVersion),
+              let appComponents = releaseVersionComponents(appVersion)
+        else { return false }
+
+        for (running, app) in zip(runningComponents, appComponents) where running != app {
+            return running < app
+        }
+        return false
+    }
+
+    private static func releaseVersionComponents(_ version: String) -> [Int]? {
+        let components = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count == 3 else { return nil }
+        let numbers = components.compactMap { Int($0) }
+        return numbers.count == components.count && numbers.allSatisfy { $0 >= 0 } ? numbers : nil
     }
 
     func start() async {
         do {
             let registrationChanged = try await unregisterOutdatedServicesIfNeeded()
-            try registerRequiredNetworking()
-            try registerEngineIfNetworkingIsReady()
+            if engineServiceEnabled {
+                try registerRequiredNetworking()
+                try registerEngineIfNetworkingIsReady()
+            }
             if registrationChanged, let serviceRegistrationRevision {
                 serviceRegistrationDefaults.set(
                     serviceRegistrationRevision,
@@ -182,7 +211,8 @@ extension SMAppService: AppService {}
     }
 
     func completeOnboarding() async {
-        UserDefaults.standard.set(true, forKey: "completedOnboarding")
+        serviceRegistrationDefaults.set(true, forKey: AppPreferenceKeys.completedOnboarding)
+        serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
         showOnboarding = false
         do {
             try registerRequiredNetworking()
@@ -493,7 +523,12 @@ extension SMAppService: AppService {}
         }
         refreshTask?.cancel()
         await CEngineServices.teardownServices()
-        DockerIntegration.remove()
+        let removal = DockerIntegration.remove(
+            recordingActiveContextTo: deleteData ? nil : activeContextMarkerURL
+        )
+        if let warning = removal.warning {
+            FileHandle.standardError.write(Data("cengine uninstall: \(warning)\n".utf8))
+        }
         if deleteData {
             do {
                 try CEngineUserData.removeAll()
@@ -588,6 +623,7 @@ extension SMAppService: AppService {}
               CEngineServices.needsRegistration(agent.status)
         else { return }
         try agent.register()
+        serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
     }
 
     private static func label(_ status: SMAppService.Status) -> String {

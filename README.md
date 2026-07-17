@@ -20,17 +20,19 @@ Install the signed cengine app and CLI with Homebrew:
 brew install --cask clarifiedlabs/tap/cengine
 ```
 
-Homebrew launches `/Applications/cengine.app` after installation and upgrades,
-so the installed engine starts without a separate manual step. On first launch,
-cengine registers its required VM networking service for administrator approval.
-Once approved, it enables the per-user engine service, installs the bundled
-cengine kernel and guest initramfs assets, initializes its runtime, and configures
-the Docker context and Buildx builder when Docker CLI is available. If the app
-cannot launch automatically (for example, in a headless session), open it with:
+After a fresh install, open cengine to begin setup:
 
 ```sh
 open /Applications/cengine.app
 ```
+
+The installer does not show the app, request networking approval, or start the
+engine until you open it. Upgrades and standard reinstalls resume an engine that
+was previously enabled. On first user launch, cengine registers its required VM
+networking service for administrator approval. Once approved, it enables the
+per-user engine service, installs the bundled cengine kernel and guest initramfs
+assets, initializes its runtime, and configures the Docker context and Buildx
+builder when Docker CLI is available.
 
 Check that the engine is ready:
 
@@ -164,9 +166,11 @@ brew uninstall --cask cengine
 
 It unregisters the background services and removes the `cengine` Docker context
 and `cengine-builder` Buildx builder, but preserves all VM disks and engine data
-for a later reinstall. To uninstall **and** remove containers, images, volumes,
-downloaded guest assets, runtime files, logs, and app preferences, use the
-explicit destructive form:
+for a later reinstall. If `cengine` was the active Docker context, a standard
+reinstall restores it on the next managed engine start. To uninstall **and**
+remove containers, images, volumes, downloaded guest assets, runtime files,
+logs, app preferences, and the saved context selection, use the explicit
+destructive form:
 
 ```sh
 brew uninstall --cask --zap cengine

@@ -16,7 +16,8 @@ enum SystemManager {
         let domain = "gui/\(getuid())"
         _ = try? run("/bin/launchctl", ["bootout", domain + "/" + label])
         try? FileManager.default.removeItem(at: launchAgentURL)
-        DockerIntegration.remove()
+        let removal = DockerIntegration.remove(recordingActiveContextTo: paths.activeContextMarker)
+        if let warning = removal.warning { warn(warning) }
         try? writeState(.stopped, message: nil, paths: paths)
         print("cengine service and Docker integration removed; data was preserved at \(paths.data.path)")
     }
@@ -90,12 +91,11 @@ enum SystemManager {
             print("Docker CLI not found; skipping context and Buildx configuration")
             return
         }
-        let expected = "unix://\(paths.socket.path)"
-        if let current = try? DockerIntegration.runDocker(["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"]),
-           current.trimmingCharacters(in: .whitespacesAndNewlines) == expected { return }
         do {
-            _ = try? DockerIntegration.runDocker(["context", "rm", "-f", "cengine"])
-            try DockerIntegration.runDocker(["context", "create", "cengine", "--docker", "host=\(expected)", "--description", "cengine (one container per VM)"])
+            try DockerIntegration.configureContext(
+                socket: paths.socket,
+                restoringActiveContextFrom: paths.activeContextMarker
+            )
         } catch {
             warn("could not configure Docker context: \(error.localizedDescription)")
         }

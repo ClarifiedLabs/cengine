@@ -125,6 +125,14 @@ import Testing
 }
 
 @MainActor @Suite struct AppModelDashboardTests {
+    @Test func comparesReleaseVersionsNumerically() {
+        #expect(AppModel.isVersion("0.0.34", olderThan: "0.0.35"))
+        #expect(AppModel.isVersion("0.9.9", olderThan: "0.10.0"))
+        #expect(!AppModel.isVersion("0.0.35", olderThan: "0.0.35"))
+        #expect(!AppModel.isVersion("0.0.36", olderThan: "0.0.35"))
+        #expect(!AppModel.isVersion("development", olderThan: "0.0.35"))
+    }
+
     @Test func refreshesTypedSnapshotAndPostsContainerLifecycleAction() async throws {
         let client = MockEngineClient(responses: Self.responses)
         let agent = DashboardMockAppService(status: .enabled)
@@ -160,6 +168,26 @@ import Testing
 
         #expect(model.snapshotIsStale)
         #expect(model.snapshot?.version.Version == "0.1.0")
+    }
+
+    @Test func olderRunningEngineIsFlaggedForDashboardRestart() async {
+        let client = MockEngineClient(responses: Self.responses)
+        let agent = DashboardMockAppService(status: .enabled)
+        let helper = DashboardMockAppService(status: .enabled)
+        let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let model = AppModel(
+            home: home,
+            agent: agent,
+            helper: helper,
+            client: client,
+            appVersion: "0.2.0",
+            serviceRegistrationRevision: nil
+        )
+        await model.refresh()
+
+        #expect(model.isRunningEngineOutdated)
+        #expect(model.canRestartEngineService)
     }
 
     @Test func invalidSettingsRemainDirtyAndAreNotSaved() throws {

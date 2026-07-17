@@ -28,7 +28,7 @@ cask "cengine" do
 
   postflight do
     system_command "/usr/bin/open",
-                   args: ["/Applications/cengine.app"],
+                   args: ["/Applications/cengine.app", "--args", "--opened-by-installer"],
                    must_succeed: false
   end
 
@@ -57,7 +57,8 @@ cask "cengine" do
   ]
 
   caveats <<~EOS
-    cengine launches after installation and upgrades so enabled services use the installed version.
+    Open cengine after a fresh install to enable its services. Upgrades resume a previously enabled engine.
+    A standard reinstall restores an active cengine Docker context on the next engine start.
     A standard uninstall preserves VM and image data. To remove all cengine data instead:
       brew uninstall --cask --zap cengine
   EOS
