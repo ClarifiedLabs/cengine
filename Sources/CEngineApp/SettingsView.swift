@@ -4,6 +4,11 @@ struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showingUninstall = false
     @State private var deleteData = false
+    private let onSectionWidthsChange: (([CGFloat]) -> Void)?
+
+    init(onSectionWidthsChange: (([CGFloat]) -> Void)? = nil) {
+        self.onSectionWidthsChange = onSectionWidthsChange
+    }
 
     var body: some View {
         ScrollView {
@@ -14,6 +19,9 @@ struct SettingsView: View {
                 builderResources
                 networking
                 uninstall
+            }
+            .onPreferenceChange(SettingsSectionWidthsKey.self) { widths in
+                onSectionWidthsChange?(widths)
             }
             .padding(24)
             .frame(maxWidth: 760, alignment: .leading)
@@ -65,11 +73,13 @@ struct SettingsView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
         } label: {
             Label("Engine", systemImage: "gearshape.2")
                 .font(.headline)
         }
+        .reportSettingsSectionWidth()
         .frame(maxWidth: .infinity)
     }
 
@@ -106,11 +116,13 @@ struct SettingsView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
         } label: {
             Label("Container Defaults", systemImage: "shippingbox")
                 .font(.headline)
         }
+        .reportSettingsSectionWidth()
         .frame(maxWidth: .infinity)
     }
 
@@ -162,11 +174,13 @@ struct SettingsView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
         } label: {
             Label("Builder Resources", systemImage: "hammer")
                 .font(.headline)
         }
+        .reportSettingsSectionWidth()
         .frame(maxWidth: .infinity)
     }
 
@@ -197,11 +211,13 @@ struct SettingsView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
         } label: {
             Label("Networking", systemImage: "network")
                 .font(.headline)
         }
+        .reportSettingsSectionWidth()
         .frame(maxWidth: .infinity)
     }
 
@@ -219,11 +235,13 @@ struct SettingsView: View {
                 Button("Uninstall cengine…", role: .destructive) { showingUninstall = true }
                     .accessibilityIdentifier("uninstall-cengine")
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
         } label: {
             Label("Uninstall", systemImage: "trash")
                 .font(.headline)
         }
+        .reportSettingsSectionWidth()
         .frame(maxWidth: .infinity)
     }
 
@@ -248,6 +266,27 @@ struct SettingsView: View {
         }
         .padding(24)
         .frame(width: 460)
+    }
+}
+
+private struct SettingsSectionWidthsKey: PreferenceKey {
+    static let defaultValue: [CGFloat] = []
+
+    static func reduce(value: inout [CGFloat], nextValue: () -> [CGFloat]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+private extension View {
+    func reportSettingsSectionWidth() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: SettingsSectionWidthsKey.self,
+                    value: [geometry.size.width]
+                )
+            }
+        }
     }
 }
 

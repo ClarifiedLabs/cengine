@@ -174,19 +174,24 @@ import Testing
         #expect(model.containerSettingsStatus == nil)
     }
 
-    @Test func settingsViewFitsTheMainWindowContentWidth() {
+    @Test func settingsViewAlignsSectionsWithinMainWindowContentWidth() throws {
         let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let model = AppModel(home: home, serviceRegistrationRevision: nil)
-        let root = SettingsView()
+        var sectionWidths: [CGFloat] = []
+        let root = SettingsView { sectionWidths = $0 }
             .environmentObject(model)
             .frame(width: 700, height: 900)
         let hostingView = NSHostingView(rootView: root)
         hostingView.frame = NSRect(x: 0, y: 0, width: 700, height: 900)
         hostingView.layoutSubtreeIfNeeded()
+        hostingView.displayIfNeeded()
 
         #expect(hostingView.fittingSize.width <= 700)
         #expect(hostingView.fittingSize.height <= 900)
+        #expect(sectionWidths.count == 5)
+        let firstSectionWidth = try #require(sectionWidths.first)
+        #expect(sectionWidths.allSatisfy { abs($0 - firstSectionWidth) < 1 })
     }
 
     @Test func containersViewFillsAvailableHeightWithoutSelection() async throws {
