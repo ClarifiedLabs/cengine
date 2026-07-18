@@ -443,46 +443,60 @@ def test_paused_stop_restart_and_force_remove_complete(client: docker.DockerClie
 
 
 @pytest.mark.compat("RTM-011")
-def test_parent_stop_terminalizes_attached_and_detached_execs(
+def test_parent_stop_and_restart_terminalize_attached_and_detached_execs(
     client: docker.DockerClient,
 ):
-    container = client.containers.run(
-        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
-    )
-    attached_errors: list[BaseException] = []
-    try:
-        detached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
-        attached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
-        client.api.exec_start(detached, detach=True)
+    for operation in ("stop", "restart"):
+        container = client.containers.run(
+            ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+        )
+        attached_errors: list[BaseException] = []
+        try:
+            detached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
+            attached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
+            client.api.exec_start(detached, detach=True)
 
-        def start_attached() -> None:
-            try:
-                client.api.exec_start(attached, detach=False, tty=False)
-            except BaseException as error:  # surfaced after joining the worker
-                attached_errors.append(error)
+            def start_attached() -> None:
+                try:
+                    client.api.exec_start(attached, detach=False, tty=False)
+                except BaseException as error:  # surfaced after joining the worker
+                    attached_errors.append(error)
 
-        starter = threading.Thread(target=start_attached)
-        starter.start()
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            states = [client.api.exec_inspect(value) for value in (detached, attached)]
-            if all(state["Running"] and state["Pid"] > 0 for state in states):
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail(f"execs did not both become running: {states}")
+            starter = threading.Thread(target=start_attached)
+            starter.start()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                states = [client.api.exec_inspect(value) for value in (detached, attached)]
+                if all(state["Running"] and state["Pid"] > 0 for state in states):
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"{operation} execs did not both become running: {states}")
 
-        container.stop(timeout=1)
-        starter.join(timeout=15)
-        assert not starter.is_alive(), "attached exec stream survived parent teardown"
-        assert not attached_errors, attached_errors
-        for exec_id in (detached, attached):
-            inspected = client.api.exec_inspect(exec_id)
-            assert inspected["Running"] is False
-            assert inspected["ExitCode"] is not None
-            assert inspected["Pid"] > 0
-    finally:
-        container.remove(force=True)
+            if operation == "stop":
+                container.stop(timeout=1)
+            else:
+                container.restart(timeout=1)
+            starter.join(timeout=15)
+            assert not starter.is_alive(), (
+                f"attached exec stream survived parent {operation}"
+            )
+            assert not attached_errors, attached_errors
+            for exec_id in (detached, attached):
+                inspected = client.api.exec_inspect(exec_id)
+                assert inspected["Running"] is False
+                assert inspected["ExitCode"] is not None
+                assert inspected["Pid"] > 0
+            container.reload()
+            if operation == "stop":
+                assert container.status == "exited"
+            else:
+                assert container.status == "running"
+                responsive = container.exec_run(["sh", "-c", "printf restarted"])
+                assert responsive.exit_code == 0
+                assert responsive.output == b"restarted"
+        finally:
+            container.remove(force=True)
 
 
 def archive_file(name: str, contents: bytes) -> bytes:

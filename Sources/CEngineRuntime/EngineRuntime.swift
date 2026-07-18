@@ -412,6 +412,10 @@ public actor EngineRuntime {
         let intent = try beginLifecycleIntent(.restart, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
         try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+        // A restart creates a new container execution generation. Terminalize
+        // every child of the old generation before publishing the new start
+        // time; its completion monitor may still be suspended in the backend.
+        await reconcileExecs(for: record.id)
         guard let current = try? containerIndex(record.id) else { throw EngineError(.conflict, "container was removed while restarting") }
         snapshot.containers[current].phase = .running
         let startedAt = Date()

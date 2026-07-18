@@ -221,7 +221,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             _ = try await shim.stop()
             shims[container.id] = shim
         } catch {
-            _ = try? await shim.shutdown()
+            try? await shim.terminate()
             preparedBindSources.removeValue(forKey: container.id)
             try? FileManager.default.removeItem(at: directory)
             throw error
@@ -286,9 +286,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     try await shim.resume()
                 }
             } catch {
-                _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
-                    try await shim.stop()
-                }
+                try await terminateShim(container.id, shim: shim)
                 return await recordCompletion(container, code: 137)
             }
         }
@@ -314,9 +312,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                         await existing.value
                     }
                 } catch {
-                    _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
-                        try await shim.stop()
-                    }
+                    try await terminateShim(container.id, shim: shim)
                     code = 137
                 }
             }
@@ -340,13 +336,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 }
                 code = Int32(value?.exitCode ?? 137)
             }
-            _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
-                try await shim.stop()
-            }
             return code
         }
         completionTasks[container.id] = task
-        return await recordCompletion(container, code: task.value)
+        let code = await task.value
+        do {
+            _ = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                try await shim.stop()
+            }
+        } catch {
+            try await terminateShim(container.id, shim: shim)
+        }
+        return await recordCompletion(container, code: code)
     }
 
     public func wait(_ container: ContainerRecord) async throws -> Int32 {
@@ -523,14 +524,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func pause(_ container: ContainerRecord) async throws { guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.pause() }
     public func resume(_ container: ContainerRecord) async throws { guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.resume() }
-    public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws { _ = try await stop(container, timeoutSeconds: timeoutSeconds); _ = try await start(container) }
+    public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws {
+        _ = try await stop(container, timeoutSeconds: timeoutSeconds)
+        if shims[container.id] == nil {
+            guard try await relaunchPreparedShim(container) != nil else {
+                throw EngineError(.notFound, "container VM preparation is unavailable")
+            }
+        }
+        _ = try await start(container)
+    }
 
     public func updateResources(_ container: ContainerRecord) async throws {
         guard container.phase != .paused else {
             throw EngineError(.conflict, "cannot update resources while container \(container.id) is paused")
         }
         if container.phase != .running {
-            if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }
+            if let shim = shims[container.id] { try await terminateShim(container.id, shim: shim) }
             guard try await relaunchPreparedShim(container) != nil else {
                 throw EngineError(.notFound, "container VM preparation is unavailable")
             }
@@ -572,10 +581,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func delete(_ container: ContainerRecord) async throws {
         portForwarder.stop(containerID: container.id)
-        if let shim = shims.removeValue(forKey: container.id) {
-            finishExecSessions(using: shim)
-            _ = try? await shim.shutdown()
-        }
+        if let shim = shims[container.id] { try await terminateShim(container.id, shim: shim) }
         completionTasks.removeValue(forKey: container.id)?.cancel()
         completions.removeValue(forKey: container.id)
         activeContainers.removeValue(forKey: container.id)
@@ -588,7 +594,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let orphanIDs = shims.keys.filter { !containerIDs.contains($0) }
         for id in orphanIDs {
             portForwarder.stop(containerID: id)
-            if let shim = shims.removeValue(forKey: id) { _ = try? await shim.shutdown() }
+            if let shim = shims[id] { try await terminateShim(id, shim: shim) }
         }
     }
 
@@ -725,6 +731,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
             execBridges.removeValue(forKey: identifier)?.finishOutput()
             execShims.removeValue(forKey: identifier)
         }
+    }
+
+    private func terminateShim(_ containerID: String, shim: VMShimClient) async throws {
+        completionTasks.removeValue(forKey: containerID)?.cancel()
+        finishExecSessions(using: shim)
+        try await shim.terminate()
+        if shims[containerID] === shim { shims.removeValue(forKey: containerID) }
     }
 
     private func ensureIO(_ container: ContainerRecord, replacingStoppedSession: Bool = false,
@@ -969,7 +982,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         guard status.state != .running && status.state != .paused else {
             throw EngineError(.conflict, "cannot change volume storage while the container VM is running")
         }
-        _ = try await shim.shutdown()
+        try await terminateShim(container.id, shim: shim)
         var specification = shim.specification
         specification.generation += 1
         specification.token = Self.randomToken()

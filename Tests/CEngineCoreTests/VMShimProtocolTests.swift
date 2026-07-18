@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import CEngineCore
 #if os(macOS)
+import Darwin
 @testable import CEngineRuntime
 #endif
 
@@ -215,6 +216,80 @@ import Testing
         await #expect(throws: EngineError.self) {
             try await RawContainerVirtualMachine.awaitConnection(timeout: .milliseconds(1)) { _ in }
         }
+    }
+
+    @Test func timeoutCancelsTheLosingOperation() async {
+        let (cancellations, continuation) = AsyncStream<Void>.makeStream()
+        await #expect(throws: AsyncTimeout.TimeoutError.self) {
+            try await AsyncTimeout.run(for: .milliseconds(10)) {
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                    return true
+                } catch {
+                    continuation.yield()
+                    continuation.finish()
+                    throw error
+                }
+            }
+        }
+        var iterator = cancellations.makeAsyncIterator()
+        #expect(await iterator.next() != nil)
+    }
+
+    @Test func unresponsiveShimTerminationAbortsItsSocketAndMeetsTheDeadline() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = try RawVirtualizationBackend.makeRuntimeSocketPath()
+        let listener = try UnixSocket.listen(path: socketPath)
+        defer { Darwin.close(listener) }
+
+        Thread.detachNewThread {
+            guard let peer = try? UnixSocket.accept(listener) else { return }
+            defer { Darwin.close(peer) }
+            var buffer = [UInt8](repeating: 0, count: 4_096)
+            while Darwin.read(peer, &buffer, buffer.count) > 0 {}
+        }
+
+        let process = Process()
+        process.executableURL = URL(filePath: "/bin/sleep")
+        process.arguments = ["30"]
+        try process.run()
+        defer { if process.isRunning { process.terminate() } }
+        Thread.detachNewThread {
+            process.waitUntilExit()
+        }
+
+        let specification = VMShimProtocol.Specification(
+            containerID: "wedged-shim",
+            generation: 7,
+            token: "test-token",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: "/root.ext4",
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:07",
+            socketPath: socketPath,
+            logPath: root.appending(path: "shim.log").path
+        )
+        let status = VMShimProtocol.Status(
+            containerID: specification.containerID,
+            generation: specification.generation,
+            state: .paused,
+            processIdentifier: process.processIdentifier
+        )
+        try JSONEncoder().encode(status).write(
+            to: URL(filePath: socketPath + ".status"), options: .atomic
+        )
+
+        let client = VMShimClient(specification: specification)
+        let clock = ContinuousClock()
+        let started = clock.now
+        try await client.terminate(gracePeriodMilliseconds: 100, forceWaitMilliseconds: 1_000)
+
+        #expect(clock.now - started < .seconds(2))
+        #expect(!process.isRunning)
     }
     #endif
 }
