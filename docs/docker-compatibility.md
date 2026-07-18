@@ -82,6 +82,15 @@ covered, partial, intentional gap, or undecided. Supported Docker inputs must no
 be silently ignored; either apply them, reject them clearly, or record and
 prioritize the gap.
 
+Docker-facing lifecycle mutations are serialized per container. Pause, unpause,
+network connect/disconnect, explicit start/stop, and policy-driven restart do not
+commit through collection positions captured before a backend suspension, and a
+stop request that overlaps an in-flight start returns a conflict instead of
+reporting a false successful stop. Focused Swift race tests cover these ownership
+rules against the [Docker container API](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Container)
+and [Docker network API](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Network)
+operation contracts.
+
 ## API version envelope
 
 Cengine advertises API v1.55 and accepts versioned operational requests from
@@ -135,7 +144,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `RTM-006` | `test_capability_add_drop_apply_to_init_and_exec` | ✅ Pass | Support | **cengine-owned.** Docker's default Linux capability set is used for unprivileged root workloads; case-insensitive `CapAdd`/`CapDrop`, optional `CAP_` prefixes, and `ALL` are normalized, drops are applied before additions, and the result is applied to bounding/permitted/effective sets for init and default exec. Privileged workloads and privileged exec retain all capabilities. See [Docker Linux capabilities](https://docs.docker.com/engine/containers/run/#runtime-privilege-and-linux-capabilities) and [OCI process capabilities](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config.md#process). |
 | `RTM-007` | `test_container_prune_honors_filters_and_rejects_unknown_keys` | ✅ Pass | Support | **cengine-owned.** Container prune applies one Docker `until` cutoff, conjunctive positive-label filters, and negated-label filters before deletion. Legacy map-shaped filter keys remain active regardless of their boolean payload. Unknown, malformed, or ambiguous filters fail without deleting any container instead of silently broadening prune scope. See the [Docker container prune API](https://docs.docker.com/reference/api/engine/version/v1.52/#tag/Container/operation/ContainerPrune). |
 | `RTM-008` | `test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks` | ✅ Pass | Support | **cengine-owned.** Exec staging processes preserve target exit codes and proxy catchable signals. Exec inspect publishes the final target PID rather than a staging proxy. Each exec target receives a dedicated cgroup-v2 leaf, and timed-out healthchecks write `1` to that leaf's `cgroup.kill`, recursively terminating both the target and descendants without affecting sibling execs. See the [Linux cgroup-v2 `cgroup.kill` contract](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files) and [OCI Linux control groups](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#control-groups). |
-| `RTM-009` | `test_attached_exec_inspect_publishes_pid_and_terminal_status` | ✅ Pass | Support | **cengine-owned.** An attached exec remains pending while its guest state is `starting` or `running`, publishes its final target PID before the HTTP upgrade completes, and transitions inspect to the terminal exit code without losing that PID. See the [Docker exec inspect API](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Exec/operation/ExecInspect) and [OCI process lifecycle](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#lifecycle). |
+| `RTM-009` | `test_attached_exec_inspect_publishes_pid_and_terminal_status` | ✅ Pass | Support | **cengine-owned.** An attached exec remains pending while its guest state is `starting` or `running`, publishes its final target PID before the HTTP upgrade completes, and transitions inspect to the terminal exit code without losing that PID, including when the target exits before its PID publication is committed. A launch failure after stream upgrade becomes terminal instead of reverting to a permanently created host record. See the [Docker exec inspect API](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Exec/operation/ExecInspect) and [OCI process lifecycle](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#lifecycle). |
 
 ### Explicit runtime input decisions
 

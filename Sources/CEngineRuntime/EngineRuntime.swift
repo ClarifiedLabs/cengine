@@ -24,7 +24,7 @@ public struct ContainerWaitSubscription: Sendable {
 
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
-        enum Operation: Equatable { case stop, restart, remove, update }
+        enum Operation: Equatable { case stop, restart, remove, update, pause, resume, network }
 
         let operation: Operation
         let token = UUID()
@@ -323,11 +323,11 @@ public actor EngineRuntime {
             try await persist()
             emit(containerEvent("update", merged))
             endLifecycleIntent(intent, for: old.id)
-            await reconcileDeferredUpdateCompletion(old.id)
+            await reconcileDeferredCompletion(old.id)
             return merged
         } catch {
             endLifecycleIntent(intent, for: old.id)
-            await reconcileDeferredUpdateCompletion(old.id)
+            await reconcileDeferredCompletion(old.id)
             throw error
         }
     }
@@ -346,20 +346,60 @@ public actor EngineRuntime {
 
     public func pauseContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase == .running else { throw EngineError(.conflict, "Container (identifier) is not running") }
-        try await backend.pause(snapshot.containers[index])
-        snapshot.containers[index].phase = .paused
-        try await persist()
-        emit(containerEvent("pause", snapshot.containers[index]))
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        guard record.phase == .running else {
+            throw EngineError(.conflict, "Container \(identifier) is not running")
+        }
+        let intent = try beginLifecycleIntent(.pause, for: record.id)
+        do {
+            try await backend.pause(record)
+            guard ownsLifecycleExecution(intent, record: record) else {
+                throw EngineError(.conflict, "container \(identifier) changed state while it was being paused")
+            }
+            let current = try containerIndex(record.id)
+            snapshot.containers[current].phase = .paused
+            let paused = snapshot.containers[current]
+            try await persist()
+            emit(containerEvent("pause", paused))
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func resumeContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase == .paused else { throw EngineError(.conflict, "Container (identifier) is not paused") }
-        try await backend.resume(snapshot.containers[index])
-        snapshot.containers[index].phase = .running
-        try await persist()
-        emit(containerEvent("unpause", snapshot.containers[index]))
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        guard record.phase == .paused else {
+            throw EngineError(.conflict, "Container \(identifier) is not paused")
+        }
+        let intent = try beginLifecycleIntent(.resume, for: record.id)
+        do {
+            try await backend.resume(record)
+            guard ownsLifecycleExecution(intent, record: record) else {
+                throw EngineError(.conflict, "container \(identifier) changed state while it was being resumed")
+            }
+            let current = try containerIndex(record.id)
+            snapshot.containers[current].phase = .running
+            let resumed = snapshot.containers[current]
+            try await persist()
+            emit(containerEvent("unpause", resumed))
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func restartContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
@@ -456,8 +496,11 @@ public actor EngineRuntime {
 
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused else { return }
         let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        guard record.phase == .running || record.phase == .paused else { return }
         let intent = try beginLifecycleIntent(.stop, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
         let code = try await backend.stop(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
@@ -725,44 +768,101 @@ public actor EngineRuntime {
                                gatewayPriority: Int? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
-        guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
-            throw EngineError(.conflict, "cannot connect a network while container \(snapshot.containers[index].name) is running")
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(containerIdentifier) is starting")
         }
-        guard !snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else { return }
-        try validateStaticEndpointModes(
-            network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
-        )
-        let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
-        let previous = snapshot.containers[index]
-        snapshot.containers[index].networks.append(.init(
-            networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
-            ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil,
-            macAddress: normalizedMac, gatewayPriority: gatewayPriority
-        ))
-        snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
-        try await persistEndpointAllocationCursors()
+        guard record.phase != .running && record.phase != .paused else {
+            throw EngineError(.conflict, "cannot connect a network while container \(record.name) is running")
+        }
+        let intent = try beginLifecycleIntent(.network, for: record.id)
+        var attemptedNetworks: [NetworkEndpointRecord]?
         do {
-            try validateEndpoints(snapshot.containers[index])
+            guard !record.networks.contains(where: { $0.networkID == network.id }) else {
+                endLifecycleIntent(intent, for: record.id)
+                return
+            }
+            try validateStaticEndpointModes(
+                network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
+            )
+            let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
+            var updated = record
+            updated.networks.append(.init(
+                networkID: network.id, aliases: aliases, ipv4Address: ipv4Address,
+                ipv6Address: ipv6Address, ipv4AddressIsStatic: ipv4Address != nil,
+                ipv6AddressIsStatic: ipv6Address != nil, macAddress: normalizedMac,
+                gatewayPriority: gatewayPriority
+            ))
+            updated = try allocatingEndpointAddresses(to: updated)
+            attemptedNetworks = updated.networks
+            snapshot.containers[index] = updated
+            try await persistEndpointAllocationCursors()
+            guard ownsNetworkMutation(intent, record: record, networks: updated.networks) else {
+                throw EngineError(.conflict, "container \(containerIdentifier) changed while its network was being connected")
+            }
+            try validateEndpoints(updated)
             try await backend.updateNetworkRecords(snapshot.containers)
-        } catch { snapshot.containers[index] = previous; try? await backend.updateNetworkRecords(snapshot.containers); throw error }
-        try await persist()
+            guard ownsNetworkMutation(intent, record: record, networks: updated.networks) else {
+                throw EngineError(.conflict, "container \(containerIdentifier) changed while its network was being connected")
+            }
+            try await persist()
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            if let attemptedNetworks,
+               lifecycleIntents[record.id] == intent,
+               let current = try? containerIndex(record.id),
+               snapshot.containers[current].networks == attemptedNetworks {
+                snapshot.containers[current].networks = record.networks
+                try? await backend.updateNetworkRecords(snapshot.containers)
+            }
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
-        guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
-            throw EngineError(.conflict, "cannot disconnect a network while container \(snapshot.containers[index].name) is running")
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(containerIdentifier) is starting")
         }
-        guard snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else {
-            if force { return }
-            throw EngineError(.notFound, "container is not connected to network \(network.name)")
+        guard record.phase != .running && record.phase != .paused else {
+            throw EngineError(.conflict, "cannot disconnect a network while container \(record.name) is running")
         }
-        let previous = snapshot.containers[index]
-        snapshot.containers[index].networks.removeAll { $0.networkID == network.id }
-        do { try await backend.updateNetworkRecords(snapshot.containers) }
-        catch { snapshot.containers[index] = previous; try? await backend.updateNetworkRecords(snapshot.containers); throw error }
-        try await persist()
+        let intent = try beginLifecycleIntent(.network, for: record.id)
+        var attemptedNetworks: [NetworkEndpointRecord]?
+        do {
+            guard record.networks.contains(where: { $0.networkID == network.id }) else {
+                endLifecycleIntent(intent, for: record.id)
+                if force { return }
+                throw EngineError(.notFound, "container is not connected to network \(network.name)")
+            }
+            var updated = record
+            updated.networks.removeAll { $0.networkID == network.id }
+            attemptedNetworks = updated.networks
+            snapshot.containers[index] = updated
+            try await backend.updateNetworkRecords(snapshot.containers)
+            guard ownsNetworkMutation(intent, record: record, networks: updated.networks) else {
+                throw EngineError(.conflict, "container \(containerIdentifier) changed while its network was being disconnected")
+            }
+            try await persist()
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            if let attemptedNetworks,
+               lifecycleIntents[record.id] == intent,
+               let current = try? containerIndex(record.id),
+               snapshot.containers[current].networks == attemptedNetworks {
+                snapshot.containers[current].networks = record.networks
+                try? await backend.updateNetworkRecords(snapshot.containers)
+            }
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func pruneNetworks() async throws -> [String] {
@@ -1153,7 +1253,7 @@ public actor EngineRuntime {
         await reconcileCompletedContainer(identifier, code: code, suppressing: intent)
     }
 
-    private func reconcileDeferredUpdateCompletion(_ identifier: String) async {
+    private func reconcileDeferredCompletion(_ identifier: String) async {
         guard lifecycleIntents[identifier] == nil,
               let index = try? containerIndex(identifier),
               snapshot.containers[index].phase == .exited,
@@ -1259,6 +1359,23 @@ public actor EngineRuntime {
         return current.phase == .exited
             && current.startedAt == record.startedAt
             && current.exitCode == record.exitCode
+    }
+
+    private func ownsLifecycleExecution(_ intent: LifecycleIntent, record: ContainerRecord) -> Bool {
+        guard lifecycleIntents[record.id] == intent,
+              let index = try? containerIndex(record.id) else { return false }
+        let current = snapshot.containers[index]
+        return current.phase == record.phase && current.startedAt == record.startedAt
+    }
+
+    private func ownsNetworkMutation(
+        _ intent: LifecycleIntent,
+        record: ContainerRecord,
+        networks: [NetworkEndpointRecord]
+    ) -> Bool {
+        guard ownsLifecycleExecution(intent, record: record),
+              let index = try? containerIndex(record.id) else { return false }
+        return snapshot.containers[index].networks == networks
     }
 
     private func beginLifecycleIntent(_ operation: LifecycleIntent.Operation, for identifier: String) throws -> LifecycleIntent {

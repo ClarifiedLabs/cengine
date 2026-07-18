@@ -579,7 +579,7 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	committed := false
 	defer func() {
 		if !committed {
-			s.rollbackExecStart(id)
+			s.failAttachedExecStart(id, err)
 		}
 	}()
 
@@ -712,15 +712,7 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		_ = command.Process.Kill()
 		return protocol.ProcessStatus{}, err
 	}
-	s.mu.Lock()
-	if s.execs[id] == command {
-		s.execTargets[id] = targetPID
-		status = protocol.ProcessStatus{Status: "running", PID: targetPID}
-		s.execStatus[id] = status
-	} else {
-		status = s.execStatus[id]
-	}
-	s.mu.Unlock()
+	status = s.publishExecTargetPID(id, command, targetPID)
 	return status, nil
 }
 
@@ -742,6 +734,32 @@ func (s *Supervisor) rollbackExecStart(id string) {
 	if s.execStatus[id].Status == "starting" {
 		s.execStatus[id] = protocol.ProcessStatus{Status: "created"}
 	}
+}
+
+func (s *Supervisor) failAttachedExecStart(id string, err error) {
+	code := ExecStageExitCode(err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.execStatus[id].Status == "starting" {
+		s.execStatus[id] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
+	}
+}
+
+func (s *Supervisor) publishExecTargetPID(id string, command *exec.Cmd, targetPID int) protocol.ProcessStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.execs[id] == command {
+		s.execTargets[id] = targetPID
+		status := protocol.ProcessStatus{Status: "running", PID: targetPID}
+		s.execStatus[id] = status
+		return status
+	}
+	status := s.execStatus[id]
+	if status.Status == "exited" {
+		status.PID = targetPID
+		s.execStatus[id] = status
+	}
+	return status
 }
 
 func attachedExecStdin(stream io.Reader) (*os.File, func(), error) {
@@ -912,10 +930,14 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	}
 	s.mu.Lock()
 	cgroup := s.execCgroups[id]
+	targetPID := s.execTargets[id]
+	if targetPID == 0 {
+		targetPID = s.execStatus[id].PID
+	}
 	delete(s.execs, id)
 	delete(s.execTargets, id)
 	delete(s.execCgroups, id)
-	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
+	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", PID: targetPID, ExitCode: &code}
 	s.mu.Unlock()
 	if cgroup != "" {
 		_ = os.Remove(cgroup)

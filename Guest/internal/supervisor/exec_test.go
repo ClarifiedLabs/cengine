@@ -104,6 +104,31 @@ func TestExecStartReservationExcludesAttachedAndDetachedLaunches(t *testing.T) {
 	}
 }
 
+func TestAttachedExecLaunchFailureBecomesTerminalAfterUpgrade(t *testing.T) {
+	supervisor := New()
+	supervisor.execStatus["missing"] = protocol.ProcessStatus{Status: "starting"}
+	supervisor.failAttachedExecStart("missing", os.ErrNotExist)
+
+	status := supervisor.ExecStatus("missing")
+	if status.Status != "exited" || status.ExitCode == nil || *status.ExitCode != 127 {
+		t.Fatalf("attached launch failure status is %#v, want exited with code 127", status)
+	}
+}
+
+func TestRapidAttachedExecExitRetainsPublishedTargetPID(t *testing.T) {
+	supervisor := New()
+	code := 23
+	supervisor.execStatus["fast"] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
+
+	status := supervisor.publishExecTargetPID("fast", &exec.Cmd{}, 789)
+	if status.Status != "exited" || status.PID != 789 || status.ExitCode == nil || *status.ExitCode != code {
+		t.Fatalf("rapid attached exec status is %#v, want exited PID 789 code 23", status)
+	}
+	if persisted := supervisor.ExecStatus("fast"); persisted.PID != 789 {
+		t.Fatalf("persisted rapid attached exec PID is %d, want 789", persisted.PID)
+	}
+}
+
 func TestWaitExecTreatsStartingAndRunningAsNonterminalStates(t *testing.T) {
 	for _, test := range []struct {
 		status  string

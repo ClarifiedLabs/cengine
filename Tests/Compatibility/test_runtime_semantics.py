@@ -392,6 +392,15 @@ def test_attached_exec_inspect_publishes_pid_and_terminal_status(
         assert completed["Running"] is False
         assert completed["ExitCode"] == 23
         assert completed["Pid"] == running["Pid"]
+
+        fast_exec = client.api.exec_create(
+            container.id, ["sh", "-c", "exit 29"], stdout=True, stderr=True,
+        )["Id"]
+        assert client.api.exec_start(fast_exec, detach=False, tty=False) == b""
+        fast_completed = client.api.exec_inspect(fast_exec)
+        assert fast_completed["Running"] is False
+        assert fast_completed["ExitCode"] == 29
+        assert fast_completed["Pid"] > 0
     finally:
         container.remove(force=True)
 
