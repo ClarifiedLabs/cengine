@@ -3,6 +3,27 @@ import CEngineRuntime
 import Foundation
 import NIOHTTP1
 
+private enum DockerFilterValues: Decodable {
+    case list([String])
+    case map([String: Bool])
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let values = try? container.decode([String].self) {
+            self = .list(values)
+        } else {
+            self = .map(try container.decode([String: Bool].self))
+        }
+    }
+
+    var active: [String] {
+        switch self {
+        case .list(let values): Array(Set(values)).sorted()
+        case .map(let values): values.compactMap { $0.value ? $0.key : nil }.sorted()
+        }
+    }
+}
+
 public struct APIRequest: Sendable {
     public let method: HTTPMethod
     public let uri: String
@@ -111,9 +132,7 @@ public struct DockerRouter: Sendable {
             })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
-            if let driver = input.VolumeDriver, !driver.isEmpty, driver != "local" {
-                throw EngineError(.unsupported, "volume driver \(driver) is not supported")
-            }
+            try validateVolumeDrivers(in: input)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
             let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
@@ -369,11 +388,11 @@ public struct DockerRouter: Sendable {
         case (.POST, "/containers/prune"):
             return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers()))
         case (.POST, "/images/prune"):
-            try rejectActivePruneFilters(query["filters"], operation: "image prune")
-            return json(status: .ok, PruneResponse(images: try await runtime.pruneImages()))
+            let scope = try imagePruneScope(filters: query["filters"])
+            return json(status: .ok, PruneResponse(images: try await runtime.pruneImages(scope: scope)))
         case (.POST, "/volumes/prune"):
-            try rejectActivePruneFilters(query["filters"], operation: "volume prune")
-            return json(status: .ok, PruneResponse(volumes: try await runtime.pruneVolumes()))
+            let scope = try volumePruneScope(filters: query["filters"], version: version)
+            return json(status: .ok, PruneResponse(volumes: try await runtime.pruneVolumes(scope: scope)))
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):
@@ -624,26 +643,60 @@ public struct DockerRouter: Sendable {
         return []
     }
 
-    private func rejectActivePruneFilters(_ encoded: String?, operation: String) throws {
-        guard let encoded, !encoded.isEmpty else { return }
-        guard let data = encoded.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+    private func activePruneFilters(_ encoded: String?) throws -> [String: [String]] {
+        guard let encoded, !encoded.isEmpty else { return [:] }
+        guard let data = encoded.replacingOccurrences(of: "+", with: " ").data(using: .utf8) else {
             throw EngineError(.badRequest, "invalid prune filters")
         }
-        for value in object.values {
-            if let values = value as? [Any] {
-                if !values.isEmpty {
-                    throw EngineError(.unsupported, "\(operation) filters are not supported")
-                }
-                continue
-            }
-            if let values = value as? [String: Bool] {
-                if values.values.contains(true) {
-                    throw EngineError(.unsupported, "\(operation) filters are not supported")
-                }
-                continue
-            }
+        do {
+            return try decoder.decode([String: DockerFilterValues].self, from: data).mapValues(\.active)
+        } catch {
             throw EngineError(.badRequest, "invalid prune filters")
+        }
+    }
+
+    private func pruneBoolean(_ values: [String], key: String) throws -> Bool {
+        guard !values.isEmpty else {
+            throw EngineError(.badRequest, "invalid filter \(key)")
+        }
+        let normalized = Set(values.map { $0.lowercased() })
+        let hasTrue = !normalized.isDisjoint(with: ["1", "true"])
+        let hasFalse = !normalized.isDisjoint(with: ["0", "false"])
+        guard hasTrue != hasFalse else {
+            throw EngineError(.badRequest, "invalid filter \(key)=\(values.joined(separator: ","))")
+        }
+        return hasTrue
+    }
+
+    private func imagePruneScope(filters encoded: String?) throws -> ImagePruneScope {
+        let filters = try activePruneFilters(encoded)
+        for (key, values) in filters where key != "dangling" && !values.isEmpty {
+            throw EngineError(.unsupported, "image prune filter \(key) is not supported")
+        }
+        guard let values = filters["dangling"] else { return .dangling }
+        return try pruneBoolean(values, key: "dangling") ? .dangling : .allUnused
+    }
+
+    private func volumePruneScope(filters encoded: String?, version: DockerAPIVersion) throws -> VolumePruneScope {
+        let filters = try activePruneFilters(encoded)
+        for (key, values) in filters where key != "all" && !values.isEmpty {
+            throw EngineError(.unsupported, "volume prune filter \(key) is not supported")
+        }
+        // Docker API versions before 1.42 pruned all unused local volumes by default.
+        // Cengine's supported API envelope starts at 1.44, but keep the version rule explicit here.
+        let defaultAll = version < .init(major: 1, minor: 42)
+        guard let values = filters["all"] else { return defaultAll ? .allUnused : .anonymous }
+        return try pruneBoolean(values, key: "all") ? .allUnused : .anonymous
+    }
+
+    private func validateVolumeDrivers(in input: ContainerCreateRequest) throws {
+        if let driver = input.HostConfig?.VolumeDriver, !driver.isEmpty, driver != "local" {
+            throw EngineError(.unsupported, "volume driver \(driver) is not supported")
+        }
+        for mount in (input.Mounts ?? []) + (input.HostConfig?.Mounts ?? []) {
+            guard let driver = mount.VolumeOptions?.DriverConfig?.Name,
+                  !driver.isEmpty, driver != "local" else { continue }
+            throw EngineError(.unsupported, "volume driver \(driver) is not supported")
         }
     }
 

@@ -50,7 +50,10 @@ attestations, and optional differential response-shape comparison.
 Container annotations now persist from create through inspect and daemon
 recovery, with list responses exposing them from API v1.46. Successful pulls
 and archive loads emit Docker-shaped image events with historical type, action,
-and image filtering. System information counts the actual image store and
+and image filtering; container events apply the same filter to their creating
+image reference. Default prune requests preserve tagged images and named
+volumes, while Docker's explicit widening selectors remove all unused records.
+System information counts the actual image store and
 versions discovered-device output; containerd, Moby's Linux firewall backend,
 and NRI remain omitted because cengine does not implement those subsystems.
 

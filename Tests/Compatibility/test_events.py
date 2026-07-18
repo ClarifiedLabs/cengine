@@ -101,3 +101,40 @@ def test_historical_image_pull_and_load_events_honor_filters(client: docker.Dock
     assert {event["Action"] for event in events} >= {"pull", "load"}, json.dumps(events, indent=2)
     assert all(event["Type"] == "image" for event in events)
     assert all(event["Actor"]["Attributes"].get("name") for event in events)
+
+
+@pytest.mark.compat("EVT-004")
+def test_container_events_match_image_filter_with_tag_stripping(client: docker.DockerClient):
+    name = f"compat-event-image-{time.time_ns()}"
+    image_name = IMAGE.split("@", maxsplit=1)[0]
+    leaf = image_name.rsplit("/", maxsplit=1)[-1]
+    if ":" in leaf:
+        image_name = image_name.rsplit(":", maxsplit=1)[0]
+
+    since = time.time() - 1
+    container = client.containers.create(IMAGE, command=["true"], name=name)
+    container.start()
+    assert container.wait(timeout=60)["StatusCode"] == 0
+    container.remove()
+    until = time.time()
+
+    response = client.api._get(
+        client.api._url("/events"),
+        params={
+            "since": since,
+            "until": until,
+            "filters": json.dumps({
+                "type": ["container"],
+                "container": [name],
+                "image": [image_name],
+            }),
+        },
+        stream=True,
+    )
+    try:
+        events = [json.loads(line) for line in response.iter_lines() if line]
+    finally:
+        response.close()
+
+    assert {event["Action"] for event in events} >= {"create", "start", "die", "destroy"}, json.dumps(events, indent=2)
+    assert all(event["Actor"]["Attributes"].get("image") for event in events)

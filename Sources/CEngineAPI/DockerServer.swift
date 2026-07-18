@@ -244,12 +244,40 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 case "container":
                     event.id == value || event.id.hasPrefix(value) || event.attributes["name"] == value
                 case "image":
-                    event.id == value || event.id.hasPrefix(value) || event.attributes["name"] == value
+                    matchesImage(event, value: value)
                 case "label": matchesLabel(event, value: value)
                 default: true
                 }
             }
         }
+    }
+
+    private static func matchesImage(_ event: RuntimeEvent, value: String) -> Bool {
+        let attribute = event.attributes[event.type == "image" ? "name" : "image"] ?? ""
+        return [event.id, attribute].contains { reference in
+            reference == value
+                || familiarImageReference(reference) == value
+                || familiarImageName(reference) == value
+        }
+    }
+
+    private static func familiarImageReference(_ reference: String) -> String {
+        if reference.hasPrefix("docker.io/library/") {
+            return String(reference.dropFirst("docker.io/library/".count))
+        }
+        if reference.hasPrefix("docker.io/") {
+            return String(reference.dropFirst("docker.io/".count))
+        }
+        return reference
+    }
+
+    private static func familiarImageName(_ reference: String) -> String {
+        let familiar = familiarImageReference(reference)
+        let withoutDigest = familiar.split(separator: "@", maxSplits: 1).first.map(String.init) ?? familiar
+        let slash = withoutDigest.lastIndex(of: "/")
+        guard let colon = withoutDigest.lastIndex(of: ":") else { return withoutDigest }
+        if let slash, colon < slash { return withoutDigest }
+        return String(withoutDigest[..<colon])
     }
 
     private static func matchesLabel(_ event: RuntimeEvent, value: String) -> Bool {

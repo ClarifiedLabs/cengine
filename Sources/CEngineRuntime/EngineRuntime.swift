@@ -22,6 +22,16 @@ public struct ContainerWaitSubscription: Sendable {
     init(stream: AsyncStream<Int32>) { self.stream = stream }
 }
 
+public enum ImagePruneScope: Equatable, Sendable {
+    case dangling
+    case allUnused
+}
+
+public enum VolumePruneScope: Equatable, Sendable {
+    case anonymous
+    case allUnused
+}
+
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
         enum Operation: Equatable { case stop, restart, remove }
@@ -756,19 +766,31 @@ public actor EngineRuntime {
         return removed.map(\.id)
     }
 
-    public func pruneImages() async throws -> [ImageRecord] {
-        let used = Set(snapshot.containers.map(\.image))
-        let removed = snapshot.images.filter { image in image.references.allSatisfy { !used.contains($0) } }
+    public func pruneImages(scope: ImagePruneScope = .dangling) async throws -> [ImageRecord] {
+        let removed = snapshot.images.filter { image in
+            let used = snapshot.containers.contains { container in
+                container.image == image.id
+                    || container.imageID == image.id
+                    || image.manifests.contains { $0.imageID == container.imageID }
+                    || image.references.contains(container.image)
+                    || image.references.contains(ImageReference.normalized(container.image))
+            }
+            guard !used else { return false }
+            return scope == .allUnused || image.references.isEmpty
+        }
         for image in removed { for reference in image.references { try await backend.deleteImage(reference: reference) } }
         let ids = Set(removed.map(\.id)); snapshot.images.removeAll { ids.contains($0.id) }
         try await persist(); return removed
     }
 
-    public func pruneVolumes() async throws -> [String] {
+    public func pruneVolumes(scope: VolumePruneScope = .anonymous) async throws -> [String] {
         let used = Set(snapshot.containers.flatMap(\.mounts).filter { $0.kind == .volume }.map(\.source))
-        let removed = snapshot.volumes.filter { !used.contains($0.name) }
+        let removed = snapshot.volumes.filter {
+            !used.contains($0.name) && (scope == .allUnused || $0.anonymous == true)
+        }
         for volume in removed { try await backend.deleteVolume(volume.name) }
-        snapshot.volumes.removeAll { !used.contains($0.name) }
+        let names = Set(removed.map(\.name))
+        snapshot.volumes.removeAll { names.contains($0.name) }
         try await persist(); return removed.map(\.name)
     }
 

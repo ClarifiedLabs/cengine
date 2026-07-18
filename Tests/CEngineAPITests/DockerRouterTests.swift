@@ -421,6 +421,13 @@ private actor AuthImageBackend: ContainerBackend {
         return (DockerRouter(runtime: try await EngineRuntime(root: root), root: root), root)
     }
 
+    private func fixture(snapshot: EngineSnapshot) async throws -> (DockerRouter, URL) {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let store = AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+        try await store.save(snapshot)
+        return (DockerRouter(runtime: try await EngineRuntime(root: root), root: root), root)
+    }
+
     @Test func eventFiltersDecodeFormEncodedDockerJSON() throws {
         let target = try DockerRequestTarget.parse(
             "/v1.55/events?filters=%7B%22type%22%3A+%5B%22container%22%5D%2C+%22container%22%3A+%5B%22sample%22%5D%2C+%22label%22%3A+%5B%22app%3Ddemo%22%5D%7D"
@@ -441,6 +448,20 @@ private actor AuthImageBackend: ContainerBackend {
             "type": ["image"], "event": ["pull"], "image": ["alpine:latest"],
         ]))
         #expect(!DockerHTTPHandler.matches(event, filters: ["image": ["busybox:latest"]]))
+    }
+
+    @Test func containerEventImageFiltersMatchActorImageWithAndWithoutTag() {
+        let event = RuntimeEvent(
+            type: "container",
+            action: "start",
+            id: "container-id",
+            attributes: ["name": "sample", "image": "docker.io/library/alpine:latest"]
+        )
+        #expect(DockerHTTPHandler.matches(event, filters: ["image": ["alpine:latest"]]))
+        #expect(DockerHTTPHandler.matches(event, filters: ["image": ["alpine"]]))
+        #expect(DockerHTTPHandler.matches(event, filters: ["image": ["docker.io/library/alpine:latest"]]))
+        #expect(!DockerHTTPHandler.matches(event, filters: ["image": ["alpine:edge"]]))
+        #expect(!DockerHTTPHandler.matches(event, filters: ["image": ["busybox"]]))
     }
 
     @Test func pingAndVersionNegotiation() async throws {
@@ -848,18 +869,91 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(unsupported.status == .notImplemented)
     }
 
-    @Test func containerCreateRejectsUnsupportedVolumeDriver() async throws {
+    @Test func containerCreateRejectsUnsupportedVolumeDriversFromDockerFields() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let response = await router.route(.init(
-            method: .POST,
-            uri: "/v1.55/containers/create",
-            body: Data(#"{"Image":"alpine","VolumeDriver":"third-party","Volumes":{"/data":{}}}"#.utf8)
-        ))
-        #expect(response.status == .notImplemented)
+        let bodies = [
+            #"{"Image":"alpine","Volumes":{"/legacy":{}},"HostConfig":{"VolumeDriver":"third-party"}}"#,
+            #"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/data","VolumeOptions":{"DriverConfig":{"Name":"third-party","Options":{"remote":"true"}}}}]}}"#,
+        ]
+        for body in bodies {
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v1.55/containers/create",
+                body: Data(body.utf8)
+            ))
+            #expect(response.status == .notImplemented)
+        }
+        let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
+        let volumeList = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
+        #expect((volumeList["Volumes"] as? [[String: Any]])?.isEmpty == true)
     }
 
-    @Test func imageAndVolumePruneRejectFiltersInsteadOfIgnoringThem() async throws {
+    @Test func imagePruneDefaultsToUnusedDanglingAndCanExplicitlyWiden() async throws {
+        let tagged = ImageRecord(
+            id: "sha256:tagged", references: ["docker.io/library/keep:latest"], createdAt: Date(),
+            size: 20, architecture: "arm64", os: "linux"
+        )
+        let dangling = ImageRecord(
+            id: "sha256:dangling", references: [], createdAt: Date(), size: 10,
+            architecture: "arm64", os: "linux"
+        )
+        let usedDangling = ImageRecord(
+            id: "sha256:used", references: [], createdAt: Date(), size: 30,
+            architecture: "arm64", os: "linux"
+        )
+        var container = ContainerRecord(name: "uses-dangling", image: usedDangling.id)
+        container.imageID = usedDangling.id
+        let (router, root) = try await fixture(snapshot: .init(
+            containers: [container], images: [tagged, dangling, usedDangling]
+        ))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let defaultPrune = await router.route(.init(method: .POST, uri: "/v1.55/images/prune"))
+        #expect(defaultPrune.status == .ok)
+        let defaultJSON = try #require(JSONSerialization.jsonObject(with: defaultPrune.body) as? [String: Any])
+        let defaultDeleted = try #require(defaultJSON["ImagesDeleted"] as? [[String: String]])
+        #expect(defaultDeleted.map { $0["Deleted"] }.contains(dangling.id))
+        #expect(!defaultDeleted.map { $0["Deleted"] }.contains(tagged.id))
+        #expect(!defaultDeleted.map { $0["Deleted"] }.contains(usedDangling.id))
+
+        let widePrune = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/images/prune?filters=%7B%22dangling%22:%7B%22false%22:true%7D%7D"
+        ))
+        #expect(widePrune.status == .ok)
+        let wideJSON = try #require(JSONSerialization.jsonObject(with: widePrune.body) as? [String: Any])
+        let wideDeleted = try #require(wideJSON["ImagesDeleted"] as? [[String: String]])
+        #expect(wideDeleted.map { $0["Deleted"] }.contains(tagged.id))
+        #expect(!wideDeleted.map { $0["Deleted"] }.contains(usedDangling.id))
+    }
+
+    @Test func volumePruneDefaultsToUnusedAnonymousAndCanExplicitlyWiden() async throws {
+        let named = VolumeRecord(name: "keep-named", sizeBytes: 1, anonymous: false)
+        let anonymous = VolumeRecord(name: "remove-anonymous", sizeBytes: 1, anonymous: true)
+        let usedAnonymous = VolumeRecord(name: "keep-used", sizeBytes: 1, anonymous: true)
+        var container = ContainerRecord(name: "uses-volume", image: "alpine")
+        container.mounts = [.init(kind: .volume, source: usedAnonymous.name, destination: "/data")]
+        let (router, root) = try await fixture(snapshot: .init(
+            containers: [container], volumes: [named, anonymous, usedAnonymous]
+        ))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let defaultPrune = await router.route(.init(method: .POST, uri: "/v1.44/volumes/prune"))
+        #expect(defaultPrune.status == .ok)
+        let defaultJSON = try #require(JSONSerialization.jsonObject(with: defaultPrune.body) as? [String: Any])
+        #expect(defaultJSON["VolumesDeleted"] as? [String] == [anonymous.name])
+
+        let widePrune = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/volumes/prune?filters=%7B%22all%22:%5B%22true%22%5D%7D"
+        ))
+        #expect(widePrune.status == .ok)
+        let wideJSON = try #require(JSONSerialization.jsonObject(with: widePrune.body) as? [String: Any])
+        #expect(wideJSON["VolumesDeleted"] as? [String] == [named.name])
+    }
+
+    @Test func imageAndVolumePruneRejectUnsupportedActiveFilters() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = await router.route(.init(
@@ -874,7 +968,7 @@ private actor AuthImageBackend: ContainerBackend {
 
         let imagePrune = await router.route(.init(
             method: .POST,
-            uri: "/v1.55/images/prune?filters=%7B%22dangling%22:%5B%22false%22%5D%7D"
+            uri: "/v1.55/images/prune?filters=%7B%22label%22:%5B%22retain=true%22%5D%7D"
         ))
         let volumePrune = await router.route(.init(
             method: .POST,
@@ -882,6 +976,17 @@ private actor AuthImageBackend: ContainerBackend {
         ))
         #expect(imagePrune.status == .notImplemented)
         #expect(volumePrune.status == .notImplemented)
+
+        let inactiveImageFilter = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/images/prune?filters=%7B%22label%22:%5B%5D%7D"
+        ))
+        let inactiveVolumeFilter = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/volumes/prune?filters=%7B%22label%22:%7B%22retain=true%22:false%7D%7D"
+        ))
+        #expect(inactiveImageFilter.status == .ok)
+        #expect(inactiveVolumeFilter.status == .ok)
 
         let images = await router.route(.init(method: .GET, uri: "/v1.55/images/json"))
         let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))

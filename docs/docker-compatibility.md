@@ -49,7 +49,7 @@ reference beneath the Docker API.
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
 | Negotiation, version, info | `SYS-001`–`SYS-004`, `CLI-001` | Counts and optional native-engine fields are versioned; operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-048`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-048`, `EVT-001`–`EVT-002`, `EVT-004`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; lifecycle event filters include the creating image; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-047`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-017`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP publishing is an intentional gap covered by `NET-017`. Endpoint sysctls, explicit IPv4 controls, and IPAM status remain gaps. |
 | Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003`, `EVT-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, authenticated registry round trips, and pull/load events are covered. |
@@ -99,6 +99,7 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 
 | API | Change affecting cengine's surface | Status | Notes |
 |---|---|---|---|
+| 1.42 | Volume prune defaults to anonymous volumes | Supported | All accepted cengine API versions inherit the safe anonymous-only default; `all=true` explicitly widens pruning to every unused local volume. |
 | 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
 | 1.45 | Named-volume mount `VolumeOptions.Subpath` | Supported | Existing subdirectories are safely resolved beneath the named-volume root. |
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
@@ -237,6 +238,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `EVT-001` | `test_filtered_container_events` | ✅ Pass | Support | **cengine-owned.** Type, container, and label filters isolate live create, start, die, and destroy events. |
 | `EVT-002` | `test_historical_events_honor_time_window_and_jsonl` | ✅ Pass | Support | **cengine-owned.** A bounded history honors time windows and API v1.53+ JSONL negotiation. |
 | `EVT-003` | `test_historical_image_pull_and_load_events_honor_filters` | ✅ Pass | Support | **cengine-owned.** Successful pulls and archive loads emit Docker-shaped image events that replay through type, action, and image filters. |
+| `EVT-004` | `test_container_events_match_image_filter_with_tag_stripping` | ✅ Pass | Support | **cengine-owned.** Container lifecycle events match the `image` actor attribute by tagged reference or its tag-stripped familiar name, as defined by Moby event filtering. |
 
 ## Resources
 

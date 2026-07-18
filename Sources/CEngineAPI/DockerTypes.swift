@@ -157,7 +157,6 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     public var Entrypoint: [String]?
     public var Labels: [String: String]?
     public var Volumes: [String: EmptyObject]?
-    public var VolumeDriver: String?
     public var StopSignal: String?
     public var StopTimeout: Int?
     public var HostConfig: HostConfig?
@@ -206,7 +205,15 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var ReadOnly: Bool?
         public var VolumeOptions: VolumeOptionsRequest?
         public var TmpfsOptions: TmpfsOptionsRequest?
-        public struct VolumeOptionsRequest: Decodable, Sendable { public var NoCopy: Bool?; public var Subpath: String? }
+        public struct VolumeOptionsRequest: Decodable, Sendable {
+            public var NoCopy: Bool?
+            public var Subpath: String?
+            public var DriverConfig: VolumeDriverRequest?
+        }
+        public struct VolumeDriverRequest: Decodable, Sendable {
+            public var Name: String?
+            public var Options: [String: String]?
+        }
         public struct TmpfsOptionsRequest: Decodable, Sendable { public var SizeBytes: Int64?; public var Mode: UInt32? }
     }
 
@@ -221,6 +228,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var CpuQuota: Int64?
         public var RestartPolicy: RestartPolicy?
         public var NetworkMode: String?
+        public var VolumeDriver: String?
         public var Binds: [String]?
         public var Mounts: [Mount]?
         public var PortBindings: [String: [PortBindingRequest]]?
