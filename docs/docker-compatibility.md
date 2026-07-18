@@ -36,6 +36,8 @@ observable behavior:
    semantics, including [`setns(2)`](https://man7.org/linux/man-pages/man2/setns.2.html),
    [`mount(2)`](https://man7.org/linux/man-pages/man2/mount.2.html), and
    [`PR_SET_NO_NEW_PRIVS`](https://man7.org/linux/man-pages/man2/PR_SET_NO_NEW_PRIVS.2const.html).
+   Per-interface network settings additionally follow Linux's
+   [`/proc/sys/net` sysctl interface](https://docs.kernel.org/admin-guide/sysctl/net.html).
 4. Reference Docker Engine/Moby behavior resolves details the API and OCI specs
    leave unspecified. Such behavior should become a deterministic differential
    oracle or a focused cengine-owned contract.
@@ -51,7 +53,7 @@ reference beneath the Docker API.
 | Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
 | Container lifecycle and inspect | `CTR-001`–`CTR-047`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-047`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
-| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-017`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP publishing is an intentional gap covered by `NET-017`. Endpoint sysctls, explicit IPv4 controls, and IPAM status remain gaps. |
+| Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-021`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | Address-family control, endpoint sysctls, IPAM status and filtered pruning, MAC application, and gateway priority are covered. SCTP publishing is an intentional gap (`NET-017`). |
 | Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, and authenticated registry round trips are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
@@ -74,7 +76,7 @@ means the one-container-per-VM architecture does not expose that OCI surface.
 | PID, mount, UTS, IPC, network and cgroup namespaces | Partial | `RTM-001` requires init/default exec to share all six namespace identities. | Docker namespace-sharing modes and configurable namespace paths are not implemented. |
 | Process security state | Partial | `RTM-001` compares capability masks, checks `NoNewPrivs`, verifies privileged-exec override, and rejects leaked stage descriptors. | Capability add/drop, ambient capabilities, seccomp, AppArmor/SELinux-shaped security options, masked/readonly paths, rlimits, and device policy need explicit decisions. |
 | Linux resources and cgroup v2 | Partial | `CTR-028`, `CTR-042`, and `CTR-047` cover CPU/memory limits and live updates; exec receives its own child cgroup. | PIDs, IO/device controls, per-device blkio, and broader cgroup-v2 delegation/accounting remain gaps. |
-| Linux devices and filesystems | Partial | `CTR-035`, `CTR-045`, `VOL-002`–`VOL-006`, and `RTM-002` cover ext4, standard devices, volumes, and tmpfs. | Configurable devices, device cgroup rules, sysctls, mount propagation, and additional filesystem options remain gaps. |
+| Linux devices and filesystems | Partial | `CTR-035`, `CTR-045`, `VOL-002`–`VOL-006`, and `RTM-002` cover ext4, standard devices, volumes, and tmpfs; `NET-019` covers endpoint-scoped network sysctls. | Configurable devices, device cgroup rules, container-wide sysctls, mount propagation, and additional filesystem options remain gaps. |
 | OCI lifecycle operations and hooks | Not applicable | Docker lifecycle maps directly to cengine shims and guest control; no OCI runtime CLI is exposed. | Reassess only if cengine adopts an OCI runtime adapter or hook surface. |
 
 Every runtime divergence discovered during implementation is classified as
@@ -102,18 +104,18 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
 | 1.45 | Named-volume mount `VolumeOptions.Subpath` | Supported | Existing subdirectories are safely resolved beneath the named-volume root. |
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
-| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Tmpfs size/mode and platform-selective push are applied; the other additions remain gaps. |
+| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Endpoint `DriverOpts` sysctls are validated, persisted, applied to the resolved guest interface, inspected, and recovered (`NET-019`); tmpfs size/mode and platform-selective push are also applied. Containerd info, annotations, and image-create events remain gaps. |
 | 1.47 | Image-list manifest summaries | Supported | `manifests=true` returns available, missing, image, and attestation manifest summaries. |
-| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Partial | Image operations, descriptor responses, and endpoint gateway priority (`NET-016`) are supported; image mounts and explicit IPv4 control remain gaps. |
+| 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Partial | Image operations, descriptor responses, endpoint gateway priority (`NET-016`), and explicit network IPv4 enable/disable (`NET-018`) are supported; image mounts remain a gap. |
 | 1.49 | Platform-specific image inspect and firewall backend info | Partial | JSON-encoded OCI platform selection and `manifests` conflicts are enforced; `FirewallBackend` is absent. |
 | 1.50 | Platform-selective image deletion and discovered-device info | Partial | Repeated JSON platform deletion preserves unselected variants; `DiscoveredDevices` is absent. |
 | 1.50 | Removal of deprecated image-config fields | Supported | Cengine's image configuration already omits the removed runtime-only fields. |
 | 1.51 | Image summary container usage count | Supported | v1.44-v1.50 report `-1`; v1.51+ calculate the number of containers using each image. |
 | 1.52 | Event legacy-field removal and container/image response omissions | Supported | Responses branch at v1.52 while older API requests retain their legacy shape. |
 | 1.52 | Container summary health and stats OS type | Supported | v1.52+ responses include `Health` and `os_type`. |
-| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Partial | Repeated image selectors, event negotiation, and disk usage are supported; IPAM status remains a gap. |
+| 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Supported | Repeated image selectors, versioned subnet allocation status (`NET-020`), event negotiation, and disk usage are supported. |
 | 1.53 | NRI info, JSONL event negotiation, and image identity | Partial | Event streams and trusted pull/push origin identity are supported; `NRI` remains absent. |
-| 1.54 | Image-list identity and endpoint MAC application | Partial | `identity=true` implies manifest summaries and returns trusted origin data; explicit endpoint `MacAddress` is decoded, validated, applied in the guest, and inspected (`NET-014`, `NET-015`); endpoint sysctls remain a gap. Endpoint gateway priority is supported (`NET-016`, API 1.48). |
+| 1.54 | Image-list identity and endpoint MAC application | Supported | `identity=true` implies manifest summaries and returns trusted origin data; explicit endpoint `MacAddress` is decoded, validated, applied in the guest, and inspected (`NET-014`, `NET-015`). Endpoint sysctls (`NET-019`) and gateway priority (`NET-016`, API 1.48) are also supported. |
 | 1.55 | Image attestations and per-device blkio updates | Partial | Attached in-toto statements support platform/type filters and statement opt-in; the five blkio device arrays remain a gap. |
 
 Status values are **✅ Pass**, **❌ Known fail**, and **⬜ Not assessed**. Intent
@@ -256,6 +258,10 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `NET-015` | `test_invalid_and_duplicate_endpoint_mac_addresses_are_rejected` | ✅ Pass | Support | **cengine-owned.** Malformed or multicast MAC addresses fail with 400 and a duplicate explicit MAC on the same network fails with 409. |
 | `NET-016` | `test_gateway_priority_selects_default_route_and_survives_recovery` | ✅ Pass | Support | **cengine-owned.** A multi-network container installs its default route from the highest-priority endpoint (`GwPriority`), reports the value in inspect, and preserves the selection across daemon recovery. |
 | `NET-017` | `test_publishing_sctp_port_is_rejected_as_intentional_gap` | ✅ Pass | Intentional gap | **cengine-owned.** Publishing an `sctp` port fails with 400 because the vmnet port forwarder bridges only TCP and UDP; TCP and UDP publishing on the same request still succeed. |
+| `NET-018` | `test_explicit_network_address_families_apply_and_survive_recovery` | ✅ Pass | Support | **cengine-owned.** `EnableIPv4=false` suppresses IPv4 IPAM and endpoint addressing while enabled IPv6 remains usable; inspect and daemon recovery preserve both family flags. This follows Docker's network `EnableIPv4`/`EnableIPv6` contract and [Moby's network-level enable labels](https://github.com/moby/moby/blob/v29.0.0/daemon/libnetwork/netlabel/labels.go). |
+| `NET-019` | `test_endpoint_sysctls_apply_validate_and_survive_recovery` | ✅ Pass | Support | **cengine-owned.** API v1.46 endpoint `DriverOpts` accepts `com.docker.network.endpoint.sysctls` with `IFNAME`, rejects malformed or unsupported settings, applies the values through the guest's `/proc/sys/net` namespace, inspects them, and preserves them across recovery. Semantics follow [Moby #47686](https://github.com/moby/moby/pull/47686). |
+| `NET-020` | `test_network_ipam_status_tracks_allocations_and_api_version` | ✅ Pass | Support | **cengine-owned.** API v1.52+ network inspect reports per-subnet `IPsInUse` and `DynamicIPsAvailable`, including bridge reservations and endpoint allocations; API v1.51 omits `Status`. Shape and accounting follow [Moby #50917](https://github.com/moby/moby/pull/50917). |
+| `NET-021` | `test_network_prune_filters_limit_deleted_networks` | ✅ Pass | Support | **cengine-owned.** Network prune applies positive and negative label filters plus `until` before deleting unused networks, preventing an ignored filter from widening deletion scope. |
 | `VOL-001` | `test_volume_list_filters_labels` | ✅ Pass | Support | **cengine-owned.** Compose project label isolation. |
 | `VOL-002` | `test_empty_named_volume_copies_image_directory` | ✅ Pass | Support | **cengine-owned.** Empty named volumes receive image directory contents. |
 | `VOL-003` | `test_volume_nocopy_leaves_empty_volume_empty` | ✅ Pass | Support | **cengine-owned.** `VolumeOptions.NoCopy` disables initialization. |

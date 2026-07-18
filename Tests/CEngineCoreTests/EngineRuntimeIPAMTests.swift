@@ -141,6 +141,48 @@ import Testing
         #expect(created.networks.first?.gatewayPriority == nil)
     }
 
+    @Test func disabledAddressFamilyDoesNotAllocateAndSurvivesRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let network = try await runtime.createNetwork(
+            name: "v6only", ipv6Subnet: "fd00:abcd::/120", enableIPv4: false, enableIPv6: true
+        )
+        var record = ContainerRecord(name: "client", image: "example")
+        record.networks = [.init(networkID: network.id)]
+        let created = try await runtime.createContainer(record)
+        #expect(created.networks.first?.ipv4Address == nil)
+        #expect(created.networks.first?.ipv6Address?.hasPrefix("fd00:abcd::") == true)
+
+        let restarted = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        #expect(try await restarted.network("v6only").enableIPv4 == false)
+        #expect(try await restarted.container("client").networks.first?.ipv4Address == nil)
+    }
+
+    @Test func endpointDriverOptionsValidateBeforePersistence() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let network = try await runtime.createNetwork(name: "sysctls")
+        var accepted = ContainerRecord(name: "accepted", image: "example")
+        accepted.networks = [.init(
+            networkID: network.id,
+            driverOptions: [NetworkEndpointRecord.sysctlsDriverOption: "net.ipv4.conf.IFNAME.forwarding=1"]
+        )]
+        let created = try await runtime.createContainer(accepted)
+        #expect(created.networks.first?.interfaceSysctls == ["net.ipv4.conf.IFNAME.forwarding=1"])
+
+        for (name, options) in [
+            ("bad-placeholder", [NetworkEndpointRecord.sysctlsDriverOption: "net.ipv4.conf.eth0.forwarding=1"]),
+            ("bad-family", [NetworkEndpointRecord.sysctlsDriverOption: "net.core.conf.IFNAME.forwarding=1"]),
+            ("bad-driver-option", ["unsupported": "value"]),
+        ] {
+            var invalid = ContainerRecord(name: name, image: "example")
+            invalid.networks = [.init(networkID: network.id, driverOptions: options)]
+            await #expect(throws: EngineError.self) { _ = try await runtime.createContainer(invalid) }
+        }
+    }
+
     @Test func publishingSCTPPortIsRejectedAsAnIntentionalGap() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

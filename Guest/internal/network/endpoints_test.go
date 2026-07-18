@@ -21,3 +21,24 @@ func TestTemporaryLinkNameCannotCollideWithDockerInterface(t *testing.T) {
 		t.Fatalf("invalid temporary interface name %q", name)
 	}
 }
+
+func TestEndpointSysctlPathReplacesInterfacePlaceholderWithoutTraversal(t *testing.T) {
+	path, value, err := endpointSysctlPath("eth0", "net.ipv4.conf.IFNAME.forwarding=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/proc/sys/net/ipv4/conf/eth0/forwarding" || value != "1" {
+		t.Fatalf("unexpected sysctl path/value: %q %q", path, value)
+	}
+	for _, assignment := range []string{
+		"net.ipv4.conf.eth0.forwarding=1",
+		"net.ipv4...IFNAME=1",
+		"net.ipv4.conf.IFNAME...=1",
+		"kernel.ipv4.conf.IFNAME.forwarding=1",
+		"net.ipv4.conf.IFNAME.forwarding=1\n2",
+	} {
+		if _, _, err := endpointSysctlPath("eth0", assignment); err == nil {
+			t.Fatalf("expected %q to be rejected", assignment)
+		}
+	}
+}

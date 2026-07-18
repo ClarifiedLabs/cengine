@@ -133,8 +133,9 @@ public enum GuestProtocol {
         public var gateways: [String]
         public var dns: [String]
         public var aliases: [String]
-        public init(networkID: String, vlan: UInt16, name: String, macAddress: String, addresses: [String], gateways: [String], dns: [String], aliases: [String]) {
-            self.networkID = networkID; self.vlan = vlan; self.name = name; self.macAddress = macAddress; self.addresses = addresses; self.gateways = gateways; self.dns = dns; self.aliases = aliases
+        public var sysctls: [String]
+        public init(networkID: String, vlan: UInt16, name: String, macAddress: String, addresses: [String], gateways: [String], dns: [String], aliases: [String], sysctls: [String] = []) {
+            self.networkID = networkID; self.vlan = vlan; self.name = name; self.macAddress = macAddress; self.addresses = addresses; self.gateways = gateways; self.dns = dns; self.aliases = aliases; self.sysctls = sysctls
         }
     }
 

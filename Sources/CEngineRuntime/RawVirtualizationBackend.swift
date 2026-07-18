@@ -559,15 +559,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
         if let existing = networks[network.id] { return existing }
         let vlan = try allocateVLAN()
         var value = network
-        if value.subnet.isEmpty {
+        if value.enableIPv4, value.subnet.isEmpty {
             let automaticNetwork = Self.automaticIPv4Network(vlan: vlan)
             value.subnet = automaticNetwork.subnet
             value.gateway = automaticNetwork.gateway
-        } else if value.gateway.isEmpty { value.gateway = Self.firstAddress(value.subnet) }
-        if value.ipv6Subnet.isEmpty {
+        } else if value.enableIPv4, value.gateway.isEmpty { value.gateway = Self.firstAddress(value.subnet) }
+        if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
+        if value.enableIPv6, value.ipv6Subnet.isEmpty {
             value.ipv6Subnet = String(format: "fdce:%x::/64", vlan)
             value.ipv6Gateway = String(format: "fdce:%x::1", vlan)
-        } else if value.ipv6Gateway.isEmpty { value.ipv6Gateway = Self.firstAddress(value.ipv6Subnet) }
+        } else if value.enableIPv6, value.ipv6Gateway.isEmpty { value.ipv6Gateway = Self.firstAddress(value.ipv6Subnet) }
+        if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
         networks[value.id] = value
         networkVLANs[value.id] = vlan
         try persistNetworks()
@@ -970,8 +972,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 macAddress: endpoint.macAddress ?? Self.endpointMacAddress(container: container.id, network: endpoint.networkID),
                 addresses: addresses,
                 gateways: gateways,
-                dns: network.internalNetwork ? [] : [network.gateway].filter { !$0.isEmpty },
-                aliases: endpoint.aliases
+                dns: network.internalNetwork ? [] : [network.gateway, network.ipv6Gateway].filter { !$0.isEmpty },
+                aliases: endpoint.aliases,
+                sysctls: endpoint.interfaceSysctls
             )
         }
     }
@@ -1023,7 +1026,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func synchronizeFabric() async throws {
         let values = networks.compactMap { id, network -> VMShimClient.FabricNetwork? in
-            guard let vlan = networkVLANs[id], !network.subnet.isEmpty else { return nil }
+            guard let vlan = networkVLANs[id], !network.subnet.isEmpty || !network.ipv6Subnet.isEmpty else { return nil }
             return .init(id: id, vlan: vlan, subnet: network.subnet, gateway: network.gateway, ipv6Subnet: network.ipv6Subnet, internalNetwork: network.internalNetwork, isolated: network.ipv4GatewayMode == .isolated, ports: [])
         }
         _ = try await infrastructure.configureFabric(networks: values.sorted { $0.id < $1.id })

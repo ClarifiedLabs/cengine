@@ -223,7 +223,19 @@ private struct OwnedHelperVMNetUplink {
             throw EngineError(.badRequest, "invalid vmnet network id")
         }
         guard (1...4094).contains(request.vlan) else { throw EngineError(.badRequest, "invalid vmnet VLAN") }
-        _ = try HelperVMNetUplink.ipv4Gateway(request.gateway, in: request.subnet)
+        guard !request.subnet.isEmpty || !request.ipv6Subnet.isEmpty else {
+            throw EngineError(.badRequest, "vmnet network requires an IPv4 subnet or IPv6 prefix")
+        }
+        if request.subnet.isEmpty {
+            guard request.gateway.isEmpty else {
+                throw EngineError(.badRequest, "vmnet IPv4 gateway requires an IPv4 subnet")
+            }
+            guard request.ports.isEmpty else {
+                throw EngineError(.badRequest, "vmnet port forwarding requires an IPv4 subnet")
+            }
+        } else {
+            _ = try HelperVMNetUplink.ipv4Gateway(request.gateway, in: request.subnet)
+        }
         if !request.ipv6Subnet.isEmpty { _ = try HelperVMNetUplink.ipv6Prefix(request.ipv6Subnet) }
         for port in request.ports {
             var address = in_addr()
@@ -389,11 +401,15 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         if !request.dhcpEnabled {
             vmnet_network_configuration_disable_dhcp(configuration)
         }
-        let (_, mask) = try ipv4Subnet(request.subnet)
-        var subnetValue = try ipv4Gateway(request.gateway, in: request.subnet)
-        var maskValue = mask
-        guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
-            throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
+        if request.subnet.isEmpty {
+            vmnet_network_configuration_disable_nat44(configuration)
+        } else {
+            let (_, mask) = try ipv4Subnet(request.subnet)
+            var subnetValue = try ipv4Gateway(request.gateway, in: request.subnet)
+            var maskValue = mask
+            guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
+                throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
+            }
         }
         if !request.ipv6Subnet.isEmpty {
             let (prefix, prefixLength) = try ipv6Prefix(request.ipv6Subnet)
@@ -401,6 +417,9 @@ private final class HelperVMNetUplink: @unchecked Sendable {
             guard vmnet_network_configuration_set_ipv6_prefix(configuration, &prefixValue, prefixLength) == .VMNET_SUCCESS else {
                 throw EngineError(.badRequest, "vmnet rejected IPv6 prefix \(request.ipv6Subnet)")
             }
+        } else {
+            vmnet_network_configuration_disable_nat66(configuration)
+            vmnet_network_configuration_disable_router_advertisement(configuration)
         }
         for port in request.internalNetwork ? [] : request.ports {
             var address = in_addr()

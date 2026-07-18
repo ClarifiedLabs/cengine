@@ -82,8 +82,8 @@ remain later validation work rather than prerequisites for this priority.
 
 ### 2. Complete modern network endpoint and IPAM semantics
 
-Close the remaining network behavior gaps that affect how clients create and
-inspect endpoints. The following sub-items are complete:
+The modern network endpoint and IPAM behavior that affects how clients create,
+configure, and inspect endpoints is complete:
 
 - Endpoint MAC address application: an explicit `MacAddress` is decoded,
   validated, applied in the guest, inspected, and preserved across recovery
@@ -94,9 +94,14 @@ inspect endpoints. The following sub-items are complete:
 - SCTP has an explicit support decision: publishing an `sctp` port is rejected
   with 400 and recorded as an intentional gap because the vmnet port forwarder
   bridges only TCP and UDP (`NET-017`).
-
-The remaining gaps are endpoint sysctls, explicit IPv4 controls (`EnableIPv4`
-and endpoint IPv4 enable/disable), and IPAM status.
+- Explicit address-family controls are persisted and applied: `EnableIPv4=false`
+  suppresses IPv4 IPAM and endpoint allocation, `EnableIPv6` controls IPv6 IPAM,
+  and both flags survive inspect and daemon recovery (`NET-018`).
+- Endpoint sysctls use API v1.46 `DriverOpts`, validate Docker's `IFNAME`
+  grammar, apply through the guest network namespace, round-trip through
+  inspect, and survive recovery (`NET-019`).
+- API v1.52+ network inspect reports per-subnet IPAM allocation status while
+  older API responses omit it (`NET-020`).
 
 Completion criteria:
 
@@ -108,8 +113,8 @@ Completion criteria:
   `NET-016`.)*
 - SCTP is either implemented and tested end to end or recorded as an intentional
   compatibility gap. *(Done: recorded as an intentional gap, `NET-017`.)*
-- Endpoint sysctls, explicit IPv4 controls, and IPAM status are still
-  outstanding.
+- Endpoint sysctls, explicit IPv4 controls, and IPAM status are covered by
+  `NET-018`–`NET-020`.
 
 ### 3. Close remaining client-visible API gaps
 

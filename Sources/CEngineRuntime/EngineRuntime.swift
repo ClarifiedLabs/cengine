@@ -196,9 +196,9 @@ public actor EngineRuntime {
             record.networks = [.init(networkID: network.id)]
         }
         record = try normalizingEndpointMacAddresses(record)
+        try validateEndpoints(record)
         record = try allocatingEndpointAddresses(to: record)
         try await persistEndpointAllocationCursors()
-        try validateEndpoints(record)
         pendingContainers[record.id] = record
         try await backend.prepare(record)
         if let backendImages = try await backend.listImages() {
@@ -615,6 +615,7 @@ public actor EngineRuntime {
 
     public func createNetwork(name: String, subnet: String? = nil, gateway: String? = nil,
                               ipv6Subnet: String? = nil, ipv6Gateway: String? = nil,
+                              enableIPv4: Bool = true, enableIPv6: Bool = true,
                               driver: String? = nil, internalNetwork: Bool = false,
                               labels: [String: String] = [:], options: [String: String] = [:]) async throws -> NetworkRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid network name: \(name)") }
@@ -649,11 +650,18 @@ public actor EngineRuntime {
         if let existing = snapshot.networks.first(where: { $0.name == name }) { return existing }
         let requestedSubnet = subnet ?? ""
         let requestedIPv6 = ipv6Subnet ?? ""
+        if !enableIPv4, !requestedSubnet.isEmpty || gateway?.isEmpty == false {
+            throw EngineError(.badRequest, "IPv4 addressing cannot be configured when IPv4 is disabled")
+        }
+        if !enableIPv6, !requestedIPv6.isEmpty || ipv6Gateway?.isEmpty == false {
+            throw EngineError(.badRequest, "IPv6 addressing cannot be configured when IPv6 is disabled")
+        }
         let requested = NetworkRecord(
             id: Identifier.random(), name: name, createdAt: Date(), subnet: requestedSubnet, gateway: gateway ?? "",
             ipv6Subnet: requestedIPv6, ipv6Gateway: ipv6Gateway ?? "",
             ipv4AllocationMode: subnet == nil ? .automatic : .explicit,
             ipv6AllocationMode: ipv6Subnet == nil ? .automatic : .explicit,
+            enableIPv4: enableIPv4, enableIPv6: enableIPv6,
             internalNetwork: internalNetwork, labels: labels, options: options
         )
         let record = try await backend.createNetwork(requested)
@@ -681,7 +689,8 @@ public actor EngineRuntime {
     public func connectNetwork(_ networkIdentifier: String, container containerIdentifier: String,
                                aliases: [String] = [], ipv4Address: String? = nil,
                                ipv6Address: String? = nil, macAddress: String? = nil,
-                               gatewayPriority: Int? = nil) async throws {
+                               gatewayPriority: Int? = nil,
+                               driverOptions: [String: String]? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
@@ -691,12 +700,13 @@ public actor EngineRuntime {
         try validateStaticEndpointModes(
             network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
         )
+        try Self.validateEndpointDriverOptions(driverOptions)
         let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
         let previous = snapshot.containers[index]
         snapshot.containers[index].networks.append(.init(
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
             ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil,
-            macAddress: normalizedMac, gatewayPriority: gatewayPriority
+            macAddress: normalizedMac, gatewayPriority: gatewayPriority, driverOptions: driverOptions
         ))
         snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
         try await persistEndpointAllocationCursors()
@@ -724,10 +734,13 @@ public actor EngineRuntime {
         try await persist()
     }
 
-    public func pruneNetworks() async throws -> [String] {
+    public func pruneNetworks(identifiers: Set<String>? = nil) async throws -> [String] {
         let used = Set(snapshot.containers.flatMap(\.networks).map(\.networkID))
-        let removed = snapshot.networks.filter { $0.name != "default" && !used.contains($0.id) }
-        snapshot.networks.removeAll { $0.name != "default" && !used.contains($0.id) }
+        let removable: (NetworkRecord) -> Bool = {
+            $0.name != "default" && !used.contains($0.id) && (identifiers?.contains($0.id) ?? true)
+        }
+        let removed = snapshot.networks.filter(removable)
+        snapshot.networks.removeAll(where: removable)
         for network in removed { try await backend.deleteNetwork(network) }
         try await persist()
         return removed.map(\.name)
@@ -798,6 +811,7 @@ public actor EngineRuntime {
                 ipv4IsStatic: endpoint.ipv4AddressIsStatic,
                 ipv6IsStatic: endpoint.ipv6AddressIsStatic
             )
+            try Self.validateEndpointDriverOptions(endpoint.driverOptions)
             for peer in snapshot.containers + Array(pendingContainers.values) where peer.id != record.id {
                 for existing in peer.networks where existing.networkID == endpoint.networkID {
                     if endpoint.ipv4AddressIsStatic, endpoint.ipv4Address == existing.ipv4Address {
@@ -863,7 +877,7 @@ public actor EngineRuntime {
                 .filter { $0.id != record.id }
                 .flatMap(\.networks)
                 .filter { $0.networkID == network.id }
-            if record.networks[index].ipv4Address == nil, !network.subnet.isEmpty {
+            if record.networks[index].ipv4Address == nil, network.enableIPv4, !network.subnet.isEmpty {
                 let cursorKey = Self.allocationCursorKey(networkID: network.id, family: AF_INET)
                 let allocation = try Self.nextAddress(
                     in: network.subnet,
@@ -874,7 +888,7 @@ public actor EngineRuntime {
                 record.networks[index].ipv4Address = allocation.address
                 endpointAllocationCursors[cursorKey] = allocation.offset
             }
-            if record.networks[index].ipv6Address == nil, !network.ipv6Subnet.isEmpty {
+            if record.networks[index].ipv6Address == nil, network.enableIPv6, !network.ipv6Subnet.isEmpty {
                 let cursorKey = Self.allocationCursorKey(networkID: network.id, family: AF_INET6)
                 let allocation = try Self.nextAddress(
                     in: network.ipv6Subnet,
@@ -904,7 +918,7 @@ public actor EngineRuntime {
         for index in network.indices {
             let remaining = prefix - index * 8
             if remaining >= 8 { continue }
-            network[index] &= remaining <= 0 ? 0 : UInt8(0xff << (8 - remaining))
+            network[index] &= remaining <= 0 ? 0 : UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
         }
         let hostBits = byteCount * 8 - prefix
         let lastOffset = hostBits >= 16 ? 65_535 : (1 << hostBits) - 1
@@ -958,11 +972,48 @@ public actor EngineRuntime {
     private func validateStaticEndpointModes(
         network: NetworkRecord, ipv4IsStatic: Bool, ipv6IsStatic: Bool
     ) throws {
+        if ipv4IsStatic, !network.enableIPv4 {
+            throw EngineError(.badRequest, "IPv4 addresses cannot be assigned when IPv4 is disabled")
+        }
+        if ipv6IsStatic, !network.enableIPv6 {
+            throw EngineError(.badRequest, "IPv6 addresses cannot be assigned when IPv6 is disabled")
+        }
         if ipv4IsStatic, network.ipv4AllocationMode != .explicit {
             throw EngineError(.badRequest, "static IPv4 addresses require an explicitly configured IPv4 subnet")
         }
         if ipv6IsStatic, network.ipv6AllocationMode != .explicit {
             throw EngineError(.badRequest, "static IPv6 addresses require an explicitly configured IPv6 subnet")
+        }
+    }
+
+    private static func validateEndpointDriverOptions(_ options: [String: String]?) throws {
+        guard let options else { return }
+        for key in options.keys where key != NetworkEndpointRecord.sysctlsDriverOption {
+            throw EngineError(.unsupported, "endpoint driver option \(key) is not supported")
+        }
+        guard let value = options[NetworkEndpointRecord.sysctlsDriverOption] else { return }
+        for assignment in value.components(separatedBy: ",") {
+            let pair = assignment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = pair.first.map(String.init) ?? ""
+            let components = name.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            let familyAllowed = components.count == 5 && ["ipv4", "ipv6", "mpls"].contains(components[1])
+            let interfacePlaceholder = components.count == 5 && components[3].lowercased() == "ifname"
+            let safeComponents = components.allSatisfy(Self.isSafeSysctlComponent)
+            guard pair.count == 2, components.first == "net", familyAllowed, interfacePlaceholder, safeComponents,
+                  !pair[1].contains("\n"), !pair[1].contains("\0") else {
+                throw EngineError(
+                    .badRequest,
+                    "invalid endpoint sysctl \(assignment); use net.(ipv4|ipv6|mpls).X.IFNAME.Y=value"
+                )
+            }
+        }
+    }
+
+    private static func isSafeSysctlComponent(_ value: String) -> Bool {
+        !value.isEmpty && value.unicodeScalars.allSatisfy { scalar in
+            let value = scalar.value
+            return (65...90).contains(value) || (97...122).contains(value) || (48...57).contains(value)
+                || value == 95 || value == 45
         }
     }
 

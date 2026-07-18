@@ -144,6 +144,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var GlobalIPv6Address: String?
         public var MacAddress: String?
         public var GwPriority: Int?
+        public var DriverOpts: [String: String]?
         public var IPAMConfig: EndpointIPAMRequest?
     }
     public struct EndpointIPAMRequest: Decodable, Sendable {
@@ -314,12 +315,22 @@ public struct NetworkCreateRequest: Decodable, Sendable {
     public let Name: String
     public var Driver: String?
     public var Internal: Bool?
+    public var EnableIPv4: Bool?
     public var EnableIPv6: Bool?
     public var Labels: [String: String]?
     public var Options: [String: String]?
     public var IPAM: IPAMRequest?
-    public struct IPAMRequest: Decodable, Sendable { public var Config: [ConfigRequest]? }
-    public struct ConfigRequest: Decodable, Sendable { public var Subnet: String?; public var Gateway: String? }
+    public struct IPAMRequest: Decodable, Sendable {
+        public var Driver: String?
+        public var Options: [String: String]?
+        public var Config: [ConfigRequest]?
+    }
+    public struct ConfigRequest: Decodable, Sendable {
+        public var Subnet: String?
+        public var IPRange: String?
+        public var Gateway: String?
+        public var AuxAddress: [String: String]?
+    }
 }
 public struct NetworkCreateResponse: Codable, Sendable { public let Id: String; public let Warning: String }
 public struct NetworkConnectRequest: Decodable, Sendable {
@@ -402,21 +413,99 @@ public struct SystemDiskUsageResponse: Encodable, Sendable {
 
 public struct DockerNetworkResponse: Encodable, Sendable {
     public let Name: String; public let Id: String; public let Created: String
-    public let Scope = "local"; public let Driver = "bridge"; public let EnableIPv6 = true
+    public let Scope = "local"; public let Driver = "bridge"
+    public let EnableIPv4: Bool?; public let EnableIPv6: Bool
     public let IPAM: IPAMResponse; public let Internal: Bool; public let Attachable = false; public let Ingress = false
     public let ConfigFrom: [String: String] = [:]; public let ConfigOnly = false
     public let Containers: [String: String] = [:]; public let Options: [String: String]; public let Labels: [String: String]
+    public let Status: StatusResponse?
     public struct IPAMResponse: Encodable, Sendable {
         public let Driver = "default"; public let Options: [String: String]? = nil; public let Config: [ConfigResponse]
     }
     public struct ConfigResponse: Encodable, Sendable { public let Subnet: String; public let Gateway: String }
-    public init(_ network: NetworkRecord) {
+    public struct StatusResponse: Encodable, Sendable {
+        public let IPAM: StatusIPAMResponse
+    }
+    public struct StatusIPAMResponse: Encodable, Sendable {
+        public let Subnets: [String: SubnetStatusResponse]
+    }
+    public struct SubnetStatusResponse: Encodable, Sendable {
+        public let IPsInUse: UInt64
+        public let DynamicIPsAvailable: UInt64
+    }
+    public init(
+        _ network: NetworkRecord,
+        containers: [ContainerRecord] = [],
+        version: DockerAPIVersion = .maximum,
+        includeStatus: Bool = true
+    ) {
         Name = network.name; Id = network.id; Created = ISO8601DateFormatter().string(from: network.createdAt)
-        IPAM = .init(Config: [
-            .init(Subnet: network.subnet, Gateway: network.gateway),
-            .init(Subnet: network.ipv6Subnet, Gateway: network.ipv6Gateway),
-        ])
+        EnableIPv4 = version >= .init(major: 1, minor: 48) ? network.enableIPv4 : nil
+        EnableIPv6 = network.enableIPv6
+        var configs: [ConfigResponse] = []
+        if network.enableIPv4 { configs.append(.init(Subnet: network.subnet, Gateway: network.gateway)) }
+        if network.enableIPv6 { configs.append(.init(Subnet: network.ipv6Subnet, Gateway: network.ipv6Gateway)) }
+        IPAM = .init(Config: configs)
         Internal = network.internalNetwork; Labels = network.labels; Options = network.options ?? [:]
+        if includeStatus, version >= .init(major: 1, minor: 52) {
+            let endpoints = containers.flatMap(\.networks).filter { $0.networkID == network.id }
+            var subnets: [String: SubnetStatusResponse] = [:]
+            if network.enableIPv4, !network.subnet.isEmpty {
+                subnets[network.subnet] = Self.subnetStatus(
+                    network.subnet,
+                    reservedAddresses: [Self.networkAddress(network.subnet), network.gateway, Self.broadcastAddress(network.subnet)],
+                    endpointAddresses: endpoints.compactMap(\.ipv4Address)
+                )
+            }
+            if network.enableIPv6, !network.ipv6Subnet.isEmpty {
+                subnets[network.ipv6Subnet] = Self.subnetStatus(
+                    network.ipv6Subnet,
+                    reservedAddresses: [Self.networkAddress(network.ipv6Subnet), network.ipv6Gateway],
+                    endpointAddresses: endpoints.compactMap(\.ipv6Address)
+                )
+            }
+            Status = .init(IPAM: .init(Subnets: subnets))
+        } else {
+            Status = nil
+        }
+    }
+
+    private static func subnetStatus(
+        _ subnet: String,
+        reservedAddresses: [String],
+        endpointAddresses: [String]
+    ) -> SubnetStatusResponse {
+        let inUse = UInt64(Set((reservedAddresses + endpointAddresses).filter { !$0.isEmpty }).count)
+        let capacity = addressCapacity(subnet, subtracting: inUse)
+        return .init(IPsInUse: inUse, DynamicIPsAvailable: capacity)
+    }
+
+    private static func addressCapacity(_ subnet: String, subtracting used: UInt64) -> UInt64 {
+        guard let prefix = subnet.split(separator: "/").last.flatMap({ Int($0) }) else { return 0 }
+        let addressBits = subnet.contains(":") ? 128 : 32
+        let hostBits = addressBits - prefix
+        guard hostBits >= 0 else { return 0 }
+        if hostBits > 64 { return UInt64.max }
+        if hostBits == 64 {
+            return used == 0 ? UInt64.max : UInt64.max - (used - 1)
+        }
+        let total = UInt64(1) << UInt64(hostBits)
+        return total > used ? total - used : 0
+    }
+
+    private static func networkAddress(_ subnet: String) -> String {
+        String(subnet.split(separator: "/", maxSplits: 1).first ?? "")
+    }
+
+    private static func broadcastAddress(_ subnet: String) -> String {
+        let parts = subnet.split(separator: "/", maxSplits: 1)
+        guard parts.count == 2, let prefix = Int(parts[1]), prefix >= 0, prefix <= 32 else { return "" }
+        let octets = parts[0].split(separator: ".").compactMap { UInt32($0) }
+        guard octets.count == 4 else { return "" }
+        let value = octets.reduce(UInt32(0)) { ($0 << 8) | $1 }
+        let mask = prefix == 0 ? UInt32(0) : UInt32.max << UInt32(32 - prefix)
+        let broadcast = (value & mask) | ~mask
+        return [24, 16, 8, 0].map { String((broadcast >> UInt32($0)) & 0xff) }.joined(separator: ".")
     }
 }
 

@@ -24,6 +24,7 @@ IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 KNOWN_GAP = pytest.mark.xfail(strict=True)
 GATEWAY_MODE_IPV4 = "com.docker.network.bridge.gateway_mode_ipv4"
 GATEWAY_MODE_IPV6 = "com.docker.network.bridge.gateway_mode_ipv6"
+ENDPOINT_SYSCTLS = "com.docker.network.endpoint.sysctls"
 
 
 def _network_container(client: docker.DockerClient, network, *, command="top"):
@@ -780,6 +781,147 @@ def test_publishing_sctp_port_is_rejected_as_intentional_gap(client: docker.Dock
     container.start(); container.reload()
     published = container.attrs["NetworkSettings"]["Ports"]
     assert published["80/tcp"] and published["90/udp"]
+
+
+@pytest.mark.compat("NET-018")
+def test_explicit_network_address_families_apply_and_survive_recovery(
+    daemon, client: docker.DockerClient
+):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"compat-v6-only-{suffix}"
+    response = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={
+            "Name": name,
+            "EnableIPv4": False,
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:18::/120", "Gateway": "fd00:18::1"}]},
+        },
+    )
+    client.api._raise_for_status(response)
+    network = client.networks.get(response.json()["Id"])
+    container = client.containers.create(IMAGE, command="top", name=f"v6-only-{suffix}", network=name)
+    container.start(); container.reload(); network.reload()
+    assert network.attrs["EnableIPv4"] is False
+    assert network.attrs["EnableIPv6"] is True
+    assert [config["Subnet"] for config in network.attrs["IPAM"]["Config"]] == ["fd00:18::/120"]
+    endpoint = container.attrs["NetworkSettings"]["Networks"][name]
+    assert endpoint["IPAddress"] == ""
+    assert endpoint["GlobalIPv6Address"].startswith("fd00:18::")
+    code, addresses = container.exec_run(["sh", "-c", "ip -o -4 addr show dev eth0; ip -o -6 addr show dev eth0"])
+    assert code == 0 and b" inet " not in addresses and b" inet6 fd00:18::" in addresses
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(container.name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"IPv6-only container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        endpoint = value.attrs["NetworkSettings"]["Networks"][name]
+        assert endpoint["IPAddress"] == ""
+        assert endpoint["GlobalIPv6Address"].startswith("fd00:18::")
+        recovered_network = recovered.networks.get(name)
+        assert recovered_network.attrs["EnableIPv4"] is False
+        assert recovered_network.attrs["EnableIPv6"] is True
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("NET-019")
+def test_endpoint_sysctls_apply_validate_and_survive_recovery(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    network = client.networks.create(f"compat-sysctl-{suffix}")
+    name = f"sysctl-{suffix}"
+    settings = "net.ipv4.conf.IFNAME.forwarding=1,net.ipv4.conf.ifname.log_martians=1"
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": name},
+        data={
+            "Image": IMAGE,
+            "Cmd": ["top"],
+            "NetworkingConfig": {"EndpointsConfig": {network.name: {"DriverOpts": {ENDPOINT_SYSCTLS: settings}}}},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    container.start(); container.reload()
+    endpoint = container.attrs["NetworkSettings"]["Networks"][network.name]
+    assert endpoint["DriverOpts"][ENDPOINT_SYSCTLS] == settings
+    code, values = container.exec_run([
+        "sh", "-c", "cat /proc/sys/net/ipv4/conf/eth0/forwarding /proc/sys/net/ipv4/conf/eth0/log_martians",
+    ])
+    assert (code, values.split()) == (0, [b"1", b"1"])
+
+    invalid = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"invalid-sysctl-{suffix}"},
+        data={
+            "Image": IMAGE,
+            "NetworkingConfig": {"EndpointsConfig": {network.name: {
+                "DriverOpts": {ENDPOINT_SYSCTLS: "net.ipv4.conf.eth0.forwarding=1"},
+            }}},
+        },
+    )
+    assert invalid.status_code == 400
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"sysctl container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        code, values = value.exec_run([
+            "sh", "-c", "cat /proc/sys/net/ipv4/conf/eth0/forwarding /proc/sys/net/ipv4/conf/eth0/log_martians",
+        ])
+        assert (code, values.split()) == (0, [b"1", b"1"])
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("NET-020")
+def test_network_ipam_status_tracks_allocations_and_api_version(client: docker.DockerClient, daemon):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"compat-ipam-status-{suffix}"
+    response = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={"Name": name, "IPAM": {"Config": [{"Subnet": "10.20.30.0/29", "Gateway": "10.20.30.1"}]}},
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.create(IMAGE, command="top", network=name)
+    network = client.networks.get(name)
+    network.reload()
+    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.0/29"]
+    assert status == {"IPsInUse": 4, "DynamicIPsAvailable": 4}
+
+    legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.51")
+    try:
+        assert "Status" not in legacy.networks.get(name).attrs
+    finally:
+        legacy.close()
+
+
+@pytest.mark.compat("NET-021")
+def test_network_prune_filters_limit_deleted_networks(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    selected = client.networks.create(f"prune-selected-{suffix}", labels={"project": "selected"})
+    retained = client.networks.create(f"prune-retained-{suffix}", labels={"project": "retained"})
+    result = client.api.prune_networks(filters={"label": ["project=selected"]})
+    assert result["NetworksDeleted"] == [selected.name]
+    with pytest.raises(errors.NotFound):
+        client.networks.get(selected.id)
+    retained.reload()
 
 
 @pytest.mark.compat("CTR-034")
