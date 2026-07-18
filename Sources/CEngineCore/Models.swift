@@ -115,6 +115,7 @@ public struct ContainerRecord: Codable, Sendable {
     public var user: String
     public var hostname: String
     public var labels: [String: String]
+    public var annotations: [String: String]
     public var tty: Bool
     public var openStdin: Bool
     public var privileged: Bool
@@ -155,6 +156,7 @@ public struct ContainerRecord: Codable, Sendable {
         self.user = ""
         self.hostname = String(id.prefix(12))
         self.labels = [:]
+        self.annotations = [:]
         self.tty = false
         self.openStdin = false
         self.privileged = false

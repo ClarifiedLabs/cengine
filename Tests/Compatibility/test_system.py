@@ -43,3 +43,19 @@ def test_version(client: docker.DockerClient, daemon):
         assert minimum.containers.list(all=True) is not None
     finally:
         minimum.close()
+
+
+@pytest.mark.compat("SYS-004")
+def test_info_reports_images_and_versioned_native_engine_details(client: docker.DockerClient, daemon):
+    info = client.info()
+    assert info["Images"] == len(client.images.list(all=True))
+    assert info["DiscoveredDevices"] == []
+    assert {"Containerd", "FirewallBackend", "NRI"}.isdisjoint(info)
+
+    legacy = docker.APIClient(
+        base_url=f"unix://{daemon['socket']}", timeout=180, version="1.49"
+    )
+    try:
+        assert "DiscoveredDevices" not in legacy.info()
+    finally:
+        legacy.close()

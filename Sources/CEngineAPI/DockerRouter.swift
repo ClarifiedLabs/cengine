@@ -86,12 +86,15 @@ public struct DockerRouter: Sendable {
             return json(status: .ok, DockerVersionResponse())
         case (.GET, "/info"):
             let all = await runtime.listContainers(all: true)
+            let images = await runtime.listImages()
             return json(status: .ok, DockerInfoResponse(
                 Containers: all.count,
                 ContainersRunning: all.filter { $0.phase == .running }.count,
                 ContainersPaused: all.filter { $0.phase == .paused }.count,
                 ContainersStopped: all.filter { $0.phase == .exited || $0.phase == .created }.count,
-                DockerRootDir: root.path
+                Images: images.count,
+                DockerRootDir: root.path,
+                version: version
             ))
         case (.GET, "/system/df"):
             return json(status: .ok, SystemDiskUsageResponse(
@@ -108,6 +111,9 @@ public struct DockerRouter: Sendable {
             })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
+            if let driver = input.VolumeDriver, !driver.isEmpty, driver != "local" {
+                throw EngineError(.unsupported, "volume driver \(driver) is not supported")
+            }
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
             let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
@@ -121,6 +127,9 @@ public struct DockerRouter: Sendable {
             record.user = input.User ?? ""
             if let hostname = input.Hostname, !hostname.isEmpty { record.hostname = hostname }
             record.labels = input.Labels ?? [:]
+            if version >= .init(major: 1, minor: 43) {
+                record.annotations = input.HostConfig?.Annotations ?? [:]
+            }
             record.tty = input.Tty ?? false
             record.openStdin = input.OpenStdin ?? false
             record.autoRemove = input.HostConfig?.AutoRemove ?? false
@@ -360,8 +369,10 @@ public struct DockerRouter: Sendable {
         case (.POST, "/containers/prune"):
             return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers()))
         case (.POST, "/images/prune"):
+            try rejectActivePruneFilters(query["filters"], operation: "image prune")
             return json(status: .ok, PruneResponse(images: try await runtime.pruneImages()))
         case (.POST, "/volumes/prune"):
+            try rejectActivePruneFilters(query["filters"], operation: "volume prune")
             return json(status: .ok, PruneResponse(volumes: try await runtime.pruneVolumes()))
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
@@ -371,6 +382,9 @@ public struct DockerRouter: Sendable {
             return json(status: .ok, DockerVolumeResponse(try await runtime.volume(String(value.dropFirst("/volumes/".count)))))
         case (.POST, "/volumes/create"):
             let input = try decoder.decode(VolumeCreateRequest.self, from: request.body)
+            if let driver = input.Driver, !driver.isEmpty, driver != "local" {
+                throw EngineError(.unsupported, "volume driver \(driver) is not supported")
+            }
             let name = input.Name.flatMap { $0.isEmpty ? nil : $0 } ?? Identifier.random()
             return json(status: .created, DockerVolumeResponse(try await runtime.createVolume(name: name, labels: input.Labels ?? [:], options: input.DriverOpts ?? [:])))
         case (.DELETE, let value) where value.hasPrefix("/volumes/"):
@@ -610,6 +624,29 @@ public struct DockerRouter: Sendable {
         return []
     }
 
+    private func rejectActivePruneFilters(_ encoded: String?, operation: String) throws {
+        guard let encoded, !encoded.isEmpty else { return }
+        guard let data = encoded.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw EngineError(.badRequest, "invalid prune filters")
+        }
+        for value in object.values {
+            if let values = value as? [Any] {
+                if !values.isEmpty {
+                    throw EngineError(.unsupported, "\(operation) filters are not supported")
+                }
+                continue
+            }
+            if let values = value as? [String: Bool] {
+                if values.values.contains(true) {
+                    throw EngineError(.unsupported, "\(operation) filters are not supported")
+                }
+                continue
+            }
+            throw EngineError(.badRequest, "invalid prune filters")
+        }
+    }
+
     private func labelsMatch(_ labels: [String: String], expressions: [String]) -> Bool {
         expressions.allSatisfy { expression in
             let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
@@ -806,6 +843,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let AutoRemove: Bool; let Privileged: Bool
         let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
+        let Annotations: [String: String]?
         let Binds: [String]; let Mounts: [MountResponse]
         let PortBindings: [String: [PortBindingResponse]]
         let NetworkMode: String; let LogConfig: LogConfigResponse
@@ -863,6 +901,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,
             RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount),
+            Annotations: record.annotations.isEmpty ? nil : record.annotations,
             Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
                 "\($0.source):\($0.destination)\($0.readOnly ? ":ro" : "")"
             },

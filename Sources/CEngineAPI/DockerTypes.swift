@@ -81,7 +81,7 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let ContainersRunning: Int
     public let ContainersPaused: Int
     public let ContainersStopped: Int
-    public let Images = 0
+    public let Images: Int
     public let Driver = "cengine-raw-vm"
     public let DriverStatus = [[String]]()
     public let DockerRootDir: String
@@ -95,6 +95,53 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let CgroupDriver = "cgroupfs"
     public let CgroupVersion = "2"
     public let SecurityOptions = ["name=vm"]
+    public let Containerd: ContainerdInfo?
+    public let FirewallBackend: FirewallInfo?
+    public let DiscoveredDevices: [DeviceInfo]?
+    public let NRI: NRIInfo?
+
+    public struct ContainerdInfo: Encodable, Sendable {
+        public let Address: String
+        public let Namespaces: NamespacesInfo
+        public struct NamespacesInfo: Encodable, Sendable {
+            public let Containers: String
+            public let Plugins: String
+        }
+    }
+    public struct FirewallInfo: Encodable, Sendable {
+        public let Driver: String
+        public let Info: [[String]]
+    }
+    public struct DeviceInfo: Encodable, Sendable {
+        public let Source: String
+        public let ID: String
+    }
+    public struct NRIInfo: Encodable, Sendable { public let Info: [[String]] }
+
+    public init(
+        Containers: Int,
+        ContainersRunning: Int,
+        ContainersPaused: Int,
+        ContainersStopped: Int,
+        Images: Int,
+        DockerRootDir: String,
+        version: DockerAPIVersion = .maximum,
+        containerd: ContainerdInfo? = nil,
+        firewallBackend: FirewallInfo? = nil,
+        discoveredDevices: [DeviceInfo] = [],
+        nri: NRIInfo? = nil
+    ) {
+        self.Containers = Containers
+        self.ContainersRunning = ContainersRunning
+        self.ContainersPaused = ContainersPaused
+        self.ContainersStopped = ContainersStopped
+        self.Images = Images
+        self.DockerRootDir = DockerRootDir
+        Containerd = version >= .init(major: 1, minor: 46) ? containerd : nil
+        FirewallBackend = version >= .init(major: 1, minor: 49) ? firewallBackend : nil
+        DiscoveredDevices = version >= .init(major: 1, minor: 50) ? discoveredDevices : nil
+        NRI = version >= .init(major: 1, minor: 53) ? nri : nil
+    }
 }
 
 public struct ContainerCreateRequest: Decodable, Sendable {
@@ -110,6 +157,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     public var Entrypoint: [String]?
     public var Labels: [String: String]?
     public var Volumes: [String: EmptyObject]?
+    public var VolumeDriver: String?
     public var StopSignal: String?
     public var StopTimeout: Int?
     public var HostConfig: HostConfig?
@@ -177,6 +225,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Mounts: [Mount]?
         public var PortBindings: [String: [PortBindingRequest]]?
         public var Tmpfs: [String: String]?
+        public var Annotations: [String: String]?
         public struct RestartPolicy: Decodable, Sendable { public var Name: String?; public var MaximumRetryCount: Int? }
         public struct PortBindingRequest: Decodable, Sendable { public var HostIp: String?; public var HostPort: String? }
     }
@@ -281,6 +330,7 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Status: String
     public let Ports: [Port]
     public let Labels: [String: String]
+    public let HostConfig: HostConfigSummary
     public let NetworkSettings: NetworkSettingsSummary
     public let Health: HealthSummary?
 
@@ -292,6 +342,16 @@ public struct ContainerSummaryResponse: Codable, Sendable {
         Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
         Ports = record.ports.map { .init(IP: $0.hostIP, PrivatePort: $0.containerPort, PublicPort: $0.hostPort, Type: $0.proto) }
         Labels = record.labels
+        let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
+        let networkMode = record.networkDisabled == true
+            ? "none"
+            : record.networks.first.flatMap { networkByID[$0.networkID]?.name } ?? "default"
+        HostConfig = .init(
+            NetworkMode: networkMode,
+            Annotations: version >= .init(major: 1, minor: 46) && !record.annotations.isEmpty
+                ? record.annotations
+                : nil
+        )
         Health = version >= .init(major: 1, minor: 52)
             ? .init(Status: record.healthStatus ?? "none", FailingStreak: record.healthFailingStreak ?? 0)
             : nil
@@ -302,6 +362,10 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     }
 
     public struct NetworkSettingsSummary: Codable, Sendable { public let Networks: [String: EndpointSummary] }
+    public struct HostConfigSummary: Codable, Sendable {
+        public let NetworkMode: String
+        public let Annotations: [String: String]?
+    }
     public struct EndpointSummary: Codable, Sendable { public let NetworkID: String }
     public struct HealthSummary: Codable, Sendable { public let Status: String; public let FailingStreak: Int }
 

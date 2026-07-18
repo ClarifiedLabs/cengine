@@ -234,7 +234,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         return (try? JSONDecoder().decode([String: [String]].self, from: data)) ?? [:]
     }
 
-    private static func matches(_ event: RuntimeEvent, filters: [String: [String]]) -> Bool {
+    static func matches(_ event: RuntimeEvent, filters: [String: [String]]) -> Bool {
         filters.allSatisfy { key, values in
             guard !values.isEmpty else { return true }
             return values.contains { value in
@@ -242,6 +242,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 case "type": event.type == value
                 case "event": event.action == value
                 case "container":
+                    event.id == value || event.id.hasPrefix(value) || event.attributes["name"] == value
+                case "image":
                     event.id == value || event.id.hasPrefix(value) || event.attributes["name"] == value
                 case "label": matchesLabel(event, value: value)
                 default: true

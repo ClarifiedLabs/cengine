@@ -38,6 +38,9 @@ extension EngineRuntime {
             snapshot.images.append(record)
         }
         try await persist()
+        for record in records {
+            emitImageEvent("load", id: record.id, name: record.id)
+        }
         return records
     }
 }

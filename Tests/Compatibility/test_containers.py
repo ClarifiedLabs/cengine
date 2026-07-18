@@ -782,6 +782,37 @@ def test_publishing_sctp_port_is_rejected_as_intentional_gap(client: docker.Dock
     assert published["80/tcp"] and published["90/udp"]
 
 
+@pytest.mark.compat("CTR-048")
+def test_container_annotations_are_versioned_and_persisted(daemon, client: docker.DockerClient):
+    annotations = {"io.example.owner": f"compat-{uuid.uuid4().hex[:8]}"}
+    host_config = client.api.create_host_config()
+    host_config["Annotations"] = annotations
+    created = client.api.create_container(
+        image=IMAGE,
+        name=f"compat-annotations-{uuid.uuid4().hex[:8]}",
+        host_config=host_config,
+    )
+    identifier = created["Id"]
+
+    current = next(item for item in client.api.containers(all=True) if item["Id"] == identifier)
+    assert current["HostConfig"]["Annotations"] == annotations
+    assert client.api.inspect_container(identifier)["HostConfig"]["Annotations"] == annotations
+
+    legacy = docker.APIClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.45")
+    try:
+        old = next(item for item in legacy.containers(all=True) if item["Id"] == identifier)
+        assert "Annotations" not in old["HostConfig"]
+    finally:
+        legacy.close()
+
+    daemon.restart()
+    restored = docker.APIClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.55")
+    try:
+        assert restored.inspect_container(identifier)["HostConfig"]["Annotations"] == annotations
+    finally:
+        restored.close()
+
+
 @pytest.mark.compat("CTR-034")
 def test_network_none_has_only_loopback(client: docker.DockerClient):
     container = client.containers.create(IMAGE, command="top", network_mode="none")

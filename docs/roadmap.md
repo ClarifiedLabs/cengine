@@ -45,6 +45,15 @@ The VM-backed compatibility suite covers successful and missing platform
 selection, multi-platform archive round trips, selective deletion, identity,
 attestations, and optional differential response-shape comparison.
 
+### Client-visible metadata and image events
+
+Container annotations now persist from create through inspect and daemon
+recovery, with list responses exposing them from API v1.46. Successful pulls
+and archive loads emit Docker-shaped image events with historical type, action,
+and image filtering. System information counts the actual image store and
+versions discovered-device output; containerd, Moby's Linux firewall backend,
+and NRI remain omitted because cengine does not implement those subsystems.
+
 ## Compatibility priorities
 
 ### 1. Establish and expand OCI/Linux runtime-semantic conformance
@@ -116,10 +125,11 @@ Completion criteria:
 Use the API v1.46-v1.55 assessment table in
 [Docker compatibility](docker-compatibility.md#api-version-envelope) as the
 endpoint-level backlog. After image and networking behavior, address the
-remaining container annotations, image-create events, registry search
-(`IMG-004`), system information, discovered-device information, and per-device
-blkio update fields. Implement these in observed Docker, Compose, Buildx, kind,
-and Testcontainers demand order.
+remaining registry search (`IMG-004`) and per-device blkio update fields.
+Container annotations, pull/load image events, accurate image counts, and
+versioned native-engine information are complete. Direct-build image `create`
+events remain part of the intentional direct-builder gap. Implement accepted
+gaps in observed Docker, Compose, Buildx, kind, and Testcontainers demand order.
 
 Completion criteria for each accepted gap:
 

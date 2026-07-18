@@ -430,6 +430,19 @@ private actor AuthImageBackend: ContainerBackend {
         ])
     }
 
+    @Test func imageEventFiltersMatchDockerImageSelectors() {
+        let event = RuntimeEvent(
+            type: "image",
+            action: "pull",
+            id: "alpine:latest",
+            attributes: ["name": "alpine"]
+        )
+        #expect(DockerHTTPHandler.matches(event, filters: [
+            "type": ["image"], "event": ["pull"], "image": ["alpine:latest"],
+        ]))
+        #expect(!DockerHTTPHandler.matches(event, filters: ["image": ["busybox:latest"]]))
+    }
+
     @Test func pingAndVersionNegotiation() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -447,6 +460,79 @@ private actor AuthImageBackend: ContainerBackend {
         for minor in 44...55 {
             #expect((await router.route(.init(method: .GET, uri: "/v1.\(minor)/info"))).status == .ok)
         }
+    }
+
+    @Test func infoCountsImagesAndVersionsOptionalEngineDetails() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/images/create?fromImage=alpine&tag=latest"
+        ))
+        let info = await router.route(.init(method: .GET, uri: "/v1.55/info"))
+        let current = try #require(JSONSerialization.jsonObject(with: info.body) as? [String: Any])
+        #expect(current["Images"] as? Int == 1)
+        #expect((current["DiscoveredDevices"] as? [[String: Any]])?.isEmpty == true)
+        #expect(current["Containerd"] == nil)
+        #expect(current["FirewallBackend"] == nil)
+        #expect(current["NRI"] == nil)
+
+        let containerd = DockerInfoResponse.ContainerdInfo(
+            Address: "/run/containerd.sock",
+            Namespaces: .init(Containers: "moby", Plugins: "plugins.moby")
+        )
+        let firewall = DockerInfoResponse.FirewallInfo(Driver: "nftables", Info: [])
+        let devices = [DockerInfoResponse.DeviceInfo(Source: "cdi", ID: "vendor.example/device=one")]
+        let nri = DockerInfoResponse.NRIInfo(Info: [["Enabled", "true"]])
+        func encoded(_ minor: Int) throws -> [String: Any] {
+            let response = DockerInfoResponse(
+                Containers: 0, ContainersRunning: 0, ContainersPaused: 0, ContainersStopped: 0,
+                Images: 0, DockerRootDir: root.path, version: .init(major: 1, minor: minor),
+                containerd: containerd, firewallBackend: firewall, discoveredDevices: devices, nri: nri
+            )
+            return try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(response)) as? [String: Any])
+        }
+        #expect(try encoded(45)["Containerd"] == nil)
+        #expect(try encoded(46)["Containerd"] != nil)
+        #expect(try encoded(48)["FirewallBackend"] == nil)
+        #expect(try encoded(49)["FirewallBackend"] != nil)
+        #expect(try encoded(49)["DiscoveredDevices"] == nil)
+        #expect(try encoded(50)["DiscoveredDevices"] != nil)
+        #expect(try encoded(52)["NRI"] == nil)
+        #expect(try encoded(53)["NRI"] != nil)
+    }
+
+    @Test func containerAnnotationsPersistAndListFromAPI146() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let create = try await #require(router).route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/create?name=annotated",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Annotations":{"io.example.owner":"api"}}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        let legacyList = try await #require(router).route(.init(method: .GET, uri: "/v1.45/containers/json?all=true"))
+        let legacy = try #require((JSONSerialization.jsonObject(with: legacyList.body) as? [[String: Any]])?.first)
+        #expect((legacy["HostConfig"] as? [String: Any])?["Annotations"] == nil)
+
+        let currentList = try await #require(router).route(.init(method: .GET, uri: "/v1.46/containers/json?all=true"))
+        let current = try #require((JSONSerialization.jsonObject(with: currentList.body) as? [[String: Any]])?.first)
+        #expect((current["HostConfig"] as? [String: Any])?["Annotations"] as? [String: String] == [
+            "io.example.owner": "api",
+        ])
+
+        router = nil
+        runtime = nil
+        let restoredRuntime = try await EngineRuntime(root: root)
+        let restoredRouter = DockerRouter(runtime: restoredRuntime, root: root)
+        let inspect = await restoredRouter.route(.init(method: .GET, uri: "/v1.55/containers/annotated/json"))
+        let inspected = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect((inspected["HostConfig"] as? [String: Any])?["Annotations"] as? [String: String] == [
+            "io.example.owner": "api",
+        ])
     }
 
     @Test func rejectsRequestsOutsideNegotiatedAPIRange() async throws {
@@ -747,13 +833,61 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(configs.count == 2)
         #expect((configs[1]["Subnet"] as? String)?.contains(":") == true)
 
-        let volumeCreate = await router.route(.init(method: .POST, uri: "/v1.44/volumes/create", body: Data(#"{"Name":"dbdata","Labels":{"app":"demo"}}"#.utf8)))
+        let volumeCreate = await router.route(.init(method: .POST, uri: "/v1.44/volumes/create", body: Data(#"{"Name":"dbdata","Driver":"local","Labels":{"app":"demo"}}"#.utf8)))
         #expect(volumeCreate.status == .created)
         let createdVolume = try #require(JSONSerialization.jsonObject(with: volumeCreate.body) as? [String: Any])
         #expect(createdVolume["Name"] as? String == "dbdata")
         #expect(createdVolume["Driver"] as? String == "local")
         let volumeInspect = await router.route(.init(method: .GET, uri: "/v1.44/volumes/dbdata", body: Data()))
         #expect(volumeInspect.status == .ok)
+        let unsupported = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/volumes/create",
+            body: Data(#"{"Name":"remote","Driver":"third-party"}"#.utf8)
+        ))
+        #expect(unsupported.status == .notImplemented)
+    }
+
+    @Test func containerCreateRejectsUnsupportedVolumeDriver() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/containers/create",
+            body: Data(#"{"Image":"alpine","VolumeDriver":"third-party","Volumes":{"/data":{}}}"#.utf8)
+        ))
+        #expect(response.status == .notImplemented)
+    }
+
+    @Test func imageAndVolumePruneRejectFiltersInsteadOfIgnoringThem() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/images/create?fromImage=alpine&tag=latest"
+        ))
+        _ = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/volumes/create",
+            body: Data(#"{"Name":"keep-me","Labels":{"retain":"true"}}"#.utf8)
+        ))
+
+        let imagePrune = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/images/prune?filters=%7B%22dangling%22:%5B%22false%22%5D%7D"
+        ))
+        let volumePrune = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/volumes/prune?filters=%7B%22label%22:%5B%22retain=true%22%5D%7D"
+        ))
+        #expect(imagePrune.status == .notImplemented)
+        #expect(volumePrune.status == .notImplemented)
+
+        let images = await router.route(.init(method: .GET, uri: "/v1.55/images/json"))
+        let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
+        #expect((try #require(JSONSerialization.jsonObject(with: images.body) as? [[String: Any]])).count == 1)
+        let volumeList = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
+        #expect((volumeList["Volumes"] as? [[String: Any]])?.contains { $0["Name"] as? String == "keep-me" } == true)
     }
 
     @Test func runningContainersRejectNetworkAttachmentChanges() async throws {
@@ -1678,6 +1812,14 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(Set(image["RepoTags"] as? [String] ?? []) == [
             "example/imported:latest", "imported-descriptor:latest",
         ])
+
+        let events = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var iterator = events.makeAsyncIterator()
+        let load = await iterator.next()
+        #expect(load?.type == "image")
+        #expect(load?.action == "load")
+        #expect(load?.id == "sha256:0123456789abcdef")
+        #expect(load?.attributes["name"] == load?.id)
     }
 
     @Test func startingAStoppedContainerPreservesItsPreparedBackend() async throws {
@@ -1900,6 +2042,25 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(event?.action == "create")
         #expect(event?.id == record.id)
         #expect(event?.attributes["name"] == "eventful")
+    }
+
+    @Test func runtimePublishesAndReplaysDockerImagePullEvents() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root)
+        let stream = await runtime.events()
+        var iterator = stream.makeAsyncIterator()
+        _ = try await runtime.pullImage("docker.io/library/alpine:latest")
+        let event = await iterator.next()
+        #expect(event?.type == "image")
+        #expect(event?.action == "pull")
+        #expect(event?.id == "alpine:latest")
+        #expect(event?.attributes["name"] == "alpine")
+
+        let history = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var historical = history.makeAsyncIterator()
+        #expect(await historical.next()?.action == "pull")
+        #expect(await historical.next() == nil)
     }
 
     @Test func runtimeReplaysBoundedEventHistory() async throws {

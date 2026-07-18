@@ -505,17 +505,31 @@ public actor EngineRuntime {
                           credentials: RegistryCredentials? = nil,
                           progress: @escaping ImagePullProgressHandler = { _ in }) async throws -> ImageRecord {
         try await backend.pullImage(reference, platform: platform, credentials: credentials, progress: progress)
+        let image: ImageRecord
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
-            try await persist()
-            if let image = snapshot.images.first(where: { $0.references.contains(reference) }) { return image }
+            if let stored = snapshot.images.first(where: { $0.references.contains(reference) }) {
+                image = stored
+            } else {
+                image = ImageRecord(
+                    id: "sha256:\(Identifier.random())", references: [reference], createdAt: Date(), size: 0,
+                    architecture: platform.hasSuffix("amd64") ? "amd64" : "arm64", os: "linux"
+                )
+                snapshot.images.append(image)
+            }
+        } else {
+            image = ImageRecord(
+                id: "sha256:\(Identifier.random())", references: [reference], createdAt: Date(), size: 0,
+                architecture: platform.hasSuffix("amd64") ? "amd64" : "arm64", os: "linux"
+            )
+            snapshot.images.append(image)
         }
-        let image = ImageRecord(
-            id: "sha256:\(Identifier.random())", references: [reference], createdAt: Date(), size: 0,
-            architecture: platform.hasSuffix("amd64") ? "amd64" : "arm64", os: "linux"
-        )
-        snapshot.images.append(image)
         try await persist()
+        emitImageEvent(
+            "pull",
+            id: Self.familiarImageReference(reference),
+            name: Self.familiarImageName(reference)
+        )
         return image
     }
 
@@ -1006,6 +1020,28 @@ public actor EngineRuntime {
         eventHistory.append(event)
         if eventHistory.count > 256 { eventHistory.removeFirst(eventHistory.count - 256) }
         eventContinuations.values.forEach { $0.yield(event) }
+    }
+    func emitImageEvent(_ action: String, id: String, name: String) {
+        emit(RuntimeEvent(type: "image", action: action, id: id, attributes: ["name": name]))
+    }
+    private static func familiarImageReference(_ reference: String) -> String {
+        if reference.hasPrefix("docker.io/library/") {
+            return String(reference.dropFirst("docker.io/library/".count))
+        }
+        if reference.hasPrefix("docker.io/") {
+            return String(reference.dropFirst("docker.io/".count))
+        }
+        return reference
+    }
+    private static func familiarImageName(_ reference: String) -> String {
+        let familiar = familiarImageReference(reference)
+        let withoutDigest = familiar.split(separator: "@", maxSplits: 1).first.map(String.init) ?? familiar
+        let slash = withoutDigest.lastIndex(of: "/")
+        guard let colon = withoutDigest.lastIndex(of: ":") else {
+            return withoutDigest
+        }
+        if let slash, colon < slash { return withoutDigest }
+        return String(withoutDigest[..<colon])
     }
     private func containerEvent(_ action: String, _ record: ContainerRecord,
                                 extra: [String: String] = [:]) -> RuntimeEvent {

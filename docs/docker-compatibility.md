@@ -48,11 +48,11 @@ reference beneath the Docker API.
 
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
 |---|---|---|
-| Negotiation, version, info | `SYS-001`–`SYS-003`, `CLI-001` | Operational shape sampling is concentrated at v1.44 and v1.55. |
-| Container lifecycle and inspect | `CTR-001`–`CTR-047`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
+| Negotiation, version, info | `SYS-001`–`SYS-004`, `CLI-001` | Counts and optional native-engine fields are versioned; operational shape sampling is concentrated at v1.44 and v1.55. |
+| Container lifecycle and inspect | `CTR-001`–`CTR-048`, `EVT-001`–`EVT-002`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-047`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-017`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | SCTP publishing is an intentional gap covered by `NET-017`. Endpoint sysctls, explicit IPv4 controls, and IPAM status remain gaps. |
-| Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, and authenticated registry round trips are covered. |
+| Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003`, `EVT-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, authenticated registry round trips, and pull/load events are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
 | Differential behavior | `ORC-001`–`ORC-002` | Optional lifecycle and multi-platform image response-shape comparisons require an explicit reference Docker Engine. |
@@ -102,17 +102,17 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
 | 1.45 | Named-volume mount `VolumeOptions.Subpath` | Supported | Existing subdirectories are safely resolved beneath the named-volume root. |
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
-| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Tmpfs size/mode and platform-selective push are applied; the other additions remain gaps. |
+| 1.46 | Containerd info, container annotations, endpoint sysctls, tmpfs options, push platform, and image-create events | Partial | Annotations persist from create/inspect and appear in list responses from v1.46; pull/load events, tmpfs size/mode, and platform-selective push are supported. `Containerd` is omitted because cengine does not use containerd, and the builder-only image `create` event is inapplicable while direct build remains intentionally unsupported. Endpoint sysctls remain a gap. |
 | 1.47 | Image-list manifest summaries | Supported | `manifests=true` returns available, missing, image, and attestation manifest summaries. |
 | 1.48 | Platform-aware history/load/save/push, image mounts, OCI descriptors/manifests, image-manifest descriptors, IPv4 network control, and gateway priority | Partial | Image operations, descriptor responses, and endpoint gateway priority (`NET-016`) are supported; image mounts and explicit IPv4 control remain gaps. |
-| 1.49 | Platform-specific image inspect and firewall backend info | Partial | JSON-encoded OCI platform selection and `manifests` conflicts are enforced; `FirewallBackend` is absent. |
-| 1.50 | Platform-selective image deletion and discovered-device info | Partial | Repeated JSON platform deletion preserves unselected variants; `DiscoveredDevices` is absent. |
+| 1.49 | Platform-specific image inspect and firewall backend info | Supported | JSON-encoded OCI platform selection and `manifests` conflicts are enforced. `FirewallBackend` is correctly omitted because cengine does not use Moby's Linux iptables/nftables backend. |
+| 1.50 | Platform-selective image deletion and discovered-device info | Supported | Repeated JSON platform deletion preserves unselected variants; `DiscoveredDevices` is an empty array because cengine has no device-discovery drivers. |
 | 1.50 | Removal of deprecated image-config fields | Supported | Cengine's image configuration already omits the removed runtime-only fields. |
 | 1.51 | Image summary container usage count | Supported | v1.44-v1.50 report `-1`; v1.51+ calculate the number of containers using each image. |
 | 1.52 | Event legacy-field removal and container/image response omissions | Supported | Responses branch at v1.52 while older API requests retain their legacy shape. |
 | 1.52 | Container summary health and stats OS type | Supported | v1.52+ responses include `Health` and `os_type`. |
 | 1.52 | Multi-platform image load/save, network IPAM status, event content negotiation, and verbose system disk usage | Partial | Repeated image selectors, event negotiation, and disk usage are supported; IPAM status remains a gap. |
-| 1.53 | NRI info, JSONL event negotiation, and image identity | Partial | Event streams and trusted pull/push origin identity are supported; `NRI` remains absent. |
+| 1.53 | NRI info, JSONL event negotiation, and image identity | Supported | Event streams and trusted pull/push origin identity are supported. `NRI` is correctly omitted because cengine has no Node Resource Interface integration. |
 | 1.54 | Image-list identity and endpoint MAC application | Partial | `identity=true` implies manifest summaries and returns trusted origin data; explicit endpoint `MacAddress` is decoded, validated, applied in the guest, and inspected (`NET-014`, `NET-015`); endpoint sysctls remain a gap. Endpoint gateway priority is supported (`NET-016`, API 1.48). |
 | 1.55 | Image attestations and per-device blkio updates | Partial | Attached in-toto statements support platform/type filters and statement opt-in; the five blkio device arrays remain a gap. |
 
@@ -182,6 +182,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `CTR-045` | `test_unprivileged_standard_devices_are_world_accessible` | ✅ Pass | Support | **cengine-owned.** Standard character devices retain mode `0666` and are usable after the workload drops root privileges. |
 | `CTR-046` | `test_concurrent_vm_starts_remain_responsive` | ✅ Pass | Support | **cengine-owned.** Twelve concurrent container creates and starts leave every running guest responsive to exec without starving shim control I/O. |
 | `CTR-047` | `test_container_memory_limit_is_separate_from_vm_capacity` | ✅ Pass | Support | **cengine-owned.** The Docker memory value remains the workload cgroup hard limit while the per-container VM includes separate guest overhead. |
+| `CTR-048` | `test_container_annotations_are_versioned_and_persisted` | ✅ Pass | Support | **cengine-owned.** Create-time annotations survive daemon recovery and inspect, while list responses expose them only from API v1.46. |
 
 ## Testcontainers
 
@@ -227,6 +228,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `SYS-001` | `test_info` | ✅ Pass | Support | Adapted from Podman registry configuration to cengine driver, platform, and root invariants. |
 | `SYS-002` | `test_info_container_details` | ✅ Pass | Support | Container totals update after create. |
 | `SYS-003` | `test_version` | ✅ Pass | Support | Platform name and negotiated API version. |
+| `SYS-004` | `test_info_reports_images_and_versioned_native_engine_details` | ✅ Pass | Support | **cengine-owned.** Image totals reflect the local store, discovered devices are reported as an empty list from v1.50, and inapplicable containerd, Linux firewall, and NRI details are not fabricated. |
 
 ## Events
 
@@ -234,6 +236,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 |---|---|---|---|---|
 | `EVT-001` | `test_filtered_container_events` | ✅ Pass | Support | **cengine-owned.** Type, container, and label filters isolate live create, start, die, and destroy events. |
 | `EVT-002` | `test_historical_events_honor_time_window_and_jsonl` | ✅ Pass | Support | **cengine-owned.** A bounded history honors time windows and API v1.53+ JSONL negotiation. |
+| `EVT-003` | `test_historical_image_pull_and_load_events_honor_filters` | ✅ Pass | Support | **cengine-owned.** Successful pulls and archive loads emit Docker-shaped image events that replay through type, action, and image filters. |
 
 ## Resources
 

@@ -70,3 +70,34 @@ def test_historical_events_honor_time_window_and_jsonl(client: docker.DockerClie
     finally:
         response.close()
     assert {event["Action"] for event in events} >= {"create", "start", "die", "destroy"}
+
+
+@pytest.mark.compat("EVT-003")
+def test_historical_image_pull_and_load_events_honor_filters(client: docker.DockerClient):
+    since = time.time() - 1
+    image = client.images.pull(IMAGE)
+    archive = b"".join(image.save(named=True))
+    client.images.load(archive)
+    until = time.time()
+
+    response = client.api._get(
+        client.api._url("/events"),
+        params={
+            "since": since,
+            "until": until,
+            "filters": json.dumps({
+                "type": ["image"],
+                "event": ["pull", "load"],
+                "image": [IMAGE, image.id],
+            }),
+        },
+        stream=True,
+    )
+    try:
+        events = [json.loads(line) for line in response.iter_lines() if line]
+    finally:
+        response.close()
+
+    assert {event["Action"] for event in events} >= {"pull", "load"}, json.dumps(events, indent=2)
+    assert all(event["Type"] == "image" for event in events)
+    assert all(event["Actor"]["Attributes"].get("name") for event in events)
