@@ -33,6 +33,7 @@ public actor EngineRuntime {
     var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
     private let endpointAllocationStore: AtomicStore<[String: Int]>
+    private let beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)?
     let backend: any ContainerBackend
     private var endpointAllocationCursors: [String: Int]
     private var execs: [String: ExecRecord] = [:]
@@ -48,8 +49,17 @@ public actor EngineRuntime {
     private var startingContainerIDs = Set<String>()
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
+        try await self.init(root: root, backend: backend, beforeEndpointAllocationPersistence: nil)
+    }
+
+    init(
+        root: URL,
+        backend: any ContainerBackend,
+        beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)?
+    ) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
         self.endpointAllocationStore = AtomicStore(url: root.appending(path: "endpoint-allocation.json"))
+        self.beforeEndpointAllocationPersistence = beforeEndpointAllocationPersistence
         self.backend = backend
         self.snapshot = try await store.load(default: EngineSnapshot())
         self.endpointAllocationCursors = try await endpointAllocationStore.load(default: [:])
@@ -198,8 +208,8 @@ public actor EngineRuntime {
         record = try normalizingEndpointMacAddresses(record)
         try validateEndpoints(record)
         record = try allocatingEndpointAddresses(to: record)
-        try await persistEndpointAllocationCursors()
         pendingContainers[record.id] = record
+        try await persistEndpointAllocationCursors()
         try await backend.prepare(record)
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
@@ -987,6 +997,7 @@ public actor EngineRuntime {
     }
 
     private func persistEndpointAllocationCursors() async throws {
+        try await beforeEndpointAllocationPersistence?()
         try await endpointAllocationStore.save(endpointAllocationCursors)
     }
 

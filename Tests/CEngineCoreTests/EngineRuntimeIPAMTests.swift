@@ -4,6 +4,38 @@ import Testing
 @testable import CEngineRuntime
 
 @Suite struct EngineRuntimeIPAMTests {
+    enum ConcurrentEndpointConflict: CaseIterable, Sendable {
+        case ipv4Address
+        case macAddress
+    }
+
+    private actor FailingPersistenceGate {
+        struct Failure: Error {}
+
+        private var didPause = false
+        private var arrivalWaiter: CheckedContinuation<Void, Never>?
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func pauseOnceThenFail() async throws {
+            guard !didPause else { return }
+            didPause = true
+            arrivalWaiter?.resume()
+            arrivalWaiter = nil
+            await withCheckedContinuation { releaseWaiter = $0 }
+            throw Failure()
+        }
+
+        func waitUntilPaused() async {
+            guard !didPause else { return }
+            await withCheckedContinuation { arrivalWaiter = $0 }
+        }
+
+        func release() {
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
     @Test func defaultNetworkAllocatesUniquePersistentDualStackAddressesBeforeBackendPreparation() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -97,6 +129,57 @@ import Testing
         _ = try await runtime.createContainer(makeRecord(
             name: "third-mac", networkID: other.id, macAddress: "02:42:ac:11:00:02"
         ))
+    }
+
+    @Test(arguments: ConcurrentEndpointConflict.allCases)
+    func concurrentCreatesReserveExplicitEndpointsBeforePersistence(
+        _ conflict: ConcurrentEndpointConflict
+    ) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = FailingPersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforeEndpointAllocationPersistence: { try await gate.pauseOnceThenFail() }
+        )
+        let network = try await runtime.createNetwork(
+            name: "concurrent-endpoints", subnet: "10.80.0.0/24", gateway: "10.80.0.1"
+        )
+
+        func record(_ name: String) -> ContainerRecord {
+            var value = ContainerRecord(name: name, image: "example")
+            switch conflict {
+            case .ipv4Address:
+                value.networks = [.init(
+                    networkID: network.id,
+                    ipv4Address: "10.80.0.2",
+                    ipv4AddressIsStatic: true
+                )]
+            case .macAddress:
+                value.networks = [.init(
+                    networkID: network.id,
+                    macAddress: "02:42:ac:11:00:02"
+                )]
+            }
+            return value
+        }
+
+        let first = Task { try await runtime.createContainer(record("first-reservation")) }
+        await gate.waitUntilPaused()
+
+        do {
+            _ = try await runtime.createContainer(record("conflicting-reservation"))
+            Issue.record("a concurrent create reused a pending explicit endpoint")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await gate.release()
+        await #expect(throws: FailingPersistenceGate.Failure.self) { _ = try await first.value }
+
+        // A failed create must release its pending endpoint reservation.
+        _ = try await runtime.createContainer(record("retried-reservation"))
     }
 
     @Test func explicitGatewayPriorityIsStoredAndSurvivesRecovery() async throws {

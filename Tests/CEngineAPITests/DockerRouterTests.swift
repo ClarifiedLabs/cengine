@@ -867,6 +867,26 @@ private actor AuthImageBackend: ContainerBackend {
         let options = try #require(endpoint["DriverOpts"] as? [String: String])
         #expect(options[NetworkEndpointRecord.sysctlsDriverOption] == "net.ipv4.conf.IFNAME.forwarding=1,net.ipv6.conf.ifname.accept_ra=0")
 
+        let oldInspect = await router.route(.init(
+            method: .GET, uri: "/v1.45/containers/sysctl-client/json"
+        ))
+        let oldObject = try #require(JSONSerialization.jsonObject(with: oldInspect.body) as? [String: Any])
+        let oldEndpoint = try #require(
+            (((oldObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(oldEndpoint["DriverOpts"] == nil)
+
+        let introducedInspect = await router.route(.init(
+            method: .GET, uri: "/v1.46/containers/sysctl-client/json"
+        ))
+        let introducedObject = try #require(
+            JSONSerialization.jsonObject(with: introducedInspect.body) as? [String: Any]
+        )
+        let introducedEndpoint = try #require(
+            (((introducedObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(introducedEndpoint["DriverOpts"] as? [String: String] == options)
+
         let restarted = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
         let recovered = try await restarted.container("sysctl-client")
         #expect(recovered.networks.first?.interfaceSysctls == [

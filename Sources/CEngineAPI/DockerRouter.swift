@@ -1001,7 +1001,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
                 : endpoint.aliases
             let dnsNames = Array(Set([record.name, record.hostname, shortID] + endpoint.aliases)).sorted()
             result[name] = .init(
-                IPAMConfig: nil, Links: nil, Aliases: aliases, DriverOpts: endpoint.driverOptions,
+                IPAMConfig: nil, Links: nil, Aliases: aliases,
+                DriverOpts: version >= .init(major: 1, minor: 46) ? endpoint.driverOptions : nil,
                 NetworkID: endpoint.networkID,
                 EndpointID: "\(record.id)-\(endpoint.networkID)", Gateway: network?.gateway ?? "",
                 IPAddress: endpoint.ipv4Address ?? "",
