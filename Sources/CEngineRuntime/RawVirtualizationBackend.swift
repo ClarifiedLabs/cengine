@@ -454,19 +454,33 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func discardExec(_ exec: ExecRecord) async {
-        if let shim = execShims[exec.id] {
-            struct Request: Encodable { let id: String }
-            struct Status: Decodable { let status: String }
-            let _: Status? = try? await shim.guest(
-                operation: "discard-exec", payload: Request(id: exec.id), response: Status.self
-            )
-        }
+        let shim = execShims[exec.id]
         execMonitors.removeValue(forKey: exec.id)?.stop()
         execBridges.removeValue(forKey: exec.id)?.finishOutput()
         execShims.removeValue(forKey: exec.id)
+        await Self.discardExecArtifacts(root: root, exec: exec) {
+            guard let shim else { return }
+            struct Request: Encodable { let id: String }
+            struct Status: Decodable { let status: String }
+            let _: Status = try await shim.guest(
+                operation: "discard-exec", payload: Request(id: exec.id), response: Status.self
+            )
+        }
+    }
+
+    static func discardExecArtifacts(
+        root: URL,
+        exec: ExecRecord,
+        guestDiscard: @Sendable () async throws -> Void
+    ) async {
+        try? await guestDiscard()
         let ioDirectory = root.appending(path: "containers/\(exec.containerID)/io")
-        for suffix in ["stdout", "stderr", "stdin", "stdin.closed", "docker.log", "docker.log.entries"] {
-            try? FileManager.default.removeItem(at: ioDirectory.appending(path: "exec-\(exec.id)-\(suffix)"))
+        let prefix = "exec-\(exec.id)"
+        for name in [
+            "\(prefix).json", "\(prefix)-stdout", "\(prefix)-stderr", "\(prefix)-stdin",
+            "\(prefix)-stdin.closed", "\(prefix)-docker.log", "\(prefix)-docker.log.entries",
+        ] {
+            try? FileManager.default.removeItem(at: ioDirectory.appending(path: name))
         }
     }
 

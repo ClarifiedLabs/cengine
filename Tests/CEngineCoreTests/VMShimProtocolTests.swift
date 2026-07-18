@@ -124,6 +124,37 @@ private func semaphoreArrives(_ semaphore: DispatchSemaphore) async -> Bool {
         #expect(!context.noNewPrivileges)
     }
 
+    @Test func failedGuestExecDiscardStillRemovesPreparedHostArtifacts() async throws {
+        struct GuestUnavailable: Error {}
+
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let exec = ExecRecord(
+            id: "prepared-exec",
+            containerID: "prepared-container",
+            configuration: .init(arguments: ["true"])
+        )
+        let ioDirectory = root.appending(path: "containers/\(exec.containerID)/io")
+        try FileManager.default.createDirectory(at: ioDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactNames = [
+            "exec-\(exec.id).json", "exec-\(exec.id)-stdout", "exec-\(exec.id)-stderr",
+            "exec-\(exec.id)-stdin", "exec-\(exec.id)-stdin.closed",
+            "exec-\(exec.id)-docker.log", "exec-\(exec.id)-docker.log.entries",
+        ]
+        for name in artifactNames {
+            #expect(FileManager.default.createFile(atPath: ioDirectory.appending(path: name).path, contents: Data()))
+        }
+
+        await RawVirtualizationBackend.discardExecArtifacts(root: root, exec: exec) {
+            throw GuestUnavailable()
+        }
+
+        for name in artifactNames {
+            #expect(!FileManager.default.fileExists(atPath: ioDirectory.appending(path: name).path))
+        }
+        await RawVirtualizationBackend.discardExecArtifacts(root: root, exec: exec) {}
+    }
+
     @Test func blockVolumesUseTheReportedSparseCapacity() {
         #expect(VolumeRecord.defaultSizeBytes == 512 * 1_024 * 1_024 * 1_024)
         #expect(RawVirtualizationBackend.defaultVolumeDiskBytes == VolumeRecord.defaultSizeBytes)
