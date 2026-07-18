@@ -156,6 +156,47 @@ private actor BlockingStartBackend: ContainerBackend {
     func releaseStart() { continuation?.resume(); continuation = nil }
 }
 
+private actor BlockingEndpointAddressBackend: ContainerBackend {
+    private var lookupContinuation: CheckedContinuation<Void, Never>?
+    private var blockNextLookup = false
+    private var lookupBlocked = false
+    private var lookups = 0
+    private var starts = 0
+    private var kills = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_: ContainerRecord) async throws {}
+    func kill(_: ContainerRecord, signal _: String) async throws { kills += 1 }
+    func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress] {
+        lookups += 1
+        let address = "192.168.64.\(200 + lookups)"
+        if blockNextLookup {
+            blockNextLookup = false
+            lookupBlocked = true
+            await withCheckedContinuation { lookupContinuation = $0 }
+            lookupBlocked = false
+        }
+        return Dictionary(uniqueKeysWithValues: container.networks.map {
+            ($0.networkID, BackendEndpointAddress(ipv4Address: address, ipv6Address: ""))
+        })
+    }
+
+    func blockNextEndpointLookup() { blockNextLookup = true }
+    func isEndpointLookupBlocked() -> Bool { lookupBlocked }
+    func releaseEndpointLookup() {
+        lookupContinuation?.resume()
+        lookupContinuation = nil
+    }
+    func counts() -> (starts: Int, kills: Int) { (starts, kills) }
+}
+
 private actor BlockingPauseResumeBackend: ContainerBackend {
     private var pauseContinuation: CheckedContinuation<Void, Never>?
     private var resumeContinuation: CheckedContinuation<Void, Never>?
@@ -3470,6 +3511,103 @@ private actor AuthImageBackend: ContainerBackend {
         try await start.value
         #expect(try await runtime.container(record.id).phase == .running)
         #expect(try await runtime.container(record.id).memoryBytes != 8_192)
+    }
+
+    @Test func startReResolvesItsContainerAfterEndpointAddressLookup() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingEndpointAddressBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let earlier = try await runtime.createContainer(
+            ContainerRecord(name: "start-index-earlier", image: "debian")
+        )
+        let target = try await runtime.createContainer(
+            ContainerRecord(name: "start-index-target", image: "debian")
+        )
+        let trailing = try await runtime.createContainer(
+            ContainerRecord(name: "start-index-trailing", image: "debian")
+        )
+
+        await backend.blockNextEndpointLookup()
+        let start = Task { try await runtime.startContainer(target.id) }
+        while !(await backend.isEndpointLookupBlocked()) { await Task.yield() }
+        try await runtime.removeContainer(earlier.id, force: false)
+        await backend.releaseEndpointLookup()
+        try await start.value
+
+        let started = try await runtime.container(target.id)
+        let sentinel = try await runtime.container(trailing.id)
+        #expect(started.phase == .running)
+        #expect(started.networks.first?.ipv4Address == "192.168.64.201")
+        #expect(sentinel.id == trailing.id)
+        #expect(sentinel.phase == .created)
+        #expect(sentinel.networks.first?.ipv4Address != "192.168.64.201")
+    }
+
+    @Test func restartReResolvesItsContainerAfterEndpointAddressLookup() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingEndpointAddressBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let earlier = try await runtime.createContainer(
+            ContainerRecord(name: "restart-index-earlier", image: "debian")
+        )
+        let target = try await runtime.createContainer(
+            ContainerRecord(name: "restart-index-target", image: "debian")
+        )
+        let trailing = try await runtime.createContainer(
+            ContainerRecord(name: "restart-index-trailing", image: "debian")
+        )
+        try await runtime.startContainer(target.id)
+
+        await backend.blockNextEndpointLookup()
+        let restart = Task { try await runtime.restartContainer(target.id, timeoutSeconds: 0) }
+        while !(await backend.isEndpointLookupBlocked()) { await Task.yield() }
+        try await runtime.removeContainer(earlier.id, force: false)
+        await backend.releaseEndpointLookup()
+        try await restart.value
+
+        let restarted = try await runtime.container(target.id)
+        let sentinel = try await runtime.container(trailing.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.restartCount == 1)
+        #expect(restarted.networks.first?.ipv4Address == "192.168.64.202")
+        #expect(sentinel.id == trailing.id)
+        #expect(sentinel.phase == .created)
+        #expect(sentinel.networks.first?.ipv4Address != "192.168.64.202")
+    }
+
+    @Test func killCannotTerminalizeAContainerDuringItsStartCommit() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingEndpointAddressBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var restartPolicyRecord = ContainerRecord(name: "start-kill-restart", image: "debian")
+        restartPolicyRecord.restartPolicy = .init(name: "always")
+        var autoRemoveRecord = ContainerRecord(name: "start-kill-remove", image: "debian")
+        autoRemoveRecord.autoRemove = true
+
+        for input in [restartPolicyRecord, autoRemoveRecord] {
+            let record = try await runtime.createContainer(input)
+            await backend.blockNextEndpointLookup()
+            let start = Task { try await runtime.startContainer(record.id) }
+            while !(await backend.isEndpointLookupBlocked()) { await Task.yield() }
+
+            do {
+                try await runtime.killContainer(record.id, signal: "KILL")
+                Issue.record("kill terminalized a container before its start commit completed")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+            }
+            #expect(await backend.counts().kills == 0)
+
+            await backend.releaseEndpointLookup()
+            try await start.value
+            let started = try await runtime.container(record.id)
+            #expect(started.phase == .running)
+            #expect(started.restartCount == 0)
+        }
+        #expect(await backend.counts().starts == 2)
     }
 
     @Test func concurrentCreatesReserveContainerNamesBeforeBackendPreparation() async throws {

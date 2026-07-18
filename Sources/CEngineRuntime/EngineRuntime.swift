@@ -258,37 +258,65 @@ public actor EngineRuntime {
         }
         guard record.phase != .running else { return }
         let intent = try beginLifecycleIntent(.start, for: record.id)
-        defer { endLifecycleIntent(intent, for: record.id) }
         guard startingContainerIDs.insert(record.id).inserted else {
+            endLifecycleIntent(intent, for: record.id)
             throw EngineError(.conflict, "container \(identifier) is already starting")
         }
-        defer { startingContainerIDs.remove(record.id) }
-        if record.phase == .dead {
-            try await backend.delete(record)
+        do {
+            if record.phase == .dead {
+                try await backend.delete(record)
+                guard ownsLifecycleExecution(intent, record: record) else {
+                    throw EngineError(.conflict, "container was removed or changed while it was starting")
+                }
+            }
+            try await backend.prepare(record)
+            guard ownsLifecycleExecution(intent, record: record) else {
+                throw EngineError(.conflict, "container was removed or changed while it was starting")
+            }
+            let resolvedPorts = try await backend.start(record)
+            guard ownsLifecycleExecution(intent, record: record),
+                  let current = try? containerIndex(record.id) else {
+                _ = try? await backend.stop(record, timeoutSeconds: 0)
+                try? await backend.delete(record)
+                throw EngineError(.conflict, "container was removed or changed while it was starting")
+            }
+
+            var started = snapshot.containers[current]
+            started.phase = .running
+            started.ports = resolvedPorts
+            let startedAt = Date()
+            started.startedAt = startedAt
+            started.finishedAt = nil
+            started.exitCode = nil
+            started = await applyingEndpointAddresses(to: started)
+            guard ownsLifecycleExecution(intent, record: record),
+                  let current = try? containerIndex(record.id) else {
+                _ = try? await backend.stop(started, timeoutSeconds: 0)
+                try? await backend.delete(started)
+                throw EngineError(.conflict, "container was removed or changed while it was starting")
+            }
+            snapshot.containers[current] = started
+            try await persist()
+            guard lifecycleIntents[record.id] == intent,
+                  let published = try? container(record.id),
+                  published.phase == .running,
+                  published.startedAt == startedAt else {
+                _ = try? await backend.stop(started, timeoutSeconds: 0)
+                try? await backend.delete(started)
+                throw EngineError(.conflict, "container was removed or changed while it was starting")
+            }
+            emit(containerEvent("start", published))
+            startHealthMonitor(record.id)
+            Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
+            startingContainerIDs.remove(record.id)
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            startingContainerIDs.remove(record.id)
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
         }
-        try await backend.prepare(record)
-        let resolvedPorts = try await backend.start(record)
-        guard let current = try? containerIndex(record.id) else {
-            _ = try? await backend.stop(record, timeoutSeconds: 0)
-            try? await backend.delete(record)
-            throw EngineError(.conflict, "container was removed while it was starting")
-        }
-        snapshot.containers[current].phase = .running
-        snapshot.containers[current].ports = resolvedPorts
-        let startedAt = Date()
-        snapshot.containers[current].startedAt = startedAt
-        snapshot.containers[current].finishedAt = nil
-        snapshot.containers[current].exitCode = nil
-        let addresses = await backend.endpointAddresses(for: record)
-        for endpoint in snapshot.containers[current].networks.indices {
-            guard let address = addresses[snapshot.containers[current].networks[endpoint].networkID] else { continue }
-            snapshot.containers[current].networks[endpoint].ipv4Address = Self.nonEmptyBackendAddress(address.ipv4Address)
-            snapshot.containers[current].networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
-        }
-        try await persist()
-        emit(containerEvent("start", snapshot.containers[current]))
-        startHealthMonitor(record.id)
-        Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
     }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
@@ -357,6 +385,9 @@ public actor EngineRuntime {
 
     public func killContainer(_ identifier: String, signal: String) async throws {
         let record = try container(identifier)
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
         guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         try await backend.kill(record, signal: signal)
         emit(containerEvent("kill", record, extra: ["signal": signal]))
@@ -436,24 +467,54 @@ public actor EngineRuntime {
             return
         }
         let intent = try beginLifecycleIntent(.restart, for: record.id)
-        defer { endLifecycleIntent(intent, for: record.id) }
-        try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
-        // A restart creates a new container execution generation. Terminalize
-        // every child of the old generation before publishing the new start
-        // time; its completion monitor may still be suspended in the backend.
-        await reconcileExecs(for: record.id)
-        guard let current = try? containerIndex(record.id) else { throw EngineError(.conflict, "container was removed while restarting") }
-        snapshot.containers[current].phase = .running
-        let startedAt = Date()
-        snapshot.containers[current].startedAt = startedAt
-        snapshot.containers[current].finishedAt = nil
-        snapshot.containers[current].exitCode = nil
-        snapshot.containers[current].restartCount += 1
-        snapshot.containers[current] = await applyingEndpointAddresses(to: snapshot.containers[current])
-        try await persist()
-        emit(containerEvent("restart", snapshot.containers[current]))
-        startHealthMonitor(record.id)
-        Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
+        do {
+            try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+            guard ownsRestartExecution(intent, record: record) else {
+                throw EngineError(.conflict, "container was removed or changed while it was restarting")
+            }
+            // A restart creates a new container execution generation. Terminalize
+            // every child of the old generation before publishing the new start
+            // time; its completion monitor may still be suspended in the backend.
+            await reconcileExecs(for: record.id)
+            guard ownsRestartExecution(intent, record: record),
+                  let current = try? containerIndex(record.id) else {
+                throw EngineError(.conflict, "container was removed or changed while it was restarting")
+            }
+
+            var restarted = snapshot.containers[current]
+            restarted.phase = .running
+            let startedAt = Date()
+            restarted.startedAt = startedAt
+            restarted.finishedAt = nil
+            restarted.exitCode = nil
+            restarted.restartCount += 1
+            snapshot.containers[current] = restarted
+
+            restarted = await applyingEndpointAddresses(to: restarted)
+            guard lifecycleIntents[record.id] == intent,
+                  let current = try? containerIndex(record.id),
+                  snapshot.containers[current].phase == .running,
+                  snapshot.containers[current].startedAt == startedAt else {
+                throw EngineError(.conflict, "container was removed or changed while it was restarting")
+            }
+            snapshot.containers[current] = restarted
+            try await persist()
+            guard lifecycleIntents[record.id] == intent,
+                  let published = try? container(record.id),
+                  published.phase == .running,
+                  published.startedAt == startedAt else {
+                throw EngineError(.conflict, "container was removed or changed while it was restarting")
+            }
+            emit(containerEvent("restart", published))
+            startHealthMonitor(record.id)
+            Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func createExec(container identifier: String, configuration: ExecConfiguration) async throws -> ExecRecord {
@@ -1780,6 +1841,17 @@ public actor EngineRuntime {
               let index = try? containerIndex(record.id) else { return false }
         let current = snapshot.containers[index]
         return current.phase == record.phase && current.startedAt == record.startedAt
+    }
+
+    private func ownsRestartExecution(_ intent: LifecycleIntent, record: ContainerRecord) -> Bool {
+        guard lifecycleIntents[record.id] == intent,
+              let index = try? containerIndex(record.id) else { return false }
+        let current = snapshot.containers[index]
+        // The old execution may report its expected terminal transition while
+        // backend.restart is replacing it. No other phase or generation change
+        // is safe for this restart operation to overwrite.
+        return (current.phase == record.phase || current.phase == .exited)
+            && current.startedAt == record.startedAt
     }
 
     private func ownsNetworkMutation(
