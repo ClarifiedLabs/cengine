@@ -48,7 +48,8 @@ attestations, and optional differential response-shape comparison.
 ### Client-visible metadata and image events
 
 Container annotations now persist from create through inspect and daemon
-recovery, with list responses exposing them from API v1.46. Successful pulls
+recovery, enter the versioned guest runtime specification, and appear in list
+responses from API v1.46. Successful pulls
 and archive loads emit Docker-shaped image events with historical type, action,
 and image filtering; container events apply the same filter to their creating
 image reference. Default prune requests preserve tagged images and named

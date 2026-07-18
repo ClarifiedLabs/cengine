@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version             = 5
+	Version             = 6
 	ControlPort         = 4100
 	FileSystemPort      = 4101
 	RootFSContentPort   = 4102
@@ -50,6 +50,7 @@ type WorkloadSpec struct {
 	Hosts            map[string]string `json:"hosts,omitempty"`
 	Resources        Resources         `json:"resources"`
 	Privileged       bool              `json:"privileged"`
+	Annotations      map[string]string `json:"annotations,omitempty"`
 }
 
 type User struct {

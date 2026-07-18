@@ -789,10 +789,14 @@ def test_container_annotations_are_versioned_and_persisted(daemon, client: docke
     host_config["Annotations"] = annotations
     created = client.api.create_container(
         image=IMAGE,
+        command=["true"],
         name=f"compat-annotations-{uuid.uuid4().hex[:8]}",
         host_config=host_config,
     )
     identifier = created["Id"]
+
+    client.api.start(identifier)
+    assert client.api.wait(identifier, timeout=60)["StatusCode"] == 0
 
     current = next(item for item in client.api.containers(all=True) if item["Id"] == identifier)
     assert current["HostConfig"]["Annotations"] == annotations

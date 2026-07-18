@@ -3,7 +3,7 @@ import CEngineRuntime
 import Foundation
 import NIOHTTP1
 
-private enum DockerFilterValues: Decodable {
+enum DockerFilterValues: Decodable {
     case list([String])
     case map([String: Bool])
 
@@ -694,9 +694,13 @@ public struct DockerRouter: Sendable {
             throw EngineError(.unsupported, "volume driver \(driver) is not supported")
         }
         for mount in (input.Mounts ?? []) + (input.HostConfig?.Mounts ?? []) {
-            guard let driver = mount.VolumeOptions?.DriverConfig?.Name,
-                  !driver.isEmpty, driver != "local" else { continue }
-            throw EngineError(.unsupported, "volume driver \(driver) is not supported")
+            guard let configuration = mount.VolumeOptions?.DriverConfig else { continue }
+            if let driver = configuration.Name, !driver.isEmpty, driver != "local" {
+                throw EngineError(.unsupported, "volume driver \(driver) is not supported")
+            }
+            if configuration.Options?.isEmpty == false {
+                throw EngineError(.unsupported, "local volume driver options are not supported")
+            }
         }
     }
 

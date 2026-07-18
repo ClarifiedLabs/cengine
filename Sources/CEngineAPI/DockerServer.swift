@@ -231,7 +231,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
               let data = raw.replacingOccurrences(of: "+", with: " ").data(using: .utf8) else {
             return [:]
         }
-        return (try? JSONDecoder().decode([String: [String]].self, from: data)) ?? [:]
+        return (try? JSONDecoder().decode([String: DockerFilterValues].self, from: data).mapValues(\.active)) ?? [:]
     }
 
     static func matches(_ event: RuntimeEvent, filters: [String: [String]]) -> Bool {

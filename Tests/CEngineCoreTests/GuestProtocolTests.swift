@@ -3,8 +3,8 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct GuestProtocolTests {
-    @Test func execPayloadUsesVersionFiveIdentityAndSecurityContext() throws {
-        #expect(GuestProtocol.version == 5)
+    @Test func execPayloadUsesVersionSixIdentityAndSecurityContext() throws {
+        #expect(GuestProtocol.version == 6)
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
             workingDirectory: "/work",
@@ -19,6 +19,21 @@ import Testing
         let user = try #require(object["user"] as? [String: Any])
         #expect(user["uid"] as? Int == 1_000)
         #expect(object["noNewPrivileges"] as? Bool == true)
+    }
+
+    @Test func workloadPayloadCarriesRuntimeAnnotations() throws {
+        let value = GuestProtocol.Workload(
+            id: "container-1", rootDevice: "/dev/vda", arguments: ["true"],
+            environment: [], workingDirectory: "/", hostname: "container-1", user: .init(),
+            terminal: false, readOnlyRoot: false, stopSignal: "SIGTERM", mounts: [], networks: [],
+            resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
+            annotations: ["io.example.owner": "runtime"]
+        )
+
+        let data = try JSONEncoder().encode(value)
+        #expect(try JSONDecoder().decode(GuestProtocol.Workload.self, from: data) == value)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["annotations"] as? [String: String] == ["io.example.owner": "runtime"])
     }
 
     @Test func controlEnvelopeRoundTripsWithLengthPrefix() throws {

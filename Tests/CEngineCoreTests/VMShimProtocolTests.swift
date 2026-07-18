@@ -95,6 +95,21 @@ import Testing
         #expect(RawVirtualizationBackend.defaultStorageDiskBytes == VolumeRecord.defaultSizeBytes)
     }
 
+    @Test func containerAnnotationsReachGuestWorkloadSpecification() throws {
+        var container = ContainerRecord(
+            id: "annotated-container", name: "annotated", image: "alpine:latest",
+            processArguments: ["true"]
+        )
+        container.annotations = ["io.example.owner": "runtime"]
+
+        let workload = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+
+        #expect(workload.annotations == container.annotations)
+    }
+
     @Test func multiContainerVolumesUseSharedStorageBeforeVMsStart() throws {
         let modes = try RawVirtualizationBackend.resolveVolumeStorageModes(
             names: ["compose-data", "buildkit-state"],

@@ -138,3 +138,31 @@ def test_container_events_match_image_filter_with_tag_stripping(client: docker.D
 
     assert {event["Action"] for event in events} >= {"create", "start", "die", "destroy"}, json.dumps(events, indent=2)
     assert all(event["Actor"]["Attributes"].get("image") for event in events)
+
+
+@pytest.mark.compat("EVT-005")
+def test_event_filters_accept_boolean_maps_and_ignore_false_entries(client: docker.DockerClient):
+    since = time.time() - 1
+    image = client.images.get(IMAGE)
+    client.images.load(b"".join(image.save(named=True)))
+    container = client.containers.create(
+        IMAGE, command=["true"], name=f"compat-event-map-{time.time_ns()}"
+    )
+    until = time.time()
+
+    response = client.api._get(
+        client.api._url("/events"),
+        params={
+            "since": since,
+            "until": until,
+            "filters": json.dumps({"type": {"container": True, "image": False}}),
+        },
+        stream=True,
+    )
+    try:
+        events = [json.loads(line) for line in response.iter_lines() if line]
+    finally:
+        response.close()
+
+    assert any(event["Actor"]["ID"] == container.id for event in events), json.dumps(events, indent=2)
+    assert all(event["Type"] == "container" for event in events), json.dumps(events, indent=2)

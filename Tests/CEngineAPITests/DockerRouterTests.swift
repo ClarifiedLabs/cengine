@@ -437,6 +437,16 @@ private actor AuthImageBackend: ContainerBackend {
         ])
     }
 
+    @Test func eventFiltersDecodeBooleanMapsAndIgnoreFalseEntries() throws {
+        let target = try DockerRequestTarget.parse(
+            "/v1.55/events?filters=%7B%22type%22:%7B%22container%22:true,%22image%22:false%7D,%22event%22:%7B%22start%22:true,%22die%22:false%7D%7D"
+        )
+
+        #expect(DockerHTTPHandler.eventFilters(target) == [
+            "type": ["container"], "event": ["start"],
+        ])
+    }
+
     @Test func imageEventFiltersMatchDockerImageSelectors() {
         let event = RuntimeEvent(
             type: "image",
@@ -869,12 +879,13 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(unsupported.status == .notImplemented)
     }
 
-    @Test func containerCreateRejectsUnsupportedVolumeDriversFromDockerFields() async throws {
+    @Test func containerCreateRejectsUnsupportedVolumeDriversAndOptionsWithoutSideEffects() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let bodies = [
             #"{"Image":"alpine","Volumes":{"/legacy":{}},"HostConfig":{"VolumeDriver":"third-party"}}"#,
             #"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/data","VolumeOptions":{"DriverConfig":{"Name":"third-party","Options":{"remote":"true"}}}}]}}"#,
+            #"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/data","VolumeOptions":{"DriverConfig":{"Name":"local","Options":{"type":"tmpfs"}}}}]}}"#,
         ]
         for body in bodies {
             let response = await router.route(.init(
@@ -887,6 +898,8 @@ private actor AuthImageBackend: ContainerBackend {
         let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
         let volumeList = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
         #expect((volumeList["Volumes"] as? [[String: Any]])?.isEmpty == true)
+        let containers = await router.route(.init(method: .GET, uri: "/v1.55/containers/json?all=1"))
+        #expect((try JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]])?.isEmpty == true)
     }
 
     @Test func imagePruneDefaultsToUnusedDanglingAndCanExplicitlyWiden() async throws {

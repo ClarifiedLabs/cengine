@@ -794,9 +794,6 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func workload(_ container: ContainerRecord, image: OCIStoredImage, volumeModes: [String: VolumeStorageMode]) async throws -> GuestProtocol.Workload {
         let config = image.configuration.config
-        let arguments = (container.entrypoint ?? config?.entrypoint ?? []) + (container.command ?? config?.command ?? [])
-        guard !arguments.isEmpty else { throw EngineError(.badRequest, "container has no command") }
-        let environment = Self.mergeEnvironment(image: config?.environment ?? [], container: container.environment)
         let bindSources = preparedBindSources[container.id] ?? [:]
         let blockVolumes = Self.volumeNames(in: container.mounts).filter { volumeModes[$0] != .shared }
         let volumeDevices = try Dictionary(uniqueKeysWithValues: blockVolumes.enumerated().map {
@@ -827,14 +824,33 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 noCopy: mount.noCopy
             )
         }
+        return try Self.workloadSpecification(
+            container: container, imageConfiguration: config,
+            mounts: mounts, networks: networkEndpoints(container), hosts: networkHosts(container),
+            volumeServer: volumeModes.values.contains(.shared) ? Self.managementServerAddress : nil
+        )
+    }
+
+    static func workloadSpecification(
+        container: ContainerRecord,
+        imageConfiguration config: OCIImageConfiguration.Configuration?,
+        mounts: [GuestProtocol.Mount],
+        networks: [GuestProtocol.NetworkEndpoint],
+        hosts: [String: String],
+        volumeServer: String?
+    ) throws -> GuestProtocol.Workload {
+        let arguments = (container.entrypoint ?? config?.entrypoint ?? []) + (container.command ?? config?.command ?? [])
+        guard !arguments.isEmpty else { throw EngineError(.badRequest, "container has no command") }
         return GuestProtocol.Workload(
             id: container.id, rootDevice: "/dev/vda", arguments: arguments,
-            environment: environment,
+            environment: Self.mergeEnvironment(image: config?.environment ?? [], container: container.environment),
             workingDirectory: container.workingDirectory.isEmpty ? (config?.workingDirectory ?? "/") : container.workingDirectory,
             hostname: container.hostname, user: Self.user(container.user.isEmpty ? config?.user : container.user),
             terminal: container.tty, readOnlyRoot: container.readOnlyRootfs, stopSignal: container.stopSignal,
-            volumeServer: volumeModes.values.contains(.shared) ? Self.managementServerAddress : nil,
-            mounts: mounts, networks: networkEndpoints(container), hosts: networkHosts(container), resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: 0), privileged: container.privileged
+            volumeServer: volumeServer,
+            mounts: mounts, networks: networks, hosts: hosts,
+            resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: 0),
+            privileged: container.privileged, annotations: container.annotations
         )
     }
 
