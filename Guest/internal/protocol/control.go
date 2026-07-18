@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version             = 5
+	Version             = 6
 	ControlPort         = 4100
 	FileSystemPort      = 4101
 	RootFSContentPort   = 4102

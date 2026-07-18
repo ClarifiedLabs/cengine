@@ -917,11 +917,75 @@ def test_network_prune_filters_limit_deleted_networks(client: docker.DockerClien
     suffix = uuid.uuid4().hex[:8]
     selected = client.networks.create(f"prune-selected-{suffix}", labels={"project": "selected"})
     retained = client.networks.create(f"prune-retained-{suffix}", labels={"project": "retained"})
+    with pytest.raises(errors.APIError) as invalid:
+        client.api.prune_networks(filters={"label": [""]})
+    assert invalid.value.response.status_code == 400
+    selected.reload(); retained.reload()
     result = client.api.prune_networks(filters={"label": ["project=selected"]})
     assert result["NetworksDeleted"] == [selected.name]
     with pytest.raises(errors.NotFound):
         client.networks.get(selected.id)
     retained.reload()
+
+
+@pytest.mark.compat("NET-022")
+def test_network_ipam_and_family_validation_is_explicit(
+    client: docker.DockerClient, daemon,
+):
+    suffix = uuid.uuid4().hex[:8]
+    unsupported = [
+        {
+            "Name": f"aux-{suffix}",
+            "IPAM": {"Config": [{
+                "Subnet": "10.210.0.0/24",
+                "AuxiliaryAddresses": {"reserved": "10.210.0.10"},
+            }]},
+        },
+        {
+            "Name": f"multi-{suffix}",
+            "IPAM": {"Config": [
+                {"Subnet": "10.211.0.0/24"},
+                {"Subnet": "10.212.0.0/24"},
+            ]},
+        },
+        {
+            "Name": f"custom-v6-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{
+                "Subnet": "fd00:22::/64",
+                "Gateway": "fd00:22::fe",
+            }]},
+        },
+        {
+            "Name": f"asymmetric-{suffix}",
+            "Internal": True,
+            "EnableIPv6": True,
+            "Options": {GATEWAY_MODE_IPV4: "isolated"},
+        },
+    ]
+    for request in unsupported:
+        response = client.api._post_json(client.api._url("/networks/create"), data=request)
+        assert response.status_code == 501, response.text
+
+    disabled = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={"Name": f"disabled-{suffix}", "EnableIPv4": False, "EnableIPv6": False},
+    )
+    assert disabled.status_code == 400
+
+    legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.47")
+    try:
+        response = legacy.api._post_json(
+            legacy.api._url("/networks/create"),
+            data={"Name": f"legacy-ipv4-{suffix}", "EnableIPv4": False},
+        )
+        legacy.api._raise_for_status(response)
+        network = client.networks.get(response.json()["Id"])
+        network.reload()
+        assert network.attrs["EnableIPv4"] is True
+        network.remove()
+    finally:
+        legacy.close()
 
 
 @pytest.mark.compat("CTR-034")

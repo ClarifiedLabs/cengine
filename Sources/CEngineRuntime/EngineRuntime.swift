@@ -619,6 +619,9 @@ public actor EngineRuntime {
                               driver: String? = nil, internalNetwork: Bool = false,
                               labels: [String: String] = [:], options: [String: String] = [:]) async throws -> NetworkRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid network name: \(name)") }
+        guard enableIPv4 || enableIPv6 else {
+            throw EngineError(.badRequest, "network must enable IPv4, IPv6, or both")
+        }
         let selectedDriver = driver.flatMap { $0.isEmpty ? nil : $0 } ?? "bridge"
         guard selectedDriver == "bridge" || selectedDriver == "default" else {
             throw EngineError(.unsupported, "network driver \(selectedDriver) is not supported")
@@ -647,6 +650,16 @@ public actor EngineRuntime {
                 throw EngineError(.badRequest, "bridge gateway mode isolated requires an internal network")
             }
         }
+        let enabledGatewayModes = Set([
+            enableIPv4 ? NetworkGatewayMode(rawValue: options[NetworkRecord.gatewayModeIPv4Option] ?? "nat") : nil,
+            enableIPv6 ? NetworkGatewayMode(rawValue: options[NetworkRecord.gatewayModeIPv6Option] ?? "nat") : nil,
+        ].compactMap { $0 })
+        guard enabledGatewayModes.count <= 1 else {
+            throw EngineError(
+                .unsupported,
+                "asymmetric IPv4 and IPv6 gateway modes are not supported by the vmnet fabric"
+            )
+        }
         if let existing = snapshot.networks.first(where: { $0.name == name }) { return existing }
         let requestedSubnet = subnet ?? ""
         let requestedIPv6 = ipv6Subnet ?? ""
@@ -655,6 +668,18 @@ public actor EngineRuntime {
         }
         if !enableIPv6, !requestedIPv6.isEmpty || ipv6Gateway?.isEmpty == false {
             throw EngineError(.badRequest, "IPv6 addressing cannot be configured when IPv6 is disabled")
+        }
+        if enableIPv6, !requestedIPv6.isEmpty, let requestedGateway = ipv6Gateway, !requestedGateway.isEmpty {
+            guard let implicitGateway = Self.firstAddress(in: requestedIPv6),
+                  let canonicalGateway = Self.canonicalAddress(requestedGateway, family: AF_INET6) else {
+                throw EngineError(.badRequest, "invalid IPv6 subnet or gateway")
+            }
+            guard canonicalGateway == implicitGateway else {
+                throw EngineError(
+                    .unsupported,
+                    "custom IPv6 gateway \(requestedGateway) is not supported; vmnet uses \(implicitGateway) for prefix \(requestedIPv6)"
+                )
+            }
         }
         let requested = NetworkRecord(
             id: Identifier.random(), name: name, createdAt: Date(), subnet: requestedSubnet, gateway: gateway ?? "",
@@ -912,7 +937,7 @@ public actor EngineRuntime {
         }
         let family = components[0].contains(":") ? AF_INET6 : AF_INET
         let byteCount = family == AF_INET6 ? 16 : 4
-        guard (0..<(byteCount * 8)).contains(prefix), var network = addressBytes(components[0], family: family) else {
+        guard (0...(byteCount * 8)).contains(prefix), var network = addressBytes(components[0], family: family) else {
             throw EngineError(.badRequest, "invalid network subnet \(subnet)")
         }
         for index in network.indices {
@@ -923,11 +948,23 @@ public actor EngineRuntime {
         let hostBits = byteCount * 8 - prefix
         let lastOffset = hostBits >= 16 ? 65_535 : (1 << hostBits) - 1
         let reserved = Set(used.map { $0.split(separator: "/", maxSplits: 1).first.map(String.init) ?? $0 } + [gateway])
-        guard lastOffset >= 1 else { throw EngineError(.conflict, "network \(subnet) has no allocatable addresses") }
-        let firstOffset = cursor >= 1 && cursor < lastOffset ? cursor + 1 : 1
-        let offsets = Array(firstOffset...lastOffset) + (firstOffset > 1 ? Array(1..<firstOffset) : [])
+        var candidateOffsets = Array(0...lastOffset)
+        if family == AF_INET {
+            if hostBits > 1 {
+                candidateOffsets.removeAll { offset in
+                    offset == 0 || (hostBits <= 16 && offset == lastOffset)
+                }
+            }
+            // RFC 3021 makes both addresses in an IPv4 /31 usable. In
+            // particular, offset zero is not a network-address reservation.
+        } else {
+            candidateOffsets.removeAll { $0 == 0 }
+        }
+        guard !candidateOffsets.isEmpty else {
+            throw EngineError(.conflict, "network \(subnet) has no allocatable addresses")
+        }
+        let offsets = candidateOffsets.filter { $0 > cursor } + candidateOffsets.filter { $0 <= cursor }
         for offset in offsets {
-            if family == AF_INET, offset == lastOffset { continue }
             var candidate = network
             var carry = offset
             for index in candidate.indices.reversed() where carry > 0 {
@@ -967,6 +1004,29 @@ public actor EngineRuntime {
         return source.withUnsafeMutableBytes { source in
             inet_ntop(family, source.baseAddress, &destination, socklen_t(destination.count)).map { _ in String(cString: destination) }
         }
+    }
+
+    static func firstAddress(in subnet: String) -> String? {
+        let components = subnet.split(separator: "/", maxSplits: 1).map(String.init)
+        guard components.count == 2, let prefix = Int(components[1]) else { return nil }
+        let family = components[0].contains(":") ? AF_INET6 : AF_INET
+        let byteCount = family == AF_INET6 ? 16 : 4
+        guard (0..<(byteCount * 8)).contains(prefix),
+              var network = addressBytes(components[0], family: family) else { return nil }
+        for index in network.indices {
+            let remaining = prefix - index * 8
+            if remaining >= 8 { continue }
+            network[index] &= remaining <= 0 ? 0 : UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
+        }
+        for index in network.indices.reversed() {
+            network[index] &+= 1
+            if network[index] != 0 { break }
+        }
+        return addressString(network, family: family)
+    }
+
+    private static func canonicalAddress(_ value: String, family: Int32) -> String? {
+        addressBytes(value, family: family).flatMap { addressString($0, family: family) }
     }
 
     private func validateStaticEndpointModes(

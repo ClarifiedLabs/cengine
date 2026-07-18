@@ -807,6 +807,45 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(invalidV6.status == .badRequest)
     }
 
+    @Test func networkIPAMAndFamilyLimitationsAreRejectedExplicitly() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let unsupportedBodies = [
+            #"{"Name":"aux","IPAM":{"Config":[{"Subnet":"10.60.0.0/24","AuxiliaryAddresses":{"reserved":"10.60.0.10"}}]}}"#,
+            #"{"Name":"multi-v4","IPAM":{"Config":[{"Subnet":"10.61.0.0/24"},{"Subnet":"10.62.0.0/24"}]}}"#,
+            #"{"Name":"custom-v6-gateway","EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fd00:63::/64","Gateway":"fd00:63::fe"}]}}"#,
+            #"{"Name":"asymmetric","Internal":true,"EnableIPv6":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}"#,
+        ]
+        for body in unsupportedBodies {
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v1.55/networks/create",
+                body: Data(body.utf8)
+            ))
+            #expect(response.status == .notImplemented)
+        }
+
+        let disabled = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"disabled","EnableIPv4":false,"EnableIPv6":false}"#.utf8)
+        ))
+        #expect(disabled.status == .badRequest)
+
+        // API versions before v1.48 did not define EnableIPv4, so a field sent
+        // by a newer client must not disable legacy IPv4 behavior.
+        let legacy = await router.route(.init(
+            method: .POST,
+            uri: "/v1.47/networks/create",
+            body: Data(#"{"Name":"legacy-ipv4","EnableIPv4":false}"#.utf8)
+        ))
+        #expect(legacy.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/networks/legacy-ipv4"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(object["EnableIPv4"] as? Bool == true)
+    }
+
     @Test func endpointSysctlsRoundTripPersistAndRejectInvalidOptions() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -879,6 +918,32 @@ private actor AuthImageBackend: ContainerBackend {
         let legacy = await router.route(.init(method: .GET, uri: "/v1.51/networks/status-net"))
         let legacyObject = try #require(JSONSerialization.jsonObject(with: legacy.body) as? [String: Any])
         #expect(legacyObject["Status"] == nil)
+
+        let slash31Create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"slash31","IPAM":{"Config":[{"Subnet":"10.55.1.0/31","Gateway":"10.55.1.1"}]}}"#.utf8)
+        ))
+        #expect(slash31Create.status == .created)
+        let slash31Container = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=slash31-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"slash31":{}}}}"#.utf8)
+        ))
+        #expect(slash31Container.status == .created)
+        let slash31Inspect = await router.route(.init(method: .GET, uri: "/v1.52/networks/slash31"))
+        let slash31Object = try #require(JSONSerialization.jsonObject(with: slash31Inspect.body) as? [String: Any])
+        let slash31Status = try #require(
+            (((slash31Object["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.1.0/31"] as? [String: Any]
+        )
+        #expect(slash31Status["IPsInUse"] as? Int == 2)
+        #expect(slash31Status["DynamicIPsAvailable"] as? Int == 0)
+        let containerInspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/slash31-client/json"
+        ))
+        let containerObject = try #require(JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any])
+        let slash31Endpoint = try #require(
+            ((containerObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["slash31"] as? [String: Any]
+        )
+        #expect(slash31Endpoint["IPAddress"] as? String == "10.55.1.0")
     }
 
     @Test func runningContainersRejectNetworkAttachmentChanges() async throws {
@@ -986,6 +1051,20 @@ private actor AuthImageBackend: ContainerBackend {
         let options = try #require(json["Options"] as? [String: String])
         #expect(options[NetworkRecord.gatewayModeIPv4Option] == "isolated")
         #expect(options[NetworkRecord.gatewayModeIPv6Option] == "isolated")
+
+        let ipv6Only = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"isolated-v6","Internal":true,"EnableIPv4":false,"EnableIPv6":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv6":"isolated"}}"#.utf8)
+        ))
+        #expect(ipv6Only.status == .created)
+        let ipv6OnlyRequest = try #require(await backend.request(named: "isolated-v6"))
+        #expect(ipv6OnlyRequest.fabricIsolated)
+
+        let asymmetric = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"asymmetric-isolation","Internal":true,"EnableIPv6":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}"#.utf8)
+        ))
+        #expect(asymmetric.status == .notImplemented)
     }
 
     @Test func networkNonePersistsWithoutAnImplicitDefaultInterface() async throws {
@@ -1149,6 +1228,15 @@ private actor AuthImageBackend: ContainerBackend {
             ))
             #expect(response.status == .created)
         }
+        let emptyLabelFilters = "%7B%22label%22:%5B%22%22%5D%7D"
+        let invalid = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/networks/prune?filters=\(emptyLabelFilters)"
+        ))
+        #expect(invalid.status == .badRequest)
+        #expect((await router.route(.init(method: .GET, uri: "/v1.55/networks/prune-alpha"))).status == .ok)
+        #expect((await router.route(.init(method: .GET, uri: "/v1.55/networks/prune-beta"))).status == .ok)
+
         let filters = "%7B%22label%22:%5B%22project=alpha%22%5D%7D"
         let prune = await router.route(.init(method: .POST, uri: "/v1.55/networks/prune?filters=\(filters)"))
         let object = try #require(JSONSerialization.jsonObject(with: prune.body) as? [String: Any])

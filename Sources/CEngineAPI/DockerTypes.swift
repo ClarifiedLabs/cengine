@@ -329,7 +329,7 @@ public struct NetworkCreateRequest: Decodable, Sendable {
         public var Subnet: String?
         public var IPRange: String?
         public var Gateway: String?
-        public var AuxAddress: [String: String]?
+        public var AuxiliaryAddresses: [String: String]?
     }
 }
 public struct NetworkCreateResponse: Codable, Sendable { public let Id: String; public let Warning: String }
@@ -453,7 +453,10 @@ public struct DockerNetworkResponse: Encodable, Sendable {
             if network.enableIPv4, !network.subnet.isEmpty {
                 subnets[network.subnet] = Self.subnetStatus(
                     network.subnet,
-                    reservedAddresses: [Self.networkAddress(network.subnet), network.gateway, Self.broadcastAddress(network.subnet)],
+                    reservedAddresses: Self.ipv4ReservedAddresses(
+                        subnet: network.subnet,
+                        gateway: network.gateway
+                    ),
                     endpointAddresses: endpoints.compactMap(\.ipv4Address)
                 )
             }
@@ -495,6 +498,15 @@ public struct DockerNetworkResponse: Encodable, Sendable {
 
     private static func networkAddress(_ subnet: String) -> String {
         String(subnet.split(separator: "/", maxSplits: 1).first ?? "")
+    }
+
+    private static func ipv4ReservedAddresses(subnet: String, gateway: String) -> [String] {
+        let prefix = subnet.split(separator: "/").last.flatMap { Int($0) }
+        // Moby's built-in IPAM treats both addresses in an RFC 3021 /31 as
+        // usable. The network and broadcast addresses are reserved only when
+        // the IPv4 pool has more than one host bit.
+        guard let prefix, prefix < 31 else { return [gateway] }
+        return [networkAddress(subnet), gateway, broadcastAddress(subnet)]
     }
 
     private static func broadcastAddress(_ subnet: String) -> String {

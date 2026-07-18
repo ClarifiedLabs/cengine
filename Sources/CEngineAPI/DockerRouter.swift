@@ -359,16 +359,24 @@ public struct DockerRouter: Sendable {
                 _ = config
                 throw EngineError(.badRequest, "IPAM config requires a subnet")
             }
-            if configs.contains(where: { $0.IPRange != nil || $0.AuxAddress?.isEmpty == false }) {
+            if configs.contains(where: { $0.IPRange != nil || $0.AuxiliaryAddresses?.isEmpty == false }) {
                 throw EngineError(.unsupported, "IPAM IP ranges and auxiliary addresses are not supported")
             }
-            let ipv4 = configs.first(where: { $0.Subnet?.contains(":") == false })
-            let ipv6 = configs.first(where: { $0.Subnet?.contains(":") == true })
-            if input.EnableIPv4 != nil, version < .init(major: 1, minor: 48) {
-                throw EngineError(.badRequest, "EnableIPv4 requires API v1.48 or newer")
+            let ipv4Configs = configs.filter { $0.Subnet?.contains(":") == false }
+            let ipv6Configs = configs.filter { $0.Subnet?.contains(":") == true }
+            guard ipv4Configs.count <= 1, ipv6Configs.count <= 1 else {
+                throw EngineError(.unsupported, "multiple IPAM subnets per address family are not supported")
             }
-            let enableIPv4 = input.EnableIPv4 ?? true
+            let ipv4 = ipv4Configs.first
+            let ipv6 = ipv6Configs.first
+            // EnableIPv4 was introduced in API v1.48. Older negotiated APIs
+            // retain legacy IPv4-enabled behavior even if a newer client field
+            // is present in the JSON body.
+            let enableIPv4 = version >= .init(major: 1, minor: 48) ? input.EnableIPv4 ?? true : true
             let enableIPv6 = input.EnableIPv6 ?? false
+            guard enableIPv4 || enableIPv6 else {
+                throw EngineError(.badRequest, "network must enable IPv4, IPv6, or both")
+            }
             if !enableIPv4, ipv4 != nil {
                 throw EngineError(.badRequest, "IPv4 IPAM config cannot be used when EnableIPv4 is false")
             }
@@ -643,9 +651,9 @@ public struct DockerRouter: Sendable {
         let statuses = values("status")
         return containers.filter { container in
             labels.allSatisfy { expression in
-                let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
-                guard let actual = container.labels[parts[0]] else { return false }
-                return parts.count == 1 || actual == parts[1]
+                guard let (key, expected) = labelExpression(expression),
+                      let actual = container.labels[key] else { return false }
+                return expected == nil || actual == expected
             } && (names.isEmpty || names.contains { container.name.contains($0) })
               && (ids.isEmpty || ids.contains { container.id.hasPrefix($0) })
               && (statuses.isEmpty || statuses.contains(container.phase.rawValue))
@@ -662,10 +670,18 @@ public struct DockerRouter: Sendable {
 
     private func labelsMatch(_ labels: [String: String], expressions: [String]) -> Bool {
         expressions.allSatisfy { expression in
-            let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
-            guard let actual = labels[parts[0]] else { return false }
-            return parts.count == 1 || actual == parts[1]
+            guard let (key, expected) = labelExpression(expression),
+                  let actual = labels[key] else { return false }
+            return expected == nil || actual == expected
         }
+    }
+
+    private func labelExpression(_ expression: String) -> (key: String, expected: String?)? {
+        let parts = expression.split(
+            separator: "=", maxSplits: 1, omittingEmptySubsequences: false
+        ).map(String.init)
+        guard let key = parts.first, !key.isEmpty else { return nil }
+        return (key, parts.count == 2 ? parts[1] : nil)
     }
 
     private func filteredNetworks(_ networks: [NetworkRecord], filters: String?) -> [NetworkRecord] {
@@ -693,6 +709,9 @@ public struct DockerRouter: Sendable {
         let requiredLabels = try values("label")
         let excludedLabels = try values("label!")
         let untilValues = try values("until")
+        guard (requiredLabels + excludedLabels).allSatisfy({ labelExpression($0) != nil }) else {
+            throw EngineError(.badRequest, "network prune label filters require a non-empty label key")
+        }
         guard untilValues.count <= 1 else { throw EngineError(.badRequest, "network prune accepts one until filter") }
         let until = try untilValues.first.map { value in
             guard let date = parseDockerPruneUntil(value) else {

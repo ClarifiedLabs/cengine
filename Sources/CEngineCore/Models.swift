@@ -236,6 +236,15 @@ public struct NetworkRecord: Codable, Sendable {
         NetworkGatewayMode(rawValue: options?[Self.gatewayModeIPv6Option] ?? "nat") ?? .nat
     }
 
+    /// Whether every enabled address family is isolated from a vmnet uplink.
+    /// EngineRuntime rejects asymmetric enabled-family modes before persistence,
+    /// so checking either enabled isolated family is sufficient here while also
+    /// handling IPv6-only networks correctly.
+    public var fabricIsolated: Bool {
+        (enableIPv4 && ipv4GatewayMode == .isolated)
+            || (enableIPv6 && ipv6GatewayMode == .isolated)
+    }
+
 }
 
 public struct VolumeRecord: Codable, Sendable {

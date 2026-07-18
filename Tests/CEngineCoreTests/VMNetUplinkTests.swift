@@ -51,6 +51,33 @@ import Testing
         #expect(RawVirtualizationBackend.nextAvailableVLAN(used: Set(1...4093)) == nil)
     }
 
+    @Test func failedNetworkCreateRollsBackRecordAndVLAN() {
+        let network = NetworkRecord(
+            id: "network-1",
+            name: "rollback",
+            subnet: "10.70.0.0/24",
+            gateway: "10.70.0.1"
+        )
+        var networks: [String: NetworkRecord] = [:]
+        var vlans: [String: UInt16] = [:]
+        let transaction = RawNetworkStateTransaction(
+            adding: network,
+            vlan: 70,
+            networks: networks,
+            networkVLANs: vlans
+        )
+
+        transaction.apply(networks: &networks, networkVLANs: &vlans)
+        #expect(networks[network.id]?.name == "rollback")
+        #expect(vlans[network.id] == 70)
+
+        // This is the state restoration used when fabric synchronization or
+        // persistence throws during RawVirtualizationBackend.createNetwork.
+        transaction.rollback(networks: &networks, networkVLANs: &vlans)
+        #expect(networks[network.id] == nil)
+        #expect(vlans[network.id] == nil)
+    }
+
     @Test func uplinkDisconnectBeforeHandlerIsDeliveredExactlyOnce() {
         let events = VMNetUplinkEvents()
         let state = EventState()

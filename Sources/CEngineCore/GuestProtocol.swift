@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 5
+    public static let version: UInt32 = 6
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
