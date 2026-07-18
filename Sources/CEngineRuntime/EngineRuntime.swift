@@ -467,10 +467,21 @@ public actor EngineRuntime {
             return
         }
         let intent = try beginLifecycleIntent(.restart, for: record.id)
+        guard startingContainerIDs.insert(record.id).inserted else {
+            endLifecycleIntent(intent, for: record.id)
+            throw EngineError(.conflict, "container \(identifier) is already starting")
+        }
+        var cancelledHealthMonitor = false
         do {
             try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
             guard ownsRestartExecution(intent, record: record) else {
                 throw EngineError(.conflict, "container was removed or changed while it was restarting")
+            }
+            // The backend has replaced the old execution. A health check that
+            // began against that generation must not publish into the new one.
+            if let task = healthTasks.removeValue(forKey: record.id) {
+                task.cancel()
+                cancelledHealthMonitor = true
             }
             // A restart creates a new container execution generation. Terminalize
             // every child of the old generation before publishing the new start
@@ -488,14 +499,25 @@ public actor EngineRuntime {
             restarted.finishedAt = nil
             restarted.exitCode = nil
             restarted.restartCount += 1
-            snapshot.containers[current] = restarted
-
-            restarted = await applyingEndpointAddresses(to: restarted)
-            guard lifecycleIntents[record.id] == intent,
-                  let current = try? containerIndex(record.id),
-                  snapshot.containers[current].phase == .running,
-                  snapshot.containers[current].startedAt == startedAt else {
+            let addresses = await backend.endpointAddresses(for: restarted)
+            guard ownsRestartExecution(intent, record: record),
+                  let current = try? containerIndex(record.id) else {
                 throw EngineError(.conflict, "container was removed or changed while it was restarting")
+            }
+
+            // Re-resolve after the backend suspension and merge only fields the
+            // restart owns. Health, metadata, resource, and network mutations
+            // committed by other actor work must survive this publication.
+            restarted = snapshot.containers[current]
+            restarted.phase = .running
+            restarted.startedAt = startedAt
+            restarted.finishedAt = nil
+            restarted.exitCode = nil
+            restarted.restartCount += 1
+            for endpoint in restarted.networks.indices {
+                guard let address = addresses[restarted.networks[endpoint].networkID] else { continue }
+                restarted.networks[endpoint].ipv4Address = Self.nonEmptyBackendAddress(address.ipv4Address)
+                restarted.networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
             }
             snapshot.containers[current] = restarted
             try await persist()
@@ -508,10 +530,17 @@ public actor EngineRuntime {
             emit(containerEvent("restart", published))
             startHealthMonitor(record.id)
             Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
+            startingContainerIDs.remove(record.id)
             endLifecycleIntent(intent, for: record.id)
             await reconcileDeferredCompletion(record.id)
         } catch {
+            startingContainerIDs.remove(record.id)
             endLifecycleIntent(intent, for: record.id)
+            if cancelledHealthMonitor,
+               let current = try? container(record.id),
+               current.phase == .running || current.phase == .paused {
+                startHealthMonitor(record.id)
+            }
             await reconcileDeferredCompletion(record.id)
             throw error
         }
@@ -1655,11 +1684,18 @@ public actor EngineRuntime {
 
     private func runHealthMonitor(_ identifier: String) async {
         guard let initial = try? container(identifier), let health = initial.healthcheck else { return }
+        let startedAt = initial.startedAt
         if health.startPeriodNanoseconds > 0 {
-            try? await Task.sleep(for: .nanoseconds(health.startPeriodNanoseconds))
+            do {
+                try await Task.sleep(for: .nanoseconds(health.startPeriodNanoseconds))
+            } catch {
+                return
+            }
         }
         while !Task.isCancelled {
-            guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .running else { return }
+            guard let index = try? containerIndex(identifier),
+                  snapshot.containers[index].phase == .running,
+                  snapshot.containers[index].startedAt == startedAt else { return }
             let record = snapshot.containers[index]
             let arguments: [String]
             switch health.test.first {
@@ -1672,7 +1708,10 @@ public actor EngineRuntime {
                 record, arguments: arguments,
                 timeoutSeconds: max(1, health.timeoutNanoseconds / 1_000_000_000)
             )
-            guard let current = try? containerIndex(identifier), snapshot.containers[current].phase == .running else { return }
+            guard !Task.isCancelled,
+                  let current = try? containerIndex(identifier),
+                  snapshot.containers[current].phase == .running,
+                  snapshot.containers[current].startedAt == startedAt else { return }
             if result?.exitCode == 0 {
                 snapshot.containers[current].healthStatus = "healthy"
                 snapshot.containers[current].healthFailingStreak = 0
@@ -1685,7 +1724,11 @@ public actor EngineRuntime {
             emit(containerEvent("health_status: \(status)", snapshot.containers[current]))
             try? await persist()
             let delay = max(health.intervalNanoseconds, 100_000_000)
-            try? await Task.sleep(for: .nanoseconds(delay))
+            do {
+                try await Task.sleep(for: .nanoseconds(delay))
+            } catch {
+                return
+            }
         }
     }
 

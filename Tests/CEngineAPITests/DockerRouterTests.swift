@@ -158,8 +158,13 @@ private actor BlockingStartBackend: ContainerBackend {
 
 private actor BlockingEndpointAddressBackend: ContainerBackend {
     private var lookupContinuation: CheckedContinuation<Void, Never>?
+    private var healthcheckContinuation: CheckedContinuation<Void, Never>?
     private var blockNextLookup = false
     private var lookupBlocked = false
+    private var blockedHealthcheckCall: Int?
+    private var blockedHealthcheckExitCode: Int32 = 0
+    private var healthcheckBlocked = false
+    private var healthchecks = 0
     private var lookups = 0
     private var starts = 0
     private var kills = 0
@@ -187,12 +192,35 @@ private actor BlockingEndpointAddressBackend: ContainerBackend {
             ($0.networkID, BackendEndpointAddress(ipv4Address: address, ipv6Address: ""))
         })
     }
+    func runHealthcheck(
+        _: ContainerRecord,
+        arguments _: [String],
+        timeoutSeconds _: Int64
+    ) async throws -> (exitCode: Int32, output: String) {
+        healthchecks += 1
+        guard blockedHealthcheckCall == healthchecks else { return (0, "healthy") }
+        let exitCode = blockedHealthcheckExitCode
+        blockedHealthcheckCall = nil
+        healthcheckBlocked = true
+        await withCheckedContinuation { healthcheckContinuation = $0 }
+        healthcheckBlocked = false
+        return (exitCode, "blocked")
+    }
 
     func blockNextEndpointLookup() { blockNextLookup = true }
     func isEndpointLookupBlocked() -> Bool { lookupBlocked }
     func releaseEndpointLookup() {
         lookupContinuation?.resume()
         lookupContinuation = nil
+    }
+    func blockHealthcheck(call: Int, exitCode: Int32) {
+        blockedHealthcheckCall = call
+        blockedHealthcheckExitCode = exitCode
+    }
+    func isHealthcheckBlocked() -> Bool { healthcheckBlocked }
+    func releaseHealthcheck() {
+        healthcheckContinuation?.resume()
+        healthcheckContinuation = nil
     }
     func counts() -> (starts: Int, kills: Int) { (starts, kills) }
 }
@@ -3575,6 +3603,95 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(sentinel.id == trailing.id)
         #expect(sentinel.phase == .created)
         #expect(sentinel.networks.first?.ipv4Address != "192.168.64.202")
+    }
+
+    @Test func restartPreservesHealthAndRejectsAStaleHealthcheckAcrossItsGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingEndpointAddressBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var input = ContainerRecord(name: "restart-health-generation", image: "debian")
+        input.healthcheck = .init(
+            test: ["CMD", "true"], intervalNanoseconds: 1_000_000,
+            timeoutNanoseconds: 1_000_000_000, retries: 1, startPeriodNanoseconds: 0
+        )
+        input.healthStatus = "starting"
+        input.healthFailingStreak = 0
+        await backend.blockHealthcheck(call: 2, exitCode: 1)
+        let target = try await runtime.createContainer(input)
+        try await runtime.startContainer(target.id)
+
+        for _ in 0..<1_000 {
+            if try await runtime.container(target.id).healthStatus == "healthy" { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(try await runtime.container(target.id).healthStatus == "healthy")
+        while !(await backend.isHealthcheckBlocked()) { await Task.yield() }
+        let originalStartedAt = try #require(try await runtime.container(target.id).startedAt)
+
+        await backend.blockNextEndpointLookup()
+        let restart = Task { try await runtime.restartContainer(target.id, timeoutSeconds: 0) }
+        while !(await backend.isEndpointLookupBlocked()) { await Task.yield() }
+
+        // Checked continuations do not observe task cancellation themselves.
+        // Releasing this failed result proves the canceled old-generation
+        // monitor is fenced before it can mutate the still-published record.
+        await backend.releaseHealthcheck()
+        for _ in 0..<100 { await Task.yield() }
+        let duringRestart = try await runtime.container(target.id)
+        #expect(duringRestart.startedAt == originalStartedAt)
+        #expect(duringRestart.healthStatus == "healthy")
+        #expect(duringRestart.healthFailingStreak == 0)
+
+        await backend.releaseEndpointLookup()
+        try await restart.value
+        let restarted = try await runtime.container(target.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.startedAt != originalStartedAt)
+        #expect(restarted.restartCount == 1)
+        #expect(restarted.healthStatus == "healthy")
+        #expect(restarted.healthFailingStreak == 0)
+    }
+
+    @Test func killConflictsForTheEntireRestartCommit() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingEndpointAddressBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var restartPolicyRecord = ContainerRecord(name: "restart-kill-policy", image: "debian")
+        restartPolicyRecord.restartPolicy = .init(name: "always")
+        var autoRemoveRecord = ContainerRecord(name: "restart-kill-remove", image: "debian")
+        autoRemoveRecord.autoRemove = true
+
+        for input in [restartPolicyRecord, autoRemoveRecord] {
+            let record = try await runtime.createContainer(input)
+            try await runtime.startContainer(record.id)
+            let originalStartedAt = try #require(try await runtime.container(record.id).startedAt)
+            await backend.blockNextEndpointLookup()
+            let restart = Task { try await runtime.restartContainer(record.id, timeoutSeconds: 0) }
+            while !(await backend.isEndpointLookupBlocked()) { await Task.yield() }
+
+            do {
+                try await runtime.killContainer(record.id, signal: "KILL")
+                Issue.record("kill terminalized a container before its restart commit completed")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+            }
+            #expect(await backend.counts().kills == 0)
+            let pending = try await runtime.container(record.id)
+            #expect(pending.phase == .running)
+            #expect(pending.startedAt == originalStartedAt)
+            #expect(pending.restartCount == 0)
+
+            await backend.releaseEndpointLookup()
+            try await restart.value
+            let restarted = try await runtime.container(record.id)
+            #expect(restarted.phase == .running)
+            #expect(restarted.startedAt != originalStartedAt)
+            #expect(restarted.restartCount == 1)
+        }
+        #expect(await backend.counts().starts == 4)
+        #expect((await runtime.listContainers(all: true)).count == 2)
     }
 
     @Test func killCannotTerminalizeAContainerDuringItsStartCommit() async throws {
