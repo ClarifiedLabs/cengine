@@ -24,7 +24,7 @@ public struct ContainerWaitSubscription: Sendable {
 
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
-        enum Operation: Equatable { case stop, restart, remove }
+        enum Operation: Equatable { case start, stop, restart, remove, connectNetwork, disconnectNetwork }
 
         let operation: Operation
         let token = UUID()
@@ -205,7 +205,7 @@ public actor EngineRuntime {
            let network = snapshot.networks.first(where: { $0.name == "default" }) {
             record.networks = [.init(networkID: network.id)]
         }
-        record = try normalizingEndpointMacAddresses(record)
+        record = try normalizingEndpointConfiguration(record)
         try validateEndpoints(record)
         record = try allocatingEndpointAddresses(to: record)
         pendingContainers[record.id] = record
@@ -240,8 +240,10 @@ public actor EngineRuntime {
 
     public func startContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase != .running else { return }
         let record = snapshot.containers[index]
+        let intent = try beginLifecycleIntent(.start, for: record.id)
+        defer { endLifecycleIntent(intent, for: record.id) }
+        guard record.phase != .running else { return }
         if record.phase == .dead {
             try await backend.delete(record)
         }
@@ -731,6 +733,9 @@ public actor EngineRuntime {
                                driverOptions: [String: String]? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
+        let containerID = snapshot.containers[index].id
+        let intent = try beginLifecycleIntent(.connectNetwork, for: containerID)
+        defer { endLifecycleIntent(intent, for: containerID) }
         guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
             throw EngineError(.conflict, "cannot connect a network while container \(snapshot.containers[index].name) is running")
         }
@@ -741,23 +746,37 @@ public actor EngineRuntime {
         try Self.validateEndpointDriverOptions(driverOptions)
         let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
         let previous = snapshot.containers[index]
-        snapshot.containers[index].networks.append(.init(
+        var updated = previous
+        updated.networks.append(.init(
             networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
             ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil,
             macAddress: normalizedMac, gatewayPriority: gatewayPriority, driverOptions: driverOptions
         ))
-        snapshot.containers[index] = try allocatingEndpointAddresses(to: snapshot.containers[index])
-        try await persistEndpointAllocationCursors()
+        updated = try normalizingEndpointConfiguration(updated)
+        try validateEndpoints(updated)
+        updated = try allocatingEndpointAddresses(to: updated)
+        snapshot.containers[index] = updated
         do {
-            try validateEndpoints(snapshot.containers[index])
+            try await persistEndpointAllocationCursors()
+            let current = try containerIndex(containerID)
+            try validateEndpoints(snapshot.containers[current])
             try await backend.updateNetworkRecords(snapshot.containers)
-        } catch { snapshot.containers[index] = previous; try? await backend.updateNetworkRecords(snapshot.containers); throw error }
-        try await persist()
+            try await persist()
+        } catch {
+            if let current = try? containerIndex(containerID) {
+                snapshot.containers[current].networks = previous.networks
+                try? await backend.updateNetworkRecords(snapshot.containers)
+            }
+            throw error
+        }
     }
 
     public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
+        let containerID = snapshot.containers[index].id
+        let intent = try beginLifecycleIntent(.disconnectNetwork, for: containerID)
+        defer { endLifecycleIntent(intent, for: containerID) }
         guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
             throw EngineError(.conflict, "cannot disconnect a network while container \(snapshot.containers[index].name) is running")
         }
@@ -767,9 +786,16 @@ public actor EngineRuntime {
         }
         let previous = snapshot.containers[index]
         snapshot.containers[index].networks.removeAll { $0.networkID == network.id }
-        do { try await backend.updateNetworkRecords(snapshot.containers) }
-        catch { snapshot.containers[index] = previous; try? await backend.updateNetworkRecords(snapshot.containers); throw error }
-        try await persist()
+        do {
+            try await backend.updateNetworkRecords(snapshot.containers)
+            try await persist()
+        } catch {
+            if let current = try? containerIndex(containerID) {
+                snapshot.containers[current].networks = previous.networks
+                try? await backend.updateNetworkRecords(snapshot.containers)
+            }
+            throw error
+        }
     }
 
     public func pruneNetworks(identifiers: Set<String>? = nil) async throws -> [String] {
@@ -787,7 +813,9 @@ public actor EngineRuntime {
     }
 
     public func pruneContainers() async throws -> [String] {
-        let removed = snapshot.containers.filter { $0.phase != .running && $0.phase != .paused }
+        let removed = snapshot.containers.filter {
+            $0.phase != .running && $0.phase != .paused && lifecycleIntents[$0.id] == nil
+        }
         for record in removed { try await backend.delete(record); try await backend.deleteLogs(for: record) }
         let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
         try await persist()
@@ -854,13 +882,21 @@ public actor EngineRuntime {
             try Self.validateEndpointDriverOptions(endpoint.driverOptions)
             for peer in snapshot.containers + Array(pendingContainers.values) where peer.id != record.id {
                 for existing in peer.networks where existing.networkID == endpoint.networkID {
-                    if endpoint.ipv4AddressIsStatic, endpoint.ipv4Address == existing.ipv4Address {
+                    if endpoint.ipv4AddressIsStatic,
+                       let requested = endpoint.ipv4Address,
+                       requested == existing.ipv4Address.flatMap({ Self.canonicalAddress($0, family: AF_INET) }) {
                         throw EngineError(.conflict, "IPv4 address \(endpoint.ipv4Address ?? "") is already allocated")
                     }
-                    if endpoint.ipv6AddressIsStatic, endpoint.ipv6Address == existing.ipv6Address {
+                    if endpoint.ipv6AddressIsStatic,
+                       let requested = endpoint.ipv6Address,
+                       requested == existing.ipv6Address.flatMap({ Self.canonicalAddress($0, family: AF_INET6) }) {
                         throw EngineError(.conflict, "IPv6 address \(endpoint.ipv6Address ?? "") is already allocated")
                     }
-                    if let mac = endpoint.macAddress, mac == existing.macAddress {
+                    let mac = endpoint.macAddress
+                        ?? EndpointMacAddress.generated(seed: record.id + endpoint.networkID)
+                    let existingMac = existing.macAddress
+                        ?? EndpointMacAddress.generated(seed: peer.id + existing.networkID)
+                    if mac == existingMac {
                         throw EngineError(.conflict, "MAC address \(mac) is already in use on this network")
                     }
                 }
@@ -895,16 +931,74 @@ public actor EngineRuntime {
         return normalized
     }
 
-    /// Normalizes any requested endpoint MACs on a container record before
-    /// persistence so stored records, inspect output, and guest configuration
-    /// all use the same canonical form.
-    private func normalizingEndpointMacAddresses(_ input: ContainerRecord) throws -> ContainerRecord {
+    /// Normalizes requested endpoint addresses and MACs before conflict checks,
+    /// allocation, and persistence. Static addresses must belong to their pool
+    /// and may not consume a gateway or protocol-reserved address.
+    private func normalizingEndpointConfiguration(_ input: ContainerRecord) throws -> ContainerRecord {
         var record = input
         for index in record.networks.indices {
-            guard let requested = record.networks[index].macAddress else { continue }
-            record.networks[index].macAddress = try Self.normalizeMacAddress(requested)
+            let endpoint = record.networks[index]
+            guard let network = snapshot.networks.first(where: { $0.id == endpoint.networkID }) else {
+                throw EngineError(.notFound, "network \(endpoint.networkID) not found")
+            }
+            if let requested = endpoint.macAddress {
+                record.networks[index].macAddress = try Self.normalizeMacAddress(requested)
+            }
+            if let requested = endpoint.ipv4Address {
+                record.networks[index].ipv4Address = try Self.normalizeEndpointAddress(
+                    requested, family: AF_INET, network: network
+                )
+            } else if endpoint.ipv4AddressIsStatic {
+                throw EngineError(.badRequest, "static IPv4 address is missing")
+            }
+            if let requested = endpoint.ipv6Address {
+                record.networks[index].ipv6Address = try Self.normalizeEndpointAddress(
+                    requested, family: AF_INET6, network: network
+                )
+            } else if endpoint.ipv6AddressIsStatic {
+                throw EngineError(.badRequest, "static IPv6 address is missing")
+            }
         }
         return record
+    }
+
+    private static func normalizeEndpointAddress(
+        _ value: String, family: Int32, network: NetworkRecord
+    ) throws -> String {
+        let familyName = family == AF_INET6 ? "IPv6" : "IPv4"
+        guard let address = addressBytes(value, family: family),
+              let canonical = addressString(address, family: family) else {
+            throw EngineError(.badRequest, "invalid static \(familyName) address \(value)")
+        }
+        let subnet = family == AF_INET6 ? network.ipv6Subnet : network.subnet
+        let gateway = family == AF_INET6 ? network.ipv6Gateway : network.gateway
+        let components = subnet.split(separator: "/", maxSplits: 1).map(String.init)
+        let byteCount = family == AF_INET6 ? 16 : 4
+        guard components.count == 2,
+              let prefix = Int(components[1]),
+              (0...(byteCount * 8)).contains(prefix),
+              let subnetAddress = addressBytes(components[0], family: family) else {
+            throw EngineError(.badRequest, "invalid \(familyName) network subnet \(subnet)")
+        }
+        let networkAddress = maskedAddress(subnetAddress, prefix: prefix)
+        guard maskedAddress(address, prefix: prefix) == networkAddress else {
+            throw EngineError(.badRequest, "static \(familyName) address \(canonical) is outside subnet \(subnet)")
+        }
+        if canonical == canonicalAddress(gateway, family: family) {
+            throw EngineError(.badRequest, "static \(familyName) address \(canonical) is reserved as the network gateway")
+        }
+        if family == AF_INET6, address == networkAddress {
+            throw EngineError(.badRequest, "static IPv6 address \(canonical) is the reserved network address")
+        }
+        if family == AF_INET, prefix < 31 {
+            if address == networkAddress {
+                throw EngineError(.badRequest, "static IPv4 address \(canonical) is the reserved network address")
+            }
+            if address == broadcastAddress(networkAddress, prefix: prefix) {
+                throw EngineError(.badRequest, "static IPv4 address \(canonical) is the reserved broadcast address")
+            }
+        }
+        return canonical
     }
 
     private func allocatingEndpointAddresses(to input: ContainerRecord) throws -> ContainerRecord {
@@ -962,7 +1056,10 @@ public actor EngineRuntime {
         }
         let hostBits = byteCount * 8 - prefix
         let lastOffset = hostBits >= 16 ? 65_535 : (1 << hostBits) - 1
-        let reserved = Set(used.map { $0.split(separator: "/", maxSplits: 1).first.map(String.init) ?? $0 } + [gateway])
+        let reserved = Set(
+            used.compactMap { canonicalAddress($0, family: family) }
+                + [canonicalAddress(gateway, family: family)].compactMap { $0 }
+        )
         var candidateOffsets = Array(0...lastOffset)
         if family == AF_INET {
             if hostBits > 1 {
@@ -1022,18 +1119,35 @@ public actor EngineRuntime {
         }
     }
 
+    private static func maskedAddress(_ bytes: [UInt8], prefix: Int) -> [UInt8] {
+        var masked = bytes
+        for index in masked.indices {
+            let remaining = prefix - index * 8
+            if remaining >= 8 { continue }
+            masked[index] &= remaining <= 0 ? 0 : UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
+        }
+        return masked
+    }
+
+    private static func broadcastAddress(_ network: [UInt8], prefix: Int) -> [UInt8] {
+        var broadcast = network
+        for index in broadcast.indices {
+            let remaining = prefix - index * 8
+            if remaining >= 8 { continue }
+            let networkMask = remaining <= 0 ? UInt8(0) : UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
+            broadcast[index] |= ~networkMask
+        }
+        return broadcast
+    }
+
     static func firstAddress(in subnet: String) -> String? {
         let components = subnet.split(separator: "/", maxSplits: 1).map(String.init)
         guard components.count == 2, let prefix = Int(components[1]) else { return nil }
         let family = components[0].contains(":") ? AF_INET6 : AF_INET
         let byteCount = family == AF_INET6 ? 16 : 4
         guard (0..<(byteCount * 8)).contains(prefix),
-              var network = addressBytes(components[0], family: family) else { return nil }
-        for index in network.indices {
-            let remaining = prefix - index * 8
-            if remaining >= 8 { continue }
-            network[index] &= remaining <= 0 ? 0 : UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
-        }
+              let subnetAddress = addressBytes(components[0], family: family) else { return nil }
+        var network = maskedAddress(subnetAddress, prefix: prefix)
         for index in network.indices.reversed() {
             network[index] &+= 1
             if network[index] != 0 { break }

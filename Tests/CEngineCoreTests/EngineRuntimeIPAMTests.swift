@@ -60,6 +60,42 @@ import Testing
         }
     }
 
+    private actor ArmedPersistenceGate {
+        enum Failure: Error { case requested }
+
+        private var armed = false
+        private var shouldFail = false
+        private var arrived = false
+        private var arrivalWaiter: CheckedContinuation<Void, Never>?
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func arm(failing: Bool = false) {
+            armed = true
+            shouldFail = failing
+            arrived = false
+        }
+
+        func pauseWhenArmed() async throws {
+            guard armed else { return }
+            armed = false
+            arrived = true
+            arrivalWaiter?.resume()
+            arrivalWaiter = nil
+            await withCheckedContinuation { releaseWaiter = $0 }
+            if shouldFail { throw Failure.requested }
+        }
+
+        func waitUntilPaused() async {
+            guard !arrived else { return }
+            await withCheckedContinuation { arrivalWaiter = $0 }
+        }
+
+        func release() {
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
     private actor EndpointAddressBackendState {
         private var recoveredContainer: ContainerRecord?
 
@@ -133,6 +169,23 @@ import Testing
         #expect(container.networks.first?.ipv4Address == "10.90.0.2")
     }
 
+    @Test func metadataBackendDerivesCanonicalIPv6GatewayAndAllocatesAfterIt() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+
+        let network = try await runtime.createNetwork(
+            name: "implicit-v6-gateway", ipv6Subnet: "fd00:90::10/124",
+            enableIPv4: false, enableIPv6: true
+        )
+        #expect(network.ipv6Gateway == "fd00:90::11")
+
+        var record = ContainerRecord(name: "implicit-v6-client", image: "example")
+        record.networks = [.init(networkID: network.id)]
+        let container = try await runtime.createContainer(record)
+        #expect(container.networks.first?.ipv6Address == "fd00:90::12")
+    }
+
     @Test func explicitEndpointMacIsNormalizedStoredAndSurvivesRecovery() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -194,6 +247,172 @@ import Testing
         _ = try await runtime.createContainer(makeRecord(
             name: "third-mac", networkID: other.id, macAddress: "02:42:ac:11:00:02"
         ))
+    }
+
+    @Test func explicitAndGeneratedEffectiveMacsConflictInEitherCreationOrder() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+
+        let automaticFirstNetwork = try await runtime.createNetwork(name: "automatic-first-mac")
+        var automaticFirst = ContainerRecord(id: "automatic-first", name: "automatic-first", image: "example")
+        automaticFirst.networks = [.init(networkID: automaticFirstNetwork.id)]
+        _ = try await runtime.createContainer(automaticFirst)
+        let generatedFirst = EndpointMacAddress.generated(seed: automaticFirst.id + automaticFirstNetwork.id)
+        do {
+            _ = try await runtime.createContainer(makeRecord(
+                name: "explicit-second", networkID: automaticFirstNetwork.id, macAddress: generatedFirst
+            ))
+            Issue.record("an explicit MAC reused an existing endpoint's generated MAC")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        let explicitFirstNetwork = try await runtime.createNetwork(name: "explicit-first-mac")
+        let automaticSecondID = "automatic-second"
+        let generatedSecond = EndpointMacAddress.generated(seed: automaticSecondID + explicitFirstNetwork.id)
+        _ = try await runtime.createContainer(makeRecord(
+            name: "explicit-first", networkID: explicitFirstNetwork.id, macAddress: generatedSecond
+        ))
+        var automaticSecond = ContainerRecord(id: automaticSecondID, name: "automatic-second", image: "example")
+        automaticSecond.networks = [.init(networkID: explicitFirstNetwork.id)]
+        do {
+            _ = try await runtime.createContainer(automaticSecond)
+            Issue.record("a generated MAC reused an existing endpoint's explicit MAC")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+    }
+
+    @Test func staticAddressesAreCanonicalAndEquivalentIPv6SpellingsConflict() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let network = try await runtime.createNetwork(
+            name: "canonical-static", subnet: "10.81.0.0/29", gateway: "10.81.0.1",
+            ipv6Subnet: "fd00:81::/124", enableIPv4: true, enableIPv6: true
+        )
+        let first = try await runtime.createContainer(ContainerRecord(name: "canonical-first", image: "example"))
+        try await runtime.connectNetwork(
+            network.id, container: first.id,
+            ipv6Address: "fd00:0081:0000:0000:0000:0000:0000:0002"
+        )
+        let stored = try #require(
+            try await runtime.container(first.id).networks.first(where: { $0.networkID == network.id })
+        )
+        #expect(stored.ipv6Address == "fd00:81::2")
+
+        let second = try await runtime.createContainer(ContainerRecord(name: "canonical-second", image: "example"))
+        do {
+            try await runtime.connectNetwork(network.id, container: second.id, ipv6Address: "fd00:81::2")
+            Issue.record("equivalent IPv6 spellings reused the same static address")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        let restarted = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let recovered = try #require(
+            try await restarted.container(first.id).networks.first(where: { $0.networkID == network.id })
+        )
+        #expect(recovered.ipv6Address == "fd00:81::2")
+    }
+
+    @Test func invalidOutOfPoolGatewayAndProtocolReservedStaticAddressesAreRejected() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let network = try await runtime.createNetwork(
+            name: "validated-static", subnet: "10.82.0.0/29", gateway: "10.82.0.1",
+            ipv6Subnet: "fd00:82::/124", enableIPv4: true, enableIPv6: true
+        )
+
+        for (index, address) in [
+            "invalid", "fd00:82::2", "10.82.1.2", "10.82.0.1", "10.82.0.0", "10.82.0.7",
+        ].enumerated() {
+            var record = ContainerRecord(name: "invalid-v4-\(index)", image: "example")
+            record.networks = [.init(
+                networkID: network.id, ipv4Address: address, ipv4AddressIsStatic: true
+            )]
+            do {
+                _ = try await runtime.createContainer(record)
+                Issue.record("invalid static IPv4 address \(address) was accepted")
+            } catch let error as EngineError {
+                #expect(error.code == .badRequest)
+            }
+        }
+
+        for (index, address) in [
+            "invalid", "10.82.0.2", "fd00:83::2", "fd00:82::1", "fd00:82::",
+        ].enumerated() {
+            var record = ContainerRecord(name: "invalid-v6-\(index)", image: "example")
+            record.networks = [.init(
+                networkID: network.id, ipv6Address: address, ipv6AddressIsStatic: true
+            )]
+            do {
+                _ = try await runtime.createContainer(record)
+                Issue.record("invalid static IPv6 address \(address) was accepted")
+            } catch let error as EngineError {
+                #expect(error.code == .badRequest)
+            }
+        }
+    }
+
+    @Test func connectReservationSurvivesUnrelatedRemovalAndExcludesRemoveAndStart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = ArmedPersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforeEndpointAllocationPersistence: { try await gate.pauseWhenArmed() }
+        )
+        let removed = try await runtime.createContainer(ContainerRecord(name: "removed-before-connect", image: "example"))
+        let target = try await runtime.createContainer(ContainerRecord(name: "connect-target", image: "example"))
+        let network = try await runtime.createNetwork(name: "connect-race")
+
+        await gate.arm()
+        let connect = Task { try await runtime.connectNetwork(network.id, container: target.id) }
+        await gate.waitUntilPaused()
+
+        try await runtime.removeContainer(removed.id, force: false)
+        for operation in [
+            { try await runtime.removeContainer(target.id, force: false) },
+            { try await runtime.startContainer(target.id) },
+        ] {
+            do {
+                try await operation()
+                Issue.record("container lifecycle operation bypassed a network-connect reservation")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+            }
+        }
+
+        await gate.release()
+        try await connect.value
+        #expect(try await runtime.container(target.id).networks.contains { $0.networkID == network.id })
+    }
+
+    @Test func failedConnectRollsBackByStableContainerIdentityAfterUnrelatedRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = ArmedPersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforeEndpointAllocationPersistence: { try await gate.pauseWhenArmed() }
+        )
+        let removed = try await runtime.createContainer(ContainerRecord(name: "rollback-prefix", image: "example"))
+        let target = try await runtime.createContainer(ContainerRecord(name: "rollback-target", image: "example"))
+        let network = try await runtime.createNetwork(name: "rollback-race")
+
+        await gate.arm(failing: true)
+        let connect = Task { try await runtime.connectNetwork(network.id, container: target.id) }
+        await gate.waitUntilPaused()
+        try await runtime.removeContainer(removed.id, force: false)
+        await gate.release()
+        await #expect(throws: ArmedPersistenceGate.Failure.self) { try await connect.value }
+
+        #expect(try await runtime.container(target.id).networks.allSatisfy { $0.networkID != network.id })
     }
 
     @Test(arguments: ConcurrentEndpointConflict.allCases)

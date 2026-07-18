@@ -188,6 +188,9 @@ public extension ContainerBackend {
         }
         if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
         if value.enableIPv6, value.ipv6Subnet.isEmpty { value.ipv6Subnet = "fd00:ce::/64"; value.ipv6Gateway = "fd00:ce::1" }
+        else if value.enableIPv6, value.ipv6Gateway.isEmpty {
+            value.ipv6Gateway = EngineRuntime.firstAddress(in: value.ipv6Subnet) ?? ""
+        }
         if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
         return value
     }

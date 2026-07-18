@@ -1007,6 +1007,41 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(slash31Endpoint["IPAddress"] as? String == "10.55.1.2")
     }
 
+    @Test func omittedExplicitIPv6GatewayIsDerivedForInspectStatusAndAllocation() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"implicit-v6-gateway","EnableIPv4":false,"EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fd00:55::10/124"}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let container = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=implicit-v6-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"implicit-v6-gateway":{}}}}"#.utf8)
+        ))
+        #expect(container.status == .created)
+
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.52/networks/implicit-v6-gateway"))
+        let network = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let config = try #require(((network["IPAM"] as? [String: Any])?["Config"] as? [[String: Any]])?.first)
+        #expect(config["Gateway"] as? String == "fd00:55::11")
+        let status = try #require(
+            (((network["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["fd00:55::10/124"] as? [String: Any]
+        )
+        #expect(status["IPsInUse"] as? Int == 3)
+        #expect(status["DynamicIPsAvailable"] as? Int == 13)
+
+        let containerInspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/implicit-v6-client/json"
+        ))
+        let containerObject = try #require(JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any])
+        let endpoint = try #require(
+            ((containerObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["implicit-v6-gateway"] as? [String: Any]
+        )
+        #expect(endpoint["IPv6Gateway"] as? String == "fd00:55::11")
+        #expect(endpoint["GlobalIPv6Address"] as? String == "fd00:55::12")
+    }
+
     @Test func runningContainersRejectNetworkAttachmentChanges() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2061,22 +2096,33 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(value["ContainerID"] as? String == container.id)
     }
 
-    @Test func concurrentRemovalWhileStartingReturnsConflictInsteadOfCrashing() async throws {
+    @Test func startingContainerExcludesRemovalAndNetworkAttachmentChanges() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = BlockingStartBackend()
         let runtime = try await EngineRuntime(root: root, backend: backend)
         let record = try await runtime.createContainer(ContainerRecord(name: "start-race", image: "debian"))
+        let defaultNetwork = try #require(record.networks.first?.networkID)
+        let extraNetwork = try await runtime.createNetwork(name: "start-race-extra")
         let start = Task { try await runtime.startContainer(record.id) }
         while !(await backend.hasEnteredStart()) { await Task.yield() }
-        try await runtime.removeContainer(record.id, force: true)
-        await backend.releaseStart()
-        do {
-            try await start.value
-            Issue.record("start should fail when the container is concurrently removed")
-        } catch let error as EngineError {
-            #expect(error.code == .conflict)
+
+        for operation in [
+            { try await runtime.removeContainer(record.id, force: true) },
+            { try await runtime.connectNetwork(extraNetwork.id, container: record.id) },
+            { try await runtime.disconnectNetwork(defaultNetwork, container: record.id, force: false) },
+        ] {
+            do {
+                try await operation()
+                Issue.record("container lifecycle operation bypassed an in-progress start")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+            }
         }
+
+        await backend.releaseStart()
+        try await start.value
+        #expect(try await runtime.container(record.id).phase == .running)
     }
 
     @Test func containerListDoesNotPublishAContainerDuringItsStartTransition() async throws {
