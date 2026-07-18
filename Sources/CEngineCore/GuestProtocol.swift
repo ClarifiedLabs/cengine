@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 4
+    public static let version: UInt32 = 5
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -73,6 +73,36 @@ public enum GuestProtocol {
         public var additionalGroups: [UInt32]
         public var username: String?
         public init(uid: UInt32 = 0, gid: UInt32 = 0, additionalGroups: [UInt32] = [], username: String? = nil) { self.uid = uid; self.gid = gid; self.additionalGroups = additionalGroups; self.username = username }
+    }
+
+    public struct Exec: Codable, Sendable, Equatable {
+        public var id: String
+        public var arguments: [String]
+        public var environment: [String]
+        public var workingDirectory: String
+        public var user: User
+        public var terminal: Bool
+        public var attachStdin: Bool
+        public var attachStdout: Bool
+        public var attachStderr: Bool
+        public var noNewPrivileges: Bool
+
+        public init(
+            id: String, arguments: [String], environment: [String], workingDirectory: String,
+            user: User, terminal: Bool, attachStdin: Bool, attachStdout: Bool,
+            attachStderr: Bool, noNewPrivileges: Bool
+        ) {
+            self.id = id
+            self.arguments = arguments
+            self.environment = environment
+            self.workingDirectory = workingDirectory
+            self.user = user
+            self.terminal = terminal
+            self.attachStdin = attachStdin
+            self.attachStdout = attachStdout
+            self.attachStderr = attachStderr
+            self.noNewPrivileges = noNewPrivileges
+        }
     }
 
     public struct Mount: Codable, Sendable, Equatable {

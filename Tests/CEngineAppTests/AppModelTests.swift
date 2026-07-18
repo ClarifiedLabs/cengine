@@ -113,6 +113,9 @@ import CEngineCore
     }
 
     @MainActor @Test func registrationFailureWithoutPendingApprovalIsReported() async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(
             status: .notFound,
@@ -124,6 +127,7 @@ import CEngineCore
             agent: agent,
             helper: helper,
             serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults,
             openLoginItemsSettings: { settingsOpenCount += 1 }
         )
         defer { model.setActive(false) }
@@ -218,6 +222,9 @@ import CEngineCore
     }
 
     @MainActor @Test func restartUsesLaunchctlController() async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let recorder = RestartRecorder()
         let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
         let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
@@ -225,6 +232,7 @@ import CEngineCore
             agent: agent,
             helper: helper,
             serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults,
             restartRegisteredEngine: { await recorder.record() }
         )
 
@@ -353,7 +361,12 @@ private actor RestartRecorder {
 
     @MainActor @Test func failedServiceStateIsSurfacedWhenSocketIsMissing() async throws {
         let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: home) }
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
         let paths = EnginePaths(home: home)
         try paths.createDirectories()
         let state = EngineServiceState(
@@ -369,7 +382,8 @@ private actor RestartRecorder {
             agent: agent,
             helper: helper,
             client: UnavailableEngineClient(),
-            serviceRegistrationRevision: nil
+            serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults
         )
 
         await model.refresh()

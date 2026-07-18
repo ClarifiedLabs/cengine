@@ -138,13 +138,19 @@ import Testing
         let agent = DashboardMockAppService(status: .enabled)
         let helper = DashboardMockAppService(status: .enabled)
         let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: home) }
+        let suiteName = "AppDataTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
         let model = AppModel(
             home: home,
             agent: agent,
             helper: helper,
             client: client,
-            serviceRegistrationRevision: nil
+            serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults
         )
 
         await model.refresh()
@@ -175,14 +181,20 @@ import Testing
         let agent = DashboardMockAppService(status: .enabled)
         let helper = DashboardMockAppService(status: .enabled)
         let home = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: home) }
+        let suiteName = "AppDataTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            try? FileManager.default.removeItem(at: home)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
         let model = AppModel(
             home: home,
             agent: agent,
             helper: helper,
             client: client,
             appVersion: "0.2.0",
-            serviceRegistrationRevision: nil
+            serviceRegistrationRevision: nil,
+            serviceRegistrationDefaults: defaults
         )
         await model.refresh()
 

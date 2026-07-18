@@ -15,12 +15,11 @@ runner owns the complete lifecycle so every run begins from a known state.
    temporary engine roots, and assert that both processes and roots are gone.
 4. Rebuild the macOS runtime and Linux guest initramfs from the current checkout.
 5. Validate the exact pinned guest kernel, build the `test-compat` Xcode scheme,
-   sign the test binary, and select the privileged networking helper. A normal
-   local run uses the freshly built helper: the scheme embeds
-   `dev.cengine.network-helper.test-compat` into both the daemon and helper, and
-   the runner bootstraps a temporary root-owned LaunchDaemon for that service.
-   Set `CENGINE_COMPAT_NETWORK_HELPER=installed` to force the installed
-   `/Applications/cengine.app` helper.
+   sign the test binary, and use the installed, already-approved
+   `dev.cengine.network-helper` service. Normal runs never request administrator
+   authorization. Set `CENGINE_COMPAT_NETWORK_HELPER=local` only while changing
+   the helper itself; that explicit mode signs the local helper and requests
+   authorization to bootstrap a temporary root-owned LaunchDaemon.
 6. Delete and recreate the Python virtual environment from the pinned requirements.
 7. Let the pytest harness create a unique engine root and Docker configuration for the
    run, then execute the requested tests.
@@ -32,6 +31,25 @@ Compiler intermediates and the pinned kernel build are caches, not runtime state
 remain between runs; Xcode dependency tracking rebuilds changed sources, guest assets
 are repacked on every run, and the kernel hash/version check prevents a stale or
 unapproved kernel from entering a VM.
+
+## One-time non-interactive host setup
+
+Install cengine, open the app once, and approve Networking. The privileged helper
+can remain registered while the per-user engine is disabled in Settings, allowing
+the isolated compatibility daemon to own all engine state without authentication
+prompts or interference from the installed daemon.
+
+Verify that setup before a long run:
+
+```sh
+/bin/launchctl print system/dev.cengine.network-helper >/dev/null
+! /bin/launchctl print "gui/$(id -u)/dev.cengine.engine" >/dev/null 2>&1
+```
+
+Automatic helper selection requires this installed helper and does not fall back
+to a privileged local bootstrap. This is the normal setup for compatibility and
+guest tests. `CENGINE_COMPAT_NETWORK_HELPER=local` is an explicit, interactive
+developer path for networking-helper changes only.
 
 ## Focused and repeated runs
 

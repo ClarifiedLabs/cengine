@@ -16,6 +16,34 @@ Containerization and does not run a shared Linux VM containing Docker.
   disk. Start boots a fresh guest from that disk and launches the workload as PID
   1 in new PID, mount, IPC, UTS, network, and cgroup namespaces.
 
+## Workload and exec semantics
+
+The workload ext4 filesystem replaces `/` in the workload mount namespace; it is
+not merely installed as a chroot beneath an initramfs mount root. This distinction
+is required by nested runtimes, which reopen a process root through `/proc` and
+expect it to be the namespace root. A read-only root remount therefore applies to
+both the init process and later exec processes, while mounts such as tmpfs retain
+their own write policy.
+
+Exec uses two guest stages. The first joins the workload UTS, IPC, network, cgroup,
+and PID namespaces while retaining access to supervisor resources. It captures
+the workload root and mount namespace through close-on-exec descriptors, places
+the process in its exec cgroup, and starts a second stage. The second stage joins
+the mount namespace, enters the captured root, applies the resolved cwd, user,
+supplementary groups, and `no_new_privs` policy, closes all staging descriptors,
+then executes the requested command. Healthchecks use the same path and resolver.
+
+Omitted exec values resolve in Docker order: explicit exec value, container
+override, image configuration, then `/` for the working directory and root for
+the user. Environment values merge image, container, then exec entries. When
+neither the container nor exec request is privileged, cengine sets
+`PR_SET_NO_NEW_PRIVS`; an explicitly privileged exec may omit it, matching the
+Docker exec privilege request.
+
+These are observable Docker/OCI semantics, not an OCI runtime-CLI implementation.
+The normative coverage and remaining runtime gaps are tracked in
+[Docker compatibility](docker-compatibility.md#runtime-semantics-and-oci-applicability).
+
 ## CPU and memory
 
 Docker CPU and memory settings are workload hard limits. The guest cgroup uses

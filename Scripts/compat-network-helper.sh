@@ -39,20 +39,12 @@ compat_network_helper_for_binary() {
         return 0
     fi
 
-    _cnh_local_helper=$(compat_network_helper_local_for_binary "$_cnh_binary") || return 1
     case "$_cnh_mode" in
-        installed)
+        auto|installed)
             _cnh_helper=$compat_network_helper_installed_path
             ;;
         local)
-            _cnh_helper=$_cnh_local_helper
-            ;;
-        auto)
-            if [ -x "$_cnh_local_helper" ]; then
-                _cnh_helper=$_cnh_local_helper
-            else
-                _cnh_helper=$compat_network_helper_installed_path
-            fi
+            _cnh_helper=$(compat_network_helper_local_for_binary "$_cnh_binary") || return 1
             ;;
     esac
 
@@ -71,10 +63,9 @@ compat_network_helper_for_binary() {
             echo "run make build before running compatibility tests" >&2
             ;;
         auto)
-            echo "cengine networking helper is missing" >&2
-            echo "checked installed helper: $compat_network_helper_installed_path" >&2
-            echo "checked local build helper: $_cnh_local_helper" >&2
-            echo "run make build or install the current cengine package before running compatibility tests" >&2
+            echo "installed cengine networking helper is missing: $_cnh_helper" >&2
+            echo "install cengine and approve Networking in the app before running compatibility tests" >&2
+            echo "use CENGINE_COMPAT_NETWORK_HELPER=local only when testing helper changes; it requests administrator authorization" >&2
             ;;
     esac
     return 1

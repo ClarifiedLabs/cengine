@@ -20,8 +20,8 @@ type NetworkStatistics struct { Name string `json:"name"`; RXBytes uint64 `json:
 type Process struct { PID int `json:"pid"`; User string `json:"user"`; Command string `json:"command"` }
 type Ownership struct { Path string `json:"path"`; User uint32 `json:"user"`; Group uint32 `json:"group"` }
 
-func CopyIn(source, destination string, ownership []Ownership) error {
-	root, err := mountedRoot(); if err != nil { return err }
+func CopyIn(pid int, source, destination string, ownership []Ownership) error {
+	root, err := containerRoot(pid); if err != nil { return err }
 	source = filepath.Join("/run/cengine/io", filepath.Clean("/"+source))
 	target, err := containerPath(root, destination); if err != nil { return err }
 	if err := copyContents(source, target); err != nil { return err }
@@ -29,8 +29,8 @@ func CopyIn(source, destination string, ownership []Ownership) error {
 	return syncRoot(root)
 }
 
-func CopyOut(source, destination string) error {
-	root, err := mountedRoot(); if err != nil { return err }
+func CopyOut(pid int, source, destination string) error {
+	root, err := containerRoot(pid); if err != nil { return err }
 	from, err := containerPath(root, source); if err != nil { return err }
 	to := filepath.Join("/run/cengine/io", filepath.Clean("/"+destination)); if err := os.RemoveAll(to); err != nil { return err }; if err := os.MkdirAll(to, 0755); err != nil { return err }
 	return copyEntry(from, filepath.Join(to, filepath.Base(from)))
@@ -51,6 +51,7 @@ func Stats(pid int) (Statistics, error) {
 func Top(pid int) ([]Process,error) { root:=fmt.Sprintf("/proc/%d/root/proc",pid);entries,err:=os.ReadDir(root);if err!=nil{return nil,err};var result []Process;for _,entry:=range entries{number,err:=strconv.Atoi(entry.Name());if err!=nil||!entry.IsDir(){continue};command,_:=os.ReadFile(filepath.Join(root,entry.Name(),"cmdline"));command=stringsToSpaces(command);status,_:=os.ReadFile(filepath.Join(root,entry.Name(),"status"));user:="0";for _,line:=range strings.Split(string(status),"\n"){if strings.HasPrefix(line,"Uid:"){fields:=strings.Fields(line);if len(fields)>1{user=fields[1]};break}};result=append(result,Process{PID:number,User:user,Command:string(command)})};return result,nil }
 
 func mountedRoot()(string,error){root:="/run/cengine/rootfs";if err:=disk.EnsureExt4("/dev/vda",root,"cengine-root");err!=nil{return "",err};return root,nil}
+func containerRoot(pid int)(string,error){if pid<=0{return mountedRoot()};root:=fmt.Sprintf("/proc/%d/root",pid);if _,err:=os.Stat(root);err!=nil{return "",fmt.Errorf("open workload root: %w",err)};return root,nil}
 func containerPath(root,value string)(string,error){if !filepath.IsAbs(value){return "",syscall.EINVAL};clean:=filepath.Clean(value);if clean=="/"{return root,nil};relative:=strings.TrimPrefix(clean,"/");if relative==".."||strings.HasPrefix(relative,"../"){return "",syscall.EPERM};return filepath.Join(root,relative),nil}
 func archivePath(root,value string)(string,error){if value==""||filepath.IsAbs(value){return "",syscall.EINVAL};clean:=filepath.Clean(value);if clean==".."||strings.HasPrefix(clean,"../"){return "",syscall.EPERM};if clean=="."{return root,nil};return filepath.Join(root,clean),nil}
 func copyContents(source,target string)error{if err:=os.MkdirAll(target,0755);err!=nil{return err};entries,err:=os.ReadDir(source);if err!=nil{return err};for _,entry:=range entries{if err:=copyEntry(filepath.Join(source,entry.Name()),filepath.Join(target,entry.Name()));err!=nil{return err}};return nil}

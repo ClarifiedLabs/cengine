@@ -25,6 +25,7 @@ import (
 )
 
 const stage2Argument = "cengine-workload-stage2"
+const workloadReadyFD = 5
 
 type Supervisor struct {
 	mu         sync.Mutex
@@ -66,7 +67,13 @@ func RunStage2() error {
 	if err := enterPlacedCgroupNamespace(gate, unix.Unshare); err != nil {
 		return err
 	}
-	return enterWorkload(spec)
+	ready := os.NewFile(workloadReadyFD, "workload-ready")
+	if ready == nil {
+		return errors.New("workload readiness file descriptor is unavailable")
+	}
+	defer ready.Close()
+	unix.CloseOnExec(workloadReadyFD)
+	return enterWorkload(spec, ready)
 }
 
 func enterPlacedCgroupNamespace(gate io.Reader, unshare func(int) error) error {
@@ -172,10 +179,20 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		writer.Close()
 		return s.status, err
 	}
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		reader.Close()
+		writer.Close()
+		gateReader.Close()
+		gateWriter.Close()
+		return s.status, err
+	}
 	command := exec.Command("/proc/self/exe", stage2Argument)
-	command.ExtraFiles = []*os.File{reader, gateReader}
+	command.ExtraFiles = []*os.File{reader, gateReader, readyWriter}
 	stdout, err := os.OpenFile("/run/cengine/io/stdout", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
+		readyReader.Close()
+		readyWriter.Close()
 		reader.Close()
 		writer.Close()
 		gateReader.Close()
@@ -190,6 +207,8 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	if s.spec.Terminal {
 		terminalMaster, terminalSlave, err = openPseudoTerminal()
 		if err != nil {
+			readyReader.Close()
+			readyWriter.Close()
 			stdout.Close()
 			reader.Close()
 			writer.Close()
@@ -203,6 +222,8 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	} else {
 		stderr, err = os.OpenFile("/run/cengine/io/stderr", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
+			readyReader.Close()
+			readyWriter.Close()
 			stdout.Close()
 			reader.Close()
 			writer.Close()
@@ -225,6 +246,8 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		command.SysProcAttr.Ctty = 0
 	}
 	if err := command.Start(); err != nil {
+		readyReader.Close()
+		readyWriter.Close()
 		stdout.Close()
 		if stderr != nil {
 			stderr.Close()
@@ -247,6 +270,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		gateWriter.Close()
 		return s.status, err
 	}
+	readyWriter.Close()
 	if terminalSlave != nil {
 		terminalSlave.Close()
 		go pumpTerminalOutput(terminalMaster, stdout, command)
@@ -257,6 +281,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	reader.Close()
 	gateReader.Close()
 	if _, err := writer.Write(data); err != nil {
+		readyReader.Close()
 		writer.Close()
 		gateWriter.Close()
 		_ = command.Process.Kill()
@@ -264,21 +289,37 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	}
 	writer.Close()
 	if err := applyCgroup(s.spec, command.Process.Pid); err != nil {
+		readyReader.Close()
 		gateWriter.Close()
 		_ = command.Process.Kill()
 		return s.status, err
 	}
 	if err := guestnetwork.Attach(command.Process.Pid, s.spec.Networks); err != nil {
+		readyReader.Close()
 		gateWriter.Close()
 		_ = command.Process.Kill()
 		return s.status, err
 	}
 	if _, err := gateWriter.Write([]byte{1}); err != nil {
+		readyReader.Close()
 		gateWriter.Close()
 		_ = command.Process.Kill()
 		return s.status, err
 	}
 	gateWriter.Close()
+	var ready [1]byte
+	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
+		readyReader.Close()
+		if stdinWriter != nil {
+			stdinWriter.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
+		_ = command.Wait()
+		return s.status, fmt.Errorf("workload failed before becoming ready: %w", err)
+	}
+	readyReader.Close()
 	s.command = command
 	s.status = protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
 	go s.reap(command)
@@ -649,7 +690,7 @@ func switchWorkloadRoot(root string, operations rootSwitchOperations) error {
 	return nil
 }
 
-func enterWorkload(spec protocol.WorkloadSpec) error {
+func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
@@ -827,6 +868,9 @@ func enterWorkload(spec protocol.WorkloadSpec) error {
 	if err != nil {
 		return err
 	}
+	if _, err := ready.Write([]byte{1}); err != nil {
+		return fmt.Errorf("signal workload readiness: %w", err)
+	}
 	return unix.Exec(path, spec.Arguments, environment)
 }
 
@@ -882,45 +926,63 @@ func resolveUser(user protocol.User) (int, int, []int, error) {
 	if user.Username == "" {
 		return int(user.UID), int(user.GID), nil, nil
 	}
-	parts := strings.SplitN(user.Username, ":", 2)
-	name := parts[0]
 	passwd, err := os.ReadFile("/etc/passwd")
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	uid, gid := -1, -1
-	for _, line := range strings.Split(string(passwd), "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) >= 4 && fields[0] == name {
-			uid, _ = strconv.Atoi(fields[2])
-			gid, _ = strconv.Atoi(fields[3])
-			break
-		}
+	groupData, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return 0, 0, nil, err
 	}
-	if uid < 0 {
-		return 0, 0, nil, fmt.Errorf("user %s not found", name)
+	return resolveUserFromData(user, passwd, groupData)
+}
+
+func resolveUserFromData(user protocol.User, passwd, groupData []byte) (int, int, []int, error) {
+	parts := strings.SplitN(user.Username, ":", 2)
+	name := ""
+	uid, numericError := strconv.Atoi(parts[0])
+	gid := int(user.GID)
+	if numericError != nil {
+		name = parts[0]
+		uid, gid = -1, -1
+		for _, line := range strings.Split(string(passwd), "\n") {
+			fields := strings.Split(line, ":")
+			if len(fields) >= 4 && fields[0] == name {
+				uid, _ = strconv.Atoi(fields[2])
+				gid, _ = strconv.Atoi(fields[3])
+				break
+			}
+		}
+		if uid < 0 {
+			return 0, 0, nil, fmt.Errorf("user %s not found", name)
+		}
 	}
 	if len(parts) == 2 && parts[1] != "" {
 		if value, parseErr := strconv.Atoi(parts[1]); parseErr == nil {
 			gid = value
 		} else {
-			groupData, _ := os.ReadFile("/etc/group")
+			found := false
 			for _, line := range strings.Split(string(groupData), "\n") {
 				fields := strings.Split(line, ":")
 				if len(fields) >= 3 && fields[0] == parts[1] {
 					gid, _ = strconv.Atoi(fields[2])
+					found = true
 					break
 				}
+			}
+			if !found {
+				return 0, 0, nil, fmt.Errorf("group %s not found", parts[1])
 			}
 		}
 	}
 	var groups []int
-	groupData, _ := os.ReadFile("/etc/group")
-	for _, line := range strings.Split(string(groupData), "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) >= 4 && containsString(strings.Split(fields[3], ","), name) {
-			if value, err := strconv.Atoi(fields[2]); err == nil && value != gid {
-				groups = append(groups, value)
+	if name != "" {
+		for _, line := range strings.Split(string(groupData), "\n") {
+			fields := strings.Split(line, ":")
+			if len(fields) >= 4 && containsString(strings.Split(fields[3], ","), name) {
+				if value, err := strconv.Atoi(fields[2]); err == nil && value != gid {
+					groups = append(groups, value)
+				}
 			}
 		}
 	}

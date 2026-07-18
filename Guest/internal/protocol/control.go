@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version             = 4
+	Version             = 5
 	ControlPort         = 4100
 	FileSystemPort      = 4101
 	RootFSContentPort   = 4102
@@ -112,11 +112,12 @@ type ExecSpec struct {
 	Arguments        []string `json:"arguments"`
 	Environment      []string `json:"environment"`
 	WorkingDirectory string   `json:"workingDirectory"`
-	User             string   `json:"user"`
+	User             User     `json:"user"`
 	Terminal         bool     `json:"terminal"`
 	AttachStdin      bool     `json:"attachStdin"`
 	AttachStdout     bool     `json:"attachStdout"`
 	AttachStderr     bool     `json:"attachStderr"`
+	NoNewPrivileges  bool     `json:"noNewPrivileges"`
 }
 
 type RootFSLayer struct {

@@ -21,6 +21,29 @@ versions. Docker-py and Compose are pinned by the repository, BuildKit is pinned
 by the Buildx contract, and external Compose/Buildx fixture images use manifest
 digests.
 
+## Normative source hierarchy
+
+Compatibility decisions use the narrowest authoritative source that defines the
+observable behavior:
+
+1. [Docker Engine API v1.55](https://docs.docker.com/reference/api/engine/version/v1.55/)
+   defines request, response, error, and version-negotiation behavior.
+2. [OCI Runtime Specification v1.3.0](https://github.com/opencontainers/runtime-spec/tree/v1.3.0)
+   defines execution semantics that apply to cengine's Docker-facing runtime,
+   especially process identity, cwd, environment, rootfs, mounts, namespaces,
+   resources, and Linux security state.
+3. Linux syscall documentation defines the mechanism used to realize those
+   semantics, including [`setns(2)`](https://man7.org/linux/man-pages/man2/setns.2.html),
+   [`mount(2)`](https://man7.org/linux/man-pages/man2/mount.2.html), and
+   [`PR_SET_NO_NEW_PRIVS`](https://man7.org/linux/man-pages/man2/PR_SET_NO_NEW_PRIVS.2const.html).
+4. Reference Docker Engine/Moby behavior resolves details the API and OCI specs
+   leave unspecified. Such behavior should become a deterministic differential
+   oracle or a focused cengine-owned contract.
+
+This hierarchy does not claim that cengine exposes the OCI runtime command-line
+interface or accepts an OCI `config.json`. It uses applicable OCI semantics as a
+reference beneath the Docker API.
+
 ## Black-box coverage map
 
 | Exposed family | VM-backed coverage | Remaining black-box gaps |
@@ -33,6 +56,31 @@ digests.
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
 | Differential behavior | `ORC-001`–`ORC-002` | Optional lifecycle and multi-platform image response-shape comparisons require an explicit reference Docker Engine. |
+| Runtime semantics | `RTM-001`–`RTM-003`, `KND-001` | Mount propagation and sharing modes, configurable capabilities/devices/rlimits/seccomp/security options, masked paths, and broader cgroup-v2 behavior remain gaps. |
+
+## Runtime semantics and OCI applicability
+
+The applicability table is the runtime-semantic backlog. **Covered** means a
+strict `RTM-*` or equivalent compatibility contract exercises the behavior;
+**Partial** means cengine implements a constrained Docker-facing subset; **Gap**
+means an exposed or planned behavior needs a decision; and **Not applicable**
+means the one-container-per-VM architecture does not expose that OCI surface.
+
+| OCI Runtime v1.3 area | Applicability | Current evidence | Remaining work |
+|---|---|---|---|
+| Process args, environment, cwd, user and groups | Covered | `RTM-001` checks init/default-exec parity and named supplementary groups; focused Swift tests cover image/container/exec precedence. | Expand differentials for invalid named identities and explicit exec overrides as clients demand them. |
+| Root filesystem and mount-namespace root | Covered | `RTM-001` compares namespace/root identity; `RTM-003` exercises nested Docker reopening process roots. | Continue porting nested-runtime regressions as distinct contracts. |
+| Read-only root and writable mounts | Covered | `RTM-002` requires exec writes to fail on the root while an explicit tmpfs remains writable. | Add bind/volume remount and propagation matrices. |
+| PID, mount, UTS, IPC, network and cgroup namespaces | Partial | `RTM-001` requires init/default exec to share all six namespace identities. | Docker namespace-sharing modes and configurable namespace paths are not implemented. |
+| Process security state | Partial | `RTM-001` compares capability masks, checks `NoNewPrivs`, verifies privileged-exec override, and rejects leaked stage descriptors. | Capability add/drop, ambient capabilities, seccomp, AppArmor/SELinux-shaped security options, masked/readonly paths, rlimits, and device policy need explicit decisions. |
+| Linux resources and cgroup v2 | Partial | `CTR-028`, `CTR-042`, and `CTR-047` cover CPU/memory limits and live updates; exec receives its own child cgroup. | PIDs, IO/device controls, per-device blkio, and broader cgroup-v2 delegation/accounting remain gaps. |
+| Linux devices and filesystems | Partial | `CTR-035`, `CTR-045`, `VOL-002`–`VOL-006`, and `RTM-002` cover ext4, standard devices, volumes, and tmpfs. | Configurable devices, device cgroup rules, sysctls, mount propagation, and additional filesystem options remain gaps. |
+| OCI lifecycle operations and hooks | Not applicable | Docker lifecycle maps directly to cengine shims and guest control; no OCI runtime CLI is exposed. | Reassess only if cengine adopts an OCI runtime adapter or hook surface. |
+
+Every runtime divergence discovered during implementation is classified as
+covered, partial, intentional gap, or undecided. Supported Docker inputs must not
+be silently ignored; either apply them, reject them clearly, or record and
+prioritize the gap.
 
 ## API version envelope
 
@@ -74,6 +122,14 @@ values are **Support**, **Intentional gap**, and **Undecided**.
 Rows inherited from the original inventory retain the pinned Podman commit as
 their origin. Rows identified as cengine-owned below are contracts added from
 Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
+
+## Runtime semantics
+
+| ID | Contract | Status | Intent | Notes |
+|---|---|---|---|---|
+| `RTM-001` | `test_init_and_default_exec_share_runtime_context` | ✅ Pass | Support | **cengine-owned.** Init and default exec share mount, PID, UTS, IPC, network, and cgroup namespaces; root identity; hostname; cwd; user and supplementary groups; environment; capability masks; and `NoNewPrivs`. Exec stage descriptors do not leak, and privileged exec clears the no-new-privileges request. |
+| `RTM-002` | `test_read_only_root_applies_to_exec_but_tmpfs_stays_writable` | ✅ Pass | Support | **cengine-owned.** Start does not report success before the workload root is ready for an immediate exec. Exec cannot write through a read-only workload root while an explicitly writable tmpfs remains writable. |
+| `RTM-003` | `test_nested_docker_exec_and_healthcheck_without_kind` | ✅ Pass | Support | **cengine-owned.** Pinned Docker 29.6.2 DinD loads the cached pinned Alpine archive, starts a nested container at `/data`, executes into it, and reaches `healthy` without kind or another registry pull. |
 
 ## Containers
 

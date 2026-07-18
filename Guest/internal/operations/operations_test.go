@@ -4,10 +4,24 @@ package operations
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 )
+
+func TestContainerRootUsesRunningProcessRoot(t *testing.T) {
+	pid := os.Getpid()
+	got, err := containerRoot(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("/proc/%d/root", pid)
+	if got != want {
+		t.Fatalf("containerRoot(%d) = %q, want %q", pid, got, want)
+	}
+}
 
 func TestArchivePathResolvesRelativeEntries(t *testing.T) {
 	root := "/container/tmp"

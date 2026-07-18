@@ -48,6 +48,47 @@ import Testing
     }
 
     #if os(macOS)
+    @Test func execContextInheritsImageThenContainerDefaults() {
+        let context = RawVirtualizationBackend.resolveExecContext(
+            configuration: .init(arguments: ["env"]),
+            containerEnvironment: ["SHARED=container", "CONTAINER=1"],
+            containerWorkingDirectory: "",
+            containerUser: "",
+            containerPrivileged: false,
+            imageEnvironment: ["IMAGE=1", "SHARED=image"],
+            imageWorkingDirectory: "/image-work",
+            imageUser: "image-user"
+        )
+
+        #expect(context.environment == ["IMAGE=1", "SHARED=container", "CONTAINER=1"])
+        #expect(context.workingDirectory == "/image-work")
+        #expect(context.user == .init(username: "image-user"))
+        #expect(context.noNewPrivileges)
+    }
+
+    @Test func execContextExplicitValuesOverrideContainerAndImage() {
+        let context = RawVirtualizationBackend.resolveExecContext(
+            configuration: .init(
+                arguments: ["env"], environment: ["SHARED=exec", "EXEC=1"],
+                workingDirectory: "/exec-work", user: "2000:3000", privileged: true
+            ),
+            containerEnvironment: ["SHARED=container", "CONTAINER=1"],
+            containerWorkingDirectory: "/container-work",
+            containerUser: "1000:1000",
+            containerPrivileged: false,
+            imageEnvironment: ["IMAGE=1", "SHARED=image"],
+            imageWorkingDirectory: "/image-work",
+            imageUser: "image-user"
+        )
+
+        #expect(context.environment == [
+            "IMAGE=1", "SHARED=exec", "CONTAINER=1", "EXEC=1",
+        ])
+        #expect(context.workingDirectory == "/exec-work")
+        #expect(context.user == .init(uid: 2_000, gid: 3_000))
+        #expect(!context.noNewPrivileges)
+    }
+
     @Test func blockVolumesUseTheReportedSparseCapacity() {
         #expect(VolumeRecord.defaultSizeBytes == 512 * 1_024 * 1_024 * 1_024)
         #expect(RawVirtualizationBackend.defaultVolumeDiskBytes == VolumeRecord.defaultSizeBytes)

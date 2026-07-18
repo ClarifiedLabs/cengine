@@ -24,7 +24,7 @@ Follow existing Swift conventions: four-space indentation, `UpperCamelCase` type
 
 ## Testing Guidelines
 
-Use Swift Testing (`@Suite`, `@Test`, `#expect`) for unit tests and name files `*Tests.swift`. Bug fixes must include regression coverage. Compatibility tests are named `test_*.py`; each non-oracle test requires a unique `@pytest.mark.compat("AREA-NNN")` entry also recorded in `docs/docker-compatibility.md`. Run the narrowest relevant suite first, then `make test` before review. VM-backed changes should also run `make test-compat` locally.
+Use Swift Testing (`@Suite`, `@Test`, `#expect`) for unit tests and name files `*Tests.swift`. Bug fixes must include regression coverage. Compatibility tests are named `test_*.py`; each non-oracle test requires a unique `@pytest.mark.compat("AREA-NNN")` entry also recorded in `docs/docker-compatibility.md`. Run the narrowest relevant suite first, then `make test` before review. VM-backed changes should also run `make test-compat` locally. Runtime-semantic changes must cite the applicable Docker API, OCI Runtime, or Linux contract in `docs/docker-compatibility.md`, update its OCI applicability table when coverage changes, and add a focused `RTM-*` compatibility test before relying on kind or another application-level integration test.
 
 ## Commit & Pull Request Guidelines
 

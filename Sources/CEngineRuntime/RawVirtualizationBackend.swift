@@ -7,6 +7,13 @@ import Foundation
 public actor RawVirtualizationBackend: ContainerBackend {
     enum VolumeStorageMode: String, Codable, Sendable { case block, shared }
 
+    struct ResolvedExecContext: Equatable, Sendable {
+        let environment: [String]
+        let workingDirectory: String
+        let user: GuestProtocol.User
+        let noNewPrivileges: Bool
+    }
+
     public static let defaultRootDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
     public static let defaultVolumeDiskBytes = VolumeRecord.defaultSizeBytes
     public static let defaultStorageDiskBytes = VolumeRecord.defaultSizeBytes
@@ -377,23 +384,26 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let bridge = ContainerIOBridge(tty: exec.configuration.tty, logURL: ioDirectory.appending(path: "exec-\(exec.id)-docker.log"))
         let monitor = ContainerLogMonitor(stdoutURL: stdout, stderrURL: stderr, inputURL: stdin, bridge: bridge); monitor.start()
         execBridges[exec.id] = bridge; execMonitors[exec.id] = monitor; execShims[exec.id] = shim
-        struct Spec: Encodable {
-            let id: String; let arguments, environment: [String]; let workingDirectory, user: String
-            let terminal, attachStdin, attachStdout, attachStderr: Bool
-        }
         struct Status: Decodable { let status: String }
         let configuration = exec.configuration
-        let containerEnvironment = Self.mergeEnvironment(
-            image: image.configuration.config?.environment ?? [], container: container.environment
+        let context = Self.resolveExecContext(
+            configuration: configuration,
+            containerEnvironment: container.environment,
+            containerWorkingDirectory: container.workingDirectory,
+            containerUser: container.user,
+            containerPrivileged: container.privileged,
+            imageEnvironment: image.configuration.config?.environment ?? [],
+            imageWorkingDirectory: image.configuration.config?.workingDirectory,
+            imageUser: image.configuration.config?.user
         )
-        let environment = Self.mergeEnvironment(image: containerEnvironment, container: configuration.environment)
         _ = try await shim.guest(
             operation: "prepare-exec",
-            payload: Spec(
-                id: exec.id, arguments: configuration.arguments, environment: environment,
-                workingDirectory: configuration.workingDirectory, user: configuration.user,
+            payload: GuestProtocol.Exec(
+                id: exec.id, arguments: configuration.arguments, environment: context.environment,
+                workingDirectory: context.workingDirectory, user: context.user,
                 terminal: configuration.tty, attachStdin: configuration.attachStdin,
-                attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr
+                attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
+                noNewPrivileges: context.noNewPrivileges
             ),
             response: Status.self
         )
@@ -434,7 +444,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String) {
-        let record = ExecRecord(containerID: container.id, configuration: .init(arguments: arguments, environment: container.environment, workingDirectory: container.workingDirectory, user: container.user))
+        let record = ExecRecord(containerID: container.id, configuration: .init(arguments: arguments))
         let bridge = try await prepareExec(record, container: container); try await startExec(record)
         guard let shim = execShims[record.id] else { throw EngineError(.notFound, "healthcheck exec is unavailable") }
         struct Request: Encodable { let id: String }; struct Signal: Encodable { let id: String; let signal: Int }; struct Status: Decodable { let status: String; let exitCode: Int? }
@@ -1060,12 +1070,45 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return order.compactMap { values[$0] }
     }
 
+    static func resolveExecContext(
+        configuration: ExecConfiguration,
+        containerEnvironment: [String],
+        containerWorkingDirectory: String,
+        containerUser: String,
+        containerPrivileged: Bool,
+        imageEnvironment: [String],
+        imageWorkingDirectory: String?,
+        imageUser: String?
+    ) -> ResolvedExecContext {
+        let inheritedEnvironment = mergeEnvironment(
+            image: imageEnvironment, container: containerEnvironment
+        )
+        return ResolvedExecContext(
+            environment: mergeEnvironment(
+                image: inheritedEnvironment, container: configuration.environment
+            ),
+            workingDirectory: configuration.workingDirectory.nilIfEmpty
+                ?? containerWorkingDirectory.nilIfEmpty
+                ?? imageWorkingDirectory?.nilIfEmpty
+                ?? "/",
+            user: user(
+                configuration.user.nilIfEmpty
+                    ?? containerUser.nilIfEmpty
+                    ?? imageUser?.nilIfEmpty
+            ),
+            noNewPrivileges: !(containerPrivileged || configuration.privileged)
+        )
+    }
+
     private static func user(_ value: String?) -> GuestProtocol.User {
         let raw = value ?? ""; if raw.isEmpty { return .init() }
         let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
         guard let uid = UInt32(parts[0]) else { return .init(username: raw) }
-        let components = parts.compactMap { UInt32($0) }
-        return .init(uid: uid, gid: components.count > 1 ? components[1] : uid)
+        guard parts.count > 1, !parts[1].isEmpty else { return .init(uid: uid, gid: uid) }
+        guard let gid = UInt32(parts[1]) else {
+            return .init(uid: uid, gid: uid, username: raw)
+        }
+        return .init(uid: uid, gid: gid)
     }
 
     private static func signalNumber(_ value: String) -> Int {

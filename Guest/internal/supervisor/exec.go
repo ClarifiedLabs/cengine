@@ -162,17 +162,25 @@ func RunExecStage2() error {
 	if err := os.Chdir(working); err != nil {
 		return fmt.Errorf("change to exec working directory %s: %w", working, err)
 	}
-	uid, gid, err := parseExecUser(spec.User)
+	uid, gid, namedGroups, err := resolveUser(spec.User)
 	if err != nil {
 		return err
 	}
-	if err := unix.Setgroups(nil); err != nil {
+	groups := make([]int, 0, len(spec.User.AdditionalGroups)+len(namedGroups))
+	for _, group := range spec.User.AdditionalGroups {
+		groups = append(groups, int(group))
+	}
+	groups = append(groups, namedGroups...)
+	if err := unix.Setgroups(groups); err != nil {
 		return err
 	}
 	if err := unix.Setgid(gid); err != nil {
 		return err
 	}
 	if err := unix.Setuid(uid); err != nil {
+		return err
+	}
+	if err := applyNoNewPrivileges(spec.NoNewPrivileges, unix.Prctl); err != nil {
 		return err
 	}
 	hostname, _ := os.Hostname()
@@ -222,6 +230,19 @@ func enterExecRoot(fd int, fchdir func(int) error, chroot func(string) error) er
 	}
 	if err := chroot("."); err != nil {
 		return fmt.Errorf("chroot workload: %w", err)
+	}
+	return nil
+}
+
+func applyNoNewPrivileges(
+	enabled bool,
+	prctl func(option int, arg2 uintptr, arg3 uintptr, arg4 uintptr, arg5 uintptr) error,
+) error {
+	if !enabled {
+		return nil
+	}
+	if err := prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("set no-new-privileges for exec: %w", err)
 	}
 	return nil
 }
@@ -581,45 +602,4 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	delete(s.execs, id)
 	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
 	s.mu.Unlock()
-}
-func parseExecUser(value string) (int, int, error) {
-	if value == "" {
-		return 0, 0, nil
-	}
-	parts := strings.SplitN(value, ":", 2)
-	uid, err := strconv.Atoi(parts[0])
-	gid := uid
-	if err != nil {
-		passwd, readErr := os.ReadFile("/etc/passwd")
-		if readErr != nil {
-			return 0, 0, readErr
-		}
-		uid = -1
-		for _, line := range strings.Split(string(passwd), "\n") {
-			fields := strings.Split(line, ":")
-			if len(fields) >= 4 && fields[0] == parts[0] {
-				uid, _ = strconv.Atoi(fields[2])
-				gid, _ = strconv.Atoi(fields[3])
-				break
-			}
-		}
-		if uid < 0 {
-			return 0, 0, fmt.Errorf("user %s not found", parts[0])
-		}
-	}
-	if len(parts) > 1 && parts[1] != "" {
-		if value, parseErr := strconv.Atoi(parts[1]); parseErr == nil {
-			gid = value
-		} else {
-			groups, _ := os.ReadFile("/etc/group")
-			for _, line := range strings.Split(string(groups), "\n") {
-				fields := strings.Split(line, ":")
-				if len(fields) >= 3 && fields[0] == parts[1] {
-					gid, _ = strconv.Atoi(fields[2])
-					break
-				}
-			}
-		}
-	}
-	return uid, gid, nil
 }

@@ -450,7 +450,7 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 		if err := json.Unmarshal(request.Payload, &value); err != nil {
 			return nil, err
 		}
-		if err := operations.CopyIn(value.Source, value.Destination, value.Ownership); err != nil {
+		if err := operations.CopyIn(state.process.PID(), value.Source, value.Destination, value.Ownership); err != nil {
 			return nil, err
 		}
 		return json.Marshal(map[string]string{"status": "copied"})
@@ -462,7 +462,7 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 		if err := json.Unmarshal(request.Payload, &value); err != nil {
 			return nil, err
 		}
-		if err := operations.CopyOut(value.Source, value.Destination); err != nil {
+		if err := operations.CopyOut(state.process.PID(), value.Source, value.Destination); err != nil {
 			return nil, err
 		}
 		return json.Marshal(map[string]string{"status": "copied"})

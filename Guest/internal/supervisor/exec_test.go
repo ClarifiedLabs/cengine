@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"testing"
 
+	"dev.cengine/guest/internal/protocol"
 	"golang.org/x/sys/unix"
 )
 
@@ -182,6 +183,52 @@ func TestExecStage2InheritsRootAndMountNamespaceDescriptors(t *testing.T) {
 	}
 	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root, mountNamespace}) {
 		t.Fatalf("unexpected exec stage 2 descriptors %#v", command.ExtraFiles)
+	}
+}
+
+func TestExecUsesWorkloadUserAndSupplementaryGroupResolution(t *testing.T) {
+	passwd := []byte("root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:app:/home/app:/bin/sh\n")
+	groups := []byte("app:x:1000:\nlogs:x:2000:app\nstaff:x:3000:\n")
+
+	uid, gid, additional, err := resolveUserFromData(
+		protocol.User{Username: "app:staff"}, passwd, groups,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != 1000 || gid != 3000 || !reflect.DeepEqual(additional, []int{2000}) {
+		t.Fatalf("resolved identity is %d:%d groups=%v", uid, gid, additional)
+	}
+
+	uid, gid, additional, err = resolveUserFromData(
+		protocol.User{UID: 1000, GID: 1000, Username: "1000:staff"}, passwd, groups,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != 1000 || gid != 3000 || len(additional) != 0 {
+		t.Fatalf("resolved numeric identity is %d:%d groups=%v", uid, gid, additional)
+	}
+}
+
+func TestExecAppliesNoNewPrivilegesWhenRequested(t *testing.T) {
+	var calls [][]uintptr
+	prctl := func(option int, arg2, arg3, arg4, arg5 uintptr) error {
+		calls = append(calls, []uintptr{uintptr(option), arg2, arg3, arg4, arg5})
+		return nil
+	}
+	if err := applyNoNewPrivileges(false, prctl); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("disabled no-new-privileges made calls: %v", calls)
+	}
+	if err := applyNoNewPrivileges(true, prctl); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]uintptr{{uintptr(unix.PR_SET_NO_NEW_PRIVS), 1, 0, 0, 0}}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("no-new-privileges calls are %v, want %v", calls, want)
 	}
 }
 

@@ -3,6 +3,24 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct GuestProtocolTests {
+    @Test func execPayloadUsesVersionFiveIdentityAndSecurityContext() throws {
+        #expect(GuestProtocol.version == 5)
+        let value = GuestProtocol.Exec(
+            id: "exec-1", arguments: ["id"], environment: ["A=1"],
+            workingDirectory: "/work",
+            user: .init(uid: 1_000, gid: 2_000, additionalGroups: [3_000]),
+            terminal: false, attachStdin: false, attachStdout: true, attachStderr: true,
+            noNewPrivileges: true
+        )
+
+        let data = try JSONEncoder().encode(value)
+        #expect(try JSONDecoder().decode(GuestProtocol.Exec.self, from: data) == value)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let user = try #require(object["user"] as? [String: Any])
+        #expect(user["uid"] as? Int == 1_000)
+        #expect(object["noNewPrivileges"] as? Bool == true)
+    }
+
     @Test func controlEnvelopeRoundTripsWithLengthPrefix() throws {
         let envelope = GuestProtocol.Envelope(id: "request-1", operation: "ping")
 

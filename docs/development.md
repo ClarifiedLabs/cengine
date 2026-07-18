@@ -60,15 +60,17 @@ and VM set. Fixture images are fetched once into a versioned immutable seed
 content store under `.build` and APFS-cloned into each root, avoiding external registry state without
 sharing mutable engine metadata. Pytest stops all VM shims owned by that root before removing it,
 including when a test fails; it does not reuse a daemon or repair resources
-left by a preceding test. The command builds the `test-compat` Xcode scheme,
-which embeds the compatibility helper Mach service name
-`dev.cengine.network-helper.test-compat` into both the daemon and
-`cengine-network-helper`. By default the runner signs that freshly built helper,
-bootstraps a temporary root-owned LaunchDaemon for the embedded service name,
-and removes the helper during cleanup. That local helper bootstrap may prompt
-for administrator authorization. Set `CENGINE_COMPAT_NETWORK_HELPER=installed`
-to force the `/Applications/cengine.app` helper instead, or set
-`CENGINE_NETWORK_HELPER_PATH` to test an explicit helper binary. The command uses the guest assets built under `.build/guest`; override
+left by a preceding test. The command builds the `test-compat` Xcode scheme and
+uses the installed, already-approved `dev.cengine.network-helper` service by
+default. Normal compatibility and guest-test runs therefore do not request
+administrator authorization. Install cengine, approve Networking once, and then
+disable the per-user engine in the app while leaving its networking helper enabled;
+this keeps installed engine state out of the isolated test lifecycle. Use
+`CENGINE_COMPAT_NETWORK_HELPER=local` only when changing the helper itself. That
+explicit mode signs and bootstraps a temporary root-owned LaunchDaemon and requests
+administrator authorization. `CENGINE_NETWORK_HELPER_PATH` likewise selects an
+explicit helper binary. See [Compatibility testing](compatibility-testing.md) for
+preflight checks. The command uses the guest assets built under `.build/guest`; override
 them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and
 `CENGINE_STORAGE_INITRAMFS`, or override the daemon and fixture image with
 `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`.
@@ -99,6 +101,14 @@ ordering. To compare normalized behavior with a real Docker Engine, run
 `make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/docker.sock`;
 the reference host is always explicit and is never inferred from the active
 Docker context.
+
+Runtime behavior changes must name their normative source in the compatibility
+ledger. Use Docker API v1.55 for wire behavior, OCI Runtime Spec v1.3.0 for
+applicable execution semantics, Linux documentation for the implementing
+syscalls, and reference Docker/Moby behavior only where those sources are silent.
+Add or update a focused `RTM-*` contract and the OCI applicability table when a
+runtime semantic changes; kind remains an integration contract, not the first
+place runtime behavior should be specified.
 
 The CLI target is ad-hoc signed for local development with
 `Configuration/cengine.entitlements`. The engine and its VM shims require

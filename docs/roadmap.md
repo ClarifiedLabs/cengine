@@ -17,6 +17,20 @@ phase.
 
 ## Recently completed
 
+### Runtime compatibility foundation
+
+Runtime compatibility now has a normative source hierarchy beneath the Docker
+API: OCI Runtime Spec v1.3.0 for applicable execution semantics, Linux
+documentation for implementation mechanisms, and Docker/Moby behavior where the
+specifications are silent. Focused `RTM-*` contracts cover init/exec namespace,
+root, identity, security-context and descriptor parity; read-only-root behavior;
+and pinned Docker-in-Docker exec and healthchecks without kind.
+
+Default exec and healthcheck context now resolves image and container cwd, user,
+groups, and environment consistently. The guest protocol carries structured
+identity and `no_new_privs` policy for exec. Compatibility tests normally use the
+installed, pre-approved networking helper without interactive authorization.
+
 ### Multi-platform and OCI image behavior
 
 The image store now preserves OCI graph roots and all locally available
@@ -33,7 +47,40 @@ attestations, and optional differential response-shape comparison.
 
 ## Compatibility priorities
 
-### 1. Complete modern network endpoint and IPAM semantics
+### 1. Establish and expand OCI/Linux runtime-semantic conformance
+
+Treat the OCI applicability table in
+[Docker compatibility](docker-compatibility.md#runtime-semantics-and-oci-applicability)
+as the first runtime backlog. Preserve the one-container-per-VM architecture and
+adopt only semantics that support cengine's Docker compatibility surface; do not
+claim an OCI runtime CLI merely because its execution rules are used as a
+reference.
+
+Work in this order:
+
+1. Find supported Docker inputs that are accepted but ignored or insufficiently
+   tested. Apply them, reject them explicitly, or classify them in the ledger.
+2. Close mount propagation, namespace, cgroup-v2, capability, device, rlimit,
+   seccomp/security-option, and masked-path gaps for functionality cengine
+   already exposes.
+3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
+   cengine contracts have stabilized the expected behavior.
+4. Implement otherwise unexposed OCI features only when cengine adopts them as
+   explicit compatibility requirements.
+
+Completion criteria:
+
+- Each runtime change names its Docker, OCI, Linux, or observed-Moby source.
+- A focused `RTM-*` contract fails strictly for every adopted black-box semantic.
+- The applicability table classifies new discoveries as covered, partial,
+  intentional gap, undecided, or architecturally not applicable.
+- Nested-runtime regressions are reproducible without kind before kind is used as
+  the integration gate.
+
+Generated API differentials, broad upstream test imports, and self-hosted VM CI
+remain later validation work rather than prerequisites for this priority.
+
+### 2. Complete modern network endpoint and IPAM semantics
 
 Close the remaining network behavior gaps that affect how clients create and
 inspect endpoints. The following sub-items are complete:
@@ -64,7 +111,7 @@ Completion criteria:
 - Endpoint sysctls, explicit IPv4 controls, and IPAM status are still
   outstanding.
 
-### 2. Close remaining client-visible API gaps
+### 3. Close remaining client-visible API gaps
 
 Use the API v1.46-v1.55 assessment table in
 [Docker compatibility](docker-compatibility.md#api-version-envelope) as the
@@ -84,7 +131,7 @@ Completion criteria for each accepted gap:
 - A deliberately unsupported behavior returns a clear error and is recorded as
   an intentional gap rather than being silently accepted.
 
-### 3. Harden compatibility under sustained use
+### 4. Harden compatibility under sustained use
 
 Current black-box gaps include higher-volume concurrent container lifecycle
 stress and broader differential-oracle sampling. Use these tests to find and fix

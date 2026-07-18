@@ -154,6 +154,9 @@ def main() -> None:
     helper_lifecycle = (REPO_ROOT / "Scripts" / "compat-network-helper.sh").read_text()
     assert 'compat_network_helper_installed_path="/Applications/cengine.app/Contents/MacOS/cengine-network-helper"' in helper_lifecycle
     assert 'CENGINE_COMPAT_NETWORK_HELPER:-auto' in helper_lifecycle
+    assert 'auto|installed)' in helper_lifecycle
+    assert 'if [ -x "$_cnh_local_helper" ]' not in helper_lifecycle
+    assert 'use CENGINE_COMPAT_NETWORK_HELPER=local only when testing helper changes' in helper_lifecycle
     assert 'compat_network_helper_test_compat_service_name="dev.cengine.network-helper.test-compat"' in helper_lifecycle
     assert 'cengine-network-helper\\n' in helper_lifecycle
     assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME' in helper_lifecycle
