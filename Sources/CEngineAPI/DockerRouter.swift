@@ -813,6 +813,16 @@ public struct DockerRouter: Sendable {
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
+    public func validateAttachedExecStart(_ identifier: String, body: Data) async throws {
+        let input = try decoder.decode(ExecStartRequest.self, from: body)
+        guard input.Detach != true else {
+            throw EngineError(.badRequest, "attached exec start requires Detach=false")
+        }
+        let exec = try await runtime.inspectExec(identifier)
+        if let tty = input.Tty, tty != exec.configuration.tty {
+            throw EngineError(.badRequest, "exec start Tty must match the exec configuration")
+        }
+    }
     public func startAttachedExec(_ identifier: String) async throws -> CInt? { try await runtime.startAttachedExec(identifier) }
     public func containerWait(_ identifier: String, condition: String?) async throws -> ContainerWaitSubscription {
         try await runtime.subscribeContainerWait(identifier, condition: condition)

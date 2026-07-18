@@ -36,6 +36,7 @@ type Supervisor struct {
 	waiters     []chan protocol.ProcessStatus
 	execs       map[string]*exec.Cmd
 	execTargets map[string]int
+	execCgroups map[string]string
 	execStatus  map[string]protocol.ProcessStatus
 }
 
@@ -44,6 +45,7 @@ func New() *Supervisor {
 		status:      protocol.ProcessStatus{Status: "empty"},
 		execs:       map[string]*exec.Cmd{},
 		execTargets: map[string]int{},
+		execCgroups: map[string]string{},
 		execStatus:  map[string]protocol.ProcessStatus{},
 	}
 }

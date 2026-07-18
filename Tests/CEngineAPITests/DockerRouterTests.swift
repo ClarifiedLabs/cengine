@@ -116,10 +116,12 @@ private actor NetworkRecordingBackend: ContainerBackend {
 private actor BlockingStartBackend: ContainerBackend {
     private var continuation: CheckedContinuation<Void, Never>?
     private var entered = false
+    private var starts = 0
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
     func start(_ container: ContainerRecord) async throws -> [PortBinding] {
         entered = true
+        starts += 1
         await withCheckedContinuation { continuation = $0 }
         return container.ports
     }
@@ -127,7 +129,42 @@ private actor BlockingStartBackend: ContainerBackend {
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
     func delete(_: ContainerRecord) async throws {}
     func hasEnteredStart() -> Bool { entered }
+    func startCount() -> Int { starts }
     func releaseStart() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingExecStartBackend: ContainerBackend {
+    enum Mode { case detached, attached }
+
+    private var mode: Mode?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var detachedStarts = 0
+    private var attachedStarts = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startExec(_: ExecRecord) async throws {
+        mode = .detached
+        detachedStarts += 1
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? {
+        mode = .attached
+        attachedStarts += 1
+        await withCheckedContinuation { continuation = $0 }
+        return nil
+    }
+    func execPID(_: ExecRecord) async -> Int32 { 42 }
+    func entered(_ expected: Mode) -> Bool { mode == expected }
+    func counts() -> (detached: Int, attached: Int) { (detachedStarts, attachedStarts) }
+    func release() { continuation?.resume(); continuation = nil }
 }
 
 private actor BlockingPrepareBackend: ContainerBackend {
@@ -204,6 +241,44 @@ private actor BlockingResourceUpdateBackend: ContainerBackend {
     }
     func hasEnteredUpdate() -> Bool { updateEntered }
     func releaseUpdate() { continuation?.resume(); continuation = nil }
+}
+
+private actor UpdateExitRaceBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var updateContinuation: CheckedContinuation<Void, Never>?
+    private var updateBlocked = false
+    private var starts = 0
+    private var prepares = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws { prepares += 1 }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws { deletes += 1 }
+    func completion(_: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuation = $0 }
+    }
+    func updateResources(_: ContainerRecord) async throws {
+        updateBlocked = true
+        await withCheckedContinuation { updateContinuation = $0 }
+        updateBlocked = false
+    }
+    func isWaitingForCompletion() -> Bool { completionContinuation != nil }
+    func isUpdateBlocked() -> Bool { updateBlocked }
+    func finish(code: Int32) {
+        completionContinuation?.resume(returning: code)
+        completionContinuation = nil
+    }
+    func releaseUpdate() {
+        updateContinuation?.resume()
+        updateContinuation = nil
+    }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
 }
 
 private actor ImageStoreBackend: ContainerBackend {
@@ -1923,6 +1998,110 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(value["ContainerID"] as? String == container.id)
     }
 
+    @Test func concurrentDetachedExecStartsLaunchOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingExecStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(ContainerRecord(name: "detached-exec-race", image: "debian"))
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"])
+        )
+
+        let first = Task { try await runtime.startExec(exec.id) }
+        while !(await backend.entered(.detached)) { await Task.yield() }
+        do {
+            try await runtime.startExec(exec.id)
+            Issue.record("a concurrent detached start launched the same exec twice")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        await backend.release()
+        try await first.value
+
+        let counts = await backend.counts()
+        #expect(counts.detached == 1)
+        #expect(counts.attached == 0)
+    }
+
+    @Test func concurrentAttachedExecStartsLaunchOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingExecStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(ContainerRecord(name: "attached-exec-race", image: "debian"))
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"])
+        )
+
+        let first = Task { try await runtime.startAttachedExec(exec.id) }
+        while !(await backend.entered(.attached)) { await Task.yield() }
+        do {
+            _ = try await runtime.startAttachedExec(exec.id)
+            Issue.record("a concurrent attached start launched the same exec twice")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        await backend.release()
+        #expect(try await first.value == nil)
+
+        let counts = await backend.counts()
+        #expect(counts.detached == 0)
+        #expect(counts.attached == 1)
+    }
+
+    @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let socket = root.appending(path: "engine.sock").path
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let container = try await runtime.createContainer(ContainerRecord(name: "upgrade-validation", image: "debian"))
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"], tty: false)
+        )
+        let server = DockerServer(socketPath: socket, router: router)
+        try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        func upgradedStart(body: String) throws -> String {
+            let process = Process()
+            let output = Pipe()
+            let errors = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            process.arguments = [
+                "--silent", "--show-error", "--include", "--max-time", "5",
+                "--unix-socket", socket,
+                "--request", "POST",
+                "--header", "Connection: Upgrade",
+                "--header", "Upgrade: tcp",
+                "--header", "Content-Type: application/json",
+                "--data-binary", body,
+                "http://localhost/v1.44/exec/\(exec.id)/start",
+            ]
+            process.standardOutput = output
+            process.standardError = errors
+            try process.run()
+            process.waitUntilExit()
+            return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                + String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        }
+
+        let detached = try upgradedStart(body: #"{"Detach":true,"Tty":false}"#)
+        #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
+        let mismatchedTTY = try upgradedStart(body: #"{"Detach":false,"Tty":true}"#)
+        #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
+        #expect(try await runtime.exec(exec.id).running == false)
+        #expect(try await runtime.exec(exec.id).exitCode == nil)
+    }
+
     @Test func concurrentRemovalWhileStartingReturnsConflictInsteadOfCrashing() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1957,6 +2136,28 @@ private actor AuthImageBackend: ContainerBackend {
         let listed = await runtime.listContainers(all: true)
         #expect(listed.map(\.id) == [record.id])
         #expect(listed.first?.phase == .running)
+    }
+
+    @Test func concurrentContainerStartsLaunchOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "concurrent-start", image: "debian"))
+        let first = Task { try await runtime.startContainer(record.id) }
+        while !(await backend.hasEnteredStart()) { await Task.yield() }
+
+        do {
+            try await runtime.startContainer(record.id)
+            Issue.record("a concurrent start launched the same container twice")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseStart()
+        try await first.value
+        #expect(await backend.startCount() == 1)
+        #expect(try await runtime.container(record.id).phase == .running)
     }
 
     @Test func concurrentCreatesReserveContainerNamesBeforeBackendPreparation() async throws {
@@ -2073,6 +2274,69 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(updated.id == target.id)
         #expect(updated.memoryBytes == 8_192)
         #expect(try await runtime.container(target.id).memoryBytes == 8_192)
+    }
+
+    @Test func exitDuringUpdateIsReconciledThroughRestartPolicy() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = UpdateExitRaceBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "update-exit-restart", image: "debian")
+        record.restartPolicy = .init(name: "always")
+        record = try await runtime.createContainer(record)
+        let containerID = record.id
+        try await runtime.startContainer(containerID)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+
+        let update = Task {
+            try await runtime.updateContainer(
+                containerID, memoryBytes: 8_192, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil
+            )
+        }
+        while !(await backend.isUpdateBlocked()) { await Task.yield() }
+        await backend.finish(code: 17)
+        while try await runtime.container(containerID).phase != .exited { await Task.yield() }
+        #expect(await backend.counts().starts == 1)
+
+        await backend.releaseUpdate()
+        _ = try await update.value
+        let restarted = try await runtime.container(containerID)
+        #expect(restarted.phase == .running)
+        #expect(restarted.restartCount == 1)
+        #expect(restarted.memoryBytes == 8_192)
+        #expect(await backend.counts().starts == 2)
+    }
+
+    @Test func autoRemoveExitDuringUpdateIsReconciledAfterUpdate() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = UpdateExitRaceBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "update-exit-remove", image: "debian")
+        record.autoRemove = true
+        record = try await runtime.createContainer(record)
+        let containerID = record.id
+        try await runtime.startContainer(containerID)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+
+        let update = Task {
+            try await runtime.updateContainer(
+                containerID, memoryBytes: 8_192, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil
+            )
+        }
+        while !(await backend.isUpdateBlocked()) { await Task.yield() }
+        await backend.finish(code: 0)
+        while try await runtime.container(containerID).phase != .exited { await Task.yield() }
+
+        await backend.releaseUpdate()
+        _ = try await update.value
+        do {
+            _ = try await runtime.container(containerID)
+            Issue.record("auto-remove container survived an exit during update")
+        } catch let error as EngineError {
+            #expect(error.code == .notFound)
+        }
+        #expect(await backend.counts().deletes == 1)
     }
 
     @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {

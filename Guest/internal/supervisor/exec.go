@@ -415,19 +415,25 @@ func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
 	return os.WriteFile("/run/cengine/io/exec-"+spec.ID+".json", data, 0600)
 }
 
-func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
+func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err error) {
 	s.mu.Lock()
 	if s.command == nil || s.command.Process == nil {
 		s.mu.Unlock()
 		return protocol.ProcessStatus{}, errors.New("workload is not running")
 	}
-	if _, exists := s.execs[id]; exists {
+	if err := s.reserveExecStartLocked(id); err != nil {
 		s.mu.Unlock()
-		return s.execStatus[id], errors.New("exec is running")
+		return s.execStatus[id], err
 	}
 	pid := s.command.Process.Pid
 	workloadID := s.spec.ID
 	s.mu.Unlock()
+	committed := false
+	defer func() {
+		if !committed {
+			s.rollbackExecStart(id)
+		}
+	}()
 	data, err := os.ReadFile("/run/cengine/io/exec-" + id + ".json")
 	if err != nil {
 		return protocol.ProcessStatus{}, err
@@ -472,7 +478,7 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		return protocol.ProcessStatus{}, err
 	}
 	stdinReader, stdinWriter := io.Pipe()
-	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID)
+	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID, id)
 	if err != nil {
 		reader.Close()
 		writer.Close()
@@ -486,6 +492,12 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		stdinWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
+	cgroupPath := cgroup.Name()
+	defer func() {
+		if !committed {
+			_ = os.Remove(cgroupPath)
+		}
+	}()
 	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
 	command.ExtraFiles = []*os.File{reader, gateReader, cgroup, targetPIDWriter}
 	command.Stdout = stdout
@@ -538,30 +550,38 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
 	}
-	status := protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
+	status = protocol.ProcessStatus{Status: "running", PID: targetPID}
 	s.mu.Lock()
 	s.execs[id] = command
 	s.execTargets[id] = targetPID
+	s.execCgroups[id] = cgroupPath
 	s.execStatus[id] = status
 	s.mu.Unlock()
+	committed = true
 	go s.reapExec(id, command)
 	go pumpInput("/run/cengine/io/exec-"+id+"-stdin", stdinWriter, command)
 	return status, nil
 }
 
-func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready func(protocol.ProcessStatus) error) (protocol.ProcessStatus, error) {
+func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready func(protocol.ProcessStatus) error) (status protocol.ProcessStatus, err error) {
 	s.mu.Lock()
 	if s.command == nil || s.command.Process == nil {
 		s.mu.Unlock()
 		return protocol.ProcessStatus{}, errors.New("workload is not running")
 	}
-	if _, exists := s.execs[id]; exists {
+	if err := s.reserveExecStartLocked(id); err != nil {
 		s.mu.Unlock()
-		return s.execStatus[id], errors.New("exec is running")
+		return s.execStatus[id], err
 	}
 	pid := s.command.Process.Pid
 	workloadID := s.spec.ID
 	s.mu.Unlock()
+	committed := false
+	defer func() {
+		if !committed {
+			s.rollbackExecStart(id)
+		}
+	}()
 
 	data, err := os.ReadFile("/run/cengine/io/exec-" + id + ".json")
 	if err != nil {
@@ -590,7 +610,7 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		return protocol.ProcessStatus{}, err
 	}
 	mux := &dockerStreamMux{writer: stream, terminal: spec.Terminal}
-	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID)
+	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID, id)
 	if err != nil {
 		reader.Close()
 		writer.Close()
@@ -600,6 +620,12 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		targetPIDWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
+	cgroupPath := cgroup.Name()
+	defer func() {
+		if !committed {
+			_ = os.Remove(cgroupPath)
+		}
+	}()
 	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
 	command.ExtraFiles = []*os.File{reader, gateReader, cgroup, targetPIDWriter}
 	var stdinFile *os.File
@@ -659,11 +685,13 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		return protocol.ProcessStatus{}, err
 	}
 	writer.Close()
-	status := protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
+	status = protocol.ProcessStatus{Status: "starting"}
 	s.mu.Lock()
 	s.execs[id] = command
+	s.execCgroups[id] = cgroupPath
 	s.execStatus[id] = status
 	s.mu.Unlock()
+	committed = true
 	go s.reapExec(id, command, cancelStdin)
 	if err := ready(status); err != nil {
 		gateWriter.Close()
@@ -687,9 +715,33 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	s.mu.Lock()
 	if s.execs[id] == command {
 		s.execTargets[id] = targetPID
+		status = protocol.ProcessStatus{Status: "running", PID: targetPID}
+		s.execStatus[id] = status
+	} else {
+		status = s.execStatus[id]
 	}
 	s.mu.Unlock()
 	return status, nil
+}
+
+func (s *Supervisor) reserveExecStartLocked(id string) error {
+	status, exists := s.execStatus[id]
+	if !exists {
+		return errors.New("exec is not prepared")
+	}
+	if status.Status != "created" {
+		return errors.New("exec has already started")
+	}
+	s.execStatus[id] = protocol.ProcessStatus{Status: "starting"}
+	return nil
+}
+
+func (s *Supervisor) rollbackExecStart(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.execStatus[id].Status == "starting" {
+		s.execStatus[id] = protocol.ProcessStatus{Status: "created"}
+	}
 }
 
 func attachedExecStdin(stream io.Reader) (*os.File, func(), error) {
@@ -760,10 +812,17 @@ func writeAll(writer io.Writer, data []byte) error {
 	return nil
 }
 
-func openExecCgroup(root, workloadID string) (*os.File, error) {
-	path := filepath.Join(root, "cengine", workloadID, ".cengine-exec")
-	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+func openExecCgroup(root, workloadID, execID string) (*os.File, error) {
+	if execID == "" || filepath.Base(execID) != execID || execID == "." || execID == ".." {
+		return nil, fmt.Errorf("invalid exec cgroup identifier %q", execID)
+	}
+	parent := filepath.Join(root, "cengine", workloadID, ".cengine-exec")
+	if err := os.Mkdir(parent, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("create exec cgroup: %w", err)
+	}
+	path := filepath.Join(parent, execID)
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("create per-exec cgroup: %w", err)
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -790,15 +849,25 @@ func (s *Supervisor) ExecStatus(id string) protocol.ProcessStatus {
 }
 func (s *Supervisor) SignalExec(id string, signal int) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	command := s.execs[id]
 	if command == nil || command.Process == nil {
+		s.mu.Unlock()
 		return errors.New("exec is not running")
 	}
 	if signal <= 0 || signal >= 65 {
+		s.mu.Unlock()
 		return syscall.EINVAL
 	}
-	target := execSignalTarget(command.Process.Pid, s.execTargets[id], unix.Signal(signal))
+	targetPID := s.execTargets[id]
+	cgroup := s.execCgroups[id]
+	s.mu.Unlock()
+	if unix.Signal(signal) == unix.SIGKILL && cgroup != "" {
+		if err := os.WriteFile(filepath.Join(cgroup, "cgroup.kill"), []byte("1"), 0o644); err != nil {
+			return fmt.Errorf("kill exec cgroup: %w", err)
+		}
+		return nil
+	}
+	target := execSignalTarget(command.Process.Pid, targetPID, unix.Signal(signal))
 	if target <= 0 {
 		return errors.New("exec target is not running")
 	}
@@ -838,8 +907,13 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 		code = 255
 	}
 	s.mu.Lock()
+	cgroup := s.execCgroups[id]
 	delete(s.execs, id)
 	delete(s.execTargets, id)
+	delete(s.execCgroups, id)
 	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
 	s.mu.Unlock()
+	if cgroup != "" {
+		_ = os.Remove(cgroup)
+	}
 }

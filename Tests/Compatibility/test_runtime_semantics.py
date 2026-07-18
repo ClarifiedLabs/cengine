@@ -274,15 +274,18 @@ def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
         mkdir -p /tmp/healthcheck-pids
         for marker in /tmp/healthcheck-pids/*; do
             [ -f "$marker" ] || continue
-            pid=$(cat "$marker")
-            state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || true)
-            if [ -n "$state" ] && [ "$state" != Z ]; then
-                touch /tmp/orphaned-healthcheck
-                exit 42
-            fi
+            for pid in $(cat "$marker"); do
+                state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || true)
+                if [ -n "$state" ] && [ "$state" != Z ]; then
+                    touch /tmp/orphaned-healthcheck
+                    exit 42
+                fi
+            done
         done
-        printf '%s' "$$" > "/tmp/healthcheck-pids/$$"
-        sleep 30
+        sleep 30 &
+        child=$!
+        printf '%s %s' "$$" "$child" > "/tmp/healthcheck-pids/$$"
+        wait "$child"
     """
     container = client.containers.run(
         ALPINE_IMAGE,
@@ -299,6 +302,27 @@ def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
         failed = container.exec_run(["sh", "-c", "exit 23"])
         assert failed.exit_code == 23
 
+        inspected_exec = client.api.exec_create(
+            container.id,
+            [
+                "sh",
+                "-c",
+                "awk '/^NSpid:/{print $2}' /proc/self/status > /tmp/exec-target-pid; sleep 30",
+            ],
+        )["Id"]
+        client.api.exec_start(inspected_exec, detach=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            observed = container.exec_run(["cat", "/tmp/exec-target-pid"])
+            if observed.exit_code == 0 and observed.output.strip():
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("exec target did not publish its outer-namespace PID")
+        inspect = client.api.exec_inspect(inspected_exec)
+        assert inspect["Running"] is True
+        assert inspect["Pid"] == int(observed.output.strip())
+
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             container.reload()
@@ -308,8 +332,11 @@ def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
         else:
             pytest.fail(f"healthcheck did not time out twice: {container.attrs['State']['Health']}")
 
+        surviving_exec = client.api.exec_inspect(inspected_exec)
+        assert surviving_exec["Running"] is True, "healthcheck cgroup kill reached a sibling exec"
+        assert surviving_exec["Pid"] == inspect["Pid"]
         orphan = container.exec_run(["test", "-e", "/tmp/orphaned-healthcheck"])
-        assert orphan.exit_code == 1, "a timed-out healthcheck target survived its exec stage"
+        assert orphan.exit_code == 1, "a timed-out healthcheck target or descendant survived its exec cgroup"
     finally:
         container.remove(force=True)
 

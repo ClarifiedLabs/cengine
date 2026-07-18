@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
@@ -76,6 +77,53 @@ func TestExecTargetPIDIsPublishedAcrossStageDescriptors(t *testing.T) {
 	}
 	if pid != 789 {
 		t.Fatalf("published target PID is %d, want 789", pid)
+	}
+}
+
+func TestExecStartReservationExcludesAttachedAndDetachedLaunches(t *testing.T) {
+	supervisor := New()
+	supervisor.execStatus["exec-id"] = protocol.ProcessStatus{Status: "created"}
+
+	supervisor.mu.Lock()
+	if err := supervisor.reserveExecStartLocked("exec-id"); err != nil {
+		supervisor.mu.Unlock()
+		t.Fatal(err)
+	}
+	if err := supervisor.reserveExecStartLocked("exec-id"); err == nil {
+		supervisor.mu.Unlock()
+		t.Fatal("attached start acquired a detached start reservation")
+	}
+	supervisor.mu.Unlock()
+
+	supervisor.rollbackExecStart("exec-id")
+	supervisor.mu.Lock()
+	err := supervisor.reserveExecStartLocked("exec-id")
+	supervisor.mu.Unlock()
+	if err != nil {
+		t.Fatalf("reservation did not roll back after launch failure: %v", err)
+	}
+}
+
+func TestSignalExecKillsItsDedicatedCgroupSubtree(t *testing.T) {
+	cgroup := t.TempDir()
+	killFile := filepath.Join(cgroup, "cgroup.kill")
+	if err := os.WriteFile(killFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	supervisor := New()
+	supervisor.execs["healthcheck"] = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	supervisor.execTargets["healthcheck"] = os.Getpid()
+	supervisor.execCgroups["healthcheck"] = cgroup
+
+	if err := supervisor.SignalExec("healthcheck", int(unix.SIGKILL)); err != nil {
+		t.Fatal(err)
+	}
+	value, err := os.ReadFile(killFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(value) != "1" {
+		t.Fatalf("cgroup.kill = %q, want 1", value)
 	}
 }
 

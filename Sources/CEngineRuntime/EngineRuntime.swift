@@ -46,6 +46,7 @@ public actor EngineRuntime {
     private var pendingContainerIDs = Set<String>()
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
+    private var startingExecIDs = Set<String>()
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -235,11 +236,13 @@ public actor EngineRuntime {
         }
         guard snapshot.containers[index].phase != .running else { return }
         let record = snapshot.containers[index]
+        guard startingContainerIDs.insert(record.id).inserted else {
+            throw EngineError(.conflict, "container \(identifier) is already starting")
+        }
+        defer { startingContainerIDs.remove(record.id) }
         if record.phase == .dead {
             try await backend.delete(record)
         }
-        startingContainerIDs.insert(record.id)
-        defer { startingContainerIDs.remove(record.id) }
         try await backend.prepare(record)
         let resolvedPorts = try await backend.start(record)
         guard let current = try? containerIndex(record.id) else {
@@ -294,29 +297,36 @@ public actor EngineRuntime {
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
         let intent = try beginLifecycleIntent(.update, for: old.id)
-        defer { endLifecycleIntent(intent, for: old.id) }
-        var updated = old
-        if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
-        if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
-        if let pidsLimit { updated.pidsLimit = pidsLimit }
-        if let restartPolicy { updated.restartPolicy = restartPolicy }
-        let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
-            || old.pidsLimit != updated.pidsLimit
-        if resourcesChanged { try await backend.updateResources(updated) }
-        guard let current = try? containerIndex(old.id) else {
-            throw EngineError(.conflict, "container \(identifier) was removed while it was being updated")
+        do {
+            var updated = old
+            if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
+            if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
+            if let pidsLimit { updated.pidsLimit = pidsLimit }
+            if let restartPolicy { updated.restartPolicy = restartPolicy }
+            let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
+                || old.pidsLimit != updated.pidsLimit
+            if resourcesChanged { try await backend.updateResources(updated) }
+            guard let current = try? containerIndex(old.id) else {
+                throw EngineError(.conflict, "container \(identifier) was removed while it was being updated")
+            }
+            var merged = snapshot.containers[current]
+            if let memoryBytes, memoryBytes > 0 { merged.memoryBytes = UInt64(memoryBytes) }
+            if let nanoCPUs, nanoCPUs > 0 {
+                merged.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000))
+            }
+            if let pidsLimit { merged.pidsLimit = pidsLimit }
+            if let restartPolicy { merged.restartPolicy = restartPolicy }
+            snapshot.containers[current] = merged
+            try await persist()
+            emit(containerEvent("update", merged))
+            endLifecycleIntent(intent, for: old.id)
+            await reconcileDeferredUpdateCompletion(old.id)
+            return merged
+        } catch {
+            endLifecycleIntent(intent, for: old.id)
+            await reconcileDeferredUpdateCompletion(old.id)
+            throw error
         }
-        var merged = snapshot.containers[current]
-        if let memoryBytes, memoryBytes > 0 { merged.memoryBytes = UInt64(memoryBytes) }
-        if let nanoCPUs, nanoCPUs > 0 {
-            merged.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000))
-        }
-        if let pidsLimit { merged.pidsLimit = pidsLimit }
-        if let restartPolicy { merged.restartPolicy = restartPolicy }
-        snapshot.containers[current] = merged
-        try await persist()
-        emit(containerEvent("update", merged))
-        return merged
     }
 
     public func killContainer(_ identifier: String, signal: String) async throws {
@@ -406,6 +416,10 @@ public actor EngineRuntime {
     public func startExec(_ identifier: String) async throws {
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
+        guard startingExecIDs.insert(identifier).inserted else {
+            throw EngineError(.conflict, "exec instance is already starting")
+        }
+        defer { startingExecIDs.remove(identifier) }
         try await backend.startExec(exec)
         exec.running = true
         exec.pid = await backend.execPID(exec)
@@ -418,6 +432,10 @@ public actor EngineRuntime {
         guard !exec.running, exec.exitCode == nil else {
             throw EngineError(.conflict, "exec instance has already run")
         }
+        guard startingExecIDs.insert(identifier).inserted else {
+            throw EngineError(.conflict, "exec instance is already starting")
+        }
+        defer { startingExecIDs.remove(identifier) }
         guard let descriptor = try await backend.startAttachedExec(exec) else { return nil }
         exec.running = true
         exec.pid = await backend.execPID(exec)
@@ -1122,11 +1140,29 @@ public actor EngineRuntime {
         snapshot.containers[index].exitCode = code
         snapshot.containers[index].finishedAt = Date()
         resumeExitWaiters(identifier, code: code)
-        let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
         let intent = lifecycleIntents[identifier]?.operation
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
+        await reconcileCompletedContainer(identifier, code: code, suppressing: intent)
+    }
+
+    private func reconcileDeferredUpdateCompletion(_ identifier: String) async {
+        guard lifecycleIntents[identifier] == nil,
+              let index = try? containerIndex(identifier),
+              snapshot.containers[index].phase == .exited,
+              let code = snapshot.containers[index].exitCode else { return }
+        await reconcileCompletedContainer(identifier, code: code, suppressing: nil)
+    }
+
+    private func reconcileCompletedContainer(
+        _ identifier: String,
+        code: Int32,
+        suppressing intent: LifecycleIntent.Operation?
+    ) async {
+        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .exited else { return }
+        let autoRemove = snapshot.containers[index].autoRemove
+        let record = snapshot.containers[index]
         if intent == nil, !autoRemove, Self.shouldRestart(record, exitCode: code) {
             do {
                 var restarted = record; restarted.restartCount += 1

@@ -156,7 +156,7 @@ func TestExecUsesDedicatedLeafBeneathTheWorkloadCgroup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workload, "cgroup.procs"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cgroup, err := openExecCgroup(root, "workload")
+	cgroup, err := openExecCgroup(root, "workload", "exec-id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,12 +172,12 @@ func TestExecUsesDedicatedLeafBeneathTheWorkloadCgroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pathInfo, err := os.Stat(filepath.Join(workload, ".cengine-exec"))
+	pathInfo, err := os.Stat(filepath.Join(workload, ".cengine-exec", "exec-id"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !os.SameFile(cgroupInfo, pathInfo) {
-		t.Fatal("exec cgroup descriptor does not reference the dedicated exec leaf")
+		t.Fatal("exec cgroup descriptor does not reference the per-exec leaf")
 	}
 }
 

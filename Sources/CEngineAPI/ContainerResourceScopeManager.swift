@@ -120,14 +120,7 @@ private final class ScopedDockerListener: @unchecked Sendable {
             .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
             .childChannelInitializer { [router, weak self] channel in
                 self?.track(channel)
-                let upgrader = DockerTCPUpgrader(router: router)
-                let upgrade: NIOHTTPServerUpgradeSendableConfiguration = (
-                    upgraders: [upgrader],
-                    completionHandler: { _ in }
-                )
-                return channel.pipeline.configureHTTPServerPipeline(withServerUpgrade: upgrade).flatMap {
-                    channel.pipeline.addHandler(DockerHTTPHandler(router: router), name: "docker-http")
-                }
+                return configureDockerHTTPPipeline(channel: channel, router: router)
             }
         channel = try await bootstrap.bind(unixDomainSocketPath: socketPath).get()
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
