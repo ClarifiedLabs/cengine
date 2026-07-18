@@ -28,8 +28,13 @@ public actor TrunkNetworkFabric {
 
     private var endpoints: [EndpointID: Endpoint] = [:]
     private var learned: [LearnedAddress: EndpointID] = [:]
+    private var dockerHostDNS = DockerHostDNSResponder()
 
     public init() {}
+
+    func configureDockerHostDNS(gateways: [UInt16: String]) {
+        dockerHostDNS.configure(gateways: gateways)
+    }
 
     public func register(
         _ id: EndpointID,
@@ -102,6 +107,14 @@ public actor TrunkNetworkFabric {
         guard endpoints[sourceID]?.registration == registration,
               let frame = VLANFrame(data), endpoints[sourceID]?.vlans.contains(frame.vlan) == true else { return }
         learned[.init(vlan: frame.vlan, address: frame.source)] = sourceID
+        if let response = dockerHostDNS.response(to: data), let file = endpoints[sourceID]?.file {
+            do { try file.write(contentsOf: response) }
+            catch {
+                if Self.isTransientPacketWriteError(error) { return }
+                unregisterDisconnected(sourceID, registration: registration)
+            }
+            return
+        }
         let recipients: [EndpointID]
         if !frame.destination.isBroadcast, !frame.destination.isMulticast,
            let destination = learned[.init(vlan: frame.vlan, address: frame.destination)], destination != sourceID {

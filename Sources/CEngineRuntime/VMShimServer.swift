@@ -302,6 +302,10 @@ import Foundation
 
     private func configureFabric(_ values: [VMShimClient.FabricNetwork]) async throws {
         let desired = Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) })
+        let dockerHostGateways = Dictionary(uniqueKeysWithValues: values.compactMap { network in
+            network.internalNetwork || network.isolated ? nil : (network.vlan, network.gateway)
+        })
+        await fabric.configureDockerHostDNS(gateways: dockerHostGateways)
         for id in Set(fabricNetworks.keys).union(desired.keys) where fabricNetworks[id] != desired[id] {
             await cancelUplinkRecovery(id: id)
             if let existing = uplinks.removeValue(forKey: id) {

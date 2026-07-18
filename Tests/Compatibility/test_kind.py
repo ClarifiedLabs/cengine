@@ -18,6 +18,29 @@ KIND_NODE_IMAGE = (
     "mirror.gcr.io/kindest/node@"
     "sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
 )
+DNS_A_QUERY = r"""
+use strict;
+use warnings;
+my ($server, $name) = @ARGV;
+my $id = 0x4345;
+my $encoded = join('', map { pack('C', length($_)) . $_ } split(/\./, $name)) . "\0";
+my $query = pack('n6', $id, 0x0100, 1, 0, 0, 0) . $encoded . pack('n2', 1, 1);
+socket(my $socket, AF_INET, SOCK_DGRAM, getprotobyname('udp')) or die "socket: $!";
+send($socket, $query, 0, sockaddr_in(53, inet_aton($server))) or die "send: $!";
+my $reply = '';
+eval {
+    local $SIG{ALRM} = sub { die "timeout\n" };
+    alarm 5;
+    defined recv($socket, $reply, 512, 0) or die "recv: $!";
+    alarm 0;
+};
+die $@ if $@;
+my ($reply_id, $flags, $questions, $answers) = unpack('n4', $reply);
+die sprintf("invalid DNS response: flags=%04x answers=%d\n", $flags, $answers)
+    unless $reply_id == $id && ($flags & 0x8000) && ($flags & 0x000f) == 0
+        && $questions == 1 && $answers > 0;
+print join('.', unpack('C4', substr($reply, -4))), "\n";
+"""
 
 
 def kind(
@@ -110,6 +133,41 @@ def wait_for_cluster_network_ready(
     )
 
 
+def verify_docker_host_resolution(
+    client: docker.DockerClient, name: str, network: str, timeout: int = 60,
+) -> str | None:
+    node = client.containers.get(f"{name}-control-plane")
+    service = node.exec_run([
+        "kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "-n", "kube-system",
+        "get", "service", "kube-dns", "-o=jsonpath={.spec.clusterIP}",
+    ])
+    if service.exit_code != 0:
+        return f"could not read cluster DNS service address: {service.output!r}"
+    server = service.output.decode(errors="replace").strip()
+    deadline = time.monotonic() + timeout
+    last_output = b"lookup has not run"
+    while time.monotonic() < deadline:
+        lookup = node.exec_run([
+            "perl", "-MSocket", "-e", DNS_A_QUERY, server, "host.docker.internal",
+        ])
+        if lookup.exit_code == 0:
+            node.reload()
+            expected = node.attrs["NetworkSettings"]["Networks"][network]["Gateway"]
+            resolved = lookup.output.decode(errors="replace").strip()
+            if resolved != expected:
+                return (
+                    f"host.docker.internal resolved to {resolved}, "
+                    f"expected network gateway {expected}"
+                )
+            return None
+        last_output = lookup.output
+        time.sleep(0.5)
+    return (
+        f"cluster DNS could not resolve host.docker.internal within {timeout}s: "
+        f"{last_output!r}"
+    )
+
+
 @pytest.mark.compat("KND-001")
 def test_kind_create_cluster(daemon, client: docker.DockerClient):
     name = f"cengine-{uuid.uuid4().hex[:8]}"
@@ -132,6 +190,8 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
             failure = wait_for_control_plane_ready(client, name)
             if failure is None:
                 failure = wait_for_cluster_network_ready(client, name)
+            if failure is None:
+                failure = verify_docker_host_resolution(client, name, network)
         if failure is not None:
             diagnostics = []
             for container in client.containers.list(all=True):

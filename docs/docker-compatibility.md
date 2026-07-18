@@ -261,7 +261,7 @@ builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
-| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster created through a scoped cengine resource wrapper receives the requested limits, reaches readiness, starts ordinary CoreDNS pods over CNI networking, reaches the Kubernetes service VIP, and is deleted through the isolated daemon. |
+| `KND-001` | `test_kind_create_cluster` | ✅ Pass | Support | A real kind control-plane cluster created through a scoped cengine resource wrapper receives the requested limits, reaches readiness, starts ordinary CoreDNS pods over CNI networking, reaches the Kubernetes service VIP, resolves `host.docker.internal` through cluster DNS to its cengine network gateway, and is deleted through the isolated daemon. |
 
 ## Optional Docker differential oracle
 
