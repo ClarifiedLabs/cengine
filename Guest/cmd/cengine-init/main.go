@@ -478,6 +478,17 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 			return nil, err
 		}
 		return json.Marshal(map[string]string{"status": "created"})
+	case "discard-exec":
+		var value struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(request.Payload, &value); err != nil {
+			return nil, err
+		}
+		if err := state.process.DiscardExec(value.ID); err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]string{"status": "discarded"})
 	case "start-exec":
 		var value struct {
 			ID string `json:"id"`

@@ -43,6 +43,7 @@ public protocol ContainerBackend: Sendable {
     func logs(for container: ContainerRecord, options: DockerLogOptions) async throws -> Data
     func kill(_ container: ContainerRecord, signal: String) async throws
     func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge
+    func discardExec(_ exec: ExecRecord) async
     func startExec(_ exec: ExecRecord) async throws
     func startAttachedExec(_ exec: ExecRecord) async throws -> CInt?
     func execCompletion(_ exec: ExecRecord) async -> Int32?
@@ -98,6 +99,7 @@ public extension ContainerBackend {
     func prepareExec(_: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
         throw EngineError(.unsupported, "exec is unavailable for this backend")
     }
+    func discardExec(_: ExecRecord) async {}
     func startExec(_: ExecRecord) async throws { throw EngineError(.unsupported, "exec is unavailable for this backend") }
     func startAttachedExec(_: ExecRecord) async throws -> CInt? { nil }
     func execCompletion(_: ExecRecord) async -> Int32? { nil }

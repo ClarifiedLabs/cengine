@@ -399,6 +399,10 @@ func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
 	if spec.ID == "" || len(spec.Arguments) == 0 {
 		return errors.New("exec requires id and arguments")
 	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.command == nil {
@@ -407,12 +411,28 @@ func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
 	if _, exists := s.execStatus[spec.ID]; exists {
 		return errors.New("exec already exists")
 	}
-	s.execStatus[spec.ID] = protocol.ProcessStatus{Status: "created"}
-	data, err := json.Marshal(spec)
-	if err != nil {
+	if err := os.WriteFile("/run/cengine/io/exec-"+spec.ID+".json", data, 0600); err != nil {
 		return err
 	}
-	return os.WriteFile("/run/cengine/io/exec-"+spec.ID+".json", data, 0600)
+	s.execStatus[spec.ID] = protocol.ProcessStatus{Status: "created"}
+	return nil
+}
+
+func (s *Supervisor) DiscardExec(id string) error {
+	if id == "" {
+		return errors.New("exec requires id")
+	}
+	s.mu.Lock()
+	if status, exists := s.execStatus[id]; exists && status.Status != "created" {
+		s.mu.Unlock()
+		return errors.New("exec has already started")
+	}
+	delete(s.execStatus, id)
+	s.mu.Unlock()
+	if err := os.Remove("/run/cengine/io/exec-" + id + ".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err error) {

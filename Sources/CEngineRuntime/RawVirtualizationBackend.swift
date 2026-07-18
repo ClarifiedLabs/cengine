@@ -453,6 +453,23 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return bridge
     }
 
+    public func discardExec(_ exec: ExecRecord) async {
+        if let shim = execShims[exec.id] {
+            struct Request: Encodable { let id: String }
+            struct Status: Decodable { let status: String }
+            let _: Status? = try? await shim.guest(
+                operation: "discard-exec", payload: Request(id: exec.id), response: Status.self
+            )
+        }
+        execMonitors.removeValue(forKey: exec.id)?.stop()
+        execBridges.removeValue(forKey: exec.id)?.finishOutput()
+        execShims.removeValue(forKey: exec.id)
+        let ioDirectory = root.appending(path: "containers/\(exec.containerID)/io")
+        for suffix in ["stdout", "stderr", "stdin", "stdin.closed", "docker.log", "docker.log.entries"] {
+            try? FileManager.default.removeItem(at: ioDirectory.appending(path: "exec-\(exec.id)-\(suffix)"))
+        }
+    }
+
     public func startExec(_ exec: ExecRecord) async throws {
         guard let shim = execShims[exec.id] else { throw EngineError(.notFound, "exec is unavailable") }
         struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let pid: Int? }

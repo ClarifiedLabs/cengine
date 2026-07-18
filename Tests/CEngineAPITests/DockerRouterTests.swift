@@ -307,6 +307,52 @@ private actor BlockingRestartExecGateBackend: ContainerBackend {
     }
 }
 
+private actor BlockingStaleExecPreparationBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var prepareContinuation: CheckedContinuation<Void, Never>?
+    private var completionCalls = 0
+    private var prepareBlocked = false
+    private var preparedExecID: String?
+    private var discardedExecIDs: Set<String> = []
+    private var starts = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? {
+        completionCalls += 1
+        guard completionCalls == 1 else { return nil }
+        return await withCheckedContinuation { completionContinuation = $0 }
+    }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        preparedExecID = exec.id
+        prepareBlocked = true
+        await withCheckedContinuation { prepareContinuation = $0 }
+        prepareBlocked = false
+        return ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func discardExec(_ exec: ExecRecord) async { discardedExecIDs.insert(exec.id) }
+    func isWaitingForCompletion() -> Bool { completionContinuation != nil }
+    func isPrepareBlocked() -> Bool { prepareBlocked }
+    func preparedID() -> String? { preparedExecID }
+    func wasDiscarded(_ identifier: String) -> Bool { discardedExecIDs.contains(identifier) }
+    func startCount() -> Int { starts }
+    func finishContainer(code: Int32) {
+        completionContinuation?.resume(returning: code)
+        completionContinuation = nil
+    }
+    func releasePrepare() {
+        prepareContinuation?.resume()
+        prepareContinuation = nil
+    }
+}
+
 private actor BlockingPrepareBackend: ContainerBackend {
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private var prepares = 0
@@ -2492,6 +2538,59 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(try await runtime.container(container.id).restartCount == 1)
         #expect(try await runtime.inspectExec(detached.id).exitCode == 137)
         #expect(try await runtime.inspectExec(attached.id).exitCode == 137)
+    }
+
+    @Test func staleExecPreparationCannotCrossParentExitAndExplicitRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStaleExecPreparationBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "stale-exec-generation", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+        let firstStartedAt = try #require(try await runtime.container(container.id).startedAt)
+
+        let create = Task {
+            try await runtime.createExec(
+                container: container.id, configuration: .init(arguments: ["true"])
+            )
+        }
+        while !(await backend.isPrepareBlocked()) { await Task.yield() }
+        let preparedID = try #require(await backend.preparedID())
+
+        await backend.finishContainer(code: 23)
+        for _ in 0..<100 {
+            if try await runtime.container(container.id).phase == .exited { break }
+            await Task.yield()
+        }
+        #expect(try await runtime.container(container.id).phase == .exited)
+        do {
+            try await runtime.restartContainer(container.id, timeoutSeconds: 0)
+            Issue.record("restart crossed an active exec preparation after parent exit")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        #expect(await backend.startCount() == 1)
+
+        await backend.releasePrepare()
+        do {
+            _ = try await create.value
+            Issue.record("stale exec preparation was published after its parent exited")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        #expect(await backend.wasDiscarded(preparedID))
+        await #expect(throws: EngineError.self) { try await runtime.exec(preparedID) }
+
+        try await runtime.restartContainer(container.id, timeoutSeconds: 0)
+        let restarted = try await runtime.container(container.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.startedAt != firstStartedAt)
+        #expect(restarted.exitCode == nil)
+        #expect(restarted.restartCount == 0)
+        #expect(await backend.startCount() == 2)
     }
 
     @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {

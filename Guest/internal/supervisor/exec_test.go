@@ -104,6 +104,25 @@ func TestExecStartReservationExcludesAttachedAndDetachedLaunches(t *testing.T) {
 	}
 }
 
+func TestDiscardExecRemovesOnlyUnstartedPreparation(t *testing.T) {
+	supervisor := New()
+	supervisor.execStatus["prepared"] = protocol.ProcessStatus{Status: "created"}
+	if err := supervisor.DiscardExec("prepared"); err != nil {
+		t.Fatal(err)
+	}
+	if status := supervisor.ExecStatus("prepared"); status.Status != "" {
+		t.Fatalf("discarded exec status is %#v, want empty", status)
+	}
+
+	supervisor.execStatus["running"] = protocol.ProcessStatus{Status: "running"}
+	if err := supervisor.DiscardExec("running"); err == nil {
+		t.Fatal("discarded an exec that had already started")
+	}
+	if status := supervisor.ExecStatus("running"); status.Status != "running" {
+		t.Fatalf("running exec status changed to %#v", status)
+	}
+}
+
 func TestAttachedExecLaunchFailureBecomesTerminalAfterUpgrade(t *testing.T) {
 	supervisor := New()
 	supervisor.execStatus["missing"] = protocol.ProcessStatus{Status: "starting"}

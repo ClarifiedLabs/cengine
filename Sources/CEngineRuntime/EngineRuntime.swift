@@ -406,12 +406,12 @@ public actor EngineRuntime {
     public func restartContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        guard activeExecOperations[record.id, default: 0] == 0 else {
+            throw EngineError(.conflict, "container \(identifier) has an exec operation in progress")
+        }
         guard record.phase == .running || record.phase == .paused else {
             try await startContainer(identifier)
             return
-        }
-        guard activeExecOperations[record.id, default: 0] == 0 else {
-            throw EngineError(.conflict, "container \(identifier) has an exec operation in progress")
         }
         let intent = try beginLifecycleIntent(.restart, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
@@ -441,9 +441,22 @@ public actor EngineRuntime {
         try beginExecOperation(for: container.id)
         defer { endExecOperation(for: container.id) }
         let exec = ExecRecord(containerID: container.id, configuration: configuration)
-        _ = try await backend.prepareExec(exec, container: container)
-        execs[exec.id] = exec
-        return exec
+        do {
+            _ = try await backend.prepareExec(exec, container: container)
+            guard let current = try? self.container(container.id),
+                  current.phase == .running,
+                  current.startedAt == container.startedAt else {
+                throw EngineError(
+                    .conflict,
+                    "container \(identifier) changed execution generation while the exec was being prepared"
+                )
+            }
+            execs[exec.id] = exec
+            return exec
+        } catch {
+            await backend.discardExec(exec)
+            throw error
+        }
     }
 
     public func exec(_ identifier: String) throws -> ExecRecord {
