@@ -147,7 +147,7 @@ func TestCgroupResourceUpdateRejectsExitedWorkload(t *testing.T) {
 	}
 }
 
-func TestExecUsesTheWorkloadCgroup(t *testing.T) {
+func TestExecUsesDedicatedLeafBeneathTheWorkloadCgroup(t *testing.T) {
 	root := t.TempDir()
 	workload := filepath.Join(root, "cengine", "workload")
 	if err := os.MkdirAll(workload, 0o755); err != nil {
@@ -156,7 +156,7 @@ func TestExecUsesTheWorkloadCgroup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workload, "cgroup.procs"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cgroup, err := openWorkloadCgroup(root, "workload")
+	cgroup, err := openExecCgroup(root, "workload")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,12 +172,12 @@ func TestExecUsesTheWorkloadCgroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pathInfo, err := os.Stat(workload)
+	pathInfo, err := os.Stat(filepath.Join(workload, ".cengine-exec"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !os.SameFile(cgroupInfo, pathInfo) {
-		t.Fatal("exec cgroup descriptor does not reference the workload cgroup")
+		t.Fatal("exec cgroup descriptor does not reference the dedicated exec leaf")
 	}
 }
 

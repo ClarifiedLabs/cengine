@@ -32,13 +32,15 @@ identity and `no_new_privs` policy for exec. Compatibility tests normally use th
 installed, pre-approved networking helper without interactive authorization.
 
 Docker PID limits now persist across recovery and drive cgroup-v2 `pids.max` on
-create and live update. Bind mounts apply all six Docker propagation modes, and
-unprivileged containers use Docker's default Linux capability set with
+create and live update. Bind mounts apply private isolation; shared/slave modes
+are rejected because virtiofs cannot form the required host/container peer or
+master mount. Unprivileged containers use Docker's default Linux capability set with
 `CapAdd`/`CapDrop` parity between init and exec. Filtered container pruning now
-fails closed on unknown inputs instead of widening deletion scope. Focused `RTM-004`–`RTM-007`
-contracts cover enforcement and recovery, recursive-shared mount propagation,
-capability masks, and prune selection. Security options, rlimits, configurable
-devices, masked paths, non-recursive bind variants, health start intervals, and
+fails closed on unknown inputs instead of widening deletion scope. Focused
+`RTM-004`–`RTM-008` contracts cover enforcement and recovery, explicit
+propagation gaps, capability masks, prune selection, and exec stage signal and
+status behavior. Security options, rlimits, configurable devices, container
+sysctls, masked paths, non-recursive bind variants, health start intervals, and
 custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
 
@@ -73,8 +75,9 @@ Work in this order:
    tested. Apply them, reject them explicitly, or classify them in the ledger.
 2. Close namespace, cgroup-v2 IO/device, device, rlimit,
    seccomp/security-option, masked-path, and remaining mount-matrix gaps for
-   functionality cengine already exposes. PID limits, bind propagation, and
-   capability add/drop are complete.
+   functionality cengine already exposes. PID limits, private bind isolation,
+   and capability add/drop are complete; shared/slave bind propagation is an
+   explicit architecture gap.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
    cengine contracts have stabilized the expected behavior.
 4. Implement otherwise unexposed OCI features only when cengine adopts them as

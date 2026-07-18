@@ -64,6 +64,7 @@ import Testing
         #expect(context.workingDirectory == "/image-work")
         #expect(context.user == .init(username: "image-user"))
         #expect(context.noNewPrivileges)
+        #expect(!context.privileged)
     }
 
     @Test func execContextExplicitValuesOverrideContainerAndImage() {
@@ -86,6 +87,23 @@ import Testing
         ])
         #expect(context.workingDirectory == "/exec-work")
         #expect(context.user == .init(uid: 2_000, gid: 3_000))
+        #expect(!context.noNewPrivileges)
+        #expect(context.privileged)
+    }
+
+    @Test func defaultExecInheritsContainerPrivilege() {
+        let context = RawVirtualizationBackend.resolveExecContext(
+            configuration: .init(arguments: ["id"]),
+            containerEnvironment: [],
+            containerWorkingDirectory: "",
+            containerUser: "",
+            containerPrivileged: true,
+            imageEnvironment: [],
+            imageWorkingDirectory: nil,
+            imageUser: nil
+        )
+
+        #expect(context.privileged)
         #expect(!context.noNewPrivileges)
     }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"syscall"
 	"testing"
 
 	"dev.cengine/guest/internal/protocol"
@@ -27,6 +28,54 @@ func TestExecStageExitCodeDistinguishesMissingExecutable(t *testing.T) {
 	err := exec.Command("sh", "-c", "exit 23").Run()
 	if code := ExecStageExitCode(err); code != 23 {
 		t.Fatalf("target process exit code is %d, want 23", code)
+	}
+	err = exec.Command("sh", "-c", "kill -TERM $$").Run()
+	if code := ExecStageExitCode(err); code != 128+int(syscall.SIGTERM) {
+		t.Fatalf("signaled target process exit code is %d, want 143", code)
+	}
+}
+
+func TestExecStageForwardsSignalsUntilItsChildExits(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	wait := make(chan error, 1)
+	forwarded := make(chan syscall.Signal, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- forwardExecSignalsUntilWait(signals, wait, func(value syscall.Signal) error {
+			forwarded <- value
+			return nil
+		})
+	}()
+	signals <- syscall.SIGTERM
+	if value := <-forwarded; value != syscall.SIGTERM {
+		t.Fatalf("forwarded signal is %d, want SIGTERM", value)
+	}
+	wait <- nil
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUncatchableExecSignalsTargetTheFinalStagedChild(t *testing.T) {
+	for _, signal := range []unix.Signal{unix.SIGKILL, unix.SIGSTOP} {
+		target := execSignalTarget(123, 789, signal)
+		if target != 789 {
+			t.Fatalf("signal %d target is %d, want final child 789", signal, target)
+		}
+	}
+	target := execSignalTarget(123, 789, unix.SIGTERM)
+	if target != 123 {
+		t.Fatalf("SIGTERM target is %d, want stage process 123", target)
+	}
+}
+
+func TestExecTargetPIDIsPublishedAcrossStageDescriptors(t *testing.T) {
+	pid, err := readExecTargetPID(bytes.NewBufferString("789\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 789 {
+		t.Fatalf("published target PID is %d, want 789", pid)
 	}
 }
 
@@ -186,15 +235,20 @@ func TestExecStage2InheritsRootAndMountNamespaceDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cgroup.Close()
+	targetPID, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetPID.Close()
 
-	command := execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup)
+	command := execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup, targetPID)
 	if command.Path != "/proc/self/exe" {
 		t.Fatalf("exec stage 2 path is %q", command.Path)
 	}
 	if !reflect.DeepEqual(command.Args, []string{"/proc/self/exe", execStage2Argument}) {
 		t.Fatalf("unexpected exec stage 2 arguments %#v", command.Args)
 	}
-	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root, mountNamespace, pidNamespace, cgroup}) {
+	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root, mountNamespace, pidNamespace, cgroup, targetPID}) {
 		t.Fatalf("unexpected exec stage 2 descriptors %#v", command.ExtraFiles)
 	}
 }

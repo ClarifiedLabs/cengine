@@ -69,6 +69,20 @@ func capabilityMask(add, drop []string, privileged bool) (uint64, error) {
 			mask |= uint64(1) << linuxCapabilityNumbers[name]
 		}
 	}
+	// Docker applies drops before additions, so an explicitly added capability
+	// wins when the same value appears in both lists.
+	for _, raw := range drop {
+		name := normalizeCapabilityName(raw)
+		if name == "ALL" {
+			mask = 0
+			continue
+		}
+		number, ok := linuxCapabilityNumbers[name]
+		if !ok {
+			return 0, fmt.Errorf("unknown Linux capability %q", raw)
+		}
+		mask &^= uint64(1) << number
+	}
 	for _, raw := range add {
 		name := normalizeCapabilityName(raw)
 		if name == "ALL" {
@@ -80,17 +94,6 @@ func capabilityMask(add, drop []string, privileged bool) (uint64, error) {
 			return 0, fmt.Errorf("unknown Linux capability %q", raw)
 		}
 		mask |= uint64(1) << number
-	}
-	for _, raw := range drop {
-		name := normalizeCapabilityName(raw)
-		if name == "ALL" {
-			continue
-		}
-		number, ok := linuxCapabilityNumbers[name]
-		if !ok {
-			return 0, fmt.Errorf("unknown Linux capability %q", raw)
-		}
-		mask &^= uint64(1) << number
 	}
 	return mask, nil
 }

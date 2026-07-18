@@ -171,6 +171,41 @@ private actor ConcurrentDeleteBackend: ContainerBackend {
     }
 }
 
+private actor BlockingPruneDeleteBackend: ContainerBackend {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var deleteEntered = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {
+        deleteEntered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func hasEnteredDelete() -> Bool { deleteEntered }
+    func releaseDelete() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingResourceUpdateBackend: ContainerBackend {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var updateEntered = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func updateResources(_: ContainerRecord) async throws {
+        updateEntered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func hasEnteredUpdate() -> Bool { updateEntered }
+    func releaseUpdate() { continuation?.resume(); continuation = nil }
+}
+
 private actor ImageStoreBackend: ContainerBackend {
     private var references = ["docker.io/library/existing:latest"]
     private var deleted: [String] = []
@@ -559,12 +594,12 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
     }
 
-    @Test func bindMountPropagationRoundTripsAndValidatesDockerShape() async throws {
+    @Test func privateBindPropagationRoundTripsAndUnrealizableModesAreRejected() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let response = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/create?name=propagated-bind",
-            body: Data(#"{"Image":"alpine","HostConfig":{"Binds":["/tmp:/legacy:rshared"],"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/typed","ReadOnly":true,"BindOptions":{"Propagation":"rslave"}}]}}"#.utf8)
+            body: Data(#"{"Image":"alpine","HostConfig":{"Binds":["/tmp:/legacy:rprivate"],"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/typed","ReadOnly":true,"BindOptions":{"Propagation":"private"}}]}}"#.utf8)
         ))
         #expect(response.status == .created)
         let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
@@ -572,12 +607,20 @@ private actor AuthImageBackend: ContainerBackend {
         let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
         let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
         let mounts = try #require(object["Mounts"] as? [[String: Any]])
-        #expect(mounts.first { $0["Destination"] as? String == "/legacy" }?["Propagation"] as? String == "rshared")
-        #expect(mounts.first { $0["Destination"] as? String == "/typed" }?["Propagation"] as? String == "rslave")
+        #expect(mounts.first { $0["Destination"] as? String == "/legacy" }?["Propagation"] as? String == "rprivate")
+        #expect(mounts.first { $0["Destination"] as? String == "/typed" }?["Propagation"] as? String == "private")
         let host = try #require(object["HostConfig"] as? [String: Any])
         let binds = try #require(host["Binds"] as? [String])
-        #expect(binds.contains("/tmp:/legacy:rshared"))
-        #expect(binds.contains("/tmp:/typed:ro,rslave"))
+        #expect(binds.contains("/tmp:/legacy"))
+        #expect(binds.contains("/tmp:/typed:ro,private"))
+
+        for (index, propagation) in ["shared", "rshared", "slave", "rslave"].enumerated() {
+            let unsupported = await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/create?name=unsupported-propagation-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":{\"Binds\":[\"/tmp:/data:\(propagation)\"]}}".utf8)
+            ))
+            #expect(unsupported.status == .notImplemented)
+        }
 
         let invalid = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/create?name=invalid-propagation",
@@ -619,6 +662,7 @@ private actor AuthImageBackend: ContainerBackend {
             #""Ulimits":[{"Name":"nofile","Soft":1024,"Hard":1024}]"#,
             #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
             #""DeviceCgroupRules":["c 1:3 rwm"]"#,
+            #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
             #""MaskedPaths":["/proc/kcore"]"#,
             #""ReadonlyPaths":["/proc/sys"]"#,
         ]
@@ -1981,6 +2025,56 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(await runtime.listContainers(all: true).isEmpty)
     }
 
+    @Test func pruneReservesEachContainerAgainstConcurrentStart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingPruneDeleteBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "prune-start-race", image: "debian"))
+        let prune = Task { try await runtime.pruneContainers(ids: [record.id]) }
+        while !(await backend.hasEnteredDelete()) { await Task.yield() }
+
+        do {
+            try await runtime.startContainer(record.id)
+            Issue.record("container started while prune held its removal reservation")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseDelete()
+        #expect(try await prune.value == [record.id])
+        #expect(await runtime.listContainers(all: true).isEmpty)
+    }
+
+    @Test func resourceUpdateReResolvesByIDAndConflictsWithConcurrentRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingResourceUpdateBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(ContainerRecord(name: "update-index-first", image: "debian"))
+        let target = try await runtime.createContainer(ContainerRecord(name: "update-index-target", image: "debian"))
+        let update = Task {
+            try await runtime.updateContainer(
+                target.id, memoryBytes: 8_192, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil
+            )
+        }
+        while !(await backend.hasEnteredUpdate()) { await Task.yield() }
+
+        try await runtime.removeContainer(first.id, force: false)
+        do {
+            try await runtime.removeContainer(target.id, force: false)
+            Issue.record("container removal overlapped an in-flight resource update")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseUpdate()
+        let updated = try await update.value
+        #expect(updated.id == target.id)
+        #expect(updated.memoryBytes == 8_192)
+        #expect(try await runtime.container(target.id).memoryBytes == 8_192)
+    }
+
     @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2088,15 +2182,15 @@ private actor AuthImageBackend: ContainerBackend {
         let router = DockerRouter(runtime: runtime, root: root)
 
         var selected = ContainerRecord(name: "selected", image: "debian")
-        selected.labels = ["prune": "yes"]
+        selected.labels = ["prune": "yes", "tier": "frontend"]
         selected.createdAt = Date(timeIntervalSince1970: 100)
         selected = try await runtime.createContainer(selected)
         var wrongLabel = ContainerRecord(name: "wrong-label", image: "debian")
-        wrongLabel.labels = ["prune": "no"]
+        wrongLabel.labels = ["prune": "no", "tier": "frontend"]
         wrongLabel.createdAt = Date(timeIntervalSince1970: 100)
         wrongLabel = try await runtime.createContainer(wrongLabel)
         var tooNew = ContainerRecord(name: "too-new", image: "debian")
-        tooNew.labels = ["prune": "yes"]
+        tooNew.labels = ["prune": "yes", "tier": "backend"]
         tooNew.createdAt = Date(timeIntervalSince1970: 200)
         tooNew = try await runtime.createContainer(tooNew)
 
@@ -2107,9 +2201,27 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(unsupported.status == .badRequest)
         #expect(await runtime.listContainers(all: true).count == 3)
 
+        let falseMap = #"{"label":{"missing=value":false}}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let falseValuedFilter = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/prune?filters=\(falseMap)"
+        ))
+        #expect(falseValuedFilter.status == .ok)
+        #expect(await runtime.listContainers(all: true).count == 3)
+
+        let multipleUntil = #"{"until":["150","250"]}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let ambiguousUntil = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/prune?filters=\(multipleUntil)"
+        ))
+        #expect(ambiguousUntil.status == .badRequest)
+        #expect(await runtime.listContainers(all: true).count == 3)
+
+        let conjunctive = #"{"label":["prune=yes","tier=frontend"],"until":["150"]}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
         let filtered = await router.route(.init(
             method: .POST,
-            uri: "/v1.44/containers/prune?filters=%7B%22label%22%3A+%5B%22prune%3Dyes%22%5D%2C+%22until%22%3A+%5B%22150%22%5D%7D"
+            uri: "/v1.44/containers/prune?filters=\(conjunctive)"
         ))
         #expect(filtered.status == .ok)
         let payload = try #require(JSONSerialization.jsonObject(with: filtered.body) as? [String: Any])

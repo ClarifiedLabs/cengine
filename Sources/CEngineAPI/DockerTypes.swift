@@ -179,6 +179,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Ulimits: [UlimitRequest]?
         public var Devices: [DeviceRequest]?
         public var DeviceCgroupRules: [String]?
+        public var Sysctls: [String: String]?
         public var MaskedPaths: [String]?
         public var ReadonlyPaths: [String]?
         public var ReadonlyRootfs: Bool?

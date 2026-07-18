@@ -74,6 +74,7 @@ def test_init_and_default_exec_share_runtime_context(
 ):
     group_file = tmp_path / "group"
     group_file.write_text("root:x:0:\nnobody:x:65534:\ncompat:x:2345:nobody\n")
+    privileged_container = None
     container = client.containers.create(
         ALPINE_IMAGE,
         ["sh", "-ec", SNAPSHOT_SCRIPT + "while :; do sleep 1; done"],
@@ -107,8 +108,22 @@ def test_init_and_default_exec_share_runtime_context(
         )
         assert privileged.exit_code == 0, privileged.output.decode(errors="replace")
         assert privileged.output.strip() == b"0"
+
+        privileged_container = client.containers.run(
+            ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True, privileged=True,
+        )
+        inherited = privileged_container.exec_run([
+            "sh", "-ec",
+            "awk '/^CapEff:/ { print $2 } /^NoNewPrivs:/ { print $2 }' /proc/self/status",
+        ])
+        assert inherited.exit_code == 0, inherited.output.decode(errors="replace")
+        capability_mask, no_new_privileges = inherited.output.splitlines()
+        assert int(capability_mask, 16) & (1 << 21), "default exec lost container CAP_SYS_ADMIN"
+        assert no_new_privileges == b"0"
     finally:
         container.remove(force=True)
+        if privileged_container is not None:
+            privileged_container.remove(force=True)
 
 
 @pytest.mark.compat("RTM-002")
@@ -183,29 +198,18 @@ def test_pids_limit_enforces_live_updates_and_survives_recovery(
 
 
 @pytest.mark.compat("RTM-005")
-def test_bind_mount_propagation_is_applied_and_inspected(
+def test_unrealizable_bind_mount_propagation_is_rejected(
     client: docker.DockerClient, tmp_path: pathlib.Path,
 ):
-    container = client.containers.run(
-        ALPINE_IMAGE,
-        ["tail", "-f", "/dev/null"],
-        detach=True,
-        mounts=[Mount(
-            target="/propagated", source=str(tmp_path), type="bind", propagation="rshared",
-        )],
-    )
-    try:
-        container.reload()
-        mount = next(value for value in container.attrs["Mounts"] if value["Destination"] == "/propagated")
-        assert mount["Propagation"] == "rshared"
-        result = container.exec_run([
-            "sh", "-ec",
-            "awk '$5 == \"/propagated\" { for (i=7; i<=NF && $i != \"-\"; i++) "
-            "if ($i ~ /^shared:/) found=1 } END { exit !found }' /proc/self/mountinfo",
-        ])
-        assert result.exit_code == 0, result.output.decode(errors="replace")
-    finally:
-        container.remove(force=True)
+    with pytest.raises(docker.errors.APIError) as error:
+        client.containers.create(
+            ALPINE_IMAGE,
+            ["tail", "-f", "/dev/null"],
+            mounts=[Mount(
+                target="/propagated", source=str(tmp_path), type="bind", propagation="rshared",
+            )],
+        )
+    assert error.value.status_code == 501
 
 
 @pytest.mark.compat("RTM-006")
@@ -218,7 +222,7 @@ def test_capability_add_drop_apply_to_init_and_exec(client: docker.DockerClient)
             "while :; do sleep 1; done",
         ],
         detach=True,
-        cap_drop=["ALL"],
+        cap_drop=["ALL", "CHOWN"],
         cap_add=["CHOWN", "NET_ADMIN"],
     )
     try:
@@ -232,7 +236,7 @@ def test_capability_add_drop_apply_to_init_and_exec(client: docker.DockerClient)
         assert init_mask == expected
         assert exec_mask == expected
         container.reload()
-        assert container.attrs["HostConfig"]["CapDrop"] == ["ALL"]
+        assert container.attrs["HostConfig"]["CapDrop"] == ["ALL", "CAP_CHOWN"]
         assert container.attrs["HostConfig"]["CapAdd"] == ["CAP_CHOWN", "CAP_NET_ADMIN"]
     finally:
         container.remove(force=True)
@@ -260,6 +264,54 @@ def test_container_prune_honors_filters_and_rejects_unknown_keys(client: docker.
                 container.remove(force=True)
             except docker.errors.NotFound:
                 pass
+
+
+@pytest.mark.compat("RTM-008")
+def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
+    client: docker.DockerClient,
+):
+    healthcheck = """
+        mkdir -p /tmp/healthcheck-pids
+        for marker in /tmp/healthcheck-pids/*; do
+            [ -f "$marker" ] || continue
+            pid=$(cat "$marker")
+            state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || true)
+            if [ -n "$state" ] && [ "$state" != Z ]; then
+                touch /tmp/orphaned-healthcheck
+                exit 42
+            fi
+        done
+        printf '%s' "$$" > "/tmp/healthcheck-pids/$$"
+        sleep 30
+    """
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        detach=True,
+        healthcheck={
+            "test": ["CMD-SHELL", healthcheck],
+            "interval": 1_000_000_000,
+            "timeout": 1_000_000_000,
+            "retries": 2,
+        },
+    )
+    try:
+        failed = container.exec_run(["sh", "-c", "exit 23"])
+        assert failed.exit_code == 23
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            container.reload()
+            if container.attrs["State"]["Health"]["FailingStreak"] >= 2:
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(f"healthcheck did not time out twice: {container.attrs['State']['Health']}")
+
+        orphan = container.exec_run(["test", "-e", "/tmp/orphaned-healthcheck"])
+        assert orphan.exit_code == 1, "a timed-out healthcheck target survived its exec stage"
+    finally:
+        container.remove(force=True)
 
 
 def archive_file(name: str, contents: bytes) -> bytes:

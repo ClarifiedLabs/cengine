@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,17 +29,23 @@ const stage2Argument = "cengine-workload-stage2"
 const workloadReadyFD = 5
 
 type Supervisor struct {
-	mu         sync.Mutex
-	spec       *protocol.WorkloadSpec
-	command    *exec.Cmd
-	status     protocol.ProcessStatus
-	waiters    []chan protocol.ProcessStatus
-	execs      map[string]*exec.Cmd
-	execStatus map[string]protocol.ProcessStatus
+	mu          sync.Mutex
+	spec        *protocol.WorkloadSpec
+	command     *exec.Cmd
+	status      protocol.ProcessStatus
+	waiters     []chan protocol.ProcessStatus
+	execs       map[string]*exec.Cmd
+	execTargets map[string]int
+	execStatus  map[string]protocol.ProcessStatus
 }
 
 func New() *Supervisor {
-	return &Supervisor{status: protocol.ProcessStatus{Status: "empty"}, execs: map[string]*exec.Cmd{}, execStatus: map[string]protocol.ProcessStatus{}}
+	return &Supervisor{
+		status:      protocol.ProcessStatus{Status: "empty"},
+		execs:       map[string]*exec.Cmd{},
+		execTargets: map[string]int{},
+		execStatus:  map[string]protocol.ProcessStatus{},
+	}
 }
 
 func IsStage2(arguments []string) bool {
@@ -46,6 +53,11 @@ func IsStage2(arguments []string) bool {
 }
 
 func RunStage2() error {
+	// Capability, credential, namespace, and no-new-privileges state is scoped
+	// to the calling Linux thread. Keep the goroutine pinned until unix.Exec
+	// replaces that thread with the workload.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	file := os.NewFile(3, "workload-spec")
 	if file == nil {
 		return errors.New("workload specification file descriptor is unavailable")
@@ -1233,16 +1245,8 @@ func mountPropagationFlags(propagation string) (uintptr, error) {
 		return unix.MS_PRIVATE | unix.MS_REC, nil
 	case "private":
 		return unix.MS_PRIVATE, nil
-	case "rshared":
-		return unix.MS_SHARED | unix.MS_REC, nil
-	case "shared":
-		return unix.MS_SHARED, nil
-	case "rslave":
-		return unix.MS_SLAVE | unix.MS_REC, nil
-	case "slave":
-		return unix.MS_SLAVE, nil
 	default:
-		return 0, fmt.Errorf("invalid mount propagation mode %q", propagation)
+		return 0, fmt.Errorf("unsupported mount propagation mode %q", propagation)
 	}
 }
 

@@ -12,6 +12,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let workingDirectory: String
         let user: GuestProtocol.User
         let noNewPrivileges: Bool
+        let privileged: Bool
     }
 
     public static let defaultRootDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
@@ -403,7 +404,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 workingDirectory: context.workingDirectory, user: context.user,
                 terminal: configuration.tty, attachStdin: configuration.attachStdin,
                 attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
-                noNewPrivileges: context.noNewPrivileges, privileged: configuration.privileged,
+                noNewPrivileges: context.noNewPrivileges, privileged: context.privileged,
                 capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
             ),
             response: Status.self
@@ -1099,7 +1100,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     ?? containerUser.nilIfEmpty
                     ?? imageUser?.nilIfEmpty
             ),
-            noNewPrivileges: !(containerPrivileged || configuration.privileged)
+            noNewPrivileges: !(containerPrivileged || configuration.privileged),
+            privileged: containerPrivileged || configuration.privileged
         )
     }
 

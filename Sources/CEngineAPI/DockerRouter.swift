@@ -641,9 +641,12 @@ public struct DockerRouter: Sendable {
             }
             return cutoff
         }
+        guard cutoffs.count <= 1 else {
+            throw EngineError(.badRequest, "multiple container prune until filters are not supported")
+        }
 
         return Set(containers.compactMap { container in
-            let positiveMatches = positiveLabels.isEmpty || positiveLabels.contains {
+            let positiveMatches = positiveLabels.allSatisfy {
                 pruneLabel($0, matches: container.labels)
             }
             // Docker combines negated label filters into one negative constraint. A container is
@@ -672,7 +675,9 @@ public struct DockerRouter: Sendable {
             if let values = raw as? [String] {
                 result[key] = values
             } else if let values = raw as? [String: Bool] {
-                result[key] = values.compactMap { $0.value ? $0.key : nil }
+                // Docker's legacy map-shaped filter encoding treats map keys as
+                // values; the boolean payload is not an enable/disable switch.
+                result[key] = Array(values.keys)
             } else {
                 throw EngineError(.badRequest, "invalid values for container prune filter: \(key)")
             }
@@ -895,6 +900,12 @@ public struct DockerRouter: Sendable {
         guard let propagation = MountRecord.Propagation(rawValue: value) else {
             throw EngineError(.badRequest, "invalid mount propagation mode: \(value)")
         }
+        guard propagation == .private || propagation == .rprivate else {
+            throw EngineError(
+                .unsupported,
+                "bind propagation mode \(value) is unavailable for virtiofs-backed host mounts"
+            )
+        }
         return propagation
     }
 
@@ -917,6 +928,7 @@ public struct DockerRouter: Sendable {
             (!(host?.Ulimits ?? []).isEmpty, "Ulimits"),
             (!(host?.Devices ?? []).isEmpty, "Devices"),
             (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
+            (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
             (!(host?.MaskedPaths ?? []).isEmpty, "MaskedPaths"),
             (!(host?.ReadonlyPaths ?? []).isEmpty, "ReadonlyPaths"),
         ]

@@ -16,10 +16,6 @@ func TestMountPropagationFlags(t *testing.T) {
 		"":         unix.MS_PRIVATE | unix.MS_REC,
 		"private":  unix.MS_PRIVATE,
 		"rprivate": unix.MS_PRIVATE | unix.MS_REC,
-		"shared":   unix.MS_SHARED,
-		"rshared":  unix.MS_SHARED | unix.MS_REC,
-		"slave":    unix.MS_SLAVE,
-		"rslave":   unix.MS_SLAVE | unix.MS_REC,
 	}
 	for propagation, expected := range tests {
 		t.Run(propagation, func(t *testing.T) {
@@ -32,8 +28,10 @@ func TestMountPropagationFlags(t *testing.T) {
 			}
 		})
 	}
-	if _, err := mountPropagationFlags("invalid"); err == nil {
-		t.Fatal("invalid propagation unexpectedly accepted")
+	for _, propagation := range []string{"shared", "rshared", "slave", "rslave", "invalid"} {
+		if _, err := mountPropagationFlags(propagation); err == nil {
+			t.Fatalf("unsupported propagation %q unexpectedly accepted", propagation)
+		}
 	}
 }
 
@@ -44,14 +42,14 @@ func TestBindMountAttributesApplyPropagationBeforeReadOnly(t *testing.T) {
 		return nil
 	}
 	err := applyBindMountAttributes("/root/data", protocol.Mount{
-		Propagation: "rshared",
+		Propagation: "rprivate",
 		ReadOnly:    true,
 	}, mount)
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
-		fmt.Sprintf("/root/data:%#x", uintptr(unix.MS_SHARED|unix.MS_REC)),
+		fmt.Sprintf("/root/data:%#x", uintptr(unix.MS_PRIVATE|unix.MS_REC)),
 		fmt.Sprintf("/root/data:%#x", uintptr(unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY)),
 	}
 	if !reflect.DeepEqual(calls, expected) {

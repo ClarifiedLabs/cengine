@@ -27,16 +27,24 @@ func TestCapabilityMaskAppliesDockerDefaultsAddsAndDrops(t *testing.T) {
 	}
 }
 
-func TestCapabilityMaskDropsCapabilitiesFromAll(t *testing.T) {
-	mask, err := capabilityMask([]string{"ALL"}, []string{"MKNOD"}, false)
+func TestCapabilityMaskDropAllClearsDockerDefaults(t *testing.T) {
+	mask, err := capabilityMask(nil, []string{"ALL"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mask&(uint64(1)<<unix.CAP_MKNOD) != 0 {
-		t.Fatal("CAP_MKNOD was not dropped from ALL")
+	if mask != 0 {
+		t.Fatalf("drop-all produced mask %#x, want zero", mask)
 	}
-	if mask&(uint64(1)<<unix.CAP_SYS_ADMIN) == 0 {
-		t.Fatal("CAP_SYS_ADMIN was not added by ALL")
+}
+
+func TestCapabilityMaskAppliesDropsBeforeOverlappingAdds(t *testing.T) {
+	mask, err := capabilityMask([]string{"CAP_CHOWN"}, []string{"ALL", "CHOWN"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := uint64(1) << unix.CAP_CHOWN
+	if mask != want {
+		t.Fatalf("drop-all followed by overlapping add produced mask %#x, want %#x", mask, want)
 	}
 }
 

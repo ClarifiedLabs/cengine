@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -24,9 +25,11 @@ import (
 const execStage1Argument = "cengine-exec-stage1"
 const execStage2Argument = "cengine-exec-stage2"
 const execStage1CgroupFD = 5
+const execStage1TargetPIDFD = 6
 const execStage2MountNamespaceFD = 5
 const execStage2PIDNamespaceFD = 6
 const execStage2CgroupFD = 7
+const execStage2TargetPIDFD = 8
 
 func IsExecStage1(arguments []string) bool {
 	return len(arguments) == 3 && arguments[1] == execStage1Argument
@@ -89,8 +92,13 @@ func RunExecStage1(pid int) error {
 	if spec == nil {
 		return errors.New("exec specification is unavailable")
 	}
-	command := execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup)
-	if err := command.Run(); err != nil {
+	targetPID := os.NewFile(execStage1TargetPIDFD, "exec-target-pid")
+	if targetPID == nil {
+		return errors.New("exec target PID descriptor is unavailable")
+	}
+	defer targetPID.Close()
+	command := execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup, targetPID)
+	if err := runExecCommand(command, nil); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			return exit
 		}
@@ -99,9 +107,9 @@ func RunExecStage1(pid int) error {
 	return nil
 }
 
-func execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup *os.File) *exec.Cmd {
+func execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup, targetPID *os.File) *exec.Cmd {
 	command := exec.Command("/proc/self/exe", execStage2Argument)
-	command.ExtraFiles = []*os.File{spec, root, mountNamespace, pidNamespace, cgroup}
+	command.ExtraFiles = []*os.File{spec, root, mountNamespace, pidNamespace, cgroup, targetPID}
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
@@ -143,6 +151,7 @@ func RunExecStage2() error {
 	// requested workload process after the final exec.
 	for _, descriptor := range []int{
 		3, 4, execStage2MountNamespaceFD, execStage2PIDNamespaceFD, execStage2CgroupFD,
+		execStage2TargetPIDFD,
 	} {
 		unix.CloseOnExec(descriptor)
 	}
@@ -167,6 +176,11 @@ func RunExecStage2() error {
 		return errors.New("exec cgroup is unavailable")
 	}
 	defer cgroup.Close()
+	targetPID := os.NewFile(execStage2TargetPIDFD, "exec-target-pid")
+	if targetPID == nil {
+		return errors.New("exec target PID descriptor is unavailable")
+	}
+	defer targetPID.Close()
 	file := os.NewFile(3, "exec-spec")
 	if file == nil {
 		return errors.New("exec specification is unavailable")
@@ -260,10 +274,76 @@ func RunExecStage2() error {
 		CgroupFD:    int(cgroup.Fd()),
 		Credential:  credential,
 	}
-	if err := command.Run(); err != nil {
+	if err := runExecCommand(command, func(pid int) error {
+		_, err := fmt.Fprintf(targetPID, "%d\n", pid)
+		return err
+	}); err != nil {
 		return err
 	}
 	return nil
+}
+
+// runExecCommand keeps each staging process alive as a transparent signal and
+// exit-status proxy for its child. SignalExec resolves the final staged child
+// directly for signals that cannot pass through these proxies.
+func runExecCommand(command *exec.Cmd, started func(int) error) error {
+	signals := make(chan os.Signal, 8)
+	signal.Notify(signals, forwardedExecSignals()...)
+	defer signal.Stop(signals)
+	if err := command.Start(); err != nil {
+		return err
+	}
+	if started != nil {
+		if err := started(command.Process.Pid); err != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			return fmt.Errorf("publish exec target PID: %w", err)
+		}
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
+	return forwardExecSignalsUntilWait(signals, wait, func(value syscall.Signal) error {
+		err := unix.Kill(command.Process.Pid, value)
+		if errors.Is(err, unix.ESRCH) {
+			return nil
+		}
+		return err
+	})
+}
+
+func forwardedExecSignals() []os.Signal {
+	result := make([]os.Signal, 0, 59)
+	for value := 1; value < 65; value++ {
+		// SIGKILL and SIGSTOP cannot be caught. SIGCHLD is consumed by Wait;
+		// signals 32 and 33 are reserved by the Linux threading runtime.
+		if value == int(unix.SIGKILL) || value == int(unix.SIGSTOP) ||
+			value == int(unix.SIGCHLD) || value == 32 || value == 33 {
+			continue
+		}
+		result = append(result, syscall.Signal(value))
+	}
+	return result
+}
+
+func forwardExecSignalsUntilWait(
+	signals <-chan os.Signal,
+	wait <-chan error,
+	forward func(syscall.Signal) error,
+) error {
+	for {
+		select {
+		case err := <-wait:
+			return err
+		case value := <-signals:
+			linuxSignal, ok := value.(syscall.Signal)
+			if !ok {
+				continue
+			}
+			if err := forward(linuxSignal); err != nil {
+				return fmt.Errorf("forward exec signal %d: %w", linuxSignal, err)
+			}
+		}
+	}
 }
 
 func enterExecMountNamespace(fd int, unshare func(int) error, setns func(int, int) error) error {
@@ -281,6 +361,9 @@ func enterExecMountNamespace(fd int, unshare func(int) error, setns func(int, in
 // executable from a command that ran and failed.
 func ExecStageExitCode(err error) int {
 	if exit, ok := err.(*exec.ExitError); ok {
+		if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return 128 + int(status.Signal())
+		}
 		return exit.ExitCode()
 	}
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
@@ -359,12 +442,22 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		writer.Close()
 		return protocol.ProcessStatus{}, err
 	}
+	targetPIDReader, targetPIDWriter, err := os.Pipe()
+	if err != nil {
+		reader.Close()
+		writer.Close()
+		gateReader.Close()
+		gateWriter.Close()
+		return protocol.ProcessStatus{}, err
+	}
 	stdout, err := os.OpenFile("/run/cengine/io/exec-"+id+"-stdout", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		reader.Close()
 		writer.Close()
 		gateReader.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
+		targetPIDWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
 	stderr, err := os.OpenFile("/run/cengine/io/exec-"+id+"-stderr", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -373,16 +466,20 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		writer.Close()
 		gateReader.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
+		targetPIDWriter.Close()
 		stdout.Close()
 		return protocol.ProcessStatus{}, err
 	}
 	stdinReader, stdinWriter := io.Pipe()
-	cgroup, err := openWorkloadCgroup("/sys/fs/cgroup", workloadID)
+	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID)
 	if err != nil {
 		reader.Close()
 		writer.Close()
 		gateReader.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
+		targetPIDWriter.Close()
 		stdout.Close()
 		stderr.Close()
 		stdinReader.Close()
@@ -390,7 +487,7 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		return protocol.ProcessStatus{}, err
 	}
 	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
-	command.ExtraFiles = []*os.File{reader, gateReader, cgroup}
+	command.ExtraFiles = []*os.File{reader, gateReader, cgroup, targetPIDWriter}
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.Stdin = stdinReader
@@ -400,6 +497,8 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		writer.Close()
 		gateReader.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
+		targetPIDWriter.Close()
 		stdout.Close()
 		stderr.Close()
 		stdinReader.Close()
@@ -409,26 +508,40 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 	cgroup.Close()
 	reader.Close()
 	gateReader.Close()
+	targetPIDWriter.Close()
 	stdout.Close()
 	stderr.Close()
 	if _, err := writer.Write(data); err != nil {
 		writer.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
 		stdinWriter.Close()
 		_ = command.Process.Kill()
+		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
 	}
 	writer.Close()
 	if _, err := gateWriter.Write([]byte{1}); err != nil {
 		gateWriter.Close()
+		targetPIDReader.Close()
 		stdinWriter.Close()
 		_ = command.Process.Kill()
+		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
 	}
 	gateWriter.Close()
+	targetPID, err := readExecTargetPID(targetPIDReader)
+	targetPIDReader.Close()
+	if err != nil {
+		stdinWriter.Close()
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return protocol.ProcessStatus{}, err
+	}
 	status := protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
 	s.mu.Lock()
 	s.execs[id] = command
+	s.execTargets[id] = targetPID
 	s.execStatus[id] = status
 	s.mu.Unlock()
 	go s.reapExec(id, command)
@@ -468,8 +581,7 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		writer.Close()
 		return protocol.ProcessStatus{}, err
 	}
-	mux := &dockerStreamMux{writer: stream, terminal: spec.Terminal}
-	cgroup, err := openWorkloadCgroup("/sys/fs/cgroup", workloadID)
+	targetPIDReader, targetPIDWriter, err := os.Pipe()
 	if err != nil {
 		reader.Close()
 		writer.Close()
@@ -477,8 +589,19 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		gateWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
+	mux := &dockerStreamMux{writer: stream, terminal: spec.Terminal}
+	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID)
+	if err != nil {
+		reader.Close()
+		writer.Close()
+		gateReader.Close()
+		gateWriter.Close()
+		targetPIDReader.Close()
+		targetPIDWriter.Close()
+		return protocol.ProcessStatus{}, err
+	}
 	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
-	command.ExtraFiles = []*os.File{reader, gateReader, cgroup}
+	command.ExtraFiles = []*os.File{reader, gateReader, cgroup, targetPIDWriter}
 	var stdinFile *os.File
 	var cancelStdin func()
 	if spec.AttachStdin {
@@ -489,6 +612,8 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 			writer.Close()
 			gateReader.Close()
 			gateWriter.Close()
+			targetPIDReader.Close()
+			targetPIDWriter.Close()
 			return protocol.ProcessStatus{}, err
 		}
 		command.Stdin = stdinFile
@@ -511,6 +636,8 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		writer.Close()
 		gateReader.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
+		targetPIDWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
 	cgroup.Close()
@@ -519,9 +646,11 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	}
 	reader.Close()
 	gateReader.Close()
+	targetPIDWriter.Close()
 	if _, err := writer.Write(data); err != nil {
 		writer.Close()
 		gateWriter.Close()
+		targetPIDReader.Close()
 		if cancelStdin != nil {
 			cancelStdin()
 		}
@@ -538,15 +667,28 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	go s.reapExec(id, command, cancelStdin)
 	if err := ready(status); err != nil {
 		gateWriter.Close()
+		targetPIDReader.Close()
 		_ = command.Process.Kill()
 		return protocol.ProcessStatus{}, err
 	}
 	if _, err := gateWriter.Write([]byte{1}); err != nil {
 		gateWriter.Close()
+		targetPIDReader.Close()
 		_ = command.Process.Kill()
 		return protocol.ProcessStatus{}, err
 	}
 	gateWriter.Close()
+	targetPID, err := readExecTargetPID(targetPIDReader)
+	targetPIDReader.Close()
+	if err != nil {
+		_ = command.Process.Kill()
+		return protocol.ProcessStatus{}, err
+	}
+	s.mu.Lock()
+	if s.execs[id] == command {
+		s.execTargets[id] = targetPID
+	}
+	s.mu.Unlock()
 	return status, nil
 }
 
@@ -618,13 +760,27 @@ func writeAll(writer io.Writer, data []byte) error {
 	return nil
 }
 
-func openWorkloadCgroup(root, workloadID string) (*os.File, error) {
-	path := filepath.Join(root, "cengine", workloadID)
+func openExecCgroup(root, workloadID string) (*os.File, error) {
+	path := filepath.Join(root, "cengine", workloadID, ".cengine-exec")
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("create exec cgroup: %w", err)
+	}
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open workload cgroup for exec: %w", err)
+		return nil, fmt.Errorf("open exec cgroup: %w", err)
 	}
 	return file, nil
+}
+
+func readExecTargetPID(reader io.Reader) (int, error) {
+	var pid int
+	if _, err := fmt.Fscan(io.LimitReader(reader, 32), &pid); err != nil {
+		return 0, fmt.Errorf("read exec target PID: %w", err)
+	}
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid exec target PID %d", pid)
+	}
+	return pid, nil
 }
 
 func (s *Supervisor) ExecStatus(id string) protocol.ProcessStatus {
@@ -642,7 +798,18 @@ func (s *Supervisor) SignalExec(id string, signal int) error {
 	if signal <= 0 || signal >= 65 {
 		return syscall.EINVAL
 	}
-	return unix.Kill(command.Process.Pid, unix.Signal(signal))
+	target := execSignalTarget(command.Process.Pid, s.execTargets[id], unix.Signal(signal))
+	if target <= 0 {
+		return errors.New("exec target is not running")
+	}
+	return unix.Kill(target, unix.Signal(signal))
+}
+
+func execSignalTarget(stagePID, targetPID int, signal unix.Signal) int {
+	if signal == unix.SIGKILL || signal == unix.SIGSTOP {
+		return targetPID
+	}
+	return stagePID
 }
 func (s *Supervisor) WaitExec(id string) protocol.ProcessStatus {
 	for {
@@ -672,6 +839,7 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	}
 	s.mu.Lock()
 	delete(s.execs, id)
+	delete(s.execTargets, id)
 	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
 	s.mu.Unlock()
 }

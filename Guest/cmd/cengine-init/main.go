@@ -36,7 +36,7 @@ func main() {
 		}
 		if err := supervisor.RunExecStage1(pid); err != nil {
 			if exit, ok := err.(*exec.ExitError); ok {
-				os.Exit(exit.ExitCode())
+				os.Exit(supervisor.ExecStageExitCode(exit))
 			}
 			log.Fatal(err)
 		}

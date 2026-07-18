@@ -24,7 +24,7 @@ public struct ContainerWaitSubscription: Sendable {
 
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
-        enum Operation: Equatable { case stop, restart, remove }
+        enum Operation: Equatable { case stop, restart, remove, update }
 
         let operation: Operation
         let token = UUID()
@@ -230,6 +230,9 @@ public actor EngineRuntime {
 
     public func startContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
+        guard lifecycleIntents[snapshot.containers[index].id] == nil else {
+            throw EngineError(.conflict, "container \(identifier) has a lifecycle operation in progress")
+        }
         guard snapshot.containers[index].phase != .running else { return }
         let record = snapshot.containers[index]
         if record.phase == .dead {
@@ -290,6 +293,8 @@ public actor EngineRuntime {
                                 pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
+        let intent = try beginLifecycleIntent(.update, for: old.id)
+        defer { endLifecycleIntent(intent, for: old.id) }
         var updated = old
         if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
         if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
@@ -298,10 +303,20 @@ public actor EngineRuntime {
         let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
             || old.pidsLimit != updated.pidsLimit
         if resourcesChanged { try await backend.updateResources(updated) }
-        snapshot.containers[index] = updated
+        guard let current = try? containerIndex(old.id) else {
+            throw EngineError(.conflict, "container \(identifier) was removed while it was being updated")
+        }
+        var merged = snapshot.containers[current]
+        if let memoryBytes, memoryBytes > 0 { merged.memoryBytes = UInt64(memoryBytes) }
+        if let nanoCPUs, nanoCPUs > 0 {
+            merged.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000))
+        }
+        if let pidsLimit { merged.pidsLimit = pidsLimit }
+        if let restartPolicy { merged.restartPolicy = restartPolicy }
+        snapshot.containers[current] = merged
         try await persist()
-        emit(containerEvent("update", updated))
-        return updated
+        emit(containerEvent("update", merged))
+        return merged
     }
 
     public func killContainer(_ identifier: String, signal: String) async throws {
@@ -736,14 +751,22 @@ public actor EngineRuntime {
     }
 
     public func pruneContainers(ids: Set<String>? = nil) async throws -> [String] {
-        let removed = snapshot.containers.filter {
-            $0.phase != .running && $0.phase != .paused && (ids?.contains($0.id) ?? true)
+        let candidates = snapshot.containers.filter {
+            $0.phase != .running && $0.phase != .paused
+                && !startingContainerIDs.contains($0.id)
+                && (ids?.contains($0.id) ?? true)
         }
-        for record in removed { try await backend.delete(record); try await backend.deleteLogs(for: record) }
-        let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
-        try await persist()
-        removed.forEach { emit(containerEvent("destroy", $0)) }
-        return removed.map(\.id)
+        var removed: [String] = []
+        for candidate in candidates {
+            guard let current = try? containerIndex(candidate.id),
+                  snapshot.containers[current].phase != .running,
+                  snapshot.containers[current].phase != .paused,
+                  !startingContainerIDs.contains(candidate.id),
+                  lifecycleIntents[candidate.id] == nil else { continue }
+            try await removeContainer(candidate.id, force: false)
+            removed.append(candidate.id)
+        }
+        return removed
     }
 
     public func pruneImages() async throws -> [ImageRecord] {
