@@ -970,8 +970,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     networkID: endpoint.networkID,
                     priority: endpoint.gatewayPriority ?? 0,
                     networkName: network.name,
-                    providesIPv4: endpoint.ipv4Address != nil && !network.gateway.isEmpty,
-                    providesIPv6: endpoint.ipv6Address != nil && !network.ipv6Gateway.isEmpty
+                    providesIPv4: endpoint.ipv4Address?.isEmpty == false && !network.gateway.isEmpty,
+                    providesIPv6: endpoint.ipv6Address?.isEmpty == false && !network.ipv6Gateway.isEmpty
                 )
             }
         )
@@ -1004,11 +1004,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let networkIDs = Set(container.networks.map(\.networkID))
         for peer in knownContainers.values {
             for endpoint in peer.networks where networkIDs.contains(endpoint.networkID) {
-                guard let address = endpoint.ipv4Address ?? endpoint.ipv6Address, !address.isEmpty else { continue }
+                guard let address = Self.peerHostAddress(endpoint) else { continue }
                 for name in Set(endpoint.aliases + [peer.name, peer.hostname]).filter({ !$0.isEmpty }) { result[name] = address }
             }
         }
         return result
+    }
+
+    static func peerHostAddress(_ endpoint: NetworkEndpointRecord) -> String? {
+        if let address = endpoint.ipv4Address, !address.isEmpty { return address }
+        if let address = endpoint.ipv6Address, !address.isEmpty { return address }
+        return nil
     }
 
     static func automaticIPv4Network(vlan: UInt16) -> (subnet: String, gateway: String) {

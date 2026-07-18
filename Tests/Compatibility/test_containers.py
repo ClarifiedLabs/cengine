@@ -829,6 +829,12 @@ def test_explicit_network_address_families_apply_and_survive_recovery(
         recovered_network = recovered.networks.get(name)
         assert recovered_network.attrs["EnableIPv4"] is False
         assert recovered_network.attrs["EnableIPv6"] is True
+        peer = recovered.containers.create(
+            IMAGE, command="top", name=f"v6-peer-{suffix}", network=name
+        )
+        peer.start()
+        code, hosts = peer.exec_run(["getent", "hosts", container.name])
+        assert code == 0 and b"fd00:18::" in hosts
     finally:
         recovered.close()
 
@@ -896,13 +902,13 @@ def test_network_ipam_status_tracks_allocations_and_api_version(client: docker.D
     name = f"compat-ipam-status-{suffix}"
     response = client.api._post_json(
         client.api._url("/networks/create"),
-        data={"Name": name, "IPAM": {"Config": [{"Subnet": "10.20.30.0/29", "Gateway": "10.20.30.1"}]}},
+        data={"Name": name, "IPAM": {"Config": [{"Subnet": "10.20.30.2/29", "Gateway": "10.20.30.1"}]}},
     )
     client.api._raise_for_status(response)
     container = client.containers.create(IMAGE, command="top", network=name)
     network = client.networks.get(name)
     network.reload()
-    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.0/29"]
+    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.2/29"]
     assert status == {"IPsInUse": 4, "DynamicIPsAvailable": 4}
 
     legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.51")

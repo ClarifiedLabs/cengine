@@ -1,5 +1,6 @@
 import CEngineCore
 import CEngineRuntime
+import Darwin
 import Foundation
 
 public struct DockerErrorBody: Codable, Sendable { public let message: String }
@@ -497,7 +498,30 @@ public struct DockerNetworkResponse: Encodable, Sendable {
     }
 
     private static func networkAddress(_ subnet: String) -> String {
-        String(subnet.split(separator: "/", maxSplits: 1).first ?? "")
+        let parts = subnet.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let prefix = Int(parts[1]) else { return "" }
+        let family = parts[0].contains(":") ? AF_INET6 : AF_INET
+        let byteCount = family == AF_INET6 ? 16 : 4
+        guard (0...(byteCount * 8)).contains(prefix) else { return "" }
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        guard parts[0].withCString({ source in
+            bytes.withUnsafeMutableBytes { inet_pton(family, source, $0.baseAddress) }
+        }) == 1 else { return "" }
+        for index in bytes.indices {
+            let remaining = prefix - index * 8
+            if remaining >= 8 { continue }
+            bytes[index] &= remaining <= 0 ? 0 : UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
+        }
+        var destination = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        return bytes.withUnsafeMutableBytes { source in
+            guard inet_ntop(family, source.baseAddress, &destination, socklen_t(destination.count)) != nil else {
+                return ""
+            }
+            return String(
+                decoding: destination.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+                as: UTF8.self
+            )
+        }
     }
 
     private static func ipv4ReservedAddresses(subnet: String, gateway: String) -> [String] {

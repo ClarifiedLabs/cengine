@@ -952,7 +952,7 @@ private actor AuthImageBackend: ContainerBackend {
         defer { try? FileManager.default.removeItem(at: root) }
         let create = await router.route(.init(
             method: .POST, uri: "/v1.55/networks/create",
-            body: Data(#"{"Name":"status-net","IPAM":{"Config":[{"Subnet":"10.55.0.0/29","Gateway":"10.55.0.1"}]}}"#.utf8)
+            body: Data(#"{"Name":"status-net","IPAM":{"Config":[{"Subnet":"10.55.0.2/29","Gateway":"10.55.0.1"}]}}"#.utf8)
         ))
         #expect(create.status == .created)
         _ = await router.route(.init(
@@ -963,7 +963,7 @@ private actor AuthImageBackend: ContainerBackend {
         let modern = await router.route(.init(method: .GET, uri: "/v1.52/networks/status-net"))
         let modernObject = try #require(JSONSerialization.jsonObject(with: modern.body) as? [String: Any])
         let subnet = try #require(
-            (((modernObject["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.0.0/29"] as? [String: Any]
+            (((modernObject["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.0.2/29"] as? [String: Any]
         )
         #expect(subnet["IPsInUse"] as? Int == 4)
         #expect(subnet["DynamicIPsAvailable"] as? Int == 4)

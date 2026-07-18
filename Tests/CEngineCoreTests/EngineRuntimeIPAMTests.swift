@@ -36,6 +36,57 @@ import Testing
         }
     }
 
+    private actor PersistenceGate {
+        private var didPause = false
+        private var arrivalWaiter: CheckedContinuation<Void, Never>?
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func pauseOnce() async {
+            guard !didPause else { return }
+            didPause = true
+            arrivalWaiter?.resume()
+            arrivalWaiter = nil
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+
+        func waitUntilPaused() async {
+            guard !didPause else { return }
+            await withCheckedContinuation { arrivalWaiter = $0 }
+        }
+
+        func release() {
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
+    private actor EndpointAddressBackendState {
+        private var recoveredContainer: ContainerRecord?
+
+        func recordRecovery(_ container: ContainerRecord) { recoveredContainer = container }
+        func recovered() -> ContainerRecord? { recoveredContainer }
+    }
+
+    private struct EmptyIPv4EndpointBackend: ContainerBackend {
+        let state: EndpointAddressBackendState
+
+        func pullImage(_: String, platform _: String) async throws {}
+        func prepare(_: ContainerRecord) async throws {}
+        func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+        func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+        func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+        func delete(_: ContainerRecord) async throws {}
+        func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress] {
+            Dictionary(uniqueKeysWithValues: container.networks.map {
+                ($0.networkID, .init(ipv4Address: "", ipv6Address: $0.ipv6Address ?? ""))
+            })
+        }
+        func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery {
+            await state.recordRecovery(container)
+            return .running
+        }
+    }
+
     @Test func defaultNetworkAllocatesUniquePersistentDualStackAddressesBeforeBackendPreparation() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -194,6 +245,93 @@ import Testing
 
         // A failed create must release its pending endpoint reservation.
         _ = try await runtime.createContainer(record("retried-reservation"))
+    }
+
+    @Test func pendingContainerEndpointPreventsNetworkRemovalDuringCreate() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = PersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforeEndpointAllocationPersistence: { await gate.pauseOnce() }
+        )
+        let network = try await runtime.createNetwork(name: "pending-delete")
+        var record = ContainerRecord(name: "pending-delete-client", image: "example")
+        record.networks = [.init(networkID: network.id)]
+
+        let creation = Task { try await runtime.createContainer(record) }
+        await gate.waitUntilPaused()
+        do {
+            try await runtime.removeNetwork(network.id)
+            Issue.record("network removal ignored a pending container endpoint")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        await gate.release()
+
+        let created = try await creation.value
+        #expect(created.networks.first?.networkID == network.id)
+        #expect(try await runtime.network(network.id).id == network.id)
+    }
+
+    @Test func pendingContainerEndpointPreventsNetworkPruneDuringCreate() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = PersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforeEndpointAllocationPersistence: { await gate.pauseOnce() }
+        )
+        let network = try await runtime.createNetwork(name: "pending-prune")
+        var record = ContainerRecord(name: "pending-prune-client", image: "example")
+        record.networks = [.init(networkID: network.id)]
+
+        let creation = Task { try await runtime.createContainer(record) }
+        await gate.waitUntilPaused()
+        let removed = try await runtime.pruneNetworks(identifiers: [network.id])
+        #expect(removed.isEmpty)
+        await gate.release()
+
+        let created = try await creation.value
+        #expect(created.networks.first?.networkID == network.id)
+        #expect(try await runtime.network(network.id).id == network.id)
+    }
+
+    @Test func emptyBackendIPv4AddressStaysNilAcrossStartAndRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = EndpointAddressBackendState()
+        let backend = EmptyIPv4EndpointBackend(state: state)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let network = try await runtime.createNetwork(
+            name: "empty-backend-v4", ipv6Subnet: "fd00:80::/120", enableIPv4: false, enableIPv6: true
+        )
+        var record = ContainerRecord(name: "v6-client", image: "example")
+        record.networks = [.init(networkID: network.id)]
+        let created = try await runtime.createContainer(record)
+        try await runtime.startContainer(created.id)
+
+        let started = try await runtime.container(created.id)
+        #expect(started.networks.first?.ipv4Address == nil)
+        #expect(started.networks.first?.ipv6Address?.hasPrefix("fd00:80::") == true)
+
+        let restarted = try await EngineRuntime(root: root, backend: backend)
+        let recovered = try await restarted.container(created.id)
+        #expect(recovered.networks.first?.ipv4Address == nil)
+        #expect(recovered.networks.first?.ipv6Address?.hasPrefix("fd00:80::") == true)
+        let backendRecovery = await state.recovered()
+        #expect(backendRecovery?.networks.first?.ipv4Address == nil)
+        #expect(backendRecovery?.networks.first?.ipv6Address?.hasPrefix("fd00:80::") == true)
+    }
+
+    @Test func peerHostAddressFallsBackFromEmptyIPv4ToIPv6() {
+        let endpoint = NetworkEndpointRecord(
+            networkID: "v6-network", ipv4Address: "", ipv6Address: "fd00:80::2"
+        )
+
+        #expect(RawVirtualizationBackend.peerHostAddress(endpoint) == "fd00:80::2")
     }
 
     @Test func explicitGatewayPriorityIsStoredAndSurvivesRecovery() async throws {

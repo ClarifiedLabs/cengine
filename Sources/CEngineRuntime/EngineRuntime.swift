@@ -131,8 +131,8 @@ public actor EngineRuntime {
                 let addresses = await backend.endpointAddresses(for: restarted)
                 for endpoint in restarted.networks.indices {
                     guard let address = addresses[restarted.networks[endpoint].networkID] else { continue }
-                    restarted.networks[endpoint].ipv4Address = address.ipv4Address
-                    restarted.networks[endpoint].ipv6Address = address.ipv6Address
+                    restarted.networks[endpoint].ipv4Address = Self.nonEmptyBackendAddress(address.ipv4Address)
+                    restarted.networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
                 }
                 let startedAt = Date(); restarted.startedAt = startedAt
                 snapshot.containers[index] = restarted
@@ -263,8 +263,8 @@ public actor EngineRuntime {
         let addresses = await backend.endpointAddresses(for: record)
         for endpoint in snapshot.containers[current].networks.indices {
             guard let address = addresses[snapshot.containers[current].networks[endpoint].networkID] else { continue }
-            snapshot.containers[current].networks[endpoint].ipv4Address = address.ipv4Address
-            snapshot.containers[current].networks[endpoint].ipv6Address = address.ipv6Address
+            snapshot.containers[current].networks[endpoint].ipv4Address = Self.nonEmptyBackendAddress(address.ipv4Address)
+            snapshot.containers[current].networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
         }
         try await persist()
         emit(containerEvent("start", snapshot.containers[current]))
@@ -713,7 +713,10 @@ public actor EngineRuntime {
         guard snapshot.networks[index].name != "default" else {
             throw EngineError(.conflict, "default is a pre-defined network and cannot be removed")
         }
-        guard !snapshot.containers.contains(where: { container in container.networks.contains { $0.networkID == snapshot.networks[index].id } }) else {
+        let networkID = snapshot.networks[index].id
+        guard !(snapshot.containers + Array(pendingContainers.values)).contains(where: { container in
+            container.networks.contains { $0.networkID == networkID }
+        }) else {
             throw EngineError(.conflict, "network \(snapshot.networks[index].name) has active endpoints")
         }
         let removed = snapshot.networks.remove(at: index)
@@ -770,7 +773,9 @@ public actor EngineRuntime {
     }
 
     public func pruneNetworks(identifiers: Set<String>? = nil) async throws -> [String] {
-        let used = Set(snapshot.containers.flatMap(\.networks).map(\.networkID))
+        let used = Set(
+            (snapshot.containers + Array(pendingContainers.values)).flatMap(\.networks).map(\.networkID)
+        )
         let removable: (NetworkRecord) -> Bool = {
             $0.name != "default" && !used.contains($0.id) && (identifiers?.contains($0.id) ?? true)
         }
@@ -1093,10 +1098,14 @@ public actor EngineRuntime {
         let addresses = await backend.endpointAddresses(for: input)
         for endpoint in record.networks.indices {
             guard let address = addresses[record.networks[endpoint].networkID] else { continue }
-            record.networks[endpoint].ipv4Address = address.ipv4Address
-            record.networks[endpoint].ipv6Address = address.ipv6Address
+            record.networks[endpoint].ipv4Address = Self.nonEmptyBackendAddress(address.ipv4Address)
+            record.networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
         }
         return record
+    }
+
+    private static func nonEmptyBackendAddress(_ address: String) -> String? {
+        address.isEmpty ? nil : address
     }
 
     func persist() async throws { try await store.save(snapshot) }
