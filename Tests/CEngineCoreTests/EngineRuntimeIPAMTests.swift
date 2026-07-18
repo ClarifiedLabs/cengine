@@ -68,6 +68,20 @@ import Testing
         #expect(endpoint.ipv6Address == "fd00:ce::3")
     }
 
+    @Test func metadataBackendDerivesSlash31GatewayFromCanonicalSubnet() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+
+        let network = try await runtime.createNetwork(name: "slash31", subnet: "10.90.0.2/31")
+        #expect(network.gateway == "10.90.0.3")
+
+        var record = ContainerRecord(name: "slash31-client", image: "example")
+        record.networks = [.init(networkID: network.id)]
+        let container = try await runtime.createContainer(record)
+        #expect(container.networks.first?.ipv4Address == "10.90.0.2")
+    }
+
     @Test func explicitEndpointMacIsNormalizedStoredAndSurvivesRecovery() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

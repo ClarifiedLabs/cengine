@@ -846,7 +846,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(object["EnableIPv4"] as? Bool == true)
     }
 
-    @Test func endpointSysctlsRoundTripPersistAndRejectInvalidOptions() async throws {
+    @Test func endpointSysctlsApplyAcrossRequestVersionsRoundTripPersistAndRejectInvalidOptions() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
@@ -855,7 +855,7 @@ private actor AuthImageBackend: ContainerBackend {
             method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"sysctl-net"}"#.utf8)
         ))
         let create = await router.route(.init(
-            method: .POST, uri: "/v1.55/containers/create?name=sysctl-client",
+            method: .POST, uri: "/v1.45/containers/create?name=sysctl-client",
             body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"sysctl-net":{"DriverOpts":{"com.docker.network.endpoint.sysctls":"net.ipv4.conf.IFNAME.forwarding=1,net.ipv6.conf.ifname.accept_ra=0"}}}}}"#.utf8)
         ))
         #expect(create.status == .created)
@@ -887,6 +887,48 @@ private actor AuthImageBackend: ContainerBackend {
         )
         #expect(introducedEndpoint["DriverOpts"] as? [String: String] == options)
 
+        let connectClient = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=connected-sysctl-client",
+            body: Data(#"{"Image":"alpine"}"#.utf8)
+        ))
+        #expect(connectClient.status == .created)
+        let connectedSetting = "net.ipv4.conf.IFNAME.forwarding=0"
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.45/networks/sysctl-net/connect",
+            body: Data(#"{"Container":"connected-sysctl-client","EndpointConfig":{"DriverOpts":{"com.docker.network.endpoint.sysctls":"net.ipv4.conf.IFNAME.forwarding=0"}}}"#.utf8)
+        ))
+        #expect(connect.status == .ok)
+
+        let oldConnectedInspect = await router.route(.init(
+            method: .GET, uri: "/v1.45/containers/connected-sysctl-client/json"
+        ))
+        let oldConnectedObject = try #require(
+            JSONSerialization.jsonObject(with: oldConnectedInspect.body) as? [String: Any]
+        )
+        let oldConnectedEndpoint = try #require(
+            (((oldConnectedObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(oldConnectedEndpoint["DriverOpts"] == nil)
+
+        let connectedInspect = await router.route(.init(
+            method: .GET, uri: "/v1.46/containers/connected-sysctl-client/json"
+        ))
+        let connectedObject = try #require(
+            JSONSerialization.jsonObject(with: connectedInspect.body) as? [String: Any]
+        )
+        let connectedEndpoint = try #require(
+            (((connectedObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(
+            (connectedEndpoint["DriverOpts"] as? [String: String])?[NetworkEndpointRecord.sysctlsDriverOption]
+                == connectedSetting
+        )
+        let connectedRecord = try await runtime.container("connected-sysctl-client")
+        #expect(
+            connectedRecord.networks.first(where: { $0.networkID != "cengine-default-network" })?.interfaceSysctls
+                == [connectedSetting]
+        )
+
         let restarted = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
         let recovered = try await restarted.container("sysctl-client")
         #expect(recovered.networks.first?.interfaceSysctls == [
@@ -903,11 +945,6 @@ private actor AuthImageBackend: ContainerBackend {
             body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"sysctl-net":{"DriverOpts":{"example.unsupported":"1"}}}}}"#.utf8)
         ))
         #expect(unsupported.status == .notImplemented)
-        let tooOld = await router.route(.init(
-            method: .POST, uri: "/v1.45/containers/create?name=old-option",
-            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"sysctl-net":{"DriverOpts":{"com.docker.network.endpoint.sysctls":"net.ipv4.conf.IFNAME.forwarding=1"}}}}}"#.utf8)
-        ))
-        #expect(tooOld.status == .badRequest)
     }
 
     @Test func networkIPAMStatusTracksAllocationsAndIsVersioned() async throws {
@@ -941,7 +978,7 @@ private actor AuthImageBackend: ContainerBackend {
 
         let slash31Create = await router.route(.init(
             method: .POST, uri: "/v1.55/networks/create",
-            body: Data(#"{"Name":"slash31","IPAM":{"Config":[{"Subnet":"10.55.1.0/31","Gateway":"10.55.1.1"}]}}"#.utf8)
+            body: Data(#"{"Name":"slash31","IPAM":{"Config":[{"Subnet":"10.55.1.2/31"}]}}"#.utf8)
         ))
         #expect(slash31Create.status == .created)
         let slash31Container = await router.route(.init(
@@ -951,8 +988,12 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(slash31Container.status == .created)
         let slash31Inspect = await router.route(.init(method: .GET, uri: "/v1.52/networks/slash31"))
         let slash31Object = try #require(JSONSerialization.jsonObject(with: slash31Inspect.body) as? [String: Any])
+        let slash31Config = try #require(
+            ((slash31Object["IPAM"] as? [String: Any])?["Config"] as? [[String: Any]])?.first
+        )
+        #expect(slash31Config["Gateway"] as? String == "10.55.1.3")
         let slash31Status = try #require(
-            (((slash31Object["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.1.0/31"] as? [String: Any]
+            (((slash31Object["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.1.2/31"] as? [String: Any]
         )
         #expect(slash31Status["IPsInUse"] as? Int == 2)
         #expect(slash31Status["DynamicIPsAvailable"] as? Int == 0)
@@ -963,7 +1004,7 @@ private actor AuthImageBackend: ContainerBackend {
         let slash31Endpoint = try #require(
             ((containerObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["slash31"] as? [String: Any]
         )
-        #expect(slash31Endpoint["IPAddress"] as? String == "10.55.1.0")
+        #expect(slash31Endpoint["IPAddress"] as? String == "10.55.1.2")
     }
 
     @Test func runningContainersRejectNetworkAttachmentChanges() async throws {

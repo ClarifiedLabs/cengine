@@ -98,14 +98,16 @@ configure, and inspect endpoints is complete:
 - Explicit address-family controls are persisted and applied: `EnableIPv4=false`
   suppresses IPv4 IPAM and endpoint allocation, `EnableIPv6` controls IPv6 IPAM,
   and both flags survive inspect and daemon recovery (`NET-018`).
-- Endpoint sysctls use API v1.46 `DriverOpts`, validate Docker's `IFNAME`
-  grammar, apply through the guest network namespace, round-trip through
-  v1.46+ inspect, remain omitted from older inspect responses, and survive
-  recovery over guest protocol v6 (`NET-019`).
+- Endpoint sysctls use the API v1.46 `DriverOpts` field, validate Docker's
+  `IFNAME` grammar, and apply through the guest network namespace. Create and
+  connect accept the current request DTO for older negotiated APIs, while the
+  field round-trips only through v1.46+ inspect and remains omitted from older
+  responses. Settings survive recovery over guest protocol v6 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
-  semantics through privileged-helper gateway validation, and pending creates
-  reserve static IP and explicit MAC endpoints before persistence (`NET-020`).
+  semantics through privileged-helper gateway validation and subnet-derived
+  default gateways, and pending creates reserve static IP and explicit MAC
+  endpoints before persistence (`NET-020`).
 - IPAM and address-family configurations cengine cannot faithfully express are
   rejected before persistence: auxiliary reservations, multiple same-family
   subnets, asymmetric dual-stack isolation, both families disabled, and custom

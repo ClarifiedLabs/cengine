@@ -35,13 +35,9 @@ public struct DockerRouter: Sendable {
         value.flatMap { $0.isEmpty ? nil : $0 }
     }
     private func endpointDriverOptions(
-        _ endpoint: ContainerCreateRequest.EndpointSettingsRequest?,
-        version: DockerAPIVersion
-    ) throws -> [String: String]? {
+        _ endpoint: ContainerCreateRequest.EndpointSettingsRequest?
+    ) -> [String: String]? {
         guard let options = endpoint?.DriverOpts, !options.isEmpty else { return nil }
-        guard version >= .init(major: 1, minor: 46) else {
-            throw EngineError(.badRequest, "endpoint DriverOpts require API v1.46 or newer")
-        }
         return options
     }
     private let encoder = JSONEncoder()
@@ -179,7 +175,7 @@ public struct DockerRouter: Sendable {
                     ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil,
                     macAddress: nonEmpty(endpoint?.MacAddress),
                     gatewayPriority: endpoint?.GwPriority,
-                    driverOptions: try endpointDriverOptions(endpoint, version: version)
+                    driverOptions: endpointDriverOptions(endpoint)
                 ))
             }
             if record.networkDisabled == true, !record.networks.isEmpty {
@@ -402,7 +398,7 @@ public struct DockerRouter: Sendable {
                 ipv6Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv6Address) ?? nonEmpty(input.EndpointConfig?.GlobalIPv6Address),
                 macAddress: nonEmpty(input.EndpointConfig?.MacAddress),
                 gatewayPriority: input.EndpointConfig?.GwPriority,
-                driverOptions: try endpointDriverOptions(input.EndpointConfig, version: version)
+                driverOptions: endpointDriverOptions(input.EndpointConfig)
             )
             return APIResponse(status: .ok)
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/disconnect"):
