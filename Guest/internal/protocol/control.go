@@ -84,6 +84,7 @@ type NetworkEndpoint struct {
 	Gateways   []string `json:"gateways"`
 	DNS        []string `json:"dns"`
 	Aliases    []string `json:"aliases"`
+	Sysctls    []string `json:"sysctls"`
 }
 
 type Resources struct {

@@ -95,34 +95,49 @@ remain later validation work rather than prerequisites for this priority.
 
 ### 2. Complete modern network endpoint and IPAM semantics
 
-Close the remaining network behavior gaps that affect how clients create and
-inspect endpoints. The following sub-items are complete:
+The modern network endpoint and IPAM behavior that affects how clients create,
+configure, and inspect endpoints is complete:
 
 - Endpoint MAC address application: an explicit `MacAddress` is decoded,
   validated, applied in the guest, inspected, and preserved across recovery
   (`NET-014`, `NET-015`).
 - Endpoint gateway priority: `GwPriority` is decoded on create and connect,
-  used to select the single default-gateway endpoint for multi-network
-  containers, inspected, and preserved across recovery (`NET-016`).
+  used to select IPv4 and IPv6 default-gateway endpoints independently for
+  multi-network containers, inspected, and preserved across recovery
+  (`NET-016`, `RTM-004`).
 - SCTP has an explicit support decision: publishing an `sctp` port is rejected
   with 400 and recorded as an intentional gap because the vmnet port forwarder
   bridges only TCP and UDP (`NET-017`).
-
-The remaining gaps are endpoint sysctls, explicit IPv4 controls (`EnableIPv4`
-and endpoint IPv4 enable/disable), and IPAM status.
+- Explicit address-family controls are persisted and applied: `EnableIPv4=false`
+  suppresses IPv4 IPAM and endpoint allocation, `EnableIPv6` controls IPv6 IPAM,
+  and both flags survive inspect and daemon recovery (`NET-018`).
+- Endpoint sysctls use the API v1.46 `DriverOpts` field, validate Docker's
+  `IFNAME` grammar, and apply through the guest network namespace. Create and
+  connect accept the current request DTO for older negotiated APIs, while the
+  field round-trips only through v1.46+ inspect and remains omitted from older
+  responses. Settings survive recovery over guest protocol v6 (`NET-019`).
+- API v1.52+ network inspect reports per-subnet IPAM allocation status while
+  older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
+  semantics through privileged-helper gateway validation and subnet-derived
+  default gateways, and pending creates reserve static IP and explicit MAC
+  endpoints before persistence (`NET-020`).
+- IPAM and address-family configurations cengine cannot faithfully express are
+  rejected before persistence: auxiliary reservations, multiple same-family
+  subnets, asymmetric dual-stack isolation, both families disabled, and custom
+  IPv6 gateways (`NET-022`).
 
 Completion criteria:
 
 - Accepted endpoint settings are applied in the guest and survive inspect and
   daemon recovery. *(Done for MAC address and gateway priority.)*
 - Invalid or unsupported settings fail explicitly instead of being ignored.
-  *(Done for MAC address and SCTP publishing.)*
-- Multi-network containers select routes according to gateway priority. *(Done:
-  `NET-016`.)*
+  *(Done for MAC address, SCTP publishing, IPAM, and family/fabric limits.)*
+- Multi-network containers select each address family's route according to
+  gateway priority. *(Done: `NET-016`, `RTM-004`.)*
 - SCTP is either implemented and tested end to end or recorded as an intentional
   compatibility gap. *(Done: recorded as an intentional gap, `NET-017`.)*
-- Endpoint sysctls, explicit IPv4 controls, and IPAM status are still
-  outstanding.
+- Endpoint sysctls, explicit IPv4 controls, IPAM status, and IPAM validation are
+  covered by `NET-018`–`NET-020` and `NET-022`.
 
 ### 3. Close remaining client-visible API gaps
 

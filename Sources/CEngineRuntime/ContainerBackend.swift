@@ -182,12 +182,10 @@ public extension ContainerBackend {
     func restoreNetworks(_ networks: [NetworkRecord]) async throws -> [NetworkRecord] { networks }
     func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {
         var value = network
-        if value.subnet.isEmpty { value.subnet = "192.168.64.0/24"; value.gateway = "192.168.64.1" }
-        else if value.gateway.isEmpty {
-            var octets = value.subnet.split(separator: "/")[0].split(separator: ".").map(String.init)
-            if octets.count == 4 { octets[3] = "1"; value.gateway = octets.joined(separator: ".") }
-        }
-        if value.ipv6Subnet.isEmpty { value.ipv6Subnet = "fd00:ce::/64"; value.ipv6Gateway = "fd00:ce::1" }
+        if value.enableIPv4, value.subnet.isEmpty { value.subnet = "192.168.64.0/24"; value.gateway = "192.168.64.1" }
+        if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
+        if value.enableIPv6, value.ipv6Subnet.isEmpty { value.ipv6Subnet = "fd00:ce::/64"; value.ipv6Gateway = "fd00:ce::1" }
+        if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
         return value
     }
     func deleteNetwork(_: NetworkRecord) async throws {}

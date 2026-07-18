@@ -44,6 +44,8 @@ public struct MountRecord: Codable, Hashable, Sendable {
 }
 
 public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
+    public static let sysctlsDriverOption = "com.docker.network.endpoint.sysctls"
+
     public var networkID: String
     public var aliases: [String]
     public var ipv4Address: String?
@@ -59,15 +61,23 @@ public struct NetworkEndpointRecord: Codable, Hashable, Sendable {
     /// network name. `nil` means the client did not request one (treated as 0),
     /// so snapshots persisted before gateway-priority support decode successfully.
     public var gatewayPriority: Int?
+    /// Driver-specific endpoint options accepted from Docker's EndpointSettings.
+    /// Cengine currently supports only per-interface sysctls.
+    public var driverOptions: [String: String]?
 
     public init(networkID: String, aliases: [String] = [], ipv4Address: String? = nil, ipv6Address: String? = nil,
                 ipv4AddressIsStatic: Bool = false, ipv6AddressIsStatic: Bool = false, macAddress: String? = nil,
-                gatewayPriority: Int? = nil) {
+                gatewayPriority: Int? = nil, driverOptions: [String: String]? = nil) {
         self.networkID = networkID; self.aliases = aliases
         self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
         self.ipv4AddressIsStatic = ipv4AddressIsStatic; self.ipv6AddressIsStatic = ipv6AddressIsStatic
         self.macAddress = macAddress
         self.gatewayPriority = gatewayPriority
+        self.driverOptions = driverOptions
+    }
+
+    public var interfaceSysctls: [String] {
+        driverOptions?[Self.sysctlsDriverOption]?.components(separatedBy: ",") ?? []
     }
 }
 
@@ -199,6 +209,8 @@ public struct NetworkRecord: Codable, Sendable {
     public var ipv6Gateway: String
     public var ipv4AllocationMode: NetworkAllocationMode
     public var ipv6AllocationMode: NetworkAllocationMode
+    public var enableIPv4: Bool
+    public var enableIPv6: Bool
     public var internalNetwork: Bool
     public var labels: [String: String]
     public var options: [String: String]?
@@ -207,11 +219,13 @@ public struct NetworkRecord: Codable, Sendable {
                 ipv6Subnet: String = "", ipv6Gateway: String = "",
                 ipv4AllocationMode: NetworkAllocationMode = .automatic,
                 ipv6AllocationMode: NetworkAllocationMode = .automatic,
+                enableIPv4: Bool = true, enableIPv6: Bool = true,
                 internalNetwork: Bool = false, labels: [String: String] = [:],
                 options: [String: String] = [:]) {
         self.id = id; self.name = name; self.createdAt = createdAt; self.subnet = subnet; self.gateway = gateway
         self.ipv6Subnet = ipv6Subnet; self.ipv6Gateway = ipv6Gateway
         self.ipv4AllocationMode = ipv4AllocationMode; self.ipv6AllocationMode = ipv6AllocationMode
+        self.enableIPv4 = enableIPv4; self.enableIPv6 = enableIPv6
         self.internalNetwork = internalNetwork; self.labels = labels
         self.options = options
     }
@@ -222,6 +236,15 @@ public struct NetworkRecord: Codable, Sendable {
 
     public var ipv6GatewayMode: NetworkGatewayMode {
         NetworkGatewayMode(rawValue: options?[Self.gatewayModeIPv6Option] ?? "nat") ?? .nat
+    }
+
+    /// Whether every enabled address family is isolated from a vmnet uplink.
+    /// EngineRuntime rejects asymmetric enabled-family modes before persistence,
+    /// so checking either enabled isolated family is sufficient here while also
+    /// handling IPv6-only networks correctly.
+    public var fabricIsolated: Bool {
+        (enableIPv4 && ipv4GatewayMode == .isolated)
+            || (enableIPv6 && ipv6GatewayMode == .isolated)
     }
 
 }

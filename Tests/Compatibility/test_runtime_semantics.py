@@ -6,6 +6,7 @@ import io
 import pathlib
 import tarfile
 import time
+import uuid
 
 import docker
 import pytest
@@ -132,6 +133,56 @@ def test_read_only_root_applies_to_exec_but_tmpfs_stays_writable(
         assert result.output == b"readonly-ok"
     finally:
         container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-004")
+def test_default_routes_are_selected_per_address_family(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    ipv4 = client.networks.create(f"runtime-ipv4-{suffix}")
+    ipv4.reload()
+    ipv4_gateway = next(
+        config["Gateway"] for config in ipv4.attrs["IPAM"]["Config"]
+        if ":" not in config["Gateway"]
+    )
+    ipv6_gateway = f"fd00:4:{suffix[:4]}::1"
+    response = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={
+            "Name": f"runtime-ipv6-{suffix}",
+            "EnableIPv4": False,
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{
+                "Subnet": f"fd00:4:{suffix[:4]}::/64",
+                "Gateway": ipv6_gateway,
+            }]},
+        },
+    )
+    client.api._raise_for_status(response)
+    ipv6 = client.networks.get(response.json()["Id"])
+    create = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"runtime-routes-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["top"],
+            "NetworkingConfig": {"EndpointsConfig": {
+                ipv4.name: {"GwPriority": 10},
+                ipv6.name: {"GwPriority": 100},
+            }},
+        },
+    )
+    client.api._raise_for_status(create)
+    container = client.containers.get(create.json()["Id"])
+    try:
+        container.start()
+        ipv4_route = container.exec_run(["sh", "-c", "ip -4 route show default"])
+        ipv6_route = container.exec_run(["sh", "-c", "ip -6 route show default"])
+        assert ipv4_route.exit_code == 0 and ipv4_gateway.encode() in ipv4_route.output
+        assert ipv6_route.exit_code == 0 and ipv6_gateway.encode() in ipv6_route.output
+    finally:
+        container.remove(force=True)
+        ipv4.remove()
+        ipv6.remove()
 
 
 def archive_file(name: str, contents: bytes) -> bytes:

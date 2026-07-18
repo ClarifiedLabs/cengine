@@ -55,6 +55,12 @@ public struct DockerRouter: Sendable {
     private func nonEmpty(_ value: String?) -> String? {
         value.flatMap { $0.isEmpty ? nil : $0 }
     }
+    private func endpointDriverOptions(
+        _ endpoint: ContainerCreateRequest.EndpointSettingsRequest?
+    ) -> [String: String]? {
+        guard let options = endpoint?.DriverOpts, !options.isEmpty else { return nil }
+        return options
+    }
     private let encoder = JSONEncoder()
 
     public init(
@@ -196,7 +202,8 @@ public struct DockerRouter: Sendable {
                     ipv4Address: requestedIPv4, ipv6Address: requestedIPv6,
                     ipv4AddressIsStatic: requestedIPv4 != nil, ipv6AddressIsStatic: requestedIPv6 != nil,
                     macAddress: nonEmpty(endpoint?.MacAddress),
-                    gatewayPriority: endpoint?.GwPriority
+                    gatewayPriority: endpoint?.GwPriority,
+                    driverOptions: endpointDriverOptions(endpoint)
                 ))
             }
             if record.networkDisabled == true, !record.networks.isEmpty {
@@ -350,18 +357,61 @@ public struct DockerRouter: Sendable {
             try await runtime.removeContainer(id, force: parseBool(query["force"]) ?? false, removeVolumes: parseBool(query["v"]) ?? false)
             return APIResponse(status: .noContent)
         case (.GET, "/networks"):
-            return json(status: .ok, filteredNetworks(await runtime.listNetworks(), filters: query["filters"]).map(DockerNetworkResponse.init))
+            let containers = await runtime.listContainers(all: true)
+            return json(
+                status: .ok,
+                filteredNetworks(await runtime.listNetworks(), filters: query["filters"]).map {
+                    DockerNetworkResponse($0, containers: containers, version: version, includeStatus: false)
+                }
+            )
         case (.GET, let value) where value.hasPrefix("/networks/"):
-            return json(status: .ok, DockerNetworkResponse(try await runtime.network(String(value.dropFirst("/networks/".count)))))
+            return json(status: .ok, DockerNetworkResponse(
+                try await runtime.network(String(value.dropFirst("/networks/".count))),
+                containers: await runtime.listContainers(all: true),
+                version: version
+            ))
         case (.POST, "/networks/create"):
             let input = try decoder.decode(NetworkCreateRequest.self, from: request.body)
             let configs = input.IPAM?.Config ?? []
-            let ipv4 = configs.first(where: { $0.Subnet?.contains(":") == false })
-            let ipv6 = configs.first(where: { $0.Subnet?.contains(":") == true })
+            if let driver = nonEmpty(input.IPAM?.Driver), driver != "default" {
+                throw EngineError(.unsupported, "IPAM driver \(driver) is not supported")
+            }
+            if input.IPAM?.Options?.isEmpty == false {
+                throw EngineError(.unsupported, "custom IPAM options are not supported")
+            }
+            if let config = configs.first(where: { $0.Subnet == nil || $0.Subnet?.isEmpty == true }) {
+                _ = config
+                throw EngineError(.badRequest, "IPAM config requires a subnet")
+            }
+            if configs.contains(where: { $0.IPRange != nil || $0.AuxiliaryAddresses?.isEmpty == false }) {
+                throw EngineError(.unsupported, "IPAM IP ranges and auxiliary addresses are not supported")
+            }
+            let ipv4Configs = configs.filter { $0.Subnet?.contains(":") == false }
+            let ipv6Configs = configs.filter { $0.Subnet?.contains(":") == true }
+            guard ipv4Configs.count <= 1, ipv6Configs.count <= 1 else {
+                throw EngineError(.unsupported, "multiple IPAM subnets per address family are not supported")
+            }
+            let ipv4 = ipv4Configs.first
+            let ipv6 = ipv6Configs.first
+            // EnableIPv4 was introduced in API v1.48. Older negotiated APIs
+            // retain legacy IPv4-enabled behavior even if a newer client field
+            // is present in the JSON body.
+            let enableIPv4 = version >= .init(major: 1, minor: 48) ? input.EnableIPv4 ?? true : true
+            let enableIPv6 = input.EnableIPv6 ?? false
+            guard enableIPv4 || enableIPv6 else {
+                throw EngineError(.badRequest, "network must enable IPv4, IPv6, or both")
+            }
+            if !enableIPv4, ipv4 != nil {
+                throw EngineError(.badRequest, "IPv4 IPAM config cannot be used when EnableIPv4 is false")
+            }
+            if !enableIPv6, ipv6 != nil {
+                throw EngineError(.badRequest, "IPv6 IPAM config requires EnableIPv6 to be true")
+            }
             let network = try await runtime.createNetwork(
                 name: input.Name,
                 subnet: ipv4?.Subnet, gateway: ipv4?.Gateway,
                 ipv6Subnet: ipv6?.Subnet, ipv6Gateway: ipv6?.Gateway,
+                enableIPv4: enableIPv4, enableIPv6: enableIPv6,
                 driver: input.Driver,
                 internalNetwork: input.Internal ?? false,
                 labels: input.Labels ?? [:], options: input.Options ?? [:]
@@ -375,7 +425,8 @@ public struct DockerRouter: Sendable {
                 ipv4Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv4Address) ?? nonEmpty(input.EndpointConfig?.IPAddress),
                 ipv6Address: nonEmpty(input.EndpointConfig?.IPAMConfig?.IPv6Address) ?? nonEmpty(input.EndpointConfig?.GlobalIPv6Address),
                 macAddress: nonEmpty(input.EndpointConfig?.MacAddress),
-                gatewayPriority: input.EndpointConfig?.GwPriority
+                gatewayPriority: input.EndpointConfig?.GwPriority,
+                driverOptions: endpointDriverOptions(input.EndpointConfig)
             )
             return APIResponse(status: .ok)
         case (.POST, let value) where value.hasPrefix("/networks/") && value.hasSuffix("/disconnect"):
@@ -384,7 +435,10 @@ public struct DockerRouter: Sendable {
             try await runtime.disconnectNetwork(id, container: input.Container, force: input.Force ?? false)
             return APIResponse(status: .ok)
         case (.POST, "/networks/prune"):
-            return json(status: .ok, PruneResponse(networks: try await runtime.pruneNetworks()))
+            let selected = try filteredNetworksForPrune(await runtime.listNetworks(), filters: query["filters"])
+            return json(status: .ok, PruneResponse(networks: try await runtime.pruneNetworks(
+                identifiers: Set(selected.map(\.id))
+            )))
         case (.POST, "/containers/prune"):
             return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers()))
         case (.POST, "/images/prune"):
@@ -626,9 +680,9 @@ public struct DockerRouter: Sendable {
         let statuses = values("status")
         return containers.filter { container in
             labels.allSatisfy { expression in
-                let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
-                guard let actual = container.labels[parts[0]] else { return false }
-                return parts.count == 1 || actual == parts[1]
+                guard let (key, expected) = labelExpression(expression),
+                      let actual = container.labels[key] else { return false }
+                return expected == nil || actual == expected
             } && (names.isEmpty || names.contains { container.name.contains($0) })
               && (ids.isEmpty || ids.contains { container.id.hasPrefix($0) })
               && (statuses.isEmpty || statuses.contains(container.phase.rawValue))
@@ -706,16 +760,60 @@ public struct DockerRouter: Sendable {
 
     private func labelsMatch(_ labels: [String: String], expressions: [String]) -> Bool {
         expressions.allSatisfy { expression in
-            let parts = expression.split(separator: "=", maxSplits: 1).map(String.init)
-            guard let actual = labels[parts[0]] else { return false }
-            return parts.count == 1 || actual == parts[1]
+            guard let (key, expected) = labelExpression(expression),
+                  let actual = labels[key] else { return false }
+            return expected == nil || actual == expected
         }
+    }
+
+    private func labelExpression(_ expression: String) -> (key: String, expected: String?)? {
+        let parts = expression.split(
+            separator: "=", maxSplits: 1, omittingEmptySubsequences: false
+        ).map(String.init)
+        guard let key = parts.first, !key.isEmpty else { return nil }
+        return (key, parts.count == 2 ? parts[1] : nil)
     }
 
     private func filteredNetworks(_ networks: [NetworkRecord], filters: String?) -> [NetworkRecord] {
         let labels = filterValues(filters, key: "label")
         let names = filterValues(filters, key: "name")
         return networks.filter { labelsMatch($0.labels, expressions: labels) && (names.isEmpty || names.contains($0.name)) }
+    }
+
+    private func filteredNetworksForPrune(_ networks: [NetworkRecord], filters: String?) throws -> [NetworkRecord] {
+        guard let filters else { return networks }
+        guard let data = filters.replacingOccurrences(of: "+", with: " ").data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw EngineError(.badRequest, "invalid network prune filters")
+        }
+        let supported = Set(["label", "label!", "until"])
+        if let key = object.keys.first(where: { !supported.contains($0) }) {
+            throw EngineError(.badRequest, "unsupported network prune filter \(key)")
+        }
+        func values(_ key: String) throws -> [String] {
+            guard let value = object[key] else { return [] }
+            if let array = value as? [String] { return array }
+            if let map = value as? [String: Bool] { return map.compactMap { $0.value ? $0.key : nil } }
+            throw EngineError(.badRequest, "invalid network prune filter \(key)")
+        }
+        let requiredLabels = try values("label")
+        let excludedLabels = try values("label!")
+        let untilValues = try values("until")
+        guard (requiredLabels + excludedLabels).allSatisfy({ labelExpression($0) != nil }) else {
+            throw EngineError(.badRequest, "network prune label filters require a non-empty label key")
+        }
+        guard untilValues.count <= 1 else { throw EngineError(.badRequest, "network prune accepts one until filter") }
+        let until = try untilValues.first.map { value in
+            guard let date = parseDockerPruneUntil(value) else {
+                throw EngineError(.badRequest, "invalid network prune until filter \(value)")
+            }
+            return date
+        }
+        return networks.filter { network in
+            labelsMatch(network.labels, expressions: requiredLabels)
+                && excludedLabels.allSatisfy { !labelsMatch(network.labels, expressions: [$0]) }
+                && (until.map { network.createdAt < $0 } ?? true)
+        }
     }
 
     private func filteredVolumes(_ volumes: [VolumeRecord], filters: String?) -> [VolumeRecord] {
@@ -852,6 +950,25 @@ func parseDockerTimestamp(_ value: String) -> Date? {
     return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
 }
 
+func parseDockerPruneUntil(_ value: String, now: Date = Date()) -> Date? {
+    if let timestamp = parseDockerTimestamp(value) { return timestamp }
+    var remainder = value[...]
+    var duration = 0.0
+    let units: [(String, Double)] = [
+        ("ns", 1e-9), ("us", 1e-6), ("µs", 1e-6), ("ms", 1e-3),
+        ("s", 1), ("m", 60), ("h", 3600),
+    ]
+    while !remainder.isEmpty {
+        let number = remainder.prefix { $0.isNumber || $0 == "." }
+        guard !number.isEmpty, let amount = Double(number) else { return nil }
+        remainder.removeFirst(number.count)
+        guard let unit = units.first(where: { remainder.hasPrefix($0.0) }) else { return nil }
+        remainder.removeFirst(unit.0.count)
+        duration += amount * unit.1
+    }
+    return duration > 0 ? now.addingTimeInterval(-duration) : nil
+}
+
 private func parseDockerByteSize(_ value: String) -> Int64? {
     let normalized = value.lowercased()
     let units: [(String, Int64)] = [("gb", 1 << 30), ("g", 1 << 30), ("mb", 1 << 20), ("m", 1 << 20), ("kb", 1 << 10), ("k", 1 << 10), ("b", 1)]
@@ -922,6 +1039,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     public struct PortBindingResponse: Codable, Sendable { let HostIp: String; let HostPort: String }
     public struct EndpointResponse: Codable, Sendable {
         let IPAMConfig: [String: String]?; let Links: [String]?; let Aliases: [String]
+        let DriverOpts: [String: String]?
         let NetworkID: String; let EndpointID: String; let Gateway: String
         let IPAddress: String; let IPPrefixLen: Int; let IPv6Gateway: String
         let GlobalIPv6Address: String; let GlobalIPv6PrefixLen: Int; let MacAddress: String
@@ -975,7 +1093,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
                 : endpoint.aliases
             let dnsNames = Array(Set([record.name, record.hostname, shortID] + endpoint.aliases)).sorted()
             result[name] = .init(
-                IPAMConfig: nil, Links: nil, Aliases: aliases, NetworkID: endpoint.networkID,
+                IPAMConfig: nil, Links: nil, Aliases: aliases,
+                DriverOpts: version >= .init(major: 1, minor: 46) ? endpoint.driverOptions : nil,
+                NetworkID: endpoint.networkID,
                 EndpointID: "\(record.id)-\(endpoint.networkID)", Gateway: network?.gateway ?? "",
                 IPAddress: endpoint.ipv4Address ?? "",
                 IPPrefixLen: network?.subnet.split(separator: "/").last.flatMap { Int($0) } ?? 0,

@@ -223,7 +223,19 @@ private struct OwnedHelperVMNetUplink {
             throw EngineError(.badRequest, "invalid vmnet network id")
         }
         guard (1...4094).contains(request.vlan) else { throw EngineError(.badRequest, "invalid vmnet VLAN") }
-        _ = try HelperVMNetUplink.ipv4Gateway(request.gateway, in: request.subnet)
+        guard !request.subnet.isEmpty || !request.ipv6Subnet.isEmpty else {
+            throw EngineError(.badRequest, "vmnet network requires an IPv4 subnet or IPv6 prefix")
+        }
+        if request.subnet.isEmpty {
+            guard request.gateway.isEmpty else {
+                throw EngineError(.badRequest, "vmnet IPv4 gateway requires an IPv4 subnet")
+            }
+            guard request.ports.isEmpty else {
+                throw EngineError(.badRequest, "vmnet port forwarding requires an IPv4 subnet")
+            }
+        } else {
+            _ = try VMNetIPv4Configuration.gateway(request.gateway, in: request.subnet)
+        }
         if !request.ipv6Subnet.isEmpty { _ = try HelperVMNetUplink.ipv6Prefix(request.ipv6Subnet) }
         for port in request.ports {
             var address = in_addr()
@@ -389,11 +401,15 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         if !request.dhcpEnabled {
             vmnet_network_configuration_disable_dhcp(configuration)
         }
-        let (_, mask) = try ipv4Subnet(request.subnet)
-        var subnetValue = try ipv4Gateway(request.gateway, in: request.subnet)
-        var maskValue = mask
-        guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
-            throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
+        if request.subnet.isEmpty {
+            vmnet_network_configuration_disable_nat44(configuration)
+        } else {
+            let (_, mask) = try VMNetIPv4Configuration.subnet(request.subnet)
+            var subnetValue = try VMNetIPv4Configuration.gateway(request.gateway, in: request.subnet)
+            var maskValue = mask
+            guard vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetValue, &maskValue) == .VMNET_SUCCESS else {
+                throw EngineError(.badRequest, "vmnet rejected subnet \(request.subnet)")
+            }
         }
         if !request.ipv6Subnet.isEmpty {
             let (prefix, prefixLength) = try ipv6Prefix(request.ipv6Subnet)
@@ -401,6 +417,9 @@ private final class HelperVMNetUplink: @unchecked Sendable {
             guard vmnet_network_configuration_set_ipv6_prefix(configuration, &prefixValue, prefixLength) == .VMNET_SUCCESS else {
                 throw EngineError(.badRequest, "vmnet rejected IPv6 prefix \(request.ipv6Subnet)")
             }
+        } else {
+            vmnet_network_configuration_disable_nat66(configuration)
+            vmnet_network_configuration_disable_router_advertisement(configuration)
         }
         for port in request.internalNetwork ? [] : request.ports {
             var address = in_addr()
@@ -527,36 +546,6 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         var output = Data(frame.prefix(12))
         output.append(frame.dropFirst(16))
         return output
-    }
-
-    static func ipv4Subnet(_ value: String) throws -> (in_addr, in_addr) {
-        let parts = value.split(separator: "/")
-        guard parts.count == 2, let prefix = Int(parts[1]), (0...32).contains(prefix) else {
-            throw EngineError(.badRequest, "invalid IPv4 subnet \(value)")
-        }
-        var subnet = in_addr()
-        guard inet_pton(AF_INET, String(parts[0]), &subnet) == 1 else {
-            throw EngineError(.badRequest, "invalid IPv4 subnet \(value)")
-        }
-        let bits: UInt32 = prefix == 0 ? 0 : UInt32.max << UInt32(32 - prefix)
-        return (subnet, in_addr(s_addr: bits.bigEndian))
-    }
-
-    static func ipv4Gateway(_ value: String, in subnet: String) throws -> in_addr {
-        let (networkAddress, maskAddress) = try ipv4Subnet(subnet)
-        var gateway = in_addr()
-        guard inet_pton(AF_INET, value, &gateway) == 1 else {
-            throw EngineError(.badRequest, "invalid IPv4 gateway \(value)")
-        }
-        let network = UInt32(bigEndian: networkAddress.s_addr)
-        let mask = UInt32(bigEndian: maskAddress.s_addr)
-        let address = UInt32(bigEndian: gateway.s_addr)
-        let first = network & mask
-        let last = first | ~mask
-        guard address & mask == first, address != first, address != last else {
-            throw EngineError(.badRequest, "IPv4 gateway \(value) is outside subnet \(subnet)")
-        }
-        return gateway
     }
 
     static func ipv6Prefix(_ value: String) throws -> (in6_addr, UInt8) {

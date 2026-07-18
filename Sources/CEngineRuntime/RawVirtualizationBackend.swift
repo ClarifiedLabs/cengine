@@ -559,19 +559,37 @@ public actor RawVirtualizationBackend: ContainerBackend {
         if let existing = networks[network.id] { return existing }
         let vlan = try allocateVLAN()
         var value = network
-        if value.subnet.isEmpty {
+        if value.enableIPv4, value.subnet.isEmpty {
             let automaticNetwork = Self.automaticIPv4Network(vlan: vlan)
             value.subnet = automaticNetwork.subnet
             value.gateway = automaticNetwork.gateway
-        } else if value.gateway.isEmpty { value.gateway = Self.firstAddress(value.subnet) }
-        if value.ipv6Subnet.isEmpty {
+        }
+        if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
+        if value.enableIPv6, value.ipv6Subnet.isEmpty {
             value.ipv6Subnet = String(format: "fdce:%x::/64", vlan)
             value.ipv6Gateway = String(format: "fdce:%x::1", vlan)
-        } else if value.ipv6Gateway.isEmpty { value.ipv6Gateway = Self.firstAddress(value.ipv6Subnet) }
-        networks[value.id] = value
-        networkVLANs[value.id] = vlan
-        try persistNetworks()
-        try await synchronizeFabric()
+        }
+        if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
+        let transaction = RawNetworkStateTransaction(
+            adding: value,
+            vlan: vlan,
+            networks: networks,
+            networkVLANs: networkVLANs
+        )
+        transaction.apply(networks: &networks, networkVLANs: &networkVLANs)
+        do {
+            // Reserve and configure vmnet before making the new network durable.
+            // If either stage fails, restore both dictionaries and the previous
+            // fabric so a failed create cannot consume a VLAN or reappear after
+            // daemon recovery.
+            try await synchronizeFabric()
+            try persistNetworks()
+        } catch {
+            transaction.rollback(networks: &networks, networkVLANs: &networkVLANs)
+            try? await synchronizeFabric()
+            try? persistNetworks()
+            throw error
+        }
         return value
     }
 
@@ -957,13 +975,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
         // endpoint gateway priority (ties broken lexicographically by network
         // name). Selecting across every endpoint means a single-network container
         // always keeps its only network's gateway.
-        let defaultGatewayNetworkID = EndpointGatewayPriority.defaultGatewayNetworkID(
+        let defaultGateways = EndpointGatewayPriority.defaultGatewayNetworks(
             among: container.networks.compactMap { endpoint in
                 guard let network = networks[endpoint.networkID] else { return nil }
                 return .init(
                     networkID: endpoint.networkID,
                     priority: endpoint.gatewayPriority ?? 0,
-                    networkName: network.name
+                    networkName: network.name,
+                    providesIPv4: endpoint.ipv4Address?.isEmpty == false && !network.gateway.isEmpty,
+                    providesIPv6: endpoint.ipv6Address?.isEmpty == false && !network.ipv6Gateway.isEmpty
                 )
             }
         )
@@ -973,12 +993,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
             if let address = endpoint.ipv4Address, !address.isEmpty { addresses.append(Self.withPrefix(address, from: network.subnet)) }
             if let address = endpoint.ipv6Address, !address.isEmpty { addresses.append(Self.withPrefix(address, from: network.ipv6Subnet)) }
             var gateways: [String] = []
-            // Only the winning endpoint installs default routes; the others keep
-            // their addresses and DNS but do not compete for the default gateway.
-            if endpoint.networkID == defaultGatewayNetworkID {
-                if endpoint.ipv4Address != nil, !network.gateway.isEmpty { gateways.append(network.gateway) }
-                if endpoint.ipv6Address != nil, !network.ipv6Gateway.isEmpty { gateways.append(network.ipv6Gateway) }
-            }
+            // Select default routes independently. A higher-priority IPv6-only
+            // endpoint must not suppress the IPv4 default route (and vice versa).
+            if endpoint.networkID == defaultGateways.ipv4NetworkID { gateways.append(network.gateway) }
+            if endpoint.networkID == defaultGateways.ipv6NetworkID { gateways.append(network.ipv6Gateway) }
             return .init(
                 networkID: endpoint.networkID,
                 vlan: vlan,
@@ -986,8 +1004,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 macAddress: endpoint.macAddress ?? Self.endpointMacAddress(container: container.id, network: endpoint.networkID),
                 addresses: addresses,
                 gateways: gateways,
-                dns: network.internalNetwork ? [] : [network.gateway].filter { !$0.isEmpty },
-                aliases: endpoint.aliases
+                dns: network.internalNetwork ? [] : [network.gateway, network.ipv6Gateway].filter { !$0.isEmpty },
+                aliases: endpoint.aliases,
+                sysctls: endpoint.interfaceSysctls
             )
         }
     }
@@ -997,11 +1016,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let networkIDs = Set(container.networks.map(\.networkID))
         for peer in knownContainers.values {
             for endpoint in peer.networks where networkIDs.contains(endpoint.networkID) {
-                guard let address = endpoint.ipv4Address ?? endpoint.ipv6Address, !address.isEmpty else { continue }
+                guard let address = Self.peerHostAddress(endpoint) else { continue }
                 for name in Set(endpoint.aliases + [peer.name, peer.hostname]).filter({ !$0.isEmpty }) { result[name] = address }
             }
         }
         return result
+    }
+
+    static func peerHostAddress(_ endpoint: NetworkEndpointRecord) -> String? {
+        if let address = endpoint.ipv4Address, !address.isEmpty { return address }
+        if let address = endpoint.ipv6Address, !address.isEmpty { return address }
+        return nil
     }
 
     static func automaticIPv4Network(vlan: UInt16) -> (subnet: String, gateway: String) {
@@ -1039,8 +1064,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func synchronizeFabric() async throws {
         let values = networks.compactMap { id, network -> VMShimClient.FabricNetwork? in
-            guard let vlan = networkVLANs[id], !network.subnet.isEmpty else { return nil }
-            return .init(id: id, vlan: vlan, subnet: network.subnet, gateway: network.gateway, ipv6Subnet: network.ipv6Subnet, internalNetwork: network.internalNetwork, isolated: network.ipv4GatewayMode == .isolated, ports: [])
+            guard let vlan = networkVLANs[id], !network.subnet.isEmpty || !network.ipv6Subnet.isEmpty else { return nil }
+            return .init(id: id, vlan: vlan, subnet: network.subnet, gateway: network.gateway, ipv6Subnet: network.ipv6Subnet, internalNetwork: network.internalNetwork, isolated: network.fabricIsolated, ports: [])
         }
         _ = try await infrastructure.configureFabric(networks: values.sorted { $0.id < $1.id })
     }
@@ -1148,14 +1173,6 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return address + "/" + (subnet.split(separator: "/").dropFirst().first.map(String.init) ?? (address.contains(":") ? "64" : "24"))
     }
 
-    private static func firstAddress(_ subnet: String) -> String {
-        let address = String(subnet.split(separator: "/").first ?? "")
-        if address.contains(":") { return address.trimmingCharacters(in: CharacterSet(charactersIn: ":")) + "::1" }
-        var parts = address.split(separator: ".").map(String.init)
-        if parts.count == 4 { parts[3] = "1"; return parts.joined(separator: ".") }
-        return ""
-    }
-
     private static func createSparseFile(at url: URL, size: UInt64) throws {
         guard !FileManager.default.fileExists(atPath: url.path) else { return }
         guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw EngineError(.internalError, "could not create sparse disk") }
@@ -1163,6 +1180,41 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private struct NetworkState: Codable { let record: NetworkRecord; let vlan: UInt16 }
+}
+
+struct RawNetworkStateTransaction {
+    let network: NetworkRecord
+    let vlan: UInt16
+    let previousNetwork: NetworkRecord?
+    let previousVLAN: UInt16?
+
+    init(
+        adding network: NetworkRecord,
+        vlan: UInt16,
+        networks: [String: NetworkRecord],
+        networkVLANs: [String: UInt16]
+    ) {
+        self.network = network
+        self.vlan = vlan
+        previousNetwork = networks[network.id]
+        previousVLAN = networkVLANs[network.id]
+    }
+
+    func apply(
+        networks: inout [String: NetworkRecord],
+        networkVLANs: inout [String: UInt16]
+    ) {
+        networks[network.id] = network
+        networkVLANs[network.id] = vlan
+    }
+
+    func rollback(
+        networks: inout [String: NetworkRecord],
+        networkVLANs: inout [String: UInt16]
+    ) {
+        networks[network.id] = previousNetwork
+        networkVLANs[network.id] = previousVLAN
+    }
 }
 
 struct PreparedVirtioFSBind: Sendable, Equatable {

@@ -105,8 +105,8 @@ private actor NetworkRecordingBackend: ContainerBackend {
     func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {
         requests[network.name] = network
         var result = network
-        if result.subnet.isEmpty { result.subnet = "192.168.250.0/24"; result.gateway = "192.168.250.1" }
-        if result.ipv6Subnet.isEmpty { result.ipv6Subnet = "fd00:ce::/64"; result.ipv6Gateway = "fd00:ce::1" }
+        if result.enableIPv4, result.subnet.isEmpty { result.subnet = "192.168.250.0/24"; result.gateway = "192.168.250.1" }
+        if result.enableIPv6, result.ipv6Subnet.isEmpty { result.ipv6Subnet = "fd00:ce::/64"; result.ipv6Gateway = "fd00:ce::1" }
         return result
     }
 
@@ -169,6 +169,33 @@ private actor ConcurrentDeleteBackend: ContainerBackend {
         }
         await withCheckedContinuation { waiters.append($0) }
     }
+}
+
+private actor BlockingContainerDeleteBackend: ContainerBackend {
+    enum Failure: Error { case injected }
+
+    private let failBlockedDelete: Bool
+    private var blockedContainerID: String?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var hasBlocked = false
+
+    init(failBlockedDelete: Bool = false) { self.failBlockedDelete = failBlockedDelete }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_ container: ContainerRecord) async throws {
+        guard !hasBlocked else { return }
+        hasBlocked = true
+        blockedContainerID = container.id
+        await withCheckedContinuation { continuation = $0 }
+        if failBlockedDelete { throw Failure.injected }
+    }
+
+    func blockedID() -> String? { blockedContainerID }
+    func releaseDelete() { continuation?.resume(); continuation = nil }
 }
 
 private actor ImageStoreBackend: ContainerBackend {
@@ -858,11 +885,12 @@ private actor AuthImageBackend: ContainerBackend {
         let network = try #require(JSONSerialization.jsonObject(with: networkInspect.body) as? [String: Any])
         #expect(network["Name"] as? String == "frontend")
         #expect(network["Driver"] as? String == "bridge")
-        #expect(network["EnableIPv6"] as? Bool == true)
+        #expect(network["EnableIPv6"] as? Bool == false)
+        #expect(network["EnableIPv4"] == nil)
         let ipam = try #require(network["IPAM"] as? [String: Any])
         let configs = try #require(ipam["Config"] as? [[String: Any]])
-        #expect(configs.count == 2)
-        #expect((configs[1]["Subnet"] as? String)?.contains(":") == true)
+        #expect(configs.count == 1)
+        #expect((configs[0]["Subnet"] as? String)?.contains(":") == false)
 
         let volumeCreate = await router.route(.init(method: .POST, uri: "/v1.44/volumes/create", body: Data(#"{"Name":"dbdata","Driver":"local","Labels":{"app":"demo"}}"#.utf8)))
         #expect(volumeCreate.status == .created)
@@ -1008,6 +1036,291 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((volumeList["Volumes"] as? [[String: Any]])?.contains { $0["Name"] as? String == "keep-me" } == true)
     }
 
+    @Test func networkAddressFamiliesAreAppliedInspectedAndRecovered() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let router = DockerRouter(runtime: runtime, root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"v6only","EnableIPv4":false,"EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fd00:1234::/120","Gateway":"fd00:1234::1"}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let container = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=v6-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"v6only":{}}}}"#.utf8)
+        ))
+        #expect(container.status == .created)
+
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/networks/v6only"))
+        let network = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(network["EnableIPv4"] as? Bool == false)
+        #expect(network["EnableIPv6"] as? Bool == true)
+        let configs = try #require((network["IPAM"] as? [String: Any])?["Config"] as? [[String: Any]])
+        #expect(configs.count == 1)
+        #expect(configs[0]["Subnet"] as? String == "fd00:1234::/120")
+
+        let containerInspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/v6-client/json"))
+        let containerObject = try #require(JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any])
+        let endpoint = try #require(
+            ((containerObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["v6only"] as? [String: Any]
+        )
+        #expect(endpoint["IPAddress"] as? String == "")
+        #expect((endpoint["GlobalIPv6Address"] as? String)?.hasPrefix("fd00:1234::") == true)
+
+        let restarted = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let recovered = try await restarted.network("v6only")
+        #expect(recovered.enableIPv4 == false)
+        #expect(recovered.enableIPv6 == true)
+        #expect(try await restarted.container("v6-client").networks.first?.ipv4Address == nil)
+
+        let invalidV4 = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"bad-v4","EnableIPv4":false,"IPAM":{"Config":[{"Subnet":"10.44.0.0/24"}]}}"#.utf8)
+        ))
+        #expect(invalidV4.status == .badRequest)
+        let invalidV6 = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"bad-v6","IPAM":{"Config":[{"Subnet":"fd00:44::/64"}]}}"#.utf8)
+        ))
+        #expect(invalidV6.status == .badRequest)
+    }
+
+    @Test func networkIPAMAndFamilyLimitationsAreRejectedExplicitly() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let unsupportedBodies = [
+            #"{"Name":"aux","IPAM":{"Config":[{"Subnet":"10.60.0.0/24","AuxiliaryAddresses":{"reserved":"10.60.0.10"}}]}}"#,
+            #"{"Name":"multi-v4","IPAM":{"Config":[{"Subnet":"10.61.0.0/24"},{"Subnet":"10.62.0.0/24"}]}}"#,
+            #"{"Name":"custom-v6-gateway","EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fd00:63::/64","Gateway":"fd00:63::fe"}]}}"#,
+            #"{"Name":"asymmetric","Internal":true,"EnableIPv6":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}"#,
+        ]
+        for body in unsupportedBodies {
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v1.55/networks/create",
+                body: Data(body.utf8)
+            ))
+            #expect(response.status == .notImplemented)
+        }
+
+        let disabled = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"disabled","EnableIPv4":false,"EnableIPv6":false}"#.utf8)
+        ))
+        #expect(disabled.status == .badRequest)
+
+        // API versions before v1.48 did not define EnableIPv4, so a field sent
+        // by a newer client must not disable legacy IPv4 behavior.
+        let legacy = await router.route(.init(
+            method: .POST,
+            uri: "/v1.47/networks/create",
+            body: Data(#"{"Name":"legacy-ipv4","EnableIPv4":false}"#.utf8)
+        ))
+        #expect(legacy.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/networks/legacy-ipv4"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        #expect(object["EnableIPv4"] as? Bool == true)
+    }
+
+    @Test func endpointSysctlsApplyAcrossRequestVersionsRoundTripPersistAndRejectInvalidOptions() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let router = DockerRouter(runtime: runtime, root: root)
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create", body: Data(#"{"Name":"sysctl-net"}"#.utf8)
+        ))
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.45/containers/create?name=sysctl-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"sysctl-net":{"DriverOpts":{"com.docker.network.endpoint.sysctls":"net.ipv4.conf.IFNAME.forwarding=1,net.ipv6.conf.ifname.accept_ra=0"}}}}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/sysctl-client/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let endpoint = try #require(
+            (((object["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        let options = try #require(endpoint["DriverOpts"] as? [String: String])
+        #expect(options[NetworkEndpointRecord.sysctlsDriverOption] == "net.ipv4.conf.IFNAME.forwarding=1,net.ipv6.conf.ifname.accept_ra=0")
+
+        let oldInspect = await router.route(.init(
+            method: .GET, uri: "/v1.45/containers/sysctl-client/json"
+        ))
+        let oldObject = try #require(JSONSerialization.jsonObject(with: oldInspect.body) as? [String: Any])
+        let oldEndpoint = try #require(
+            (((oldObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(oldEndpoint["DriverOpts"] == nil)
+
+        let introducedInspect = await router.route(.init(
+            method: .GET, uri: "/v1.46/containers/sysctl-client/json"
+        ))
+        let introducedObject = try #require(
+            JSONSerialization.jsonObject(with: introducedInspect.body) as? [String: Any]
+        )
+        let introducedEndpoint = try #require(
+            (((introducedObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(introducedEndpoint["DriverOpts"] as? [String: String] == options)
+
+        let connectClient = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=connected-sysctl-client",
+            body: Data(#"{"Image":"alpine"}"#.utf8)
+        ))
+        #expect(connectClient.status == .created)
+        let connectedSetting = "net.ipv4.conf.IFNAME.forwarding=0"
+        let connect = await router.route(.init(
+            method: .POST, uri: "/v1.45/networks/sysctl-net/connect",
+            body: Data(#"{"Container":"connected-sysctl-client","EndpointConfig":{"DriverOpts":{"com.docker.network.endpoint.sysctls":"net.ipv4.conf.IFNAME.forwarding=0"}}}"#.utf8)
+        ))
+        #expect(connect.status == .ok)
+
+        let oldConnectedInspect = await router.route(.init(
+            method: .GET, uri: "/v1.45/containers/connected-sysctl-client/json"
+        ))
+        let oldConnectedObject = try #require(
+            JSONSerialization.jsonObject(with: oldConnectedInspect.body) as? [String: Any]
+        )
+        let oldConnectedEndpoint = try #require(
+            (((oldConnectedObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(oldConnectedEndpoint["DriverOpts"] == nil)
+
+        let connectedInspect = await router.route(.init(
+            method: .GET, uri: "/v1.46/containers/connected-sysctl-client/json"
+        ))
+        let connectedObject = try #require(
+            JSONSerialization.jsonObject(with: connectedInspect.body) as? [String: Any]
+        )
+        let connectedEndpoint = try #require(
+            (((connectedObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["sysctl-net"] as? [String: Any])
+        )
+        #expect(
+            (connectedEndpoint["DriverOpts"] as? [String: String])?[NetworkEndpointRecord.sysctlsDriverOption]
+                == connectedSetting
+        )
+        let connectedRecord = try await runtime.container("connected-sysctl-client")
+        #expect(
+            connectedRecord.networks.first(where: { $0.networkID != "cengine-default-network" })?.interfaceSysctls
+                == [connectedSetting]
+        )
+
+        let restarted = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        let recovered = try await restarted.container("sysctl-client")
+        #expect(recovered.networks.first?.interfaceSysctls == [
+            "net.ipv4.conf.IFNAME.forwarding=1", "net.ipv6.conf.ifname.accept_ra=0",
+        ])
+
+        let malformed = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=bad-sysctl",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"sysctl-net":{"DriverOpts":{"com.docker.network.endpoint.sysctls":"net.ipv4.conf.eth0.forwarding=1"}}}}}"#.utf8)
+        ))
+        #expect(malformed.status == .badRequest)
+        let unsupported = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=bad-option",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"sysctl-net":{"DriverOpts":{"example.unsupported":"1"}}}}}"#.utf8)
+        ))
+        #expect(unsupported.status == .notImplemented)
+    }
+
+    @Test func networkIPAMStatusTracksAllocationsAndIsVersioned() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"status-net","IPAM":{"Config":[{"Subnet":"10.55.0.2/29","Gateway":"10.55.0.1"}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        _ = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=status-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"status-net":{}}}}"#.utf8)
+        ))
+
+        let modern = await router.route(.init(method: .GET, uri: "/v1.52/networks/status-net"))
+        let modernObject = try #require(JSONSerialization.jsonObject(with: modern.body) as? [String: Any])
+        let subnet = try #require(
+            (((modernObject["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.0.0/29"] as? [String: Any]
+        )
+        #expect(subnet["IPsInUse"] as? Int == 4)
+        #expect(subnet["DynamicIPsAvailable"] as? Int == 4)
+
+        let list = await router.route(.init(method: .GET, uri: "/v1.52/networks"))
+        let listedNetworks = try #require(JSONSerialization.jsonObject(with: list.body) as? [[String: Any]])
+        #expect(listedNetworks.first(where: { $0["Name"] as? String == "status-net" })?["Status"] == nil)
+
+        let legacy = await router.route(.init(method: .GET, uri: "/v1.51/networks/status-net"))
+        let legacyObject = try #require(JSONSerialization.jsonObject(with: legacy.body) as? [String: Any])
+        #expect(legacyObject["Status"] == nil)
+
+        let slash31Create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"slash31","IPAM":{"Config":[{"Subnet":"10.55.1.2/31"}]}}"#.utf8)
+        ))
+        #expect(slash31Create.status == .created)
+        let slash31Container = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=slash31-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"slash31":{}}}}"#.utf8)
+        ))
+        #expect(slash31Container.status == .created)
+        let slash31Inspect = await router.route(.init(method: .GET, uri: "/v1.52/networks/slash31"))
+        let slash31Object = try #require(JSONSerialization.jsonObject(with: slash31Inspect.body) as? [String: Any])
+        let slash31Config = try #require(
+            ((slash31Object["IPAM"] as? [String: Any])?["Config"] as? [[String: Any]])?.first
+        )
+        #expect(slash31Config["Gateway"] as? String == "10.55.1.3")
+        let slash31Status = try #require(
+            (((slash31Object["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.1.2/31"] as? [String: Any]
+        )
+        #expect(slash31Status["IPsInUse"] as? Int == 2)
+        #expect(slash31Status["DynamicIPsAvailable"] as? Int == 0)
+        let containerInspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/slash31-client/json"
+        ))
+        let containerObject = try #require(JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any])
+        let slash31Endpoint = try #require(
+            ((containerObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["slash31"] as? [String: Any]
+        )
+        #expect(slash31Endpoint["IPAddress"] as? String == "10.55.1.2")
+    }
+
+    @Test func omittedExplicitIPv6GatewayIsDerivedForInspectStatusAndAllocation() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"implicit-v6-gateway","EnableIPv4":false,"EnableIPv6":true,"IPAM":{"Config":[{"Subnet":"fd00:55::10/124"}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let container = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=implicit-v6-client",
+            body: Data(#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"implicit-v6-gateway":{}}}}"#.utf8)
+        ))
+        #expect(container.status == .created)
+
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.52/networks/implicit-v6-gateway"))
+        let network = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let config = try #require(((network["IPAM"] as? [String: Any])?["Config"] as? [[String: Any]])?.first)
+        #expect(config["Gateway"] as? String == "fd00:55::11")
+        let status = try #require(
+            (((network["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["fd00:55::10/124"] as? [String: Any]
+        )
+        #expect(status["IPsInUse"] as? Int == 3)
+        #expect(status["DynamicIPsAvailable"] as? Int == 13)
+
+        let containerInspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/implicit-v6-client/json"
+        ))
+        let containerObject = try #require(JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any])
+        let endpoint = try #require(
+            ((containerObject["NetworkSettings"] as? [String: Any])?["Networks"] as? [String: Any])?["implicit-v6-gateway"] as? [String: Any]
+        )
+        #expect(endpoint["IPv6Gateway"] as? String == "fd00:55::11")
+        #expect(endpoint["GlobalIPv6Address"] as? String == "fd00:55::12")
+    }
+
     @Test func runningContainersRejectNetworkAttachmentChanges() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1087,6 +1400,62 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(dual.ipv6AllocationMode == .explicit)
     }
 
+    @Test func engineRuntimeRejectsInvalidNetworkAddressingBeforeCallingBackend() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let invalidRequests: [(String, String?, String?, String?, String?)] = [
+            ("bogus-cidr", "bogus/24", nil, nil, nil),
+            ("wrong-v4-subnet-family", "fd00:41::/64", nil, nil, nil),
+            ("wrong-v6-subnet-family", nil, nil, "10.41.0.0/24", nil),
+            ("wrong-v4-gateway-family", "10.41.0.0/24", "fd00:41::1", nil, nil),
+            ("wrong-v6-gateway-family", nil, nil, "fd00:41::/64", "10.41.0.1"),
+            ("outside-v4", "10.41.0.0/24", "10.42.0.1", nil, nil),
+            ("reserved-v4-network", "10.41.0.0/24", "10.41.0.0", nil, nil),
+            ("reserved-v4-broadcast", "10.41.0.0/24", "10.41.0.255", nil, nil),
+            ("outside-v6", nil, nil, "fd00:41::/64", "fd00:42::1"),
+            ("reserved-v6-network", nil, nil, "fd00:41::/64", "fd00:41::"),
+            ("invalid-v6-prefix", nil, nil, "fd00:41::/129", nil),
+        ]
+
+        for (name, subnet, gateway, ipv6Subnet, ipv6Gateway) in invalidRequests {
+            do {
+                _ = try await runtime.createNetwork(
+                    name: name, subnet: subnet, gateway: gateway,
+                    ipv6Subnet: ipv6Subnet, ipv6Gateway: ipv6Gateway
+                )
+                Issue.record("invalid network addressing was accepted for \(name)")
+            } catch let error as EngineError {
+                #expect(error.code == .badRequest)
+            }
+            #expect(await backend.request(named: name) == nil)
+        }
+    }
+
+    @Test func engineRuntimeCanonicalizesSubnetsAndImplicitGatewaysBeforeCallingBackend() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+
+        let network = try await runtime.createNetwork(
+            name: "canonical-network",
+            subnet: "10.44.0.30/28",
+            ipv6Subnet: "FD00:0044:0000:0000:0000:0000:0000:001E/124"
+        )
+
+        let request = try #require(await backend.request(named: network.name))
+        #expect(request.subnet == "10.44.0.16/28")
+        #expect(request.gateway == "10.44.0.17")
+        #expect(request.ipv6Subnet == "fd00:44::10/124")
+        #expect(request.ipv6Gateway == "fd00:44::11")
+        #expect(network.subnet == request.subnet)
+        #expect(network.gateway == request.gateway)
+        #expect(network.ipv6Subnet == request.ipv6Subnet)
+        #expect(network.ipv6Gateway == request.ipv6Gateway)
+    }
+
     @Test func isolatedGatewayOptionsRoundTripAndRequireInternalNetwork() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1113,6 +1482,20 @@ private actor AuthImageBackend: ContainerBackend {
         let options = try #require(json["Options"] as? [String: String])
         #expect(options[NetworkRecord.gatewayModeIPv4Option] == "isolated")
         #expect(options[NetworkRecord.gatewayModeIPv6Option] == "isolated")
+
+        let ipv6Only = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"isolated-v6","Internal":true,"EnableIPv4":false,"EnableIPv6":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv6":"isolated"}}"#.utf8)
+        ))
+        #expect(ipv6Only.status == .created)
+        let ipv6OnlyRequest = try #require(await backend.request(named: "isolated-v6"))
+        #expect(ipv6OnlyRequest.fabricIsolated)
+
+        let asymmetric = await router.route(.init(
+            method: .POST, uri: "/v1.55/networks/create",
+            body: Data(#"{"Name":"asymmetric-isolation","Internal":true,"EnableIPv6":true,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}"#.utf8)
+        ))
+        #expect(asymmetric.status == .notImplemented)
     }
 
     @Test func networkNonePersistsWithoutAnImplicitDefaultInterface() async throws {
@@ -1264,6 +1647,33 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(prune.status == .ok)
         let after = await router.route(.init(method: .GET, uri: "/v1.44/networks/default"))
         #expect(after.status == .ok)
+    }
+
+    @Test func networkPruneFiltersLimitDeletionScope() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (name, project) in [("prune-alpha", "alpha"), ("prune-beta", "beta")] {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/networks/create",
+                body: Data(#"{"Name":"\#(name)","Labels":{"project":"\#(project)"}}"#.utf8)
+            ))
+            #expect(response.status == .created)
+        }
+        let emptyLabelFilters = "%7B%22label%22:%5B%22%22%5D%7D"
+        let invalid = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/networks/prune?filters=\(emptyLabelFilters)"
+        ))
+        #expect(invalid.status == .badRequest)
+        #expect((await router.route(.init(method: .GET, uri: "/v1.55/networks/prune-alpha"))).status == .ok)
+        #expect((await router.route(.init(method: .GET, uri: "/v1.55/networks/prune-beta"))).status == .ok)
+
+        let filters = "%7B%22label%22:%5B%22project=alpha%22%5D%7D"
+        let prune = await router.route(.init(method: .POST, uri: "/v1.55/networks/prune?filters=\(filters)"))
+        let object = try #require(JSONSerialization.jsonObject(with: prune.body) as? [String: Any])
+        #expect(object["NetworksDeleted"] as? [String] == ["prune-alpha"])
+        #expect((await router.route(.init(method: .GET, uri: "/v1.55/networks/prune-alpha"))).status == .notFound)
+        #expect((await router.route(.init(method: .GET, uri: "/v1.55/networks/prune-beta"))).status == .ok)
     }
 
     @Test func composeNetworkingAndNetworkLifecyclePersistEndpoints() async throws {
@@ -2029,22 +2439,36 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(value["ContainerID"] as? String == container.id)
     }
 
-    @Test func concurrentRemovalWhileStartingReturnsConflictInsteadOfCrashing() async throws {
+    @Test func startingContainerExcludesStopRemovalAndNetworkAttachmentChanges() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = BlockingStartBackend()
         let runtime = try await EngineRuntime(root: root, backend: backend)
         let record = try await runtime.createContainer(ContainerRecord(name: "start-race", image: "debian"))
+        let defaultNetwork = try #require(record.networks.first?.networkID)
+        let extraNetwork = try await runtime.createNetwork(name: "start-race-extra")
         let start = Task { try await runtime.startContainer(record.id) }
         while !(await backend.hasEnteredStart()) { await Task.yield() }
-        try await runtime.removeContainer(record.id, force: true)
-        await backend.releaseStart()
-        do {
-            try await start.value
-            Issue.record("start should fail when the container is concurrently removed")
-        } catch let error as EngineError {
-            #expect(error.code == .conflict)
+
+        for operation in [
+            { try await runtime.stopContainer(record.id) },
+            { try await runtime.removeContainer(record.id, force: true) },
+            { try await runtime.connectNetwork(extraNetwork.id, container: record.id) },
+            { try await runtime.disconnectNetwork(defaultNetwork, container: record.id, force: false) },
+        ] {
+            do {
+                try await operation()
+                Issue.record("container lifecycle operation bypassed an in-progress start")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+            }
         }
+
+        await backend.releaseStart()
+        try await start.value
+        #expect(try await runtime.container(record.id).phase == .running)
+        try await runtime.stopContainer(record.id)
+        #expect(try await runtime.container(record.id).phase == .exited)
     }
 
     @Test func containerListDoesNotPublishAContainerDuringItsStartTransition() async throws {
@@ -2129,6 +2553,46 @@ private actor AuthImageBackend: ContainerBackend {
         async let removeSecond: Void = runtime.removeContainer(second.id, force: false)
         _ = try await (removeFirst, removeSecond)
         #expect(await runtime.listContainers(all: true).isEmpty)
+    }
+
+    @Test func containerPruneClaimsEveryCandidateBeforeDeletingAnyBackendState() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingContainerDeleteBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(ContainerRecord(name: "prune-first", image: "debian"))
+        let second = try await runtime.createContainer(ContainerRecord(name: "prune-second", image: "debian"))
+        let prune = Task { try await runtime.pruneContainers() }
+        while await backend.blockedID() == nil { await Task.yield() }
+
+        do {
+            try await runtime.startContainer(second.id)
+            Issue.record("container start bypassed an in-progress prune")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseDelete()
+        #expect(Set(try await prune.value) == [first.id, second.id])
+        #expect(await runtime.listContainers(all: true).isEmpty)
+    }
+
+    @Test func failedContainerPruneReleasesClaimsAndRetainsMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingContainerDeleteBackend(failBlockedDelete: true)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(ContainerRecord(name: "failed-prune-first", image: "debian"))
+        let second = try await runtime.createContainer(ContainerRecord(name: "failed-prune-second", image: "debian"))
+        let prune = Task { try await runtime.pruneContainers() }
+        while await backend.blockedID() == nil { await Task.yield() }
+
+        await backend.releaseDelete()
+        await #expect(throws: BlockingContainerDeleteBackend.Failure.self) { try await prune.value }
+        #expect(Set(await runtime.listContainers(all: true).map(\.id)) == [first.id, second.id])
+
+        try await runtime.startContainer(second.id)
+        #expect(try await runtime.container(second.id).phase == .running)
     }
 
     @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {

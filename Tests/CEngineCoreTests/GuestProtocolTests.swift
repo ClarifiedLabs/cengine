@@ -5,6 +5,7 @@ import Testing
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesVersionSixIdentityAndSecurityContext() throws {
         #expect(GuestProtocol.version == 6)
+
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
             workingDirectory: "/work",
@@ -19,6 +20,26 @@ import Testing
         let user = try #require(object["user"] as? [String: Any])
         #expect(user["uid"] as? Int == 1_000)
         #expect(object["noNewPrivileges"] as? Bool == true)
+    }
+
+    @Test func endpointSysctlsUseGuestProtocolVersionSix() throws {
+        #expect(GuestProtocol.version == 6)
+        let endpoint = GuestProtocol.NetworkEndpoint(
+            networkID: "network-1",
+            vlan: 42,
+            name: "eth0",
+            macAddress: "02:42:ac:11:00:02",
+            addresses: ["192.0.2.2/24"],
+            gateways: ["192.0.2.1"],
+            dns: ["192.0.2.1"],
+            aliases: ["client"],
+            sysctls: ["net.ipv4.conf.IFNAME.forwarding=1"]
+        )
+        let endpointData = try JSONEncoder().encode(endpoint)
+        let endpointObject = try #require(
+            try JSONSerialization.jsonObject(with: endpointData) as? [String: Any]
+        )
+        #expect(endpointObject["sysctls"] as? [String] == ["net.ipv4.conf.IFNAME.forwarding=1"])
     }
 
     @Test func workloadPayloadCarriesRuntimeAnnotations() throws {

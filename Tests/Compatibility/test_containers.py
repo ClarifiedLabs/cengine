@@ -24,6 +24,7 @@ IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
 KNOWN_GAP = pytest.mark.xfail(strict=True)
 GATEWAY_MODE_IPV4 = "com.docker.network.bridge.gateway_mode_ipv4"
 GATEWAY_MODE_IPV6 = "com.docker.network.bridge.gateway_mode_ipv6"
+ENDPOINT_SYSCTLS = "com.docker.network.endpoint.sysctls"
 
 
 def _network_container(client: docker.DockerClient, network, *, command="top"):
@@ -815,6 +816,275 @@ def test_container_annotations_are_versioned_and_persisted(daemon, client: docke
         assert restored.inspect_container(identifier)["HostConfig"]["Annotations"] == annotations
     finally:
         restored.close()
+
+
+@pytest.mark.compat("NET-018")
+def test_explicit_network_address_families_apply_and_survive_recovery(
+    daemon, client: docker.DockerClient
+):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"compat-v6-only-{suffix}"
+    response = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={
+            "Name": name,
+            "EnableIPv4": False,
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:18::/120", "Gateway": "fd00:18::1"}]},
+        },
+    )
+    client.api._raise_for_status(response)
+    network = client.networks.get(response.json()["Id"])
+    container = client.containers.create(IMAGE, command="top", name=f"v6-only-{suffix}", network=name)
+    container.start(); container.reload(); network.reload()
+    assert network.attrs["EnableIPv4"] is False
+    assert network.attrs["EnableIPv6"] is True
+    assert [config["Subnet"] for config in network.attrs["IPAM"]["Config"]] == ["fd00:18::/120"]
+    endpoint = container.attrs["NetworkSettings"]["Networks"][name]
+    assert endpoint["IPAddress"] == ""
+    assert endpoint["GlobalIPv6Address"].startswith("fd00:18::")
+    code, addresses = container.exec_run(["sh", "-c", "ip -o -4 addr show dev eth0; ip -o -6 addr show dev eth0"])
+    assert code == 0 and b" inet " not in addresses and b" inet6 fd00:18::" in addresses
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(container.name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"IPv6-only container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        endpoint = value.attrs["NetworkSettings"]["Networks"][name]
+        assert endpoint["IPAddress"] == ""
+        assert endpoint["GlobalIPv6Address"].startswith("fd00:18::")
+        recovered_network = recovered.networks.get(name)
+        assert recovered_network.attrs["EnableIPv4"] is False
+        assert recovered_network.attrs["EnableIPv6"] is True
+        peer = recovered.containers.create(
+            IMAGE, command="top", name=f"v6-peer-{suffix}", network=name
+        )
+        peer.start()
+        code, hosts = peer.exec_run(["getent", "hosts", container.name])
+        assert code == 0 and b"fd00:18::" in hosts
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("NET-019")
+def test_endpoint_sysctls_apply_validate_and_survive_recovery(daemon, client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    network = client.networks.create(f"compat-sysctl-{suffix}")
+    name = f"sysctl-{suffix}"
+    settings = "net.ipv4.conf.IFNAME.forwarding=1,net.ipv4.conf.ifname.log_martians=1"
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": name},
+        data={
+            "Image": IMAGE,
+            "Cmd": ["top"],
+            "NetworkingConfig": {"EndpointsConfig": {network.name: {"DriverOpts": {ENDPOINT_SYSCTLS: settings}}}},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    container.start(); container.reload()
+    endpoint = container.attrs["NetworkSettings"]["Networks"][network.name]
+    assert endpoint["DriverOpts"][ENDPOINT_SYSCTLS] == settings
+    code, values = container.exec_run([
+        "sh", "-c", "cat /proc/sys/net/ipv4/conf/eth0/forwarding /proc/sys/net/ipv4/conf/eth0/log_martians",
+    ])
+    assert (code, values.split()) == (0, [b"1", b"1"])
+
+    invalid = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"invalid-sysctl-{suffix}"},
+        data={
+            "Image": IMAGE,
+            "NetworkingConfig": {"EndpointsConfig": {network.name: {
+                "DriverOpts": {ENDPOINT_SYSCTLS: "net.ipv4.conf.eth0.forwarding=1"},
+            }}},
+        },
+    )
+    assert invalid.status_code == 400
+
+    daemon.restart(kill=True)
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            value = recovered.containers.get(name)
+            value.reload()
+            if value.status == "running":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"sysctl container did not recover: {value.attrs['State']}")
+            time.sleep(0.2)
+        code, values = value.exec_run([
+            "sh", "-c", "cat /proc/sys/net/ipv4/conf/eth0/forwarding /proc/sys/net/ipv4/conf/eth0/log_martians",
+        ])
+        assert (code, values.split()) == (0, [b"1", b"1"])
+    finally:
+        recovered.close()
+
+
+@pytest.mark.compat("NET-020")
+def test_network_ipam_status_tracks_allocations_and_api_version(client: docker.DockerClient, daemon):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"compat-ipam-status-{suffix}"
+    response = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={"Name": name, "IPAM": {"Config": [{"Subnet": "10.20.30.2/29", "Gateway": "10.20.30.1"}]}},
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.create(IMAGE, command="top", network=name)
+    network = client.networks.get(name)
+    network.reload()
+    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.0/29"]
+    assert status == {"IPsInUse": 4, "DynamicIPsAvailable": 4}
+
+    legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.51")
+    try:
+        assert "Status" not in legacy.networks.get(name).attrs
+    finally:
+        legacy.close()
+
+
+@pytest.mark.compat("NET-021")
+def test_network_prune_filters_limit_deleted_networks(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    selected = client.networks.create(f"prune-selected-{suffix}", labels={"project": "selected"})
+    retained = client.networks.create(f"prune-retained-{suffix}", labels={"project": "retained"})
+    with pytest.raises(errors.APIError) as invalid:
+        client.api.prune_networks(filters={"label": [""]})
+    assert invalid.value.response.status_code == 400
+    selected.reload(); retained.reload()
+    result = client.api.prune_networks(filters={"label": ["project=selected"]})
+    assert result["NetworksDeleted"] == [selected.name]
+    with pytest.raises(errors.NotFound):
+        client.networks.get(selected.id)
+    retained.reload()
+
+
+@pytest.mark.compat("NET-022")
+def test_network_ipam_and_family_validation_is_explicit(
+    client: docker.DockerClient, daemon,
+):
+    suffix = uuid.uuid4().hex[:8]
+    unsupported = [
+        {
+            "Name": f"aux-{suffix}",
+            "IPAM": {"Config": [{
+                "Subnet": "10.210.0.0/24",
+                "AuxiliaryAddresses": {"reserved": "10.210.0.10"},
+            }]},
+        },
+        {
+            "Name": f"multi-{suffix}",
+            "IPAM": {"Config": [
+                {"Subnet": "10.211.0.0/24"},
+                {"Subnet": "10.212.0.0/24"},
+            ]},
+        },
+        {
+            "Name": f"custom-v6-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{
+                "Subnet": "fd00:22::/64",
+                "Gateway": "fd00:22::fe",
+            }]},
+        },
+        {
+            "Name": f"asymmetric-{suffix}",
+            "Internal": True,
+            "EnableIPv6": True,
+            "Options": {GATEWAY_MODE_IPV4: "isolated"},
+        },
+    ]
+    for request in unsupported:
+        response = client.api._post_json(client.api._url("/networks/create"), data=request)
+        assert response.status_code == 501, response.text
+
+    disabled = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={"Name": f"disabled-{suffix}", "EnableIPv4": False, "EnableIPv6": False},
+    )
+    assert disabled.status_code == 400
+
+    invalid = [
+        {"Name": f"bogus-cidr-{suffix}", "IPAM": {"Config": [{"Subnet": "bogus/24"}]}},
+        {
+            "Name": f"wrong-v4-gateway-family-{suffix}",
+            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "fd00:22::1"}]},
+        },
+        {
+            "Name": f"outside-v4-gateway-{suffix}",
+            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "10.214.0.1"}]},
+        },
+        {
+            "Name": f"reserved-v4-gateway-{suffix}",
+            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "10.213.0.255"}]},
+        },
+        {
+            "Name": f"invalid-v6-prefix-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/129"}]},
+        },
+        {
+            "Name": f"wrong-v6-gateway-family-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "10.213.0.1"}]},
+        },
+        {
+            "Name": f"outside-v6-gateway-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "fd00:23::1"}]},
+        },
+        {
+            "Name": f"reserved-v6-gateway-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "fd00:22::"}]},
+        },
+    ]
+    for request in invalid:
+        response = client.api._post_json(client.api._url("/networks/create"), data=request)
+        assert response.status_code == 400, response.text
+
+    canonical = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={
+            "Name": f"canonical-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [
+                {"Subnet": "10.215.0.30/28"},
+                {"Subnet": "FD00:0022:0000:0000:0000:0000:0000:001E/124"},
+            ]},
+        },
+    )
+    client.api._raise_for_status(canonical)
+    canonical_network = client.networks.get(canonical.json()["Id"])
+    assert canonical_network.attrs["IPAM"]["Config"] == [
+        {"Subnet": "10.215.0.16/28", "Gateway": "10.215.0.17"},
+        {"Subnet": "fd00:22::10/124", "Gateway": "fd00:22::11"},
+    ]
+    canonical_network.remove()
+
+    legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.47")
+    try:
+        response = legacy.api._post_json(
+            legacy.api._url("/networks/create"),
+            data={"Name": f"legacy-ipv4-{suffix}", "EnableIPv4": False},
+        )
+        legacy.api._raise_for_status(response)
+        network = client.networks.get(response.json()["Id"])
+        network.reload()
+        assert network.attrs["EnableIPv4"] is True
+        network.remove()
+    finally:
+        legacy.close()
 
 
 @pytest.mark.compat("CTR-034")
