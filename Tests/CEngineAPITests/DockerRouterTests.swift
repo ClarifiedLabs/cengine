@@ -23,6 +23,29 @@ private func versionMetadataBundle() throws -> (Bundle, URL) {
     return (try #require(Bundle(url: bundleURL)), root)
 }
 
+private func upgradedExecStart(socketPath: String, execID: String, body: String) throws -> String {
+    let process = Process()
+    let output = Pipe()
+    let errors = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+    process.arguments = [
+        "--silent", "--show-error", "--include", "--max-time", "5",
+        "--unix-socket", socketPath,
+        "--request", "POST",
+        "--header", "Connection: Upgrade",
+        "--header", "Upgrade: tcp",
+        "--header", "Content-Type: application/json",
+        "--data-binary", body,
+        "http://localhost/v1.44/exec/\(execID)/start",
+    ]
+    process.standardOutput = output
+    process.standardError = errors
+    try process.run()
+    process.waitUntilExit()
+    return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        + String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+}
+
 private actor CompletionBackend: ContainerBackend {
     private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private let log: Data
@@ -116,10 +139,12 @@ private actor NetworkRecordingBackend: ContainerBackend {
 private actor BlockingStartBackend: ContainerBackend {
     private var continuation: CheckedContinuation<Void, Never>?
     private var entered = false
+    private var starts = 0
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
     func start(_ container: ContainerRecord) async throws -> [PortBinding] {
         entered = true
+        starts += 1
         await withCheckedContinuation { continuation = $0 }
         return container.ports
     }
@@ -127,7 +152,205 @@ private actor BlockingStartBackend: ContainerBackend {
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
     func delete(_: ContainerRecord) async throws {}
     func hasEnteredStart() -> Bool { entered }
+    func startCount() -> Int { starts }
     func releaseStart() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingPauseResumeBackend: ContainerBackend {
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+    private var pauseBlocked = false
+    private var resumeBlocked = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func pause(_: ContainerRecord) async throws {
+        pauseBlocked = true
+        await withCheckedContinuation { pauseContinuation = $0 }
+        pauseBlocked = false
+    }
+    func resume(_: ContainerRecord) async throws {
+        resumeBlocked = true
+        await withCheckedContinuation { resumeContinuation = $0 }
+        resumeBlocked = false
+    }
+    func isPauseBlocked() -> Bool { pauseBlocked }
+    func isResumeBlocked() -> Bool { resumeBlocked }
+    func releasePause() { pauseContinuation?.resume(); pauseContinuation = nil }
+    func releaseResume() { resumeContinuation?.resume(); resumeContinuation = nil }
+}
+
+private actor PauseExitRaceBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var pauseBlocked = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuation = $0 }
+    }
+    func pause(_: ContainerRecord) async throws {
+        pauseBlocked = true
+        await withCheckedContinuation { pauseContinuation = $0 }
+        pauseBlocked = false
+    }
+    func isWaitingForCompletion() -> Bool { completionContinuation != nil }
+    func isPauseBlocked() -> Bool { pauseBlocked }
+    func finish(code: Int32) {
+        completionContinuation?.resume(returning: code)
+        completionContinuation = nil
+    }
+    func releasePause() { pauseContinuation?.resume(); pauseContinuation = nil }
+}
+
+private actor BlockingNetworkUpdateBackend: ContainerBackend {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var blockNextUpdate = false
+    private var updateBlocked = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func updateNetworkRecords(_: [ContainerRecord]) async throws {
+        guard blockNextUpdate else { return }
+        blockNextUpdate = false
+        updateBlocked = true
+        await withCheckedContinuation { continuation = $0 }
+        updateBlocked = false
+    }
+    func blockNextNetworkUpdate() { blockNextUpdate = true }
+    func isNetworkUpdateBlocked() -> Bool { updateBlocked }
+    func releaseNetworkUpdate() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingExecStartBackend: ContainerBackend {
+    enum Mode { case detached, attached }
+
+    private var mode: Mode?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var detachedStarts = 0
+    private var attachedStarts = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startExec(_: ExecRecord) async throws {
+        mode = .detached
+        detachedStarts += 1
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? {
+        mode = .attached
+        attachedStarts += 1
+        await withCheckedContinuation { continuation = $0 }
+        return nil
+    }
+    func execPID(_: ExecRecord) async -> Int32 { 42 }
+    func entered(_ expected: Mode) -> Bool { mode == expected }
+    func counts() -> (detached: Int, attached: Int) { (detachedStarts, attachedStarts) }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingRestartExecGateBackend: ContainerBackend {
+    private var restartContinuation: CheckedContinuation<Void, Never>?
+    private var replacementReady = false
+    private var preparedExecs = 0
+    private var detachedStarts = 0
+    private var attachedStarts = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func restart(_: ContainerRecord, timeoutSeconds _: Int) async throws {
+        // Model RawVirtualizationBackend after it has installed the replacement
+        // shim but before EngineRuntime has reconciled the old exec generation.
+        replacementReady = true
+        await withCheckedContinuation { restartContinuation = $0 }
+    }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        preparedExecs += 1
+        return ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startExec(_: ExecRecord) async throws { detachedStarts += 1 }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? {
+        attachedStarts += 1
+        return nil
+    }
+    func isReplacementReady() -> Bool { replacementReady }
+    func counts() -> (prepared: Int, detached: Int, attached: Int) {
+        (preparedExecs, detachedStarts, attachedStarts)
+    }
+    func releaseRestart() {
+        restartContinuation?.resume()
+        restartContinuation = nil
+    }
+}
+
+private actor BlockingStaleExecPreparationBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var prepareContinuation: CheckedContinuation<Void, Never>?
+    private var completionCalls = 0
+    private var prepareBlocked = false
+    private var preparedExecID: String?
+    private var discardedExecIDs: Set<String> = []
+    private var starts = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? {
+        completionCalls += 1
+        guard completionCalls == 1 else { return nil }
+        return await withCheckedContinuation { completionContinuation = $0 }
+    }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        preparedExecID = exec.id
+        prepareBlocked = true
+        await withCheckedContinuation { prepareContinuation = $0 }
+        prepareBlocked = false
+        return ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func discardExec(_ exec: ExecRecord) async { discardedExecIDs.insert(exec.id) }
+    func isWaitingForCompletion() -> Bool { completionContinuation != nil }
+    func isPrepareBlocked() -> Bool { prepareBlocked }
+    func preparedID() -> String? { preparedExecID }
+    func wasDiscarded(_ identifier: String) -> Bool { discardedExecIDs.contains(identifier) }
+    func startCount() -> Int { starts }
+    func finishContainer(code: Int32) {
+        completionContinuation?.resume(returning: code)
+        completionContinuation = nil
+    }
+    func releasePrepare() {
+        prepareContinuation?.resume()
+        prepareContinuation = nil
+    }
 }
 
 private actor BlockingPrepareBackend: ContainerBackend {
@@ -196,6 +419,202 @@ private actor BlockingContainerDeleteBackend: ContainerBackend {
 
     func blockedID() -> String? { blockedContainerID }
     func releaseDelete() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingPruneDeleteBackend: ContainerBackend {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var deleteEntered = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {
+        deleteEntered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func hasEnteredDelete() -> Bool { deleteEntered }
+    func releaseDelete() { continuation?.resume(); continuation = nil }
+}
+
+private actor BlockingResourceUpdateBackend: ContainerBackend {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var updateEntered = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func updateResources(_: ContainerRecord) async throws {
+        updateEntered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func hasEnteredUpdate() -> Bool { updateEntered }
+    func releaseUpdate() { continuation?.resume(); continuation = nil }
+}
+
+private actor UpdateExitRaceBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var updateContinuation: CheckedContinuation<Void, Never>?
+    private var updateBlocked = false
+    private var starts = 0
+    private var prepares = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws { prepares += 1 }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws { deletes += 1 }
+    func completion(_: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuation = $0 }
+    }
+    func updateResources(_: ContainerRecord) async throws {
+        updateBlocked = true
+        await withCheckedContinuation { updateContinuation = $0 }
+        updateBlocked = false
+    }
+    func isWaitingForCompletion() -> Bool { completionContinuation != nil }
+    func isUpdateBlocked() -> Bool { updateBlocked }
+    func finish(code: Int32) {
+        completionContinuation?.resume(returning: code)
+        completionContinuation = nil
+    }
+    func releaseUpdate() {
+        updateContinuation?.resume()
+        updateContinuation = nil
+    }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
+}
+
+private actor BlockingReconciliationBackend: ContainerBackend {
+    private var completionContinuations: [String: CheckedContinuation<Int32?, Never>] = [:]
+    private var deleteContinuation: CheckedContinuation<Void, Never>?
+    private var deleteBlocked = false
+    private var prepares = 0
+    private var starts = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws { prepares += 1 }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        return container.ports
+    }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        guard container.phase == .exited else { return }
+        deleteBlocked = true
+        await withCheckedContinuation { deleteContinuation = $0 }
+        deleteBlocked = false
+    }
+    func completion(_ container: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuations[container.id] = $0 }
+    }
+    func isWaitingForCompletion(_ identifier: String) -> Bool {
+        completionContinuations[identifier] != nil
+    }
+    func finish(_ identifier: String, code: Int32) {
+        completionContinuations.removeValue(forKey: identifier)?.resume(returning: code)
+    }
+    func hasBlockedReconciliationDelete() -> Bool { deleteBlocked }
+    func releaseReconciliationDelete() {
+        deleteContinuation?.resume()
+        deleteContinuation = nil
+    }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
+}
+
+private actor AttachedExecLifecycleBackend: ContainerBackend {
+    private var execCompletionContinuation: CheckedContinuation<Int32?, Never>?
+    private var terminal = false
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? { 123 }
+    func execCompletion(_: ExecRecord) async -> Int32? {
+        await withCheckedContinuation { execCompletionContinuation = $0 }
+    }
+    func execPID(_: ExecRecord) async -> Int32 { terminal ? 0 : 73 }
+    func isWaitingForExecCompletion() -> Bool { execCompletionContinuation != nil }
+    func finishExec(code: Int32) {
+        terminal = true
+        execCompletionContinuation?.resume(returning: code)
+        execCompletionContinuation = nil
+    }
+}
+
+private actor FailedAttachedExecBackend: ContainerBackend {
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? { 123 }
+    func execCompletion(_: ExecRecord) async -> Int32? { 126 }
+    func execPID(_: ExecRecord) async -> Int32 { 0 }
+    func execStatus(_: ExecRecord) async -> Int32? { 126 }
+}
+
+private actor ParentTeardownExecBackend: ContainerBackend {
+    private var containerCompletions: [CheckedContinuation<Int32?, Never>] = []
+    private var execCompletions: [String: CheckedContinuation<Int32?, Never>] = [:]
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { containerCompletions.append($0) }
+    }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startExec(_: ExecRecord) async throws {}
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? { 123 }
+    func execCompletion(_ exec: ExecRecord) async -> Int32? {
+        await withCheckedContinuation { execCompletions[exec.id] = $0 }
+    }
+    func execPID(_: ExecRecord) async -> Int32 { 81 }
+    func execStatus(_: ExecRecord) async -> Int32? { nil }
+    func isWaitingForContainerCompletion() -> Bool { !containerCompletions.isEmpty }
+    func waitingContainerCount() -> Int { containerCompletions.count }
+    func waitingExecCount() -> Int { execCompletions.count }
+    func finishContainer(code: Int32) {
+        if !containerCompletions.isEmpty {
+            containerCompletions.removeFirst().resume(returning: code)
+        }
+        let pending = execCompletions.values
+        execCompletions.removeAll()
+        pending.forEach { $0.resume(returning: nil) }
+    }
+    func releaseContainerCompletions() {
+        let pending = containerCompletions
+        containerCompletions.removeAll()
+        pending.forEach { $0.resume(returning: nil) }
+    }
 }
 
 private actor ImageStoreBackend: ContainerBackend {
@@ -693,6 +1112,7 @@ private actor AuthImageBackend: ContainerBackend {
         let mounts = try #require(object["Mounts"] as? [[String: Any]])
         #expect(mounts.first?["Destination"] as? String == "/data")
         #expect(mounts.first?["RW"] as? Bool == false)
+        #expect(mounts.first?["Propagation"] as? String == "")
         let host = try #require(object["HostConfig"] as? [String: Any])
         #expect((host["Binds"] as? [String]) == ["data:/data:ro"])
         #expect(host["NetworkMode"] as? String == "default")
@@ -700,6 +1120,88 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(logConfig["Type"] as? String == "json-file")
         let bindings = try #require(host["PortBindings"] as? [String: [[String: String]]])
         #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
+    }
+
+    @Test func privateBindPropagationRoundTripsAndUnrealizableModesAreRejected() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=propagated-bind",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Binds":["/tmp:/legacy:rprivate"],"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/typed","ReadOnly":true,"BindOptions":{"Propagation":"private"}}]}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let mounts = try #require(object["Mounts"] as? [[String: Any]])
+        #expect(mounts.first { $0["Destination"] as? String == "/legacy" }?["Propagation"] as? String == "rprivate")
+        #expect(mounts.first { $0["Destination"] as? String == "/typed" }?["Propagation"] as? String == "private")
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        let binds = try #require(host["Binds"] as? [String])
+        #expect(binds.contains("/tmp:/legacy"))
+        #expect(binds.contains("/tmp:/typed:ro,private"))
+
+        for (index, propagation) in ["shared", "rshared", "slave", "rslave"].enumerated() {
+            let unsupported = await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/create?name=unsupported-propagation-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":{\"Binds\":[\"/tmp:/data:\(propagation)\"]}}".utf8)
+            ))
+            #expect(unsupported.status == .notImplemented)
+        }
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=invalid-propagation",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/data","BindOptions":{"Propagation":"sideways"}}]}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
+
+        let mismatched = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=mismatched-options",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Source":"data","Target":"/data","BindOptions":{"Propagation":"rshared"}}]}}"#.utf8)
+        ))
+        #expect(mismatched.status == .badRequest)
+    }
+
+    @Test func capabilityChangesRoundTripAndUnsupportedSecurityFieldsAreRejected() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=capabilities",
+            body: Data(#"{"Image":"alpine","HostConfig":{"CapAdd":["net_admin","CAP_CHOWN"],"CapDrop":["net_raw","CHOWN"]}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        #expect(host["CapAdd"] as? [String] == ["CAP_NET_ADMIN", "CAP_CHOWN"])
+        #expect(host["CapDrop"] as? [String] == ["CAP_NET_RAW", "CAP_CHOWN"])
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=invalid-capability",
+            body: Data(#"{"Image":"alpine","HostConfig":{"CapAdd":["CAP_SIDEWAYS"]}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
+
+        let unsupportedFields = [
+            #""SecurityOpt":["no-new-privileges"]"#,
+            #""Ulimits":[{"Name":"nofile","Soft":1024,"Hard":1024}]"#,
+            #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
+            #""DeviceCgroupRules":["c 1:3 rwm"]"#,
+            #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
+            #""MaskedPaths":["/proc/kcore"]"#,
+            #""ReadonlyPaths":["/proc/sys"]"#,
+        ]
+        for (index, field) in unsupportedFields.enumerated() {
+            let body = "{\"Image\":\"alpine\",\"HostConfig\":{\(field)}}"
+            let rejected = await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/create?name=unsupported-security-\(index)",
+                body: Data(body.utf8)
+            ))
+            #expect(rejected.status == .notImplemented)
+        }
     }
 
     @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
@@ -717,6 +1219,31 @@ private actor AuthImageBackend: ContainerBackend {
 
         #expect(host["Memory"] as? Int == 4 * 1_024 * 1_024 * 1_024)
         #expect(host["NanoCpus"] as? Int == 4_000_000_000)
+    }
+
+    @Test func pidsLimitRoundTripsAndRejectsInvalidValues() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=pids-limited",
+            body: Data(#"{"Image":"alpine","HostConfig":{"PidsLimit":32}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        #expect(host["PidsLimit"] as? Int == 32)
+        let snapshot = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(snapshot.containers.first { $0.id == id }).pidsLimit == 32)
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=invalid-pids",
+            body: Data(#"{"Image":"alpine","HostConfig":{"PidsLimit":-2}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
     }
 
     @Test func createUsesConfiguredContainerDefaultsUnlessResourcesAreExplicit() async throws {
@@ -2419,6 +2946,12 @@ private actor AuthImageBackend: ContainerBackend {
         let container = try await runtime.createContainer(ContainerRecord(name: "exec-host", image: "debian"))
         try await runtime.startContainer(container.id)
 
+        let detachKeys = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/\(container.id)/exec",
+            body: Data(#"{"DetachKeys":"ctrl-x,x","Cmd":["true"]}"#.utf8)
+        ))
+        #expect(detachKeys.status == .notImplemented)
+
         let create = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/\(container.id)/exec",
             body: Data(#"{"AttachStdout":true,"AttachStderr":true,"Cmd":["echo","ok"]}"#.utf8)
@@ -2426,6 +2959,11 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(create.status == .created)
         let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
         let execID = try #require(created["Id"] as? String)
+        let mismatchedTTY = await router.route(.init(
+            method: .POST, uri: "/v1.44/exec/\(execID)/start",
+            body: Data(#"{"Detach":true,"Tty":true}"#.utf8)
+        ))
+        #expect(mismatchedTTY.status == .badRequest)
         let start = await router.route(.init(method: .POST, uri: "/v1.44/exec/\(execID)/start", body: Data(#"{"Detach":true,"Tty":false}"#.utf8)))
         #expect(start.status == .ok)
         for _ in 0..<20 {
@@ -2437,6 +2975,368 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(value["Running"] as? Bool == false)
         #expect(value["ExitCode"] as? Int == 0)
         #expect(value["ContainerID"] as? String == container.id)
+    }
+
+    @Test func concurrentDetachedExecStartsLaunchOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingExecStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(ContainerRecord(name: "detached-exec-race", image: "debian"))
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"])
+        )
+
+        let first = Task { try await runtime.startExec(exec.id) }
+        while !(await backend.entered(.detached)) { await Task.yield() }
+        do {
+            try await runtime.startExec(exec.id)
+            Issue.record("a concurrent detached start launched the same exec twice")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        await backend.release()
+        try await first.value
+
+        let counts = await backend.counts()
+        #expect(counts.detached == 1)
+        #expect(counts.attached == 0)
+    }
+
+    @Test func concurrentAttachedExecStartsLaunchOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingExecStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(ContainerRecord(name: "attached-exec-race", image: "debian"))
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"])
+        )
+
+        let first = Task { try await runtime.startAttachedExec(exec.id) }
+        while !(await backend.entered(.attached)) { await Task.yield() }
+        do {
+            _ = try await runtime.startAttachedExec(exec.id)
+            Issue.record("a concurrent attached start launched the same exec twice")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        await backend.release()
+        #expect(try await first.value == nil)
+
+        let counts = await backend.counts()
+        #expect(counts.detached == 0)
+        #expect(counts.attached == 1)
+    }
+
+    @Test func attachedExecPublishesPIDAndReconcilesCompletion() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = AttachedExecLifecycleBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "attached-exec-lifecycle", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["sh", "-c", "exit 23"])
+        )
+
+        #expect(try await runtime.startAttachedExec(exec.id) == 123)
+        let running = try await runtime.inspectExec(exec.id)
+        #expect(running.running)
+        #expect(running.pid == 73)
+        while !(await backend.isWaitingForExecCompletion()) { await Task.yield() }
+
+        await backend.finishExec(code: 23)
+        for _ in 0..<100 {
+            if try await runtime.inspectExec(exec.id).exitCode != nil { break }
+            await Task.yield()
+        }
+        let completed = try await runtime.inspectExec(exec.id)
+        #expect(!completed.running)
+        #expect(completed.exitCode == 23)
+        #expect(completed.pid == 73)
+    }
+
+    @Test func attachedExecLaunchFailureReconcilesTheHostRecord() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: FailedAttachedExecBackend())
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "attached-launch-failure", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["missing-command"], attachStdout: true)
+        )
+
+        #expect(try await runtime.startAttachedExec(exec.id) == 123)
+        for _ in 0..<100 {
+            if try await runtime.inspectExec(exec.id).exitCode != nil { break }
+            await Task.yield()
+        }
+        let completed = try await runtime.inspectExec(exec.id)
+        #expect(completed.running == false)
+        #expect(completed.exitCode == 126)
+    }
+
+    @Test func parentCompletionTerminalizesAttachedAndDetachedExecsWhenGuestStatusDisappears() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ParentTeardownExecBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "parent-exec-teardown", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        while !(await backend.isWaitingForContainerCompletion()) { await Task.yield() }
+
+        let detached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["sleep", "30"])
+        )
+        let attached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["sleep", "30"])
+        )
+        try await runtime.startExec(detached.id)
+        #expect(try await runtime.startAttachedExec(attached.id) == 123)
+        while (await backend.waitingExecCount()) != 2 { await Task.yield() }
+
+        await backend.finishContainer(code: 0)
+        for _ in 0..<100 {
+            if try await runtime.inspectExec(detached.id).exitCode != nil,
+               try await runtime.inspectExec(attached.id).exitCode != nil { break }
+            await Task.yield()
+        }
+        let detachedCompleted = try await runtime.inspectExec(detached.id)
+        let attachedCompleted = try await runtime.inspectExec(attached.id)
+        #expect(!detachedCompleted.running)
+        #expect(detachedCompleted.exitCode == 137)
+        #expect(detachedCompleted.pid == 81)
+        #expect(!attachedCompleted.running)
+        #expect(attachedCompleted.exitCode == 137)
+        #expect(attachedCompleted.pid == 81)
+
+        try await runtime.removeContainer(container.id, force: false)
+        #expect(try await runtime.inspectExec(detached.id).exitCode == 137)
+        #expect(try await runtime.inspectExec(attached.id).exitCode == 137)
+    }
+
+    @Test func parentRestartTerminalizesOldAttachedAndDetachedExecsBeforePublishingNewGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ParentTeardownExecBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "parent-exec-restart", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        while !(await backend.isWaitingForContainerCompletion()) { await Task.yield() }
+        let firstStartedAt = try #require(try await runtime.container(container.id).startedAt)
+
+        let detached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["sleep", "30"])
+        )
+        let attached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["sleep", "30"])
+        )
+        try await runtime.startExec(detached.id)
+        #expect(try await runtime.startAttachedExec(attached.id) == 123)
+        while (await backend.waitingExecCount()) != 2 { await Task.yield() }
+
+        try await runtime.restartContainer(container.id, timeoutSeconds: 0)
+
+        // The old completion continuations are deliberately still suspended.
+        // Restart itself must close the old exec generation.
+        for identifier in [detached.id, attached.id] {
+            let completed = try await runtime.inspectExec(identifier)
+            #expect(!completed.running)
+            #expect(completed.exitCode == 137)
+            #expect(completed.pid == 81)
+        }
+        let restarted = try await runtime.container(container.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.restartCount == 1)
+        #expect(restarted.startedAt != firstStartedAt)
+
+        while (await backend.waitingContainerCount()) != 2 { await Task.yield() }
+        await backend.finishContainer(code: 0)
+        for _ in 0..<100 { await Task.yield() }
+        #expect(try await runtime.container(container.id).phase == .running)
+        await backend.releaseContainerCompletions()
+    }
+
+    @Test func explicitRestartRejectsExecBindingUntilOldGenerationIsReconciled() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingRestartExecGateBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "restart-exec-gate", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        let detached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["true"])
+        )
+        let attached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["true"])
+        )
+
+        let restart = Task { try await runtime.restartContainer(container.id, timeoutSeconds: 0) }
+        while !(await backend.isReplacementReady()) { await Task.yield() }
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.createExec(
+                container: container.id, configuration: .init(arguments: ["new-generation"])
+            )
+        }
+        await #expect(throws: EngineError.self) { try await runtime.startExec(detached.id) }
+        await #expect(throws: EngineError.self) { _ = try await runtime.startAttachedExec(attached.id) }
+        let blockedCounts = await backend.counts()
+        #expect(blockedCounts.prepared == 2)
+        #expect(blockedCounts.detached == 0)
+        #expect(blockedCounts.attached == 0)
+
+        await backend.releaseRestart()
+        try await restart.value
+        #expect(try await runtime.container(container.id).restartCount == 1)
+        #expect(try await runtime.inspectExec(detached.id).exitCode == 137)
+        #expect(try await runtime.inspectExec(attached.id).exitCode == 137)
+    }
+
+    @Test func staleExecPreparationCannotCrossParentExitAndExplicitRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStaleExecPreparationBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "stale-exec-generation", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+        let firstStartedAt = try #require(try await runtime.container(container.id).startedAt)
+
+        let create = Task {
+            try await runtime.createExec(
+                container: container.id, configuration: .init(arguments: ["true"])
+            )
+        }
+        while !(await backend.isPrepareBlocked()) { await Task.yield() }
+        let preparedID = try #require(await backend.preparedID())
+
+        await backend.finishContainer(code: 23)
+        for _ in 0..<100 {
+            if try await runtime.container(container.id).phase == .exited { break }
+            await Task.yield()
+        }
+        #expect(try await runtime.container(container.id).phase == .exited)
+        do {
+            try await runtime.restartContainer(container.id, timeoutSeconds: 0)
+            Issue.record("restart crossed an active exec preparation after parent exit")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        #expect(await backend.startCount() == 1)
+
+        await backend.releasePrepare()
+        do {
+            _ = try await create.value
+            Issue.record("stale exec preparation was published after its parent exited")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        #expect(await backend.wasDiscarded(preparedID))
+        await #expect(throws: EngineError.self) { try await runtime.exec(preparedID) }
+
+        try await runtime.restartContainer(container.id, timeoutSeconds: 0)
+        let restarted = try await runtime.container(container.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.startedAt != firstStartedAt)
+        #expect(restarted.exitCode == nil)
+        #expect(restarted.restartCount == 0)
+        #expect(await backend.startCount() == 2)
+    }
+
+    @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let socket = root.appending(path: "engine.sock").path
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+        let container = try await runtime.createContainer(ContainerRecord(name: "upgrade-validation", image: "debian"))
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"], tty: false)
+        )
+        let server = DockerServer(socketPath: socket, router: router)
+        try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let detached = try upgradedExecStart(
+            socketPath: socket, execID: exec.id, body: #"{"Detach":true,"Tty":false}"#
+        )
+        #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
+        let mismatchedTTY = try upgradedExecStart(
+            socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
+        )
+        #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
+        #expect(try await runtime.exec(exec.id).running == false)
+        #expect(try await runtime.exec(exec.id).exitCode == nil)
+    }
+
+    @Test func scopedSocketValidatesExecUpgradeBodyBeforeHijacking() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let sockets = URL(
+            filePath: "/tmp/cengine-scope-upgrade-test-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: sockets)
+        }
+        let runtime = try await EngineRuntime(
+            root: root, backend: CompletionBackend(completionEnabled: false)
+        )
+        let manager = ContainerResourceScopeManager(
+            runtime: runtime, root: root, socketDirectory: sockets
+        )
+        do {
+            let container = try await runtime.createContainer(
+                ContainerRecord(name: "scoped-upgrade-validation", image: "debian")
+            )
+            try await runtime.startContainer(container.id)
+            let exec = try await runtime.createExec(
+                container: container.id,
+                configuration: .init(arguments: ["true"], tty: false)
+            )
+            let scope = try await manager.create(
+                ownerPID: getpid(), resources: .init(cpus: 1, memoryGiB: 1)
+            )
+            let socket = String(scope.dockerHost.dropFirst("unix://".count))
+
+            let detached = try upgradedExecStart(
+                socketPath: socket, execID: exec.id, body: #"{"Detach":true,"Tty":false}"#
+            )
+            #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
+            let mismatchedTTY = try upgradedExecStart(
+                socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
+            )
+            #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
+            #expect(try await runtime.exec(exec.id).running == false)
+            #expect(try await runtime.exec(exec.id).exitCode == nil)
+            try await manager.shutdown()
+        } catch {
+            try? await manager.shutdown()
+            throw error
+        }
     }
 
     @Test func startingContainerExcludesStopRemovalAndNetworkAttachmentChanges() async throws {
@@ -2487,6 +3387,89 @@ private actor AuthImageBackend: ContainerBackend {
         let listed = await runtime.listContainers(all: true)
         #expect(listed.map(\.id) == [record.id])
         #expect(listed.first?.phase == .running)
+    }
+
+    @Test func concurrentContainerStartsLaunchOnlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "concurrent-start", image: "debian"))
+        let first = Task { try await runtime.startContainer(record.id) }
+        while !(await backend.hasEnteredStart()) { await Task.yield() }
+
+        do {
+            try await runtime.startContainer(record.id)
+            Issue.record("a concurrent start launched the same container twice")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseStart()
+        try await first.value
+        #expect(await backend.startCount() == 1)
+        #expect(try await runtime.container(record.id).phase == .running)
+    }
+
+    @Test func stopAndNetworkMutationConflictWithAnInFlightStart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let extra = try await runtime.createNetwork(
+            name: "start-race-network", subnet: "192.168.210.0/24", gateway: "192.168.210.1"
+        )
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "start-stop-network-race", image: "debian")
+        )
+        let defaultNetwork = try #require(record.networks.first?.networkID)
+        let start = Task { try await runtime.startContainer(record.id) }
+        while !(await backend.hasEnteredStart()) { await Task.yield() }
+
+        for operation in [
+            { try await runtime.stopContainer(record.id) },
+            { try await runtime.connectNetwork(extra.id, container: record.id) },
+            { try await runtime.disconnectNetwork(defaultNetwork, container: record.id, force: false) },
+        ] {
+            do {
+                try await operation()
+                Issue.record("an operation reported success while the container was still starting")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+            }
+        }
+
+        await backend.releaseStart()
+        try await start.value
+        #expect(try await runtime.container(record.id).phase == .running)
+        #expect(try await runtime.container(record.id).networks.map(\.networkID) == [defaultNetwork])
+    }
+
+    @Test func resourceUpdateConflictsWithAnInFlightContainerStart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingStartBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "start-update-race", image: "debian")
+        )
+        let start = Task { try await runtime.startContainer(record.id) }
+        while !(await backend.hasEnteredStart()) { await Task.yield() }
+
+        do {
+            _ = try await runtime.updateContainer(
+                record.id, memoryBytes: 8_192, nanoCPUs: nil,
+                pidsLimit: nil, restartPolicy: nil
+            )
+            Issue.record("resource update overlapped an in-flight container start")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseStart()
+        try await start.value
+        #expect(try await runtime.container(record.id).phase == .running)
+        #expect(try await runtime.container(record.id).memoryBytes != 8_192)
     }
 
     @Test func concurrentCreatesReserveContainerNamesBeforeBackendPreparation() async throws {
@@ -2595,6 +3578,311 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(try await runtime.container(second.id).phase == .running)
     }
 
+    @Test func pruneReservesEachContainerAgainstConcurrentStart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingPruneDeleteBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(ContainerRecord(name: "prune-start-race", image: "debian"))
+        let prune = Task { try await runtime.pruneContainers(ids: [record.id]) }
+        while !(await backend.hasEnteredDelete()) { await Task.yield() }
+
+        do {
+            try await runtime.startContainer(record.id)
+            Issue.record("container started while prune held its removal reservation")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseDelete()
+        #expect(try await prune.value == [record.id])
+        #expect(await runtime.listContainers(all: true).isEmpty)
+    }
+
+    @Test func resourceUpdateReResolvesByIDAndConflictsWithConcurrentRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingResourceUpdateBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(ContainerRecord(name: "update-index-first", image: "debian"))
+        let target = try await runtime.createContainer(ContainerRecord(name: "update-index-target", image: "debian"))
+        let update = Task {
+            try await runtime.updateContainer(
+                target.id, memoryBytes: 8_192, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil
+            )
+        }
+        while !(await backend.hasEnteredUpdate()) { await Task.yield() }
+
+        try await runtime.removeContainer(first.id, force: false)
+        do {
+            try await runtime.removeContainer(target.id, force: false)
+            Issue.record("container removal overlapped an in-flight resource update")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseUpdate()
+        let updated = try await update.value
+        #expect(updated.id == target.id)
+        #expect(updated.memoryBytes == 8_192)
+        #expect(try await runtime.container(target.id).memoryBytes == 8_192)
+    }
+
+    @Test func networkMutationsReResolveByIDAndReserveTheirContainer() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingNetworkUpdateBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(
+            ContainerRecord(name: "network-index-first", image: "debian")
+        )
+        let second = try await runtime.createContainer(
+            ContainerRecord(name: "network-index-second", image: "debian")
+        )
+        let target = try await runtime.createContainer(
+            ContainerRecord(name: "network-index-target", image: "debian")
+        )
+        let extra = try await runtime.createNetwork(
+            name: "network-index-extra", subnet: "192.168.211.0/24", gateway: "192.168.211.1"
+        )
+
+        await backend.blockNextNetworkUpdate()
+        let connect = Task { try await runtime.connectNetwork(extra.id, container: target.id) }
+        while !(await backend.isNetworkUpdateBlocked()) { await Task.yield() }
+        do {
+            try await runtime.startContainer(target.id)
+            Issue.record("container start overlapped an in-flight network connection")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        try await runtime.removeContainer(first.id, force: false)
+        await backend.releaseNetworkUpdate()
+        try await connect.value
+        #expect(try await runtime.container(target.id).networks.contains { $0.networkID == extra.id })
+
+        await backend.blockNextNetworkUpdate()
+        let disconnect = Task {
+            try await runtime.disconnectNetwork(extra.id, container: target.id, force: false)
+        }
+        while !(await backend.isNetworkUpdateBlocked()) { await Task.yield() }
+        do {
+            try await runtime.removeContainer(target.id, force: false)
+            Issue.record("container removal overlapped an in-flight network disconnection")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        try await runtime.removeContainer(second.id, force: false)
+        await backend.releaseNetworkUpdate()
+        try await disconnect.value
+        #expect(try await runtime.container(target.id).networks.allSatisfy { $0.networkID != extra.id })
+    }
+
+    @Test func automaticRestartReservesContainerAgainstPruneAndUpdate() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingReconciliationBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "reconcile-restart-race", image: "debian")
+        record.restartPolicy = .init(name: "always")
+        record = try await runtime.createContainer(record)
+        try await runtime.startContainer(record.id)
+        while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+
+        await backend.finish(record.id, code: 17)
+        while !(await backend.hasBlockedReconciliationDelete()) { await Task.yield() }
+
+        #expect(try await runtime.pruneContainers(ids: [record.id]).isEmpty)
+        do {
+            _ = try await runtime.updateContainer(
+                record.id, memoryBytes: 8_192, nanoCPUs: nil,
+                pidsLimit: nil, restartPolicy: nil
+            )
+            Issue.record("resource update overlapped an automatic restart")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        do {
+            try await runtime.renameContainer(record.id, name: "restart-race-renamed-too-early")
+            Issue.record("rename overlapped an automatic restart")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseReconciliationDelete()
+        for _ in 0..<100 {
+            if try await runtime.container(record.id).phase == .running,
+               try await runtime.container(record.id).restartCount == 1 { break }
+            await Task.yield()
+        }
+        let restarted = try await runtime.container(record.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.restartCount == 1)
+        var renamed = false
+        for _ in 0..<1_000 {
+            do {
+                try await runtime.renameContainer(record.id, name: "restart-race-renamed")
+                renamed = true
+                break
+            } catch let error as EngineError where error.code == .conflict {
+                await Task.yield()
+            }
+        }
+        #expect(renamed)
+        #expect(try await runtime.container(record.id).name == "restart-race-renamed")
+        let counts = await backend.counts()
+        #expect(counts.prepares == 3)
+        #expect(counts.starts == 2)
+        #expect(counts.deletes == 1)
+    }
+
+    @Test func automaticRestartReservesContainerAgainstNetworkMutation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingReconciliationBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let extra = try await runtime.createNetwork(
+            name: "restart-race-network", subnet: "192.168.212.0/24", gateway: "192.168.212.1"
+        )
+        var record = ContainerRecord(name: "restart-network-race", image: "debian")
+        record.restartPolicy = .init(name: "always")
+        record = try await runtime.createContainer(record)
+        let defaultNetwork = try #require(record.networks.first?.networkID)
+        try await runtime.startContainer(record.id)
+        while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+
+        await backend.finish(record.id, code: 17)
+        while !(await backend.hasBlockedReconciliationDelete()) { await Task.yield() }
+        do {
+            try await runtime.connectNetwork(extra.id, container: record.id)
+            Issue.record("network connection overlapped automatic restart")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        do {
+            try await runtime.disconnectNetwork(defaultNetwork, container: record.id, force: false)
+            Issue.record("network disconnection overlapped automatic restart")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseReconciliationDelete()
+        for _ in 0..<100 {
+            if try await runtime.container(record.id).phase == .running { break }
+            await Task.yield()
+        }
+        let restarted = try await runtime.container(record.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.networks.map(\.networkID) == [defaultNetwork])
+    }
+
+    @Test func automaticRemovalReservesContainerAgainstConcurrentLifecycleWork() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingReconciliationBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "reconcile-remove-race", image: "debian")
+        record.autoRemove = true
+        record = try await runtime.createContainer(record)
+        try await runtime.startContainer(record.id)
+        while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+
+        await backend.finish(record.id, code: 0)
+        while !(await backend.hasBlockedReconciliationDelete()) { await Task.yield() }
+
+        #expect(try await runtime.pruneContainers(ids: [record.id]).isEmpty)
+        do {
+            _ = try await runtime.updateContainer(
+                record.id, memoryBytes: 8_192, nanoCPUs: nil,
+                pidsLimit: nil, restartPolicy: nil
+            )
+            Issue.record("resource update overlapped automatic removal")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        do {
+            try await runtime.removeContainer(record.id, force: false)
+            Issue.record("explicit removal overlapped automatic removal")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseReconciliationDelete()
+        for _ in 0..<100 {
+            if (try? await runtime.container(record.id)) == nil { break }
+            await Task.yield()
+        }
+        do {
+            _ = try await runtime.container(record.id)
+            Issue.record("auto-remove reconciliation did not remove its container")
+        } catch let error as EngineError {
+            #expect(error.code == .notFound)
+        }
+        #expect(await backend.counts().deletes == 1)
+    }
+
+    @Test func exitDuringUpdateIsReconciledThroughRestartPolicy() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = UpdateExitRaceBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "update-exit-restart", image: "debian")
+        record.restartPolicy = .init(name: "always")
+        record = try await runtime.createContainer(record)
+        let containerID = record.id
+        try await runtime.startContainer(containerID)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+
+        let update = Task {
+            try await runtime.updateContainer(
+                containerID, memoryBytes: 8_192, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil
+            )
+        }
+        while !(await backend.isUpdateBlocked()) { await Task.yield() }
+        await backend.finish(code: 17)
+        while try await runtime.container(containerID).phase != .exited { await Task.yield() }
+        #expect(await backend.counts().starts == 1)
+
+        await backend.releaseUpdate()
+        _ = try await update.value
+        let restarted = try await runtime.container(containerID)
+        #expect(restarted.phase == .running)
+        #expect(restarted.restartCount == 1)
+        #expect(restarted.memoryBytes == 8_192)
+        #expect(await backend.counts().starts == 2)
+    }
+
+    @Test func autoRemoveExitDuringUpdateIsReconciledAfterUpdate() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = UpdateExitRaceBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var record = ContainerRecord(name: "update-exit-remove", image: "debian")
+        record.autoRemove = true
+        record = try await runtime.createContainer(record)
+        let containerID = record.id
+        try await runtime.startContainer(containerID)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+
+        let update = Task {
+            try await runtime.updateContainer(
+                containerID, memoryBytes: 8_192, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil
+            )
+        }
+        while !(await backend.isUpdateBlocked()) { await Task.yield() }
+        await backend.finish(code: 0)
+        while try await runtime.container(containerID).phase != .exited { await Task.yield() }
+
+        await backend.releaseUpdate()
+        _ = try await update.value
+        do {
+            _ = try await runtime.container(containerID)
+            Issue.record("auto-remove container survived an exit during update")
+        } catch let error as EngineError {
+            #expect(error.code == .notFound)
+        }
+        #expect(await backend.counts().deletes == 1)
+    }
+
     @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2611,6 +3899,76 @@ private actor AuthImageBackend: ContainerBackend {
         let restarted = try await runtime.container(record.id)
         #expect(restarted.phase == .running)
         #expect(restarted.restartCount == 1)
+    }
+
+    @Test func pauseAndResumeReResolveByIDAndReserveTheirContainer() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingPauseResumeBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(
+            ContainerRecord(name: "pause-index-first", image: "debian")
+        )
+        let second = try await runtime.createContainer(
+            ContainerRecord(name: "pause-index-second", image: "debian")
+        )
+        let target = try await runtime.createContainer(
+            ContainerRecord(name: "pause-index-target", image: "debian")
+        )
+        try await runtime.startContainer(target.id)
+
+        let pause = Task { try await runtime.pauseContainer(target.id) }
+        while !(await backend.isPauseBlocked()) { await Task.yield() }
+        do {
+            try await runtime.stopContainer(target.id)
+            Issue.record("container stop overlapped an in-flight pause")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        try await runtime.removeContainer(first.id, force: false)
+        await backend.releasePause()
+        try await pause.value
+        #expect(try await runtime.container(target.id).phase == .paused)
+
+        let resume = Task { try await runtime.resumeContainer(target.id) }
+        while !(await backend.isResumeBlocked()) { await Task.yield() }
+        do {
+            try await runtime.removeContainer(target.id, force: true)
+            Issue.record("container removal overlapped an in-flight resume")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        try await runtime.removeContainer(second.id, force: false)
+        await backend.releaseResume()
+        try await resume.value
+        #expect(try await runtime.container(target.id).phase == .running)
+    }
+
+    @Test func containerExitDuringPauseCannotBeOverwrittenByThePauseCommit() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = PauseExitRaceBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "pause-exit-race", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        while !(await backend.isWaitingForCompletion()) { await Task.yield() }
+
+        let pause = Task { try await runtime.pauseContainer(record.id) }
+        while !(await backend.isPauseBlocked()) { await Task.yield() }
+        await backend.finish(code: 19)
+        while try await runtime.container(record.id).phase != .exited { await Task.yield() }
+        await backend.releasePause()
+        do {
+            try await pause.value
+            Issue.record("pause overwrote a terminal container execution")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+        let completed = try await runtime.container(record.id)
+        #expect(completed.phase == .exited)
+        #expect(completed.exitCode == 19)
     }
 
     @Test func runtimePublishesDockerLifecycleEvents() async throws {
@@ -2714,6 +4072,82 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((pruneJSON["ContainersDeleted"] as? [String])?.contains(record.id) == true)
     }
 
+    @Test func containerPruneFiltersLimitDeletionAndRejectUnknownKeys() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        var selected = ContainerRecord(name: "selected", image: "debian")
+        selected.labels = ["prune": "yes", "tier": "frontend"]
+        selected.createdAt = Date(timeIntervalSince1970: 100)
+        selected = try await runtime.createContainer(selected)
+        var wrongLabel = ContainerRecord(name: "wrong-label", image: "debian")
+        wrongLabel.labels = ["prune": "no", "tier": "frontend"]
+        wrongLabel.createdAt = Date(timeIntervalSince1970: 100)
+        wrongLabel = try await runtime.createContainer(wrongLabel)
+        var tooNew = ContainerRecord(name: "too-new", image: "debian")
+        tooNew.labels = ["prune": "yes", "tier": "backend"]
+        tooNew.createdAt = Date(timeIntervalSince1970: 200)
+        tooNew = try await runtime.createContainer(tooNew)
+
+        let unsupported = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/prune?filters=%7B%22name%22%3A%5B%22selected%22%5D%7D"
+        ))
+        #expect(unsupported.status == .badRequest)
+        #expect(await runtime.listContainers(all: true).count == 3)
+
+        let falseMap = #"{"label":{"missing=value":false}}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let falseValuedFilter = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/prune?filters=\(falseMap)"
+        ))
+        #expect(falseValuedFilter.status == .ok)
+        #expect(await runtime.listContainers(all: true).count == 3)
+
+        let multipleUntil = #"{"until":["150","250"]}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let ambiguousUntil = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/prune?filters=\(multipleUntil)"
+        ))
+        #expect(ambiguousUntil.status == .badRequest)
+        #expect(await runtime.listContainers(all: true).count == 3)
+
+        let conjunctive = #"{"label":["prune=yes","tier=frontend"],"until":["150"]}"#
+            .addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let filtered = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/prune?filters=\(conjunctive)"
+        ))
+        #expect(filtered.status == .ok)
+        let payload = try #require(JSONSerialization.jsonObject(with: filtered.body) as? [String: Any])
+        #expect(payload["ContainersDeleted"] as? [String] == [selected.id])
+        let remaining = await runtime.listContainers(all: true)
+        #expect(Set(remaining.map(\.id)) == Set([wrongLabel.id, tooNew.id]))
+    }
+
+    @Test func createPreservesAttachStdinAndRejectsUnsupportedHealthStartInterval() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=stdin-config",
+            body: Data(#"{"Image":"debian","AttachStdin":true,"OpenStdin":true}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/stdin-config/json"))
+        let payload = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let config = try #require(payload["Config"] as? [String: Any])
+        #expect(config["AttachStdin"] as? Bool == true)
+        #expect(config["OpenStdin"] as? Bool == true)
+
+        let health = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=start-interval",
+            body: Data(#"{"Image":"debian","Healthcheck":{"Test":["CMD","true"],"StartInterval":1000000000}}"#.utf8)
+        ))
+        #expect(health.status == .notImplemented)
+    }
+
     @Test func restartPolicyUpdateDoesNotRecreateRunningContainer() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2759,7 +4193,7 @@ private actor AuthImageBackend: ContainerBackend {
 
         let response = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/live-resources/update",
-            body: Data(#"{"Memory":536870912,"NanoCpus":0,"CpuQuota":200000,"CpuPeriod":100000}"#.utf8)
+            body: Data(#"{"Memory":536870912,"NanoCpus":0,"CpuQuota":200000,"CpuPeriod":100000,"PidsLimit":64}"#.utf8)
         ))
 
         #expect(response.status == .ok)
@@ -2768,8 +4202,10 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(updated.startedAt == startedAt)
         #expect(updated.memoryBytes == 512 * 1_024 * 1_024)
         #expect(updated.cpus == 2)
+        #expect(updated.pidsLimit == 64)
         #expect(await backend.lastResourceUpdate()?.memoryBytes == updated.memoryBytes)
         #expect(await backend.lastResourceUpdate()?.cpus == updated.cpus)
+        #expect(await backend.lastResourceUpdate()?.pidsLimit == 64)
         #expect(await backend.startCount() == startCount)
         #expect(await backend.prepareCount() == prepareCount)
         #expect(await backend.deleteCount() == deleteCount)

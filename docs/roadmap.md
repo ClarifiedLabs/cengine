@@ -31,6 +31,19 @@ groups, and environment consistently. The guest protocol carries structured
 identity and `no_new_privs` policy for exec. Compatibility tests normally use the
 installed, pre-approved networking helper without interactive authorization.
 
+Docker PID limits now persist across recovery and drive cgroup-v2 `pids.max` on
+create and live update. Bind mounts apply private isolation; shared/slave modes
+are rejected because virtiofs cannot form the required host/container peer or
+master mount. Unprivileged containers use Docker's default Linux capability set with
+`CapAdd`/`CapDrop` parity between init and exec. Filtered container pruning now
+fails closed on unknown inputs instead of widening deletion scope. Focused
+`RTM-004`–`RTM-008` contracts cover enforcement and recovery, explicit
+propagation gaps, capability masks, prune selection, and exec stage signal and
+status behavior. Security options, rlimits, configurable devices, container
+sysctls, masked paths, non-recursive bind variants, health start intervals, and
+custom exec detach keys are decoded and rejected explicitly instead of being
+silently ignored.
+
 ### Multi-platform and OCI image behavior
 
 The image store now preserves OCI graph roots and all locally available
@@ -73,9 +86,11 @@ Work in this order:
 
 1. Find supported Docker inputs that are accepted but ignored or insufficiently
    tested. Apply them, reject them explicitly, or classify them in the ledger.
-2. Close mount propagation, namespace, cgroup-v2, capability, device, rlimit,
-   seccomp/security-option, and masked-path gaps for functionality cengine
-   already exposes.
+2. Close namespace, cgroup-v2 IO/device, device, rlimit,
+   seccomp/security-option, masked-path, and remaining mount-matrix gaps for
+   functionality cengine already exposes. PID limits, private bind isolation,
+   and capability add/drop are complete; shared/slave bind propagation is an
+   explicit architecture gap.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
    cengine contracts have stabilized the expected behavior.
 4. Implement otherwise unexposed OCI features only when cengine adopts them as
@@ -104,7 +119,7 @@ configure, and inspect endpoints is complete:
 - Endpoint gateway priority: `GwPriority` is decoded on create and connect,
   used to select IPv4 and IPv6 default-gateway endpoints independently for
   multi-network containers, inspected, and preserved across recovery
-  (`NET-016`, `RTM-004`).
+  (`NET-016`, `RTM-012`).
 - SCTP has an explicit support decision: publishing an `sctp` port is rejected
   with 400 and recorded as an intentional gap because the vmnet port forwarder
   bridges only TCP and UDP (`NET-017`).
@@ -133,7 +148,7 @@ Completion criteria:
 - Invalid or unsupported settings fail explicitly instead of being ignored.
   *(Done for MAC address, SCTP publishing, IPAM, and family/fabric limits.)*
 - Multi-network containers select each address family's route according to
-  gateway priority. *(Done: `NET-016`, `RTM-004`.)*
+  gateway priority. *(Done: `NET-016`, `RTM-012`.)*
 - SCTP is either implemented and tested end to end or recorded as an intentional
   compatibility gap. *(Done: recorded as an intentional gap, `NET-017`.)*
 - Endpoint sysctls, explicit IPv4 controls, IPAM status, and IPAM validation are

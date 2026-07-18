@@ -147,7 +147,7 @@ func TestCgroupResourceUpdateRejectsExitedWorkload(t *testing.T) {
 	}
 }
 
-func TestExecCgroupPlacementKeepsWorkloadRootEmpty(t *testing.T) {
+func TestExecUsesDedicatedLeafBeneathTheWorkloadCgroup(t *testing.T) {
 	root := t.TempDir()
 	workload := filepath.Join(root, "cengine", "workload")
 	if err := os.MkdirAll(workload, 0o755); err != nil {
@@ -156,9 +156,11 @@ func TestExecCgroupPlacementKeepsWorkloadRootEmpty(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workload, "cgroup.procs"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := placeExecInCgroup(root, "workload", "exec", 42); err != nil {
+	cgroup, err := openExecCgroup(root, "workload", "exec-id")
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer cgroup.Close()
 	rootProcesses, err := os.ReadFile(filepath.Join(workload, "cgroup.procs"))
 	if err != nil {
 		t.Fatal(err)
@@ -166,12 +168,16 @@ func TestExecCgroupPlacementKeepsWorkloadRootEmpty(t *testing.T) {
 	if len(rootProcesses) != 0 {
 		t.Fatalf("workload root contains exec process %q", rootProcesses)
 	}
-	execProcesses, err := os.ReadFile(filepath.Join(workload, "cengine-exec-exec", "cgroup.procs"))
+	cgroupInfo, err := cgroup.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(execProcesses) != "42" {
-		t.Fatalf("exec cgroup processes = %q", execProcesses)
+	pathInfo, err := os.Stat(filepath.Join(workload, ".cengine-exec", "exec-id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(cgroupInfo, pathInfo) {
+		t.Fatal("exec cgroup descriptor does not reference the per-exec leaf")
 	}
 }
 

@@ -24,6 +24,9 @@ public struct PortBinding: Codable, Hashable, Sendable {
 
 public struct MountRecord: Codable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable { case bind, volume, tmpfs }
+    public enum Propagation: String, Codable, Sendable {
+        case `private`, rprivate, shared, rshared, slave, rslave
+    }
     public var kind: Kind
     public var source: String
     public var destination: String
@@ -33,13 +36,15 @@ public struct MountRecord: Codable, Hashable, Sendable {
     public var tmpfsSizeBytes: Int64?
     public var tmpfsMode: UInt32?
     public var createSourceIfMissing: Bool?
+    public var propagation: Propagation?
 
     public init(kind: Kind, source: String, destination: String, readOnly: Bool = false, noCopy: Bool = false,
                 subpath: String? = nil, tmpfsSizeBytes: Int64? = nil, tmpfsMode: UInt32? = nil,
-                createSourceIfMissing: Bool? = nil) {
+                createSourceIfMissing: Bool? = nil, propagation: Propagation? = nil) {
         self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly
         self.noCopy = noCopy; self.subpath = subpath; self.tmpfsSizeBytes = tmpfsSizeBytes; self.tmpfsMode = tmpfsMode
         self.createSourceIfMissing = createSourceIfMissing
+        self.propagation = propagation
     }
 }
 
@@ -127,13 +132,18 @@ public struct ContainerRecord: Codable, Sendable {
     public var labels: [String: String]
     public var annotations: [String: String]
     public var tty: Bool
+    public var attachStdin: Bool
     public var openStdin: Bool
     public var privileged: Bool
+    public var capabilityAdd: [String]
+    public var capabilityDrop: [String]
     public var readOnlyRootfs: Bool
     public var autoRemove: Bool
     public var useInit: Bool
     public var memoryBytes: UInt64
     public var cpus: Int
+    /// Docker's configured process limit. `0` and `-1` both mean unlimited.
+    public var pidsLimit: Int64
     public var stopSignal: String
     public var stopTimeoutSeconds: Int
     public var restartPolicy: RestartPolicyRecord
@@ -168,13 +178,17 @@ public struct ContainerRecord: Codable, Sendable {
         self.labels = [:]
         self.annotations = [:]
         self.tty = false
+        self.attachStdin = false
         self.openStdin = false
         self.privileged = false
+        self.capabilityAdd = []
+        self.capabilityDrop = []
         self.readOnlyRootfs = false
         self.autoRemove = false
         self.useInit = false
         self.memoryBytes = ContainerSettings.default.memoryBytes
         self.cpus = ContainerSettings.default.cpus
+        self.pidsLimit = 0
         self.stopSignal = "SIGTERM"
         self.stopTimeoutSeconds = 10
         self.restartPolicy = .init()

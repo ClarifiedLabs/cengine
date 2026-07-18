@@ -26,12 +26,47 @@ enum UnixSocket {
     }
 
     static func connect(path: String) throws -> Int32 {
+        try connect(path: path, timeoutMilliseconds: nil)
+    }
+
+    static func connect(path: String, timeoutMilliseconds: Int32?) throws -> Int32 {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw systemError("create Unix socket") }
         do {
             try suppressSIGPIPE(descriptor)
+            let flags = fcntl(descriptor, F_GETFL)
+            if timeoutMilliseconds != nil {
+                guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+                    throw systemError("configure Unix socket deadline")
+                }
+            }
             try withAddress(path) { address, length in
-                guard Darwin.connect(descriptor, address, length) == 0 else { throw systemError("connect Unix socket") }
+                if Darwin.connect(descriptor, address, length) == 0 { return }
+                guard let timeoutMilliseconds,
+                      errno == EINPROGRESS || errno == EAGAIN else {
+                    throw systemError("connect Unix socket")
+                }
+                var event = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+                let result = Darwin.poll(&event, 1, timeoutMilliseconds)
+                guard result > 0 else {
+                    if result == 0 { throw EngineError(.internalError, "connect Unix socket timed out") }
+                    throw systemError("connect Unix socket")
+                }
+                var socketError: CInt = 0
+                var size = socklen_t(MemoryLayout<CInt>.size)
+                guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &socketError, &size) == 0 else {
+                    throw systemError("inspect Unix socket connection")
+                }
+                guard socketError == 0 else {
+                    throw EngineError(
+                        .internalError,
+                        "connect Unix socket failed: \(String(cString: strerror(socketError)))"
+                    )
+                }
+            }
+            if timeoutMilliseconds != nil,
+               fcntl(descriptor, F_SETFL, flags) != 0 {
+                throw systemError("restore Unix socket configuration")
             }
             return descriptor
         } catch {

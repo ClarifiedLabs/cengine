@@ -36,7 +36,7 @@ func main() {
 		}
 		if err := supervisor.RunExecStage1(pid); err != nil {
 			if exit, ok := err.(*exec.ExitError); ok {
-				os.Exit(exit.ExitCode())
+				os.Exit(supervisor.ExecStageExitCode(exit))
 			}
 			log.Fatal(err)
 		}
@@ -44,7 +44,10 @@ func main() {
 	}
 	if supervisor.IsExecStage2(os.Args) {
 		if err := supervisor.RunExecStage2(); err != nil {
-			log.Print(err)
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				log.Print(err)
+			}
 			os.Exit(supervisor.ExecStageExitCode(err))
 		}
 		return
@@ -475,6 +478,17 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 			return nil, err
 		}
 		return json.Marshal(map[string]string{"status": "created"})
+	case "discard-exec":
+		var value struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(request.Payload, &value); err != nil {
+			return nil, err
+		}
+		if err := state.process.DiscardExec(value.ID); err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]string{"status": "discarded"})
 	case "start-exec":
 		var value struct {
 			ID string `json:"id"`

@@ -48,13 +48,16 @@ import Testing
             environment: [], workingDirectory: "/", hostname: "container-1", user: .init(),
             terminal: false, readOnlyRoot: false, stopSignal: "SIGTERM", mounts: [], networks: [],
             resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
-            annotations: ["io.example.owner": "runtime"]
+            annotations: ["io.example.owner": "runtime"],
+            capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"]
         )
 
         let data = try JSONEncoder().encode(value)
         #expect(try JSONDecoder().decode(GuestProtocol.Workload.self, from: data) == value)
         let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(object["annotations"] as? [String: String] == ["io.example.owner": "runtime"])
+        #expect(object["capabilityAdd"] as? [String] == ["CAP_NET_ADMIN"])
+        #expect(object["capabilityDrop"] as? [String] == ["CAP_CHOWN"])
     }
 
     @Test func controlEnvelopeRoundTripsWithLengthPrefix() throws {

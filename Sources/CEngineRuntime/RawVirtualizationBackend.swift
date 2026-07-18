@@ -12,12 +12,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let workingDirectory: String
         let user: GuestProtocol.User
         let noNewPrivileges: Bool
+        let privileged: Bool
     }
 
     public static let defaultRootDiskBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
     public static let defaultVolumeDiskBytes = VolumeRecord.defaultSizeBytes
     public static let defaultStorageDiskBytes = VolumeRecord.defaultSizeBytes
     static let managementServerAddress = "100.64.0.1"
+    private static let forcedStopWaitSeconds: Int64 = 5
 
     private let root: URL
     private let kernel: URL
@@ -219,7 +221,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             _ = try await shim.stop()
             shims[container.id] = shim
         } catch {
-            _ = try? await shim.shutdown()
+            try? await shim.terminate()
             preparedBindSources.removeValue(forKey: container.id)
             try? FileManager.default.removeItem(at: directory)
             throw error
@@ -278,34 +280,74 @@ public actor RawVirtualizationBackend: ContainerBackend {
         struct Signal: Encodable { let signal: Int }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let exitCode: Int? }
-        _ = try? await shim.guest(operation: "signal", payload: Signal(signal: Self.signalNumber(container.stopSignal)), response: Status.self)
+        if container.phase == .paused {
+            do {
+                _ = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.resume()
+                }
+            } catch {
+                try await terminateShim(container.id, shim: shim)
+                return await recordCompletion(container, code: 137)
+            }
+        }
+        _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+            try await shim.guest(
+                operation: "signal",
+                payload: Signal(signal: Self.signalNumber(container.stopSignal)),
+                response: Status.self
+            )
+        }
         if let existing = completionTasks[container.id] {
             let code: Int32
             do {
-                code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) { await existing.value }
+                code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) { await existing.value }
             } catch {
-                _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
-                code = await existing.value
+                _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.guest(
+                        operation: "signal", payload: Signal(signal: 9), response: Status.self
+                    )
+                }
+                do {
+                    code = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                        await existing.value
+                    }
+                } catch {
+                    try await terminateShim(container.id, shim: shim)
+                    code = 137
+                }
             }
             return await recordCompletion(container, code: code)
         }
         let task = Task {
             let code: Int32
             do {
-                code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) {
+                code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) {
                     let value: Status = try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
                     return Int32(value.exitCode ?? 0)
                 }
             } catch {
-                _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
-                let value: Status? = try? await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.guest(
+                        operation: "signal", payload: Signal(signal: 9), response: Status.self
+                    )
+                }
+                let value: Status? = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                }
                 code = Int32(value?.exitCode ?? 137)
             }
-            _ = try? await shim.stop()
             return code
         }
         completionTasks[container.id] = task
-        return await recordCompletion(container, code: task.value)
+        let code = await task.value
+        do {
+            _ = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                try await shim.stop()
+            }
+        } catch {
+            try await terminateShim(container.id, shim: shim)
+        }
+        return await recordCompletion(container, code: code)
     }
 
     public func wait(_ container: ContainerRecord) async throws -> Int32 {
@@ -403,11 +445,43 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 workingDirectory: context.workingDirectory, user: context.user,
                 terminal: configuration.tty, attachStdin: configuration.attachStdin,
                 attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
-                noNewPrivileges: context.noNewPrivileges
+                noNewPrivileges: context.noNewPrivileges, privileged: context.privileged,
+                capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
             ),
             response: Status.self
         )
         return bridge
+    }
+
+    public func discardExec(_ exec: ExecRecord) async {
+        let shim = execShims[exec.id]
+        execMonitors.removeValue(forKey: exec.id)?.stop()
+        execBridges.removeValue(forKey: exec.id)?.finishOutput()
+        execShims.removeValue(forKey: exec.id)
+        await Self.discardExecArtifacts(root: root, exec: exec) {
+            guard let shim else { return }
+            struct Request: Encodable { let id: String }
+            struct Status: Decodable { let status: String }
+            let _: Status = try await shim.guest(
+                operation: "discard-exec", payload: Request(id: exec.id), response: Status.self
+            )
+        }
+    }
+
+    static func discardExecArtifacts(
+        root: URL,
+        exec: ExecRecord,
+        guestDiscard: @Sendable () async throws -> Void
+    ) async {
+        try? await guestDiscard()
+        let ioDirectory = root.appending(path: "containers/\(exec.containerID)/io")
+        let prefix = "exec-\(exec.id)"
+        for name in [
+            "\(prefix).json", "\(prefix)-stdout", "\(prefix)-stderr", "\(prefix)-stdin",
+            "\(prefix)-stdin.closed", "\(prefix)-docker.log", "\(prefix)-docker.log.entries",
+        ] {
+            try? FileManager.default.removeItem(at: ioDirectory.appending(path: name))
+        }
     }
 
     public func startExec(_ exec: ExecRecord) async throws {
@@ -432,8 +506,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge { guard let bridge = execBridges[exec.id] else { throw EngineError(.notFound, "exec I/O is unavailable") }; return bridge }
 
     public func execPID(_ exec: ExecRecord) async -> Int32 {
-        guard let shim = execShims[exec.id] else { return 0 }; struct Request: Encodable { let id: String }; struct Status: Decodable { let pid: Int? }
-        let value: Status? = try? await shim.guest(operation: "exec-status", payload: Request(id: exec.id), response: Status.self); return Int32(value?.pid ?? 0)
+        guard let shim = execShims[exec.id] else { return 0 }
+        struct Request: Encodable { let id: String }
+        struct Status: Decodable { let status: String; let pid: Int? }
+        for _ in 0..<1_000 where !Task.isCancelled {
+            guard let value: Status = try? await shim.guest(
+                operation: "exec-status", payload: Request(id: exec.id), response: Status.self
+            ) else { return 0 }
+            if let pid = value.pid, pid > 0 { return Int32(pid) }
+            guard value.status == "created" || value.status == "starting" else { return 0 }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return 0
     }
 
     public func execStatus(_ exec: ExecRecord) async -> Int32? {
@@ -471,14 +555,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func pause(_ container: ContainerRecord) async throws { guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.pause() }
     public func resume(_ container: ContainerRecord) async throws { guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.resume() }
-    public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws { _ = try await stop(container, timeoutSeconds: timeoutSeconds); _ = try await start(container) }
+    public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws {
+        _ = try await stop(container, timeoutSeconds: timeoutSeconds)
+        if shims[container.id] == nil {
+            guard try await relaunchPreparedShim(container) != nil else {
+                throw EngineError(.notFound, "container VM preparation is unavailable")
+            }
+        }
+        _ = try await start(container)
+    }
 
     public func updateResources(_ container: ContainerRecord) async throws {
         guard container.phase != .paused else {
             throw EngineError(.conflict, "cannot update resources while container \(container.id) is paused")
         }
         if container.phase != .running {
-            if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }
+            if let shim = shims[container.id] { try await terminateShim(container.id, shim: shim) }
             guard try await relaunchPreparedShim(container) != nil else {
                 throw EngineError(.notFound, "container VM preparation is unavailable")
             }
@@ -505,7 +597,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             memoryBytes: container.memoryBytes,
             cpuQuota: Int64(container.cpus * 100_000),
             cpuPeriod: 100_000,
-            pids: 0
+            pids: container.pidsLimit
         )
         struct Status: Decodable { let status: String }
         let response: Status = try await shim.guest(
@@ -520,7 +612,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func delete(_ container: ContainerRecord) async throws {
         portForwarder.stop(containerID: container.id)
-        if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }
+        if let shim = shims[container.id] { try await terminateShim(container.id, shim: shim) }
         completionTasks.removeValue(forKey: container.id)?.cancel()
         completions.removeValue(forKey: container.id)
         activeContainers.removeValue(forKey: container.id)
@@ -533,7 +625,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let orphanIDs = shims.keys.filter { !containerIDs.contains($0) }
         for id in orphanIDs {
             portForwarder.stop(containerID: id)
-            if let shim = shims.removeValue(forKey: id) { _ = try? await shim.shutdown() }
+            if let shim = shims[id] { try await terminateShim(id, shim: shim) }
         }
     }
 
@@ -672,10 +764,29 @@ public actor RawVirtualizationBackend: ContainerBackend {
         if let existing = completions[container.id] { return existing }
         completions[container.id] = code
         activeContainers.removeValue(forKey: container.id)
+        if let shim = shims[container.id] { finishExecSessions(using: shim) }
         try? await synchronizeFabric()
         portForwarder.stop(containerID: container.id)
         logMonitors.removeValue(forKey: container.id)?.stop()
         return code
+    }
+
+    private func finishExecSessions(using shim: VMShimClient) {
+        let identifiers = execShims.compactMap { identifier, value in
+            value === shim ? identifier : nil
+        }
+        for identifier in identifiers {
+            execMonitors.removeValue(forKey: identifier)?.stop()
+            execBridges.removeValue(forKey: identifier)?.finishOutput()
+            execShims.removeValue(forKey: identifier)
+        }
+    }
+
+    private func terminateShim(_ containerID: String, shim: VMShimClient) async throws {
+        completionTasks.removeValue(forKey: containerID)?.cancel()
+        finishExecSessions(using: shim)
+        try await shim.terminate()
+        if shims[containerID] === shim { shims.removeValue(forKey: containerID) }
     }
 
     private func ensureIO(_ container: ContainerRecord, replacingStoppedSession: Bool = false,
@@ -839,7 +950,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 readOnly: mount.readOnly,
                 options: options,
                 subpath: bindSubpath,
-                noCopy: mount.noCopy
+                noCopy: mount.noCopy,
+                propagation: mount.propagation?.rawValue ?? ""
             )
         }
         return try Self.workloadSpecification(
@@ -867,8 +979,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
             terminal: container.tty, readOnlyRoot: container.readOnlyRootfs, stopSignal: container.stopSignal,
             volumeServer: volumeServer,
             mounts: mounts, networks: networks, hosts: hosts,
-            resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: 0),
-            privileged: container.privileged, annotations: container.annotations
+            resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: container.pidsLimit),
+            privileged: container.privileged, annotations: container.annotations,
+            capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
         )
     }
 
@@ -934,7 +1047,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         guard status.state != .running && status.state != .paused else {
             throw EngineError(.conflict, "cannot change volume storage while the container VM is running")
         }
-        _ = try await shim.shutdown()
+        try await terminateShim(container.id, shim: shim)
         var specification = shim.specification
         specification.generation += 1
         specification.token = Self.randomToken()
@@ -1137,7 +1250,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     ?? containerUser.nilIfEmpty
                     ?? imageUser?.nilIfEmpty
             ),
-            noNewPrivileges: !(containerPrivileged || configuration.privileged)
+            noNewPrivileges: !(containerPrivileged || configuration.privileged),
+            privileged: containerPrivileged || configuration.privileged
         )
     }
 

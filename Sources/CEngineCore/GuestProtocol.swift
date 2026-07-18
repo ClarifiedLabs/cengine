@@ -60,11 +60,14 @@ public enum GuestProtocol {
         public var resources: Resources
         public var privileged: Bool
         public var annotations: [String: String]
+        public var capabilityAdd: [String]
+        public var capabilityDrop: [String]
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:]) {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = []) {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
-            self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged; self.annotations = annotations
+            self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
+            self.annotations = annotations; self.capabilityAdd = capabilityAdd; self.capabilityDrop = capabilityDrop
         }
     }
 
@@ -87,11 +90,15 @@ public enum GuestProtocol {
         public var attachStdout: Bool
         public var attachStderr: Bool
         public var noNewPrivileges: Bool
+        public var privileged: Bool
+        public var capabilityAdd: [String]
+        public var capabilityDrop: [String]
 
         public init(
             id: String, arguments: [String], environment: [String], workingDirectory: String,
             user: User, terminal: Bool, attachStdin: Bool, attachStdout: Bool,
-            attachStderr: Bool, noNewPrivileges: Bool
+            attachStderr: Bool, noNewPrivileges: Bool, privileged: Bool = false,
+            capabilityAdd: [String] = [], capabilityDrop: [String] = []
         ) {
             self.id = id
             self.arguments = arguments
@@ -103,6 +110,9 @@ public enum GuestProtocol {
             self.attachStdout = attachStdout
             self.attachStderr = attachStderr
             self.noNewPrivileges = noNewPrivileges
+            self.privileged = privileged
+            self.capabilityAdd = capabilityAdd
+            self.capabilityDrop = capabilityDrop
         }
     }
 
@@ -115,13 +125,15 @@ public enum GuestProtocol {
         public var options: [String]
         public var subpath: String?
         public var noCopy: Bool
+        public var propagation: String
         public var socketPort: UInt32?
         public var socketMode: UInt32?
         public var socketUID: UInt32?
         public var socketGID: UInt32?
-        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil) {
+        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, propagation: String = "rprivate", socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil) {
             self.kind = kind; self.source = source; self.device = device; self.destination = destination; self.readOnly = readOnly; self.options = options; self.subpath = subpath; self.noCopy = noCopy
             self.socketPort = socketPort; self.socketMode = socketMode; self.socketUID = socketUID; self.socketGID = socketGID
+            self.propagation = propagation
         }
     }
 

@@ -34,7 +34,7 @@ public enum VolumePruneScope: Equatable, Sendable {
 
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
-        enum Operation: Equatable { case start, stop, restart, remove, connectNetwork, disconnectNetwork }
+        enum Operation: Equatable { case start, stop, restart, remove, update, pause, resume, rename, network }
 
         let operation: Operation
         let token = UUID()
@@ -57,6 +57,8 @@ public actor EngineRuntime {
     private var pendingContainerIDs = Set<String>()
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
+    private var startingExecIDs = Set<String>()
+    private var activeExecOperations: [String: Int] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         try await self.init(root: root, backend: backend, beforeEndpointAllocationPersistence: nil)
@@ -251,14 +253,19 @@ public actor EngineRuntime {
     public func startContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        guard lifecycleIntents[record.id] == nil else {
+            throw EngineError(.conflict, "container \(identifier) has a lifecycle operation in progress")
+        }
+        guard record.phase != .running else { return }
         let intent = try beginLifecycleIntent(.start, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
-        guard record.phase != .running else { return }
+        guard startingContainerIDs.insert(record.id).inserted else {
+            throw EngineError(.conflict, "container \(identifier) is already starting")
+        }
+        defer { startingContainerIDs.remove(record.id) }
         if record.phase == .dead {
             try await backend.delete(record)
         }
-        startingContainerIDs.insert(record.id)
-        defer { startingContainerIDs.remove(record.id) }
         try await backend.prepare(record)
         let resolvedPorts = try await backend.start(record)
         guard let current = try? containerIndex(record.id) else {
@@ -309,19 +316,43 @@ public actor EngineRuntime {
     }
 
     public func updateContainer(_ identifier: String, memoryBytes: Int64?, nanoCPUs: Int64?,
-                                restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
+                                pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
-        var updated = old
-        if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
-        if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
-        if let restartPolicy { updated.restartPolicy = restartPolicy }
-        let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
-        if resourcesChanged { try await backend.updateResources(updated) }
-        snapshot.containers[index] = updated
-        try await persist()
-        emit(containerEvent("update", updated))
-        return updated
+        guard !startingContainerIDs.contains(old.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        let intent = try beginLifecycleIntent(.update, for: old.id)
+        do {
+            var updated = old
+            if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
+            if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
+            if let pidsLimit { updated.pidsLimit = pidsLimit }
+            if let restartPolicy { updated.restartPolicy = restartPolicy }
+            let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
+                || old.pidsLimit != updated.pidsLimit
+            if resourcesChanged { try await backend.updateResources(updated) }
+            guard let current = try? containerIndex(old.id) else {
+                throw EngineError(.conflict, "container \(identifier) was removed while it was being updated")
+            }
+            var merged = snapshot.containers[current]
+            if let memoryBytes, memoryBytes > 0 { merged.memoryBytes = UInt64(memoryBytes) }
+            if let nanoCPUs, nanoCPUs > 0 {
+                merged.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000))
+            }
+            if let pidsLimit { merged.pidsLimit = pidsLimit }
+            if let restartPolicy { merged.restartPolicy = restartPolicy }
+            snapshot.containers[current] = merged
+            try await persist()
+            emit(containerEvent("update", merged))
+            endLifecycleIntent(intent, for: old.id)
+            await reconcileDeferredCompletion(old.id)
+            return merged
+        } catch {
+            endLifecycleIntent(intent, for: old.id)
+            await reconcileDeferredCompletion(old.id)
+            throw error
+        }
     }
 
     public func killContainer(_ identifier: String, signal: String) async throws {
@@ -338,25 +369,68 @@ public actor EngineRuntime {
 
     public func pauseContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase == .running else { throw EngineError(.conflict, "Container (identifier) is not running") }
-        try await backend.pause(snapshot.containers[index])
-        snapshot.containers[index].phase = .paused
-        try await persist()
-        emit(containerEvent("pause", snapshot.containers[index]))
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        guard record.phase == .running else {
+            throw EngineError(.conflict, "Container \(identifier) is not running")
+        }
+        let intent = try beginLifecycleIntent(.pause, for: record.id)
+        do {
+            try await backend.pause(record)
+            guard ownsLifecycleExecution(intent, record: record) else {
+                throw EngineError(.conflict, "container \(identifier) changed state while it was being paused")
+            }
+            let current = try containerIndex(record.id)
+            snapshot.containers[current].phase = .paused
+            let paused = snapshot.containers[current]
+            try await persist()
+            emit(containerEvent("pause", paused))
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func resumeContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase == .paused else { throw EngineError(.conflict, "Container (identifier) is not paused") }
-        try await backend.resume(snapshot.containers[index])
-        snapshot.containers[index].phase = .running
-        try await persist()
-        emit(containerEvent("unpause", snapshot.containers[index]))
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        guard record.phase == .paused else {
+            throw EngineError(.conflict, "Container \(identifier) is not paused")
+        }
+        let intent = try beginLifecycleIntent(.resume, for: record.id)
+        do {
+            try await backend.resume(record)
+            guard ownsLifecycleExecution(intent, record: record) else {
+                throw EngineError(.conflict, "container \(identifier) changed state while it was being resumed")
+            }
+            let current = try containerIndex(record.id)
+            snapshot.containers[current].phase = .running
+            let resumed = snapshot.containers[current]
+            try await persist()
+            emit(containerEvent("unpause", resumed))
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
+        }
     }
 
     public func restartContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        guard activeExecOperations[record.id, default: 0] == 0 else {
+            throw EngineError(.conflict, "container \(identifier) has an exec operation in progress")
+        }
         guard record.phase == .running || record.phase == .paused else {
             try await startContainer(identifier)
             return
@@ -364,6 +438,10 @@ public actor EngineRuntime {
         let intent = try beginLifecycleIntent(.restart, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
         try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+        // A restart creates a new container execution generation. Terminalize
+        // every child of the old generation before publishing the new start
+        // time; its completion monitor may still be suspended in the backend.
+        await reconcileExecs(for: record.id)
         guard let current = try? containerIndex(record.id) else { throw EngineError(.conflict, "container was removed while restarting") }
         snapshot.containers[current].phase = .running
         let startedAt = Date()
@@ -382,10 +460,25 @@ public actor EngineRuntime {
         let container = try container(identifier)
         guard container.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         guard !configuration.arguments.isEmpty else { throw EngineError(.badRequest, "exec command cannot be empty") }
+        try beginExecOperation(for: container.id)
+        defer { endExecOperation(for: container.id) }
         let exec = ExecRecord(containerID: container.id, configuration: configuration)
-        _ = try await backend.prepareExec(exec, container: container)
-        execs[exec.id] = exec
-        return exec
+        do {
+            _ = try await backend.prepareExec(exec, container: container)
+            guard let current = try? self.container(container.id),
+                  current.phase == .running,
+                  current.startedAt == container.startedAt else {
+                throw EngineError(
+                    .conflict,
+                    "container \(identifier) changed execution generation while the exec was being prepared"
+                )
+            }
+            execs[exec.id] = exec
+            return exec
+        } catch {
+            await backend.discardExec(exec)
+            throw error
+        }
     }
 
     public func exec(_ identifier: String) throws -> ExecRecord {
@@ -398,7 +491,8 @@ public actor EngineRuntime {
         if value.running, let code = await backend.execStatus(value) {
             value.running = false
             value.exitCode = code
-            value.pid = await backend.execPID(value)
+            let refreshedPID = await backend.execPID(value)
+            if refreshedPID > 0 { value.pid = refreshedPID }
             execs[identifier] = value
         }
         return value
@@ -411,10 +505,21 @@ public actor EngineRuntime {
     public func startExec(_ identifier: String) async throws {
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
+        try beginExecOperation(for: exec.containerID)
+        defer { endExecOperation(for: exec.containerID) }
+        guard startingExecIDs.insert(identifier).inserted else {
+            throw EngineError(.conflict, "exec instance is already starting")
+        }
+        defer { startingExecIDs.remove(identifier) }
         try await backend.startExec(exec)
+        guard execs[identifier]?.exitCode == nil,
+              let container = try? container(exec.containerID), container.phase == .running else {
+            throw EngineError(.conflict, "container stopped while exec instance was starting")
+        }
         exec.running = true
-        exec.pid = await backend.execPID(exec)
         execs[identifier] = exec
+        let pid = await backend.execPID(exec)
+        if pid > 0 { execs[identifier]?.pid = pid }
         Task { [weak self] in await self?.monitorExec(identifier) }
     }
 
@@ -423,10 +528,22 @@ public actor EngineRuntime {
         guard !exec.running, exec.exitCode == nil else {
             throw EngineError(.conflict, "exec instance has already run")
         }
+        try beginExecOperation(for: exec.containerID)
+        defer { endExecOperation(for: exec.containerID) }
+        guard startingExecIDs.insert(identifier).inserted else {
+            throw EngineError(.conflict, "exec instance is already starting")
+        }
+        defer { startingExecIDs.remove(identifier) }
         guard let descriptor = try await backend.startAttachedExec(exec) else { return nil }
+        guard execs[identifier]?.exitCode == nil,
+              let container = try? container(exec.containerID), container.phase == .running else {
+            Darwin.close(descriptor)
+            throw EngineError(.conflict, "container stopped while exec instance was starting")
+        }
         exec.running = true
-        exec.pid = await backend.execPID(exec)
         execs[identifier] = exec
+        let pid = await backend.execPID(exec)
+        if pid > 0 { execs[identifier]?.pid = pid }
         Task { [weak self] in await self?.monitorExec(identifier) }
         return descriptor
     }
@@ -438,6 +555,10 @@ public actor EngineRuntime {
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
+        guard record.phase == .running || record.phase == .paused else { return }
         let intent = try beginLifecycleIntent(.stop, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
         guard record.phase == .running || record.phase == .paused else { return }
@@ -479,7 +600,19 @@ public actor EngineRuntime {
             let code = try await backend.stop(removed, timeoutSeconds: 0)
             await recordCompletion(removed.id, startedAt: removed.startedAt, code: code)
         }
+        try await removeClaimedContainer(removed, removeVolumes: removeVolumes, intent: intent)
+    }
+
+    private func removeClaimedContainer(
+        _ removed: ContainerRecord,
+        removeVolumes: Bool,
+        intent: LifecycleIntent
+    ) async throws {
+        guard lifecycleIntents[removed.id] == intent else {
+            throw EngineError(.conflict, "container \(removed.id) removal reservation was lost")
+        }
         guard (try? containerIndex(removed.id)) != nil else { return }
+        await reconcileExecs(for: removed.id)
         resumeExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
@@ -496,12 +629,27 @@ public actor EngineRuntime {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid container name: \(name)") }
         let normalized = name.normalizedContainerName
         let index = try containerIndex(identifier)
-        if let conflicting = snapshot.containers.indices.first(where: { $0 != index && snapshot.containers[$0].name == normalized }) {
-            throw Self.containerNameConflict(name: normalized, conflictingID: snapshot.containers[conflicting].id)
+        let record = snapshot.containers[index]
+        let intent = try beginLifecycleIntent(.rename, for: record.id)
+        do {
+            if let conflicting = snapshot.containers.indices.first(where: {
+                $0 != index && snapshot.containers[$0].name == normalized
+            }) {
+                throw Self.containerNameConflict(
+                    name: normalized, conflictingID: snapshot.containers[conflicting].id
+                )
+            }
+            snapshot.containers[index].name = normalized
+            try await persist()
+            let current = try containerIndex(record.id)
+            emit(containerEvent("rename", snapshot.containers[current]))
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
         }
-        snapshot.containers[index].name = normalized
-        try await persist()
-        emit(containerEvent("rename", snapshot.containers[index]))
     }
 
     public func listNetworks() -> [NetworkRecord] { snapshot.networks }
@@ -751,40 +899,59 @@ public actor EngineRuntime {
                                driverOptions: [String: String]? = nil) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
-        let containerID = snapshot.containers[index].id
-        let intent = try beginLifecycleIntent(.connectNetwork, for: containerID)
-        defer { endLifecycleIntent(intent, for: containerID) }
-        guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
-            throw EngineError(.conflict, "cannot connect a network while container \(snapshot.containers[index].name) is running")
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(containerIdentifier) is starting")
         }
-        guard !snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else { return }
-        try validateStaticEndpointModes(
-            network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
-        )
-        try Self.validateEndpointDriverOptions(driverOptions)
-        let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
-        let previous = snapshot.containers[index]
-        var updated = previous
-        updated.networks.append(.init(
-            networkID: network.id, aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address,
-            ipv4AddressIsStatic: ipv4Address != nil, ipv6AddressIsStatic: ipv6Address != nil,
-            macAddress: normalizedMac, gatewayPriority: gatewayPriority, driverOptions: driverOptions
-        ))
-        updated = try normalizingEndpointConfiguration(updated)
-        try validateEndpoints(updated)
-        updated = try allocatingEndpointAddresses(to: updated)
-        snapshot.containers[index] = updated
+        guard record.phase != .running && record.phase != .paused else {
+            throw EngineError(.conflict, "cannot connect a network while container \(record.name) is running")
+        }
+        let intent = try beginLifecycleIntent(.network, for: record.id)
+        var attemptedNetworks: [NetworkEndpointRecord]?
         do {
+            guard !record.networks.contains(where: { $0.networkID == network.id }) else {
+                endLifecycleIntent(intent, for: record.id)
+                return
+            }
+            try validateStaticEndpointModes(
+                network: network, ipv4IsStatic: ipv4Address != nil, ipv6IsStatic: ipv6Address != nil
+            )
+            try Self.validateEndpointDriverOptions(driverOptions)
+            let normalizedMac = try macAddress.map(Self.normalizeMacAddress)
+            var updated = record
+            updated.networks.append(.init(
+                networkID: network.id, aliases: aliases, ipv4Address: ipv4Address,
+                ipv6Address: ipv6Address, ipv4AddressIsStatic: ipv4Address != nil,
+                ipv6AddressIsStatic: ipv6Address != nil, macAddress: normalizedMac,
+                gatewayPriority: gatewayPriority, driverOptions: driverOptions
+            ))
+            updated = try normalizingEndpointConfiguration(updated)
+            try validateEndpoints(updated)
+            updated = try allocatingEndpointAddresses(to: updated)
+            attemptedNetworks = updated.networks
+            snapshot.containers[index] = updated
             try await persistEndpointAllocationCursors()
-            let current = try containerIndex(containerID)
-            try validateEndpoints(snapshot.containers[current])
+            guard ownsNetworkMutation(intent, record: record, networks: updated.networks) else {
+                throw EngineError(.conflict, "container \(containerIdentifier) changed while its network was being connected")
+            }
+            try validateEndpoints(updated)
             try await backend.updateNetworkRecords(snapshot.containers)
+            guard ownsNetworkMutation(intent, record: record, networks: updated.networks) else {
+                throw EngineError(.conflict, "container \(containerIdentifier) changed while its network was being connected")
+            }
             try await persist()
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
         } catch {
-            if let current = try? containerIndex(containerID) {
-                snapshot.containers[current].networks = previous.networks
+            if let attemptedNetworks,
+               lifecycleIntents[record.id] == intent,
+               let current = try? containerIndex(record.id),
+               snapshot.containers[current].networks == attemptedNetworks {
+                snapshot.containers[current].networks = record.networks
                 try? await backend.updateNetworkRecords(snapshot.containers)
             }
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
             throw error
         }
     }
@@ -792,26 +959,42 @@ public actor EngineRuntime {
     public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
-        let containerID = snapshot.containers[index].id
-        let intent = try beginLifecycleIntent(.disconnectNetwork, for: containerID)
-        defer { endLifecycleIntent(intent, for: containerID) }
-        guard snapshot.containers[index].phase != .running && snapshot.containers[index].phase != .paused else {
-            throw EngineError(.conflict, "cannot disconnect a network while container \(snapshot.containers[index].name) is running")
+        let record = snapshot.containers[index]
+        guard !startingContainerIDs.contains(record.id) else {
+            throw EngineError(.conflict, "container \(containerIdentifier) is starting")
         }
-        guard snapshot.containers[index].networks.contains(where: { $0.networkID == network.id }) else {
-            if force { return }
-            throw EngineError(.notFound, "container is not connected to network \(network.name)")
+        guard record.phase != .running && record.phase != .paused else {
+            throw EngineError(.conflict, "cannot disconnect a network while container \(record.name) is running")
         }
-        let previous = snapshot.containers[index]
-        snapshot.containers[index].networks.removeAll { $0.networkID == network.id }
+        let intent = try beginLifecycleIntent(.network, for: record.id)
+        var attemptedNetworks: [NetworkEndpointRecord]?
         do {
+            guard record.networks.contains(where: { $0.networkID == network.id }) else {
+                endLifecycleIntent(intent, for: record.id)
+                if force { return }
+                throw EngineError(.notFound, "container is not connected to network \(network.name)")
+            }
+            var updated = record
+            updated.networks.removeAll { $0.networkID == network.id }
+            attemptedNetworks = updated.networks
+            snapshot.containers[index] = updated
             try await backend.updateNetworkRecords(snapshot.containers)
+            guard ownsNetworkMutation(intent, record: record, networks: updated.networks) else {
+                throw EngineError(.conflict, "container \(containerIdentifier) changed while its network was being disconnected")
+            }
             try await persist()
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
         } catch {
-            if let current = try? containerIndex(containerID) {
-                snapshot.containers[current].networks = previous.networks
+            if let attemptedNetworks,
+               lifecycleIntents[record.id] == intent,
+               let current = try? containerIndex(record.id),
+               snapshot.containers[current].networks == attemptedNetworks {
+                snapshot.containers[current].networks = record.networks
                 try? await backend.updateNetworkRecords(snapshot.containers)
             }
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
             throw error
         }
     }
@@ -830,27 +1013,31 @@ public actor EngineRuntime {
         return removed.map(\.name)
     }
 
-    public func pruneContainers() async throws -> [String] {
-        let removed = snapshot.containers.filter {
-            $0.phase != .running && $0.phase != .paused && lifecycleIntents[$0.id] == nil
+    public func pruneContainers(ids: Set<String>? = nil) async throws -> [String] {
+        let candidates = snapshot.containers.filter {
+            $0.phase != .running && $0.phase != .paused
+                && !startingContainerIDs.contains($0.id)
+                && lifecycleIntents[$0.id] == nil
+                && (ids?.contains($0.id) ?? true)
         }
-        var intents: [String: LifecycleIntent] = [:]
-        do {
-            for record in removed {
-                intents[record.id] = try beginLifecycleIntent(.remove, for: record.id)
-            }
-        } catch {
-            for (identifier, intent) in intents { endLifecycleIntent(intent, for: identifier) }
-            throw error
+        var claims: [(record: ContainerRecord, intent: LifecycleIntent)] = []
+        for candidate in candidates {
+            guard let current = try? containerIndex(candidate.id),
+                  snapshot.containers[current].phase != .running,
+                  snapshot.containers[current].phase != .paused,
+                  !startingContainerIDs.contains(candidate.id),
+                  lifecycleIntents[candidate.id] == nil else { continue }
+            claims.append((snapshot.containers[current], try beginLifecycleIntent(.remove, for: candidate.id)))
         }
         defer {
-            for (identifier, intent) in intents { endLifecycleIntent(intent, for: identifier) }
+            for claim in claims { endLifecycleIntent(claim.intent, for: claim.record.id) }
         }
-        for record in removed { try await backend.delete(record); try await backend.deleteLogs(for: record) }
-        let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
-        try await persist()
-        removed.forEach { emit(containerEvent("destroy", $0)) }
-        return removed.map(\.id)
+        var removed: [String] = []
+        for claim in claims {
+            try await removeClaimedContainer(claim.record, removeVolumes: false, intent: claim.intent)
+            removed.append(claim.record.id)
+        }
+        return removed
     }
 
     public func pruneImages(scope: ImagePruneScope = .dangling) async throws -> [ImageRecord] {
@@ -1472,36 +1659,137 @@ public actor EngineRuntime {
         snapshot.containers[index].exitCode = code
         snapshot.containers[index].finishedAt = Date()
         resumeExitWaiters(identifier, code: code)
-        let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
-        let intent = lifecycleIntents[identifier]?.operation
+        let intent = lifecycleIntents[identifier]
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
+        await reconcileExecs(for: identifier)
+        await reconcileCompletedContainer(identifier, code: code, suppressing: intent)
+    }
+
+    private func reconcileDeferredCompletion(_ identifier: String) async {
+        guard lifecycleIntents[identifier] == nil,
+              let index = try? containerIndex(identifier),
+              snapshot.containers[index].phase == .exited,
+              let code = snapshot.containers[index].exitCode else { return }
+        await reconcileCompletedContainer(identifier, code: code, suppressing: nil)
+    }
+
+    private func reconcileCompletedContainer(
+        _ identifier: String,
+        code: Int32,
+        suppressing intent: LifecycleIntent?
+    ) async {
+        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .exited else { return }
+        let autoRemove = snapshot.containers[index].autoRemove
+        let record = snapshot.containers[index]
         if intent == nil, !autoRemove, Self.shouldRestart(record, exitCode: code) {
+            let restartIntent: LifecycleIntent
+            do {
+                restartIntent = try beginLifecycleIntent(.restart, for: identifier)
+            } catch {
+                return
+            }
+            guard startingContainerIDs.insert(identifier).inserted else {
+                endLifecycleIntent(restartIntent, for: identifier)
+                return
+            }
+            defer {
+                startingContainerIDs.remove(identifier)
+                endLifecycleIntent(restartIntent, for: identifier)
+            }
             do {
                 var restarted = record; restarted.restartCount += 1
-                try await backend.delete(record); try await backend.prepare(restarted)
+                try await backend.delete(record)
+                guard ownsReconciliation(restartIntent, record: record) else { return }
+                try await backend.prepare(restarted)
+                guard ownsReconciliation(restartIntent, record: record) else { return }
                 restarted.ports = try await backend.start(restarted)
+                guard ownsReconciliation(restartIntent, record: record) else {
+                    _ = try? await backend.stop(restarted, timeoutSeconds: 0)
+                    try? await backend.delete(restarted)
+                    return
+                }
                 restarted = await applyingEndpointAddresses(to: restarted)
+                guard ownsReconciliation(restartIntent, record: record),
+                      let current = try? containerIndex(identifier) else {
+                    _ = try? await backend.stop(restarted, timeoutSeconds: 0)
+                    try? await backend.delete(restarted)
+                    return
+                }
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let restartedAt = Date(); restarted.startedAt = restartedAt
-                if let current = try? containerIndex(identifier) { snapshot.containers[current] = restarted }
+                snapshot.containers[current] = restarted
                 try await persist(); emit(containerEvent("restart", restarted)); startHealthMonitor(identifier)
                 Task { [weak self] in await self?.monitorContainer(identifier, startedAt: restartedAt) }
                 return
             } catch {
-                if let current = try? containerIndex(identifier) { snapshot.containers[current].phase = .dead }
+                if ownsReconciliation(restartIntent, record: record),
+                   let current = try? containerIndex(identifier) {
+                    snapshot.containers[current].phase = .dead
+                }
             }
+            try? await persist()
+            return
         }
-        if autoRemove, intent == nil || intent == .stop {
+
+        if autoRemove, intent == nil || intent?.operation == .stop {
+            let removeIntent: LifecycleIntent
+            let ownsIntent: Bool
+            if let intent {
+                guard lifecycleIntents[identifier] == intent else { return }
+                removeIntent = intent
+                ownsIntent = false
+            } else {
+                do {
+                    removeIntent = try beginLifecycleIntent(.remove, for: identifier)
+                } catch {
+                    return
+                }
+                ownsIntent = true
+            }
+            defer {
+                if ownsIntent { endLifecycleIntent(removeIntent, for: identifier) }
+            }
+            guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.delete(record)
+            guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.deleteLogs(for: record)
+            guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await removeAnonymousVolumes(usedBy: record)
-            if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
+            guard ownsReconciliation(removeIntent, record: record),
+                  let current = try? containerIndex(identifier) else { return }
+            snapshot.containers.remove(at: current)
             resumeRemovalWaiters(identifier, code: code)
             emit(containerEvent("destroy", record))
         }
         try? await persist()
+    }
+
+    private func ownsReconciliation(_ intent: LifecycleIntent, record: ContainerRecord) -> Bool {
+        guard lifecycleIntents[record.id] == intent,
+              let index = try? containerIndex(record.id) else { return false }
+        let current = snapshot.containers[index]
+        return current.phase == .exited
+            && current.startedAt == record.startedAt
+            && current.exitCode == record.exitCode
+    }
+
+    private func ownsLifecycleExecution(_ intent: LifecycleIntent, record: ContainerRecord) -> Bool {
+        guard lifecycleIntents[record.id] == intent,
+              let index = try? containerIndex(record.id) else { return false }
+        let current = snapshot.containers[index]
+        return current.phase == record.phase && current.startedAt == record.startedAt
+    }
+
+    private func ownsNetworkMutation(
+        _ intent: LifecycleIntent,
+        record: ContainerRecord,
+        networks: [NetworkEndpointRecord]
+    ) -> Bool {
+        guard ownsLifecycleExecution(intent, record: record),
+              let index = try? containerIndex(record.id) else { return false }
+        return snapshot.containers[index].networks == networks
     }
 
     private func beginLifecycleIntent(_ operation: LifecycleIntent.Operation, for identifier: String) throws -> LifecycleIntent {
@@ -1515,6 +1803,19 @@ public actor EngineRuntime {
 
     private func endLifecycleIntent(_ intent: LifecycleIntent, for identifier: String) {
         if lifecycleIntents[identifier] == intent { lifecycleIntents.removeValue(forKey: identifier) }
+    }
+
+    private func beginExecOperation(for containerID: String) throws {
+        guard lifecycleIntents[containerID]?.operation != .restart else {
+            throw EngineError(.conflict, "container \(containerID) is restarting")
+        }
+        activeExecOperations[containerID, default: 0] += 1
+    }
+
+    private func endExecOperation(for containerID: String) {
+        guard let count = activeExecOperations[containerID] else { return }
+        if count == 1 { activeExecOperations.removeValue(forKey: containerID) }
+        else { activeExecOperations[containerID] = count - 1 }
     }
 
     private func waitSubscription(containerID: String, removal: Bool) -> ContainerWaitSubscription {
@@ -1574,10 +1875,25 @@ public actor EngineRuntime {
 
     private func monitorExec(_ identifier: String) async {
         guard let exec = try? exec(identifier), let code = await backend.execCompletion(exec) else { return }
+        let refreshedPID = await backend.execPID(exec)
         guard var current = execs[identifier] else { return }
         current.running = false
         current.exitCode = code
-        current.pid = await backend.execPID(current)
+        if refreshedPID > 0 { current.pid = refreshedPID }
         execs[identifier] = current
+    }
+
+    private func reconcileExecs(for containerID: String) async {
+        let identifiers = execs.values.filter {
+            $0.containerID == containerID && $0.exitCode == nil
+        }.map(\.id)
+        for identifier in identifiers {
+            guard let candidate = execs[identifier], candidate.exitCode == nil else { continue }
+            let code = candidate.running ? await backend.execStatus(candidate) : nil
+            guard var current = execs[identifier], current.exitCode == nil else { continue }
+            current.running = false
+            current.exitCode = code ?? 137
+            execs[identifier] = current
+        }
     }
 }

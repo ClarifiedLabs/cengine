@@ -386,14 +386,7 @@ public final class DockerServer: @unchecked Sendable {
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
             .childChannelInitializer { [router] channel in
-                let upgrader = DockerTCPUpgrader(router: router)
-                let upgrade: NIOHTTPServerUpgradeSendableConfiguration = (
-                    upgraders: [upgrader],
-                    completionHandler: { _ in }
-                )
-                return channel.pipeline.configureHTTPServerPipeline(withServerUpgrade: upgrade).flatMap {
-                    channel.pipeline.addHandler(DockerHTTPHandler(router: router), name: "docker-http")
-                }
+                configureDockerHTTPPipeline(channel: channel, router: router)
             }
         channel = try await bootstrap.bind(unixDomainSocketPath: socketPath).get()
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
@@ -410,10 +403,120 @@ public final class DockerServer: @unchecked Sendable {
     }
 }
 
+func configureDockerHTTPPipeline(channel: Channel, router: DockerRouter) -> EventLoopFuture<Void> {
+    let responseEncoder = HTTPResponseEncoder()
+    let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes))
+    let pipelineHandler = HTTPServerPipelineHandler()
+    let headerValidator = NIOHTTPResponseHeadersValidator()
+    let protocolErrorHandler = HTTPServerProtocolErrorHandler()
+    let requestBodies = DockerUpgradeRequestBodyStore()
+    let bodyCollector = DockerUpgradeRequestBodyCollector(store: requestBodies)
+    let tcpUpgrader = DockerTCPUpgrader(router: router, requestBodies: requestBodies)
+    let upgradeHandler = HTTPServerUpgradeHandler(
+        upgraders: [tcpUpgrader],
+        httpEncoder: responseEncoder,
+        extraHTTPHandlers: [
+            requestDecoder, pipelineHandler, headerValidator, protocolErrorHandler, bodyCollector,
+        ],
+        upgradeCompletionHandler: { _ in }
+    )
+    do {
+        try channel.pipeline.syncOperations.addHandlers([
+            responseEncoder, requestDecoder, pipelineHandler, headerValidator, protocolErrorHandler,
+            bodyCollector, upgradeHandler,
+        ])
+        try channel.pipeline.syncOperations.addHandler(DockerHTTPHandler(router: router), name: "docker-http")
+        return channel.eventLoop.makeSucceededFuture(())
+    } catch {
+        return channel.eventLoop.makeFailedFuture(error)
+    }
+}
+
+final class DockerUpgradeRequestBodyStore: @unchecked Sendable {
+    private struct Entry {
+        let promise: EventLoopPromise<Data>
+        var body = Data()
+        var failure: EngineError?
+    }
+
+    private let lock = NSLock()
+    private var entries: [ObjectIdentifier: Entry] = [:]
+
+    func begin(for channel: Channel) {
+        let key = ObjectIdentifier(channel as AnyObject)
+        lock.withLock { entries[key] = Entry(promise: channel.eventLoop.makePromise(of: Data.self)) }
+    }
+
+    func append(_ bytes: ByteBufferView, for channel: Channel) {
+        let key = ObjectIdentifier(channel as AnyObject)
+        lock.withLock {
+            guard entries[key] != nil else { return }
+            if entries[key]!.body.count + bytes.count > 64 * 1_024 {
+                entries[key]!.failure = EngineError(.badRequest, "upgrade request body is too large")
+                return
+            }
+            entries[key]!.body.append(contentsOf: bytes)
+        }
+    }
+
+    func finish(for channel: Channel) {
+        let key = ObjectIdentifier(channel as AnyObject)
+        guard let entry = lock.withLock({ entries.removeValue(forKey: key) }) else { return }
+        if let failure = entry.failure {
+            entry.promise.fail(failure)
+        } else {
+            entry.promise.succeed(entry.body)
+        }
+    }
+
+    func body(for channel: Channel) -> EventLoopFuture<Data>? {
+        let key = ObjectIdentifier(channel as AnyObject)
+        return lock.withLock { entries[key]?.promise.futureResult }
+    }
+
+    func cancel(for channel: Channel) {
+        let key = ObjectIdentifier(channel as AnyObject)
+        guard let entry = lock.withLock({ entries.removeValue(forKey: key) }) else { return }
+        entry.promise.fail(EngineError(.badRequest, "upgrade request body was interrupted"))
+    }
+}
+
+final class DockerUpgradeRequestBodyCollector: ChannelInboundHandler, RemovableChannelHandler {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias InboundOut = HTTPServerRequestPart
+
+    private let store: DockerUpgradeRequestBodyStore
+    private var collecting = false
+
+    init(store: DockerUpgradeRequestBodyStore) { self.store = store }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let part = unwrapInboundIn(data)
+        switch part {
+        case .head(let head):
+            collecting = head.headers[canonicalForm: "upgrade"].contains { $0.lowercased() == "tcp" }
+            if collecting { store.begin(for: context.channel) }
+        case .body(let body):
+            if collecting { store.append(body.readableBytesView, for: context.channel) }
+        case .end:
+            if collecting { store.finish(for: context.channel) }
+            collecting = false
+        }
+        context.fireChannelRead(wrapInboundOut(part))
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        if collecting { store.cancel(for: context.channel) }
+        collecting = false
+        context.fireChannelInactive()
+    }
+}
+
 final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
     let supportedProtocol = "tcp"
     let requiredUpgradeHeaders: [String] = []
     private let router: DockerRouter
+    private let requestBodies: DockerUpgradeRequestBodyStore
     private let lock = NSLock()
     private enum Pending: Sendable {
         case buffered(io: ContainerIOBridge, execID: String?)
@@ -421,7 +524,10 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
     }
     private var pending: [ObjectIdentifier: Pending] = [:]
 
-    init(router: DockerRouter) { self.router = router }
+    init(router: DockerRouter, requestBodies: DockerUpgradeRequestBodyStore) {
+        self.router = router
+        self.requestBodies = requestBodies
+    }
 
     func buildUpgradeResponse(
         channel: Channel,
@@ -433,13 +539,19 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
             promise.fail(EngineError(.notFound, "attach endpoint not found"))
             return promise.futureResult
         }
+        guard let body = requestBodies.body(for: channel) else {
+            promise.fail(EngineError(.badRequest, "upgrade request body is unavailable"))
+            return promise.futureResult
+        }
         Task { [router] in
             do {
+                let requestBody = try await body.get()
                 let pending: Pending
                 switch target {
                 case .container(let id):
                     pending = try await .buffered(io: router.containerIO(id), execID: nil)
                 case .exec(let id):
+                    try await router.validateAttachedExecStart(id, body: requestBody)
                     if let descriptor = try await router.startAttachedExec(id) {
                         let stream = try await ClientBootstrap(group: channel.eventLoop)
                             .channelOption(ChannelOptions.autoRead, value: false)

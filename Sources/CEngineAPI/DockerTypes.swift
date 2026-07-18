@@ -169,7 +169,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
 
     public struct HealthcheckRequest: Decodable, Sendable {
         public var Test: [String]?; public var Interval: Int64?; public var Timeout: Int64?
-        public var Retries: Int?; public var StartPeriod: Int64?
+        public var Retries: Int?; public var StartPeriod: Int64?; public var StartInterval: Int64?
     }
 
     public struct NetworkingConfigRequest: Decodable, Sendable {
@@ -205,8 +205,16 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Source: String?
         public var Target: String
         public var ReadOnly: Bool?
+        public var BindOptions: BindOptionsRequest?
         public var VolumeOptions: VolumeOptionsRequest?
         public var TmpfsOptions: TmpfsOptionsRequest?
+        public struct BindOptionsRequest: Decodable, Sendable {
+            public var Propagation: String?
+            public var NonRecursive: Bool?
+            public var CreateMountpoint: Bool?
+            public var ReadOnlyNonRecursive: Bool?
+            public var ReadOnlyForceRecursive: Bool?
+        }
         public struct VolumeOptionsRequest: Decodable, Sendable {
             public var NoCopy: Bool?
             public var Subpath: String?
@@ -222,12 +230,22 @@ public struct ContainerCreateRequest: Decodable, Sendable {
     public struct HostConfig: Decodable, Sendable {
         public var AutoRemove: Bool?
         public var Privileged: Bool?
+        public var CapAdd: [String]?
+        public var CapDrop: [String]?
+        public var SecurityOpt: [String]?
+        public var Ulimits: [UlimitRequest]?
+        public var Devices: [DeviceRequest]?
+        public var DeviceCgroupRules: [String]?
+        public var Sysctls: [String: String]?
+        public var MaskedPaths: [String]?
+        public var ReadonlyPaths: [String]?
         public var ReadonlyRootfs: Bool?
         public var Init: Bool?
         public var Memory: Int64?
         public var NanoCpus: Int64?
         public var CpuPeriod: Int64?
         public var CpuQuota: Int64?
+        public var PidsLimit: Int64?
         public var RestartPolicy: RestartPolicy?
         public var NetworkMode: String?
         public var VolumeDriver: String?
@@ -236,6 +254,12 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var PortBindings: [String: [PortBindingRequest]]?
         public var Tmpfs: [String: String]?
         public var Annotations: [String: String]?
+        public struct UlimitRequest: Decodable, Sendable { public var Name: String; public var Soft: Int64; public var Hard: Int64 }
+        public struct DeviceRequest: Decodable, Sendable {
+            public var PathOnHost: String
+            public var PathInContainer: String
+            public var CgroupPermissions: String
+        }
         public struct RestartPolicy: Decodable, Sendable { public var Name: String?; public var MaximumRetryCount: Int? }
         public struct PortBindingRequest: Decodable, Sendable { public var HostIp: String?; public var HostPort: String? }
     }
@@ -248,6 +272,7 @@ public struct ContainerWaitResponse: Encodable, Sendable {
 }
 public struct ContainerUpdateRequest: Decodable, Sendable {
     public var Memory: Int64?; public var NanoCpus: Int64?; public var CpuPeriod: Int64?; public var CpuQuota: Int64?
+    public var PidsLimit: Int64?
     public var RestartPolicy: RestartPolicy?
     public struct RestartPolicy: Decodable, Sendable { public var Name: String; public var MaximumRetryCount: Int? }
 }
@@ -280,7 +305,11 @@ public struct ContainerStatsResponse: Encodable, Sendable {
         os_type = version >= .init(major: 1, minor: 52) ? "linux" : nil
         let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         read = formatter.string(from: value.read); preread = formatter.string(from: value.read.addingTimeInterval(-1))
-        pids_stats = .init(current: value.pids, limit: UInt64.max); num_procs = value.pids
+        pids_stats = .init(
+            current: value.pids,
+            limit: container.pidsLimit > 0 ? UInt64(container.pidsLimit) : UInt64.max
+        )
+        num_procs = value.pids
         blkio_stats = .init(io_service_bytes_recursive: [
             .init(major: 0, minor: 0, op: "Read", value: value.blockReadBytes),
             .init(major: 0, minor: 0, op: "Write", value: value.blockWriteBytes),

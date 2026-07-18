@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import pathlib
 import tarfile
+import threading
 import time
 import uuid
 
@@ -75,6 +76,7 @@ def test_init_and_default_exec_share_runtime_context(
 ):
     group_file = tmp_path / "group"
     group_file.write_text("root:x:0:\nnobody:x:65534:\ncompat:x:2345:nobody\n")
+    privileged_container = None
     container = client.containers.create(
         ALPINE_IMAGE,
         ["sh", "-ec", SNAPSHOT_SCRIPT + "while :; do sleep 1; done"],
@@ -108,8 +110,22 @@ def test_init_and_default_exec_share_runtime_context(
         )
         assert privileged.exit_code == 0, privileged.output.decode(errors="replace")
         assert privileged.output.strip() == b"0"
+
+        privileged_container = client.containers.run(
+            ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True, privileged=True,
+        )
+        inherited = privileged_container.exec_run([
+            "sh", "-ec",
+            "awk '/^CapEff:/ { print $2 } /^NoNewPrivs:/ { print $2 }' /proc/self/status",
+        ])
+        assert inherited.exit_code == 0, inherited.output.decode(errors="replace")
+        capability_mask, no_new_privileges = inherited.output.splitlines()
+        assert int(capability_mask, 16) & (1 << 21), "default exec lost container CAP_SYS_ADMIN"
+        assert no_new_privileges == b"0"
     finally:
         container.remove(force=True)
+        if privileged_container is not None:
+            privileged_container.remove(force=True)
 
 
 @pytest.mark.compat("RTM-002")
@@ -135,7 +151,7 @@ def test_read_only_root_applies_to_exec_but_tmpfs_stays_writable(
         container.remove(force=True)
 
 
-@pytest.mark.compat("RTM-004")
+@pytest.mark.compat("RTM-012")
 def test_default_routes_are_selected_per_address_family(client: docker.DockerClient):
     suffix = uuid.uuid4().hex[:8]
     ipv4 = client.networks.create(f"runtime-ipv4-{suffix}")
@@ -183,6 +199,355 @@ def test_default_routes_are_selected_per_address_family(client: docker.DockerCli
         container.remove(force=True)
         ipv4.remove()
         ipv6.remove()
+
+
+@pytest.mark.compat("RTM-004")
+def test_pids_limit_enforces_live_updates_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True, pids_limit=8,
+    )
+    try:
+        container.reload()
+        assert container.attrs["HostConfig"]["PidsLimit"] == 8
+        result = container.exec_run(["cat", "/sys/fs/cgroup/pids.max"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output.strip() == b"8"
+
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={"PidsLimit": 1},
+        )
+        client.api._result(response, True)
+        try:
+            constrained = container.exec_run(["true"])
+        except docker.errors.APIError:
+            pass
+        else:
+            assert constrained.exit_code != 0, "pids.max=1 unexpectedly allowed an exec process"
+
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={"PidsLimit": 12},
+        )
+        client.api._result(response, True)
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        try:
+            value = recovered.containers.get(container.id)
+            value.reload()
+            assert value.attrs["HostConfig"]["PidsLimit"] == 12
+            result = value.exec_run(["cat", "/sys/fs/cgroup/pids.max"])
+            assert result.exit_code == 0, result.output.decode(errors="replace")
+            assert result.output.strip() == b"12"
+        finally:
+            recovered.close()
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-005")
+def test_unrealizable_bind_mount_propagation_is_rejected(
+    client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    with pytest.raises(docker.errors.APIError) as error:
+        client.containers.create(
+            ALPINE_IMAGE,
+            ["tail", "-f", "/dev/null"],
+            mounts=[Mount(
+                target="/propagated", source=str(tmp_path), type="bind", propagation="rshared",
+            )],
+        )
+    assert error.value.status_code == 501
+
+
+@pytest.mark.compat("RTM-006")
+def test_capability_add_drop_apply_to_init_and_exec(client: docker.DockerClient):
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        [
+            "sh", "-ec",
+            "awk '/^CapEff:/ { print $2 }' /proc/self/status >/tmp/init-cap; "
+            "while :; do sleep 1; done",
+        ],
+        detach=True,
+        cap_drop=["ALL", "CHOWN"],
+        cap_add=["CHOWN", "NET_ADMIN"],
+    )
+    try:
+        result = container.exec_run([
+            "sh", "-ec",
+            "cat /tmp/init-cap; awk '/^CapEff:/ { print $2 }' /proc/self/status",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        init_mask, exec_mask = (int(value, 16) for value in result.output.splitlines())
+        expected = (1 << 0) | (1 << 12)  # CAP_CHOWN | CAP_NET_ADMIN
+        assert init_mask == expected
+        assert exec_mask == expected
+        container.reload()
+        assert container.attrs["HostConfig"]["CapDrop"] == ["ALL", "CAP_CHOWN"]
+        assert container.attrs["HostConfig"]["CapAdd"] == ["CAP_CHOWN", "CAP_NET_ADMIN"]
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-007")
+def test_container_prune_honors_filters_and_rejects_unknown_keys(client: docker.DockerClient):
+    selected = client.containers.create(ALPINE_IMAGE, ["true"], labels={"prune": "yes"})
+    preserved = client.containers.create(ALPINE_IMAGE, ["true"], labels={"prune": "no"})
+    try:
+        with pytest.raises(docker.errors.APIError) as error:
+            client.containers.prune(filters={"name": [selected.name]})
+        assert error.value.status_code == 400
+        client.containers.get(selected.id)
+        client.containers.get(preserved.id)
+
+        response = client.containers.prune(filters={"label": ["prune=yes"]})
+        assert response["ContainersDeleted"] == [selected.id]
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(selected.id)
+        client.containers.get(preserved.id)
+    finally:
+        for container in (selected, preserved):
+            try:
+                container.remove(force=True)
+            except docker.errors.NotFound:
+                pass
+
+
+@pytest.mark.compat("RTM-008")
+def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
+    client: docker.DockerClient,
+):
+    healthcheck = """
+        mkdir -p /tmp/healthcheck-pids
+        for marker in /tmp/healthcheck-pids/*; do
+            [ -f "$marker" ] || continue
+            for pid in $(cat "$marker"); do
+                state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || true)
+                if [ -n "$state" ] && [ "$state" != Z ]; then
+                    touch /tmp/orphaned-healthcheck
+                    exit 42
+                fi
+            done
+        done
+        sleep 30 &
+        child=$!
+        printf '%s %s' "$$" "$child" > "/tmp/healthcheck-pids/$$"
+        wait "$child"
+    """
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        detach=True,
+        healthcheck={
+            "test": ["CMD-SHELL", healthcheck],
+            "interval": 1_000_000_000,
+            "timeout": 1_000_000_000,
+            "retries": 2,
+        },
+    )
+    try:
+        failed = container.exec_run(["sh", "-c", "exit 23"])
+        assert failed.exit_code == 23
+
+        inspected_exec = client.api.exec_create(
+            container.id,
+            [
+                "sh",
+                "-c",
+                "awk '/^NSpid:/{print $2}' /proc/self/status > /tmp/exec-target-pid; sleep 30",
+            ],
+        )["Id"]
+        client.api.exec_start(inspected_exec, detach=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            observed = container.exec_run(["cat", "/tmp/exec-target-pid"])
+            if observed.exit_code == 0 and observed.output.strip():
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("exec target did not publish its outer-namespace PID")
+        inspect = client.api.exec_inspect(inspected_exec)
+        assert inspect["Running"] is True
+        assert inspect["Pid"] == int(observed.output.strip())
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            container.reload()
+            if container.attrs["State"]["Health"]["FailingStreak"] >= 2:
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(f"healthcheck did not time out twice: {container.attrs['State']['Health']}")
+
+        surviving_exec = client.api.exec_inspect(inspected_exec)
+        assert surviving_exec["Running"] is True, "healthcheck cgroup kill reached a sibling exec"
+        assert surviving_exec["Pid"] == inspect["Pid"]
+        orphan = container.exec_run(["test", "-e", "/tmp/orphaned-healthcheck"])
+        assert orphan.exit_code == 1, "a timed-out healthcheck target or descendant survived its exec cgroup"
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-009")
+def test_attached_exec_inspect_publishes_pid_and_terminal_status(
+    client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    try:
+        exec_id = client.api.exec_create(
+            container.id,
+            [
+                "sh", "-ec",
+                "rm -f /tmp/release-attached-exec; "
+                "while [ ! -e /tmp/release-attached-exec ]; do sleep 1; done; exit 23",
+            ],
+            stdout=True,
+            stderr=True,
+        )["Id"]
+        results: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def start_attached() -> None:
+            try:
+                results.append(client.api.exec_start(exec_id, detach=False, tty=False))
+            except BaseException as error:  # surfaced after joining the worker
+                errors.append(error)
+
+        starter = threading.Thread(target=start_attached)
+        starter.start()
+        deadline = time.monotonic() + 10
+        running = None
+        while time.monotonic() < deadline:
+            running = client.api.exec_inspect(exec_id)
+            if running["Running"] and running["Pid"] > 0:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"attached exec did not publish a running PID: {running}")
+
+        released = container.exec_run(["touch", "/tmp/release-attached-exec"])
+        assert released.exit_code == 0, released.output
+        starter.join(timeout=30)
+        assert not starter.is_alive(), "attached exec stream did not close after process exit"
+        assert not errors, errors
+        assert results == [b""]
+
+        completed = client.api.exec_inspect(exec_id)
+        assert completed["Running"] is False
+        assert completed["ExitCode"] == 23
+        assert completed["Pid"] == running["Pid"]
+
+        fast_exec = client.api.exec_create(
+            container.id, ["sh", "-c", "exit 29"], stdout=True, stderr=True,
+        )["Id"]
+        assert client.api.exec_start(fast_exec, detach=False, tty=False) == b""
+        fast_completed = client.api.exec_inspect(fast_exec)
+        assert fast_completed["Running"] is False
+        assert fast_completed["ExitCode"] == 29
+        assert fast_completed["Pid"] > 0
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-010")
+def test_paused_stop_restart_and_force_remove_complete(client: docker.DockerClient):
+    stopped = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    restarted = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    removed = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    try:
+        stopped.pause()
+        stopped.stop(timeout=1)
+        stopped.reload()
+        assert stopped.status == "exited"
+
+        restarted.pause()
+        restarted.restart(timeout=1)
+        restarted.reload()
+        assert restarted.status == "running"
+        responsive = restarted.exec_run(["sh", "-c", "printf restarted"])
+        assert responsive.exit_code == 0
+        assert responsive.output == b"restarted"
+
+        removed.pause()
+        removed.remove(force=True)
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(removed.id)
+    finally:
+        for container in (stopped, restarted, removed):
+            try:
+                container.remove(force=True)
+            except docker.errors.NotFound:
+                pass
+
+
+@pytest.mark.compat("RTM-011")
+def test_parent_stop_and_restart_terminalize_attached_and_detached_execs(
+    client: docker.DockerClient,
+):
+    for operation in ("stop", "restart"):
+        container = client.containers.run(
+            ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+        )
+        attached_errors: list[BaseException] = []
+        try:
+            detached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
+            attached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
+            client.api.exec_start(detached, detach=True)
+
+            def start_attached() -> None:
+                try:
+                    client.api.exec_start(attached, detach=False, tty=False)
+                except BaseException as error:  # surfaced after joining the worker
+                    attached_errors.append(error)
+
+            starter = threading.Thread(target=start_attached)
+            starter.start()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                states = [client.api.exec_inspect(value) for value in (detached, attached)]
+                if all(state["Running"] and state["Pid"] > 0 for state in states):
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"{operation} execs did not both become running: {states}")
+
+            if operation == "stop":
+                container.stop(timeout=1)
+            else:
+                container.restart(timeout=1)
+            starter.join(timeout=15)
+            assert not starter.is_alive(), (
+                f"attached exec stream survived parent {operation}"
+            )
+            assert not attached_errors, attached_errors
+            for exec_id in (detached, attached):
+                inspected = client.api.exec_inspect(exec_id)
+                assert inspected["Running"] is False
+                assert inspected["ExitCode"] is not None
+                assert inspected["Pid"] > 0
+            container.reload()
+            if operation == "stop":
+                assert container.status == "exited"
+            else:
+                assert container.status == "running"
+                responsive = container.exec_run(["sh", "-c", "printf restarted"])
+                assert responsive.exit_code == 0
+                assert responsive.output == b"restarted"
+        finally:
+            container.remove(force=True)
 
 
 def archive_file(name: str, contents: bytes) -> bytes:
