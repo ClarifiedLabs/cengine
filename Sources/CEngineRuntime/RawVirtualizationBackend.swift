@@ -19,6 +19,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public static let defaultVolumeDiskBytes = VolumeRecord.defaultSizeBytes
     public static let defaultStorageDiskBytes = VolumeRecord.defaultSizeBytes
     static let managementServerAddress = "100.64.0.1"
+    private static let forcedStopWaitSeconds: Int64 = 5
 
     private let root: URL
     private let kernel: URL
@@ -279,30 +280,69 @@ public actor RawVirtualizationBackend: ContainerBackend {
         struct Signal: Encodable { let signal: Int }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let exitCode: Int? }
-        _ = try? await shim.guest(operation: "signal", payload: Signal(signal: Self.signalNumber(container.stopSignal)), response: Status.self)
+        if container.phase == .paused {
+            do {
+                _ = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.resume()
+                }
+            } catch {
+                _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.stop()
+                }
+                return await recordCompletion(container, code: 137)
+            }
+        }
+        _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+            try await shim.guest(
+                operation: "signal",
+                payload: Signal(signal: Self.signalNumber(container.stopSignal)),
+                response: Status.self
+            )
+        }
         if let existing = completionTasks[container.id] {
             let code: Int32
             do {
-                code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) { await existing.value }
+                code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) { await existing.value }
             } catch {
-                _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
-                code = await existing.value
+                _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.guest(
+                        operation: "signal", payload: Signal(signal: 9), response: Status.self
+                    )
+                }
+                do {
+                    code = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                        await existing.value
+                    }
+                } catch {
+                    _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                        try await shim.stop()
+                    }
+                    code = 137
+                }
             }
             return await recordCompletion(container, code: code)
         }
         let task = Task {
             let code: Int32
             do {
-                code = try await AsyncTimeout.run(seconds: Int64(timeoutSeconds)) {
+                code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) {
                     let value: Status = try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
                     return Int32(value.exitCode ?? 0)
                 }
             } catch {
-                _ = try? await shim.guest(operation: "signal", payload: Signal(signal: 9), response: Status.self)
-                let value: Status? = try? await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.guest(
+                        operation: "signal", payload: Signal(signal: 9), response: Status.self
+                    )
+                }
+                let value: Status? = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                    try await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
+                }
                 code = Int32(value?.exitCode ?? 137)
             }
-            _ = try? await shim.stop()
+            _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                try await shim.stop()
+            }
             return code
         }
         completionTasks[container.id] = task
@@ -532,7 +572,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func delete(_ container: ContainerRecord) async throws {
         portForwarder.stop(containerID: container.id)
-        if let shim = shims.removeValue(forKey: container.id) { _ = try? await shim.shutdown() }
+        if let shim = shims.removeValue(forKey: container.id) {
+            finishExecSessions(using: shim)
+            _ = try? await shim.shutdown()
+        }
         completionTasks.removeValue(forKey: container.id)?.cancel()
         completions.removeValue(forKey: container.id)
         activeContainers.removeValue(forKey: container.id)
@@ -666,10 +709,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
         if let existing = completions[container.id] { return existing }
         completions[container.id] = code
         activeContainers.removeValue(forKey: container.id)
+        if let shim = shims[container.id] { finishExecSessions(using: shim) }
         try? await synchronizeFabric()
         portForwarder.stop(containerID: container.id)
         logMonitors.removeValue(forKey: container.id)?.stop()
         return code
+    }
+
+    private func finishExecSessions(using shim: VMShimClient) {
+        let identifiers = execShims.compactMap { identifier, value in
+            value === shim ? identifier : nil
+        }
+        for identifier in identifiers {
+            execMonitors.removeValue(forKey: identifier)?.stop()
+            execBridges.removeValue(forKey: identifier)?.finishOutput()
+            execShims.removeValue(forKey: identifier)
+        }
     }
 
     private func ensureIO(_ container: ContainerRecord, replacingStoppedSession: Bool = false,

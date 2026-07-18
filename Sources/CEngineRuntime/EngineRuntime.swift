@@ -24,7 +24,7 @@ public struct ContainerWaitSubscription: Sendable {
 
 public actor EngineRuntime {
     private struct LifecycleIntent: Equatable {
-        enum Operation: Equatable { case stop, restart, remove, update, pause, resume, network }
+        enum Operation: Equatable { case stop, restart, remove, update, pause, resume, rename, network }
 
         let operation: Operation
         let token = UUID()
@@ -465,6 +465,10 @@ public actor EngineRuntime {
         }
         defer { startingExecIDs.remove(identifier) }
         try await backend.startExec(exec)
+        guard execs[identifier]?.exitCode == nil,
+              let container = try? container(exec.containerID), container.phase == .running else {
+            throw EngineError(.conflict, "container stopped while exec instance was starting")
+        }
         exec.running = true
         execs[identifier] = exec
         let pid = await backend.execPID(exec)
@@ -482,6 +486,11 @@ public actor EngineRuntime {
         }
         defer { startingExecIDs.remove(identifier) }
         guard let descriptor = try await backend.startAttachedExec(exec) else { return nil }
+        guard execs[identifier]?.exitCode == nil,
+              let container = try? container(exec.containerID), container.phase == .running else {
+            Darwin.close(descriptor)
+            throw EngineError(.conflict, "container stopped while exec instance was starting")
+        }
         exec.running = true
         execs[identifier] = exec
         let pid = await backend.execPID(exec)
@@ -542,6 +551,7 @@ public actor EngineRuntime {
             await recordCompletion(removed.id, startedAt: removed.startedAt, code: code)
         }
         guard (try? containerIndex(removed.id)) != nil else { return }
+        await reconcileExecs(for: removed.id)
         resumeExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
         try await backend.delete(removed)
@@ -558,12 +568,27 @@ public actor EngineRuntime {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid container name: \(name)") }
         let normalized = name.normalizedContainerName
         let index = try containerIndex(identifier)
-        if let conflicting = snapshot.containers.indices.first(where: { $0 != index && snapshot.containers[$0].name == normalized }) {
-            throw Self.containerNameConflict(name: normalized, conflictingID: snapshot.containers[conflicting].id)
+        let record = snapshot.containers[index]
+        let intent = try beginLifecycleIntent(.rename, for: record.id)
+        do {
+            if let conflicting = snapshot.containers.indices.first(where: {
+                $0 != index && snapshot.containers[$0].name == normalized
+            }) {
+                throw Self.containerNameConflict(
+                    name: normalized, conflictingID: snapshot.containers[conflicting].id
+                )
+            }
+            snapshot.containers[index].name = normalized
+            try await persist()
+            let current = try containerIndex(record.id)
+            emit(containerEvent("rename", snapshot.containers[current]))
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+        } catch {
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            throw error
         }
-        snapshot.containers[index].name = normalized
-        try await persist()
-        emit(containerEvent("rename", snapshot.containers[index]))
     }
 
     public func listNetworks() -> [NetworkRecord] { snapshot.networks }
@@ -1250,6 +1275,7 @@ public actor EngineRuntime {
         let intent = lifecycleIntents[identifier]
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
+        await reconcileExecs(for: identifier)
         await reconcileCompletedContainer(identifier, code: code, suppressing: intent)
     }
 
@@ -1454,5 +1480,19 @@ public actor EngineRuntime {
         current.exitCode = code
         if refreshedPID > 0 { current.pid = refreshedPID }
         execs[identifier] = current
+    }
+
+    private func reconcileExecs(for containerID: String) async {
+        let identifiers = execs.values.filter {
+            $0.containerID == containerID && $0.exitCode == nil
+        }.map(\.id)
+        for identifier in identifiers {
+            guard let candidate = execs[identifier], candidate.exitCode == nil else { continue }
+            let code = candidate.running ? await backend.execStatus(candidate) : nil
+            guard var current = execs[identifier], current.exitCode == nil else { continue }
+            current.running = false
+            current.exitCode = code ?? 137
+            execs[identifier] = current
+        }
     }
 }

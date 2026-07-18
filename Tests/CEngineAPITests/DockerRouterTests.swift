@@ -465,6 +465,40 @@ private actor FailedAttachedExecBackend: ContainerBackend {
     func execStatus(_: ExecRecord) async -> Int32? { 126 }
 }
 
+private actor ParentTeardownExecBackend: ContainerBackend {
+    private var containerCompletion: CheckedContinuation<Int32?, Never>?
+    private var execCompletions: [String: CheckedContinuation<Int32?, Never>] = [:]
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_: ContainerRecord) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { containerCompletion = $0 }
+    }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startExec(_: ExecRecord) async throws {}
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? { 123 }
+    func execCompletion(_ exec: ExecRecord) async -> Int32? {
+        await withCheckedContinuation { execCompletions[exec.id] = $0 }
+    }
+    func execPID(_: ExecRecord) async -> Int32 { 81 }
+    func execStatus(_: ExecRecord) async -> Int32? { nil }
+    func isWaitingForContainerCompletion() -> Bool { containerCompletion != nil }
+    func waitingExecCount() -> Int { execCompletions.count }
+    func finishContainer(code: Int32) {
+        containerCompletion?.resume(returning: code)
+        containerCompletion = nil
+        let pending = execCompletions.values
+        execCompletions.removeAll()
+        pending.forEach { $0.resume(returning: nil) }
+    }
+}
+
 private actor ImageStoreBackend: ContainerBackend {
     private var references = ["docker.io/library/existing:latest"]
     private var deleted: [String] = []
@@ -2292,6 +2326,47 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(completed.exitCode == 126)
     }
 
+    @Test func parentCompletionTerminalizesAttachedAndDetachedExecsWhenGuestStatusDisappears() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ParentTeardownExecBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "parent-exec-teardown", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        while !(await backend.isWaitingForContainerCompletion()) { await Task.yield() }
+
+        let detached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["sleep", "30"])
+        )
+        let attached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["sleep", "30"])
+        )
+        try await runtime.startExec(detached.id)
+        #expect(try await runtime.startAttachedExec(attached.id) == 123)
+        while (await backend.waitingExecCount()) != 2 { await Task.yield() }
+
+        await backend.finishContainer(code: 0)
+        for _ in 0..<100 {
+            if try await runtime.inspectExec(detached.id).exitCode != nil,
+               try await runtime.inspectExec(attached.id).exitCode != nil { break }
+            await Task.yield()
+        }
+        let detachedCompleted = try await runtime.inspectExec(detached.id)
+        let attachedCompleted = try await runtime.inspectExec(attached.id)
+        #expect(!detachedCompleted.running)
+        #expect(detachedCompleted.exitCode == 137)
+        #expect(detachedCompleted.pid == 81)
+        #expect(!attachedCompleted.running)
+        #expect(attachedCompleted.exitCode == 137)
+        #expect(attachedCompleted.pid == 81)
+
+        try await runtime.removeContainer(container.id, force: false)
+        #expect(try await runtime.inspectExec(detached.id).exitCode == 137)
+        #expect(try await runtime.inspectExec(attached.id).exitCode == 137)
+    }
+
     @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
@@ -2676,6 +2751,12 @@ private actor AuthImageBackend: ContainerBackend {
         } catch let error as EngineError {
             #expect(error.code == .conflict)
         }
+        do {
+            try await runtime.renameContainer(record.id, name: "restart-race-renamed-too-early")
+            Issue.record("rename overlapped an automatic restart")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
 
         await backend.releaseReconciliationDelete()
         for _ in 0..<100 {
@@ -2686,6 +2767,18 @@ private actor AuthImageBackend: ContainerBackend {
         let restarted = try await runtime.container(record.id)
         #expect(restarted.phase == .running)
         #expect(restarted.restartCount == 1)
+        var renamed = false
+        for _ in 0..<1_000 {
+            do {
+                try await runtime.renameContainer(record.id, name: "restart-race-renamed")
+                renamed = true
+                break
+            } catch let error as EngineError where error.code == .conflict {
+                await Task.yield()
+            }
+        }
+        #expect(renamed)
+        #expect(try await runtime.container(record.id).name == "restart-race-renamed")
         let counts = await backend.counts()
         #expect(counts.prepares == 3)
         #expect(counts.starts == 2)

@@ -56,7 +56,7 @@ reference beneath the Docker API.
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
 | Differential behavior | `ORC-001`–`ORC-002` | Optional lifecycle and multi-platform image response-shape comparisons require an explicit reference Docker Engine. |
-| Runtime semantics | `RTM-001`–`RTM-009`, `KND-001` | PID limits, private bind isolation, configurable capability add/drop, filter-safe container pruning, and attached/detached exec status behavior are covered. Shared/slave bind propagation, configurable devices/rlimits/seccomp/security options, masked paths, and broader cgroup-v2 IO/device behavior remain gaps with explicit rejection where decoded. |
+| Runtime semantics | `RTM-001`–`RTM-011`, `KND-001` | PID limits, private bind isolation, configurable capability add/drop, filter-safe container pruning, paused lifecycle control, and attached/detached exec status behavior are covered. Shared/slave bind propagation, configurable devices/rlimits/seccomp/security options, masked paths, and broader cgroup-v2 IO/device behavior remain gaps with explicit rejection where decoded. |
 
 ## Runtime semantics and OCI applicability
 
@@ -68,7 +68,7 @@ means the one-container-per-VM architecture does not expose that OCI surface.
 
 | OCI Runtime v1.3 area | Applicability | Current evidence | Remaining work |
 |---|---|---|---|
-| Process args, environment, cwd, user and groups | Covered | `RTM-001` checks init/default-exec parity and named supplementary groups; `RTM-009` verifies attached exec PID and terminal-state publication; focused Swift tests cover image/container/exec precedence. | Expand differentials for invalid named identities and explicit exec overrides as clients demand them. |
+| Process args, environment, cwd, user and groups | Covered | `RTM-001` checks init/default-exec parity and named supplementary groups; `RTM-009` verifies attached exec PID and terminal-state publication; `RTM-011` terminalizes attached and detached execs when their parent stops; focused Swift tests cover image/container/exec precedence. | Expand differentials for invalid named identities and explicit exec overrides as clients demand them. |
 | Root filesystem and mount-namespace root | Covered | `RTM-001` compares namespace/root identity; `RTM-003` exercises nested Docker reopening process roots. | Continue porting nested-runtime regressions as distinct contracts. |
 | Read-only root and writable mounts | Partial | `RTM-002` requires exec writes to fail on the root while an explicit tmpfs remains writable; private and recursive-private bind modes are applied. | Shared/slave propagation cannot cross the macOS virtiofs boundary and is explicitly rejected by `RTM-005`; expand bind/volume remount matrices. |
 | PID, mount, UTS, IPC, network and cgroup namespaces | Partial | `RTM-001` requires init/default exec to share all six namespace identities. | Docker namespace-sharing modes and configurable namespace paths are not implemented. |
@@ -83,7 +83,7 @@ be silently ignored; either apply them, reject them clearly, or record and
 prioritize the gap.
 
 Docker-facing lifecycle mutations are serialized per container. Pause, unpause,
-network connect/disconnect, explicit start/stop, and policy-driven restart do not
+rename, network connect/disconnect, explicit start/stop, and policy-driven restart do not
 commit through collection positions captured before a backend suspension, and a
 stop request that overlaps an in-flight start returns a conflict instead of
 reporting a false successful stop. Focused Swift race tests cover these ownership
@@ -145,6 +145,8 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `RTM-007` | `test_container_prune_honors_filters_and_rejects_unknown_keys` | ✅ Pass | Support | **cengine-owned.** Container prune applies one Docker `until` cutoff, conjunctive positive-label filters, and negated-label filters before deletion. Legacy map-shaped filter keys remain active regardless of their boolean payload. Unknown, malformed, or ambiguous filters fail without deleting any container instead of silently broadening prune scope. See the [Docker container prune API](https://docs.docker.com/reference/api/engine/version/v1.52/#tag/Container/operation/ContainerPrune). |
 | `RTM-008` | `test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks` | ✅ Pass | Support | **cengine-owned.** Exec staging processes preserve target exit codes and proxy catchable signals. Exec inspect publishes the final target PID rather than a staging proxy. Each exec target receives a dedicated cgroup-v2 leaf, and timed-out healthchecks write `1` to that leaf's `cgroup.kill`, recursively terminating both the target and descendants without affecting sibling execs. See the [Linux cgroup-v2 `cgroup.kill` contract](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files) and [OCI Linux control groups](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/config-linux.md#control-groups). |
 | `RTM-009` | `test_attached_exec_inspect_publishes_pid_and_terminal_status` | ✅ Pass | Support | **cengine-owned.** An attached exec remains pending while its guest state is `starting` or `running`, publishes its final target PID before the HTTP upgrade completes, and transitions inspect to the terminal exit code without losing that PID, including when the target exits before its PID publication is committed. A launch failure after stream upgrade becomes terminal instead of reverting to a permanently created host record. See the [Docker exec inspect API](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Exec/operation/ExecInspect) and [OCI process lifecycle](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#lifecycle). |
+| `RTM-010` | `test_paused_stop_restart_and_force_remove_complete` | ✅ Pass | Support | **cengine-owned.** Stop, restart, and forced removal resume a paused VM before sending guest process signals, then use a bounded forced-shutdown fallback so lifecycle requests cannot wait forever on a suspended guest. Restart returns the workload to a responsive running state. |
+| `RTM-011` | `test_parent_stop_terminalizes_attached_and_detached_execs` | ✅ Pass | Support | **cengine-owned.** Parent completion or removal reconciles every attached and detached child exec to a terminal inspect state, preserving its published PID and using exit code 137 when VM teardown makes the guest's final exec status unavailable. See the [Docker exec inspect API](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Exec/operation/ExecInspect) and [OCI process lifecycle](https://github.com/opencontainers/runtime-spec/blob/v1.3.0/runtime.md#lifecycle). |
 
 ### Explicit runtime input decisions
 

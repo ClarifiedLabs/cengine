@@ -405,6 +405,86 @@ def test_attached_exec_inspect_publishes_pid_and_terminal_status(
         container.remove(force=True)
 
 
+@pytest.mark.compat("RTM-010")
+def test_paused_stop_restart_and_force_remove_complete(client: docker.DockerClient):
+    stopped = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    restarted = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    removed = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    try:
+        stopped.pause()
+        stopped.stop(timeout=1)
+        stopped.reload()
+        assert stopped.status == "exited"
+
+        restarted.pause()
+        restarted.restart(timeout=1)
+        restarted.reload()
+        assert restarted.status == "running"
+        responsive = restarted.exec_run(["sh", "-c", "printf restarted"])
+        assert responsive.exit_code == 0
+        assert responsive.output == b"restarted"
+
+        removed.pause()
+        removed.remove(force=True)
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(removed.id)
+    finally:
+        for container in (stopped, restarted, removed):
+            try:
+                container.remove(force=True)
+            except docker.errors.NotFound:
+                pass
+
+
+@pytest.mark.compat("RTM-011")
+def test_parent_stop_terminalizes_attached_and_detached_execs(
+    client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    attached_errors: list[BaseException] = []
+    try:
+        detached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
+        attached = client.api.exec_create(container.id, ["sleep", "300"])["Id"]
+        client.api.exec_start(detached, detach=True)
+
+        def start_attached() -> None:
+            try:
+                client.api.exec_start(attached, detach=False, tty=False)
+            except BaseException as error:  # surfaced after joining the worker
+                attached_errors.append(error)
+
+        starter = threading.Thread(target=start_attached)
+        starter.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            states = [client.api.exec_inspect(value) for value in (detached, attached)]
+            if all(state["Running"] and state["Pid"] > 0 for state in states):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"execs did not both become running: {states}")
+
+        container.stop(timeout=1)
+        starter.join(timeout=15)
+        assert not starter.is_alive(), "attached exec stream survived parent teardown"
+        assert not attached_errors, attached_errors
+        for exec_id in (detached, attached):
+            inspected = client.api.exec_inspect(exec_id)
+            assert inspected["Running"] is False
+            assert inspected["ExitCode"] is not None
+            assert inspected["Pid"] > 0
+    finally:
+        container.remove(force=True)
+
+
 def archive_file(name: str, contents: bytes) -> bytes:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:") as archive:
