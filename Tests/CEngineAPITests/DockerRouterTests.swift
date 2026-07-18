@@ -171,6 +171,33 @@ private actor ConcurrentDeleteBackend: ContainerBackend {
     }
 }
 
+private actor BlockingContainerDeleteBackend: ContainerBackend {
+    enum Failure: Error { case injected }
+
+    private let failBlockedDelete: Bool
+    private var blockedContainerID: String?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var hasBlocked = false
+
+    init(failBlockedDelete: Bool = false) { self.failBlockedDelete = failBlockedDelete }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_ container: ContainerRecord) async throws {
+        guard !hasBlocked else { return }
+        hasBlocked = true
+        blockedContainerID = container.id
+        await withCheckedContinuation { continuation = $0 }
+        if failBlockedDelete { throw Failure.injected }
+    }
+
+    func blockedID() -> String? { blockedContainerID }
+    func releaseDelete() { continuation?.resume(); continuation = nil }
+}
+
 private actor ImageStoreBackend: ContainerBackend {
     private var references = ["docker.io/library/existing:latest"]
     private var deleted: [String] = []
@@ -963,7 +990,7 @@ private actor AuthImageBackend: ContainerBackend {
         let modern = await router.route(.init(method: .GET, uri: "/v1.52/networks/status-net"))
         let modernObject = try #require(JSONSerialization.jsonObject(with: modern.body) as? [String: Any])
         let subnet = try #require(
-            (((modernObject["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.0.2/29"] as? [String: Any]
+            (((modernObject["Status"] as? [String: Any])?["IPAM"] as? [String: Any])?["Subnets"] as? [String: Any])?["10.55.0.0/29"] as? [String: Any]
         )
         #expect(subnet["IPsInUse"] as? Int == 4)
         #expect(subnet["DynamicIPsAvailable"] as? Int == 4)
@@ -1119,6 +1146,62 @@ private actor AuthImageBackend: ContainerBackend {
         let dual = try #require(await backend.request(named: "dual"))
         #expect(dual.ipv4AllocationMode == .explicit)
         #expect(dual.ipv6AllocationMode == .explicit)
+    }
+
+    @Test func engineRuntimeRejectsInvalidNetworkAddressingBeforeCallingBackend() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let invalidRequests: [(String, String?, String?, String?, String?)] = [
+            ("bogus-cidr", "bogus/24", nil, nil, nil),
+            ("wrong-v4-subnet-family", "fd00:41::/64", nil, nil, nil),
+            ("wrong-v6-subnet-family", nil, nil, "10.41.0.0/24", nil),
+            ("wrong-v4-gateway-family", "10.41.0.0/24", "fd00:41::1", nil, nil),
+            ("wrong-v6-gateway-family", nil, nil, "fd00:41::/64", "10.41.0.1"),
+            ("outside-v4", "10.41.0.0/24", "10.42.0.1", nil, nil),
+            ("reserved-v4-network", "10.41.0.0/24", "10.41.0.0", nil, nil),
+            ("reserved-v4-broadcast", "10.41.0.0/24", "10.41.0.255", nil, nil),
+            ("outside-v6", nil, nil, "fd00:41::/64", "fd00:42::1"),
+            ("reserved-v6-network", nil, nil, "fd00:41::/64", "fd00:41::"),
+            ("invalid-v6-prefix", nil, nil, "fd00:41::/129", nil),
+        ]
+
+        for (name, subnet, gateway, ipv6Subnet, ipv6Gateway) in invalidRequests {
+            do {
+                _ = try await runtime.createNetwork(
+                    name: name, subnet: subnet, gateway: gateway,
+                    ipv6Subnet: ipv6Subnet, ipv6Gateway: ipv6Gateway
+                )
+                Issue.record("invalid network addressing was accepted for \(name)")
+            } catch let error as EngineError {
+                #expect(error.code == .badRequest)
+            }
+            #expect(await backend.request(named: name) == nil)
+        }
+    }
+
+    @Test func engineRuntimeCanonicalizesSubnetsAndImplicitGatewaysBeforeCallingBackend() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = NetworkRecordingBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+
+        let network = try await runtime.createNetwork(
+            name: "canonical-network",
+            subnet: "10.44.0.30/28",
+            ipv6Subnet: "FD00:0044:0000:0000:0000:0000:0000:001E/124"
+        )
+
+        let request = try #require(await backend.request(named: network.name))
+        #expect(request.subnet == "10.44.0.16/28")
+        #expect(request.gateway == "10.44.0.17")
+        #expect(request.ipv6Subnet == "fd00:44::10/124")
+        #expect(request.ipv6Gateway == "fd00:44::11")
+        #expect(network.subnet == request.subnet)
+        #expect(network.gateway == request.gateway)
+        #expect(network.ipv6Subnet == request.ipv6Subnet)
+        #expect(network.ipv6Gateway == request.ipv6Gateway)
     }
 
     @Test func isolatedGatewayOptionsRoundTripAndRequireInternalNetwork() async throws {
@@ -2096,7 +2179,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(value["ContainerID"] as? String == container.id)
     }
 
-    @Test func startingContainerExcludesRemovalAndNetworkAttachmentChanges() async throws {
+    @Test func startingContainerExcludesStopRemovalAndNetworkAttachmentChanges() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = BlockingStartBackend()
@@ -2108,6 +2191,7 @@ private actor AuthImageBackend: ContainerBackend {
         while !(await backend.hasEnteredStart()) { await Task.yield() }
 
         for operation in [
+            { try await runtime.stopContainer(record.id) },
             { try await runtime.removeContainer(record.id, force: true) },
             { try await runtime.connectNetwork(extraNetwork.id, container: record.id) },
             { try await runtime.disconnectNetwork(defaultNetwork, container: record.id, force: false) },
@@ -2123,6 +2207,8 @@ private actor AuthImageBackend: ContainerBackend {
         await backend.releaseStart()
         try await start.value
         #expect(try await runtime.container(record.id).phase == .running)
+        try await runtime.stopContainer(record.id)
+        #expect(try await runtime.container(record.id).phase == .exited)
     }
 
     @Test func containerListDoesNotPublishAContainerDuringItsStartTransition() async throws {
@@ -2207,6 +2293,46 @@ private actor AuthImageBackend: ContainerBackend {
         async let removeSecond: Void = runtime.removeContainer(second.id, force: false)
         _ = try await (removeFirst, removeSecond)
         #expect(await runtime.listContainers(all: true).isEmpty)
+    }
+
+    @Test func containerPruneClaimsEveryCandidateBeforeDeletingAnyBackendState() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingContainerDeleteBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(ContainerRecord(name: "prune-first", image: "debian"))
+        let second = try await runtime.createContainer(ContainerRecord(name: "prune-second", image: "debian"))
+        let prune = Task { try await runtime.pruneContainers() }
+        while await backend.blockedID() == nil { await Task.yield() }
+
+        do {
+            try await runtime.startContainer(second.id)
+            Issue.record("container start bypassed an in-progress prune")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+        }
+
+        await backend.releaseDelete()
+        #expect(Set(try await prune.value) == [first.id, second.id])
+        #expect(await runtime.listContainers(all: true).isEmpty)
+    }
+
+    @Test func failedContainerPruneReleasesClaimsAndRetainsMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingContainerDeleteBackend(failBlockedDelete: true)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let first = try await runtime.createContainer(ContainerRecord(name: "failed-prune-first", image: "debian"))
+        let second = try await runtime.createContainer(ContainerRecord(name: "failed-prune-second", image: "debian"))
+        let prune = Task { try await runtime.pruneContainers() }
+        while await backend.blockedID() == nil { await Task.yield() }
+
+        await backend.releaseDelete()
+        await #expect(throws: BlockingContainerDeleteBackend.Failure.self) { try await prune.value }
+        #expect(Set(await runtime.listContainers(all: true).map(\.id)) == [first.id, second.id])
+
+        try await runtime.startContainer(second.id)
+        #expect(try await runtime.container(second.id).phase == .running)
     }
 
     @Test func pauseUnpauseAndRestartUpdateContainerState() async throws {

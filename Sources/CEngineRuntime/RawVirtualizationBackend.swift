@@ -563,15 +563,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let automaticNetwork = Self.automaticIPv4Network(vlan: vlan)
             value.subnet = automaticNetwork.subnet
             value.gateway = automaticNetwork.gateway
-        } else if value.enableIPv4, value.gateway.isEmpty {
-            value.gateway = EngineRuntime.firstAddress(in: value.subnet) ?? ""
         }
         if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
         if value.enableIPv6, value.ipv6Subnet.isEmpty {
             value.ipv6Subnet = String(format: "fdce:%x::/64", vlan)
             value.ipv6Gateway = String(format: "fdce:%x::1", vlan)
-        } else if value.enableIPv6, value.ipv6Gateway.isEmpty {
-            value.ipv6Gateway = EngineRuntime.firstAddress(in: value.ipv6Subnet) ?? ""
         }
         if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
         let transaction = RawNetworkStateTransaction(

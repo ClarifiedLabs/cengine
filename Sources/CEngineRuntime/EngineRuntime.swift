@@ -427,10 +427,10 @@ public actor EngineRuntime {
 
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
-        guard snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused else { return }
         let record = snapshot.containers[index]
         let intent = try beginLifecycleIntent(.stop, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
+        guard record.phase == .running || record.phase == .paused else { return }
         let code = try await backend.stop(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
         await recordCompletion(record.id, startedAt: record.startedAt, code: code)
     }
@@ -672,7 +672,6 @@ public actor EngineRuntime {
                 "asymmetric IPv4 and IPv6 gateway modes are not supported by the vmnet fabric"
             )
         }
-        if let existing = snapshot.networks.first(where: { $0.name == name }) { return existing }
         let requestedSubnet = subnet ?? ""
         let requestedIPv6 = ipv6Subnet ?? ""
         if !enableIPv4, !requestedSubnet.isEmpty || gateway?.isEmpty == false {
@@ -681,21 +680,16 @@ public actor EngineRuntime {
         if !enableIPv6, !requestedIPv6.isEmpty || ipv6Gateway?.isEmpty == false {
             throw EngineError(.badRequest, "IPv6 addressing cannot be configured when IPv6 is disabled")
         }
-        if enableIPv6, !requestedIPv6.isEmpty, let requestedGateway = ipv6Gateway, !requestedGateway.isEmpty {
-            guard let implicitGateway = Self.firstAddress(in: requestedIPv6),
-                  let canonicalGateway = Self.canonicalAddress(requestedGateway, family: AF_INET6) else {
-                throw EngineError(.badRequest, "invalid IPv6 subnet or gateway")
-            }
-            guard canonicalGateway == implicitGateway else {
-                throw EngineError(
-                    .unsupported,
-                    "custom IPv6 gateway \(requestedGateway) is not supported; vmnet uses \(implicitGateway) for prefix \(requestedIPv6)"
-                )
-            }
-        }
+        let ipv4 = try Self.normalizeNetworkAddressing(
+            subnet: requestedSubnet, gateway: gateway ?? "", family: AF_INET
+        )
+        let ipv6 = try Self.normalizeNetworkAddressing(
+            subnet: requestedIPv6, gateway: ipv6Gateway ?? "", family: AF_INET6
+        )
+        if let existing = snapshot.networks.first(where: { $0.name == name }) { return existing }
         let requested = NetworkRecord(
-            id: Identifier.random(), name: name, createdAt: Date(), subnet: requestedSubnet, gateway: gateway ?? "",
-            ipv6Subnet: requestedIPv6, ipv6Gateway: ipv6Gateway ?? "",
+            id: Identifier.random(), name: name, createdAt: Date(), subnet: ipv4.subnet, gateway: ipv4.gateway,
+            ipv6Subnet: ipv6.subnet, ipv6Gateway: ipv6.gateway,
             ipv4AllocationMode: subnet == nil ? .automatic : .explicit,
             ipv6AllocationMode: ipv6Subnet == nil ? .automatic : .explicit,
             enableIPv4: enableIPv4, enableIPv6: enableIPv6,
@@ -815,6 +809,18 @@ public actor EngineRuntime {
     public func pruneContainers() async throws -> [String] {
         let removed = snapshot.containers.filter {
             $0.phase != .running && $0.phase != .paused && lifecycleIntents[$0.id] == nil
+        }
+        var intents: [String: LifecycleIntent] = [:]
+        do {
+            for record in removed {
+                intents[record.id] = try beginLifecycleIntent(.remove, for: record.id)
+            }
+        } catch {
+            for (identifier, intent) in intents { endLifecycleIntent(intent, for: identifier) }
+            throw error
+        }
+        defer {
+            for (identifier, intent) in intents { endLifecycleIntent(intent, for: identifier) }
         }
         for record in removed { try await backend.delete(record); try await backend.deleteLogs(for: record) }
         let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
@@ -1140,7 +1146,75 @@ public actor EngineRuntime {
         return broadcast
     }
 
-    static func firstAddress(in subnet: String) -> String? {
+    private static func normalizeNetworkAddressing(
+        subnet: String, gateway: String, family: Int32
+    ) throws -> (subnet: String, gateway: String) {
+        let familyName = family == AF_INET6 ? "IPv6" : "IPv4"
+        guard !subnet.isEmpty else {
+            guard gateway.isEmpty else {
+                throw EngineError(.badRequest, "\(familyName) gateway requires an explicit subnet")
+            }
+            return ("", "")
+        }
+        let components = subnet.split(
+            separator: "/", maxSplits: 1, omittingEmptySubsequences: false
+        ).map(String.init)
+        let byteCount = family == AF_INET6 ? 16 : 4
+        guard components.count == 2,
+              let prefix = Int(components[1]),
+              (0...(byteCount * 8)).contains(prefix),
+              let requestedAddress = addressBytes(components[0], family: family) else {
+            throw EngineError(.badRequest, "invalid \(familyName) subnet \(subnet)")
+        }
+        let networkAddress = maskedAddress(requestedAddress, prefix: prefix)
+        guard let canonicalNetwork = addressString(networkAddress, family: family) else {
+            throw EngineError(.badRequest, "invalid \(familyName) subnet \(subnet)")
+        }
+        let canonicalSubnet = "\(canonicalNetwork)/\(prefix)"
+        let implicitGateway = firstAddress(in: canonicalSubnet)
+        let gatewayAddress: [UInt8]
+        let canonicalGateway: String
+        if gateway.isEmpty {
+            guard let implicitGateway,
+                  let address = addressBytes(implicitGateway, family: family) else {
+                throw EngineError(.badRequest, "\(familyName) subnet \(canonicalSubnet) has no usable gateway address")
+            }
+            gatewayAddress = address
+            canonicalGateway = implicitGateway
+        } else {
+            guard let address = addressBytes(gateway, family: family),
+                  let canonical = addressString(address, family: family) else {
+                throw EngineError(.badRequest, "invalid \(familyName) gateway \(gateway)")
+            }
+            gatewayAddress = address
+            canonicalGateway = canonical
+        }
+        guard maskedAddress(gatewayAddress, prefix: prefix) == networkAddress else {
+            throw EngineError(
+                .badRequest, "\(familyName) gateway \(canonicalGateway) is outside subnet \(canonicalSubnet)"
+            )
+        }
+        if family == AF_INET6, gatewayAddress == networkAddress {
+            throw EngineError(.badRequest, "IPv6 gateway \(canonicalGateway) is the reserved network address")
+        }
+        if family == AF_INET, prefix < 31 {
+            if gatewayAddress == networkAddress {
+                throw EngineError(.badRequest, "IPv4 gateway \(canonicalGateway) is the reserved network address")
+            }
+            if gatewayAddress == broadcastAddress(networkAddress, prefix: prefix) {
+                throw EngineError(.badRequest, "IPv4 gateway \(canonicalGateway) is the reserved broadcast address")
+            }
+        }
+        if family == AF_INET6, canonicalGateway != implicitGateway {
+            throw EngineError(
+                .unsupported,
+                "custom IPv6 gateway \(canonicalGateway) is not supported; vmnet uses \(implicitGateway ?? "") for prefix \(canonicalSubnet)"
+            )
+        }
+        return (canonicalSubnet, canonicalGateway)
+    }
+
+    private static func firstAddress(in subnet: String) -> String? {
         let components = subnet.split(separator: "/", maxSplits: 1).map(String.init)
         guard components.count == 2, let prefix = Int(components[1]) else { return nil }
         let family = components[0].contains(":") ? AF_INET6 : AF_INET

@@ -183,14 +183,8 @@ public extension ContainerBackend {
     func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {
         var value = network
         if value.enableIPv4, value.subnet.isEmpty { value.subnet = "192.168.64.0/24"; value.gateway = "192.168.64.1" }
-        else if value.enableIPv4, value.gateway.isEmpty {
-            value.gateway = EngineRuntime.firstAddress(in: value.subnet) ?? ""
-        }
         if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
         if value.enableIPv6, value.ipv6Subnet.isEmpty { value.ipv6Subnet = "fd00:ce::/64"; value.ipv6Gateway = "fd00:ce::1" }
-        else if value.enableIPv6, value.ipv6Gateway.isEmpty {
-            value.ipv6Gateway = EngineRuntime.firstAddress(in: value.ipv6Subnet) ?? ""
-        }
         if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
         return value
     }

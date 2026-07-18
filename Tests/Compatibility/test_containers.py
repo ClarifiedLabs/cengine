@@ -908,7 +908,7 @@ def test_network_ipam_status_tracks_allocations_and_api_version(client: docker.D
     container = client.containers.create(IMAGE, command="top", network=name)
     network = client.networks.get(name)
     network.reload()
-    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.2/29"]
+    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.0/29"]
     assert status == {"IPsInUse": 4, "DynamicIPsAvailable": 4}
 
     legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.51")
@@ -978,6 +978,64 @@ def test_network_ipam_and_family_validation_is_explicit(
         data={"Name": f"disabled-{suffix}", "EnableIPv4": False, "EnableIPv6": False},
     )
     assert disabled.status_code == 400
+
+    invalid = [
+        {"Name": f"bogus-cidr-{suffix}", "IPAM": {"Config": [{"Subnet": "bogus/24"}]}},
+        {
+            "Name": f"wrong-v4-gateway-family-{suffix}",
+            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "fd00:22::1"}]},
+        },
+        {
+            "Name": f"outside-v4-gateway-{suffix}",
+            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "10.214.0.1"}]},
+        },
+        {
+            "Name": f"reserved-v4-gateway-{suffix}",
+            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "10.213.0.255"}]},
+        },
+        {
+            "Name": f"invalid-v6-prefix-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/129"}]},
+        },
+        {
+            "Name": f"wrong-v6-gateway-family-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "10.213.0.1"}]},
+        },
+        {
+            "Name": f"outside-v6-gateway-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "fd00:23::1"}]},
+        },
+        {
+            "Name": f"reserved-v6-gateway-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "fd00:22::"}]},
+        },
+    ]
+    for request in invalid:
+        response = client.api._post_json(client.api._url("/networks/create"), data=request)
+        assert response.status_code == 400, response.text
+
+    canonical = client.api._post_json(
+        client.api._url("/networks/create"),
+        data={
+            "Name": f"canonical-{suffix}",
+            "EnableIPv6": True,
+            "IPAM": {"Config": [
+                {"Subnet": "10.215.0.30/28"},
+                {"Subnet": "FD00:0022:0000:0000:0000:0000:0000:001E/124"},
+            ]},
+        },
+    )
+    client.api._raise_for_status(canonical)
+    canonical_network = client.networks.get(canonical.json()["Id"])
+    assert canonical_network.attrs["IPAM"]["Config"] == [
+        {"Subnet": "10.215.0.16/28", "Gateway": "10.215.0.17"},
+        {"Subnet": "fd00:22::10/124", "Gateway": "fd00:22::11"},
+    ]
+    canonical_network.remove()
 
     legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.47")
     try:
