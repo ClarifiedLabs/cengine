@@ -883,11 +883,15 @@ func execSignalTarget(stagePID, targetPID int, signal unix.Signal) int {
 func (s *Supervisor) WaitExec(id string) protocol.ProcessStatus {
 	for {
 		status := s.ExecStatus(id)
-		if status.Status != "running" {
+		if !execWaitPending(status.Status) {
 			return status
 		}
 		_ = unix.Nanosleep(&unix.Timespec{Nsec: 20_000_000}, nil)
 	}
+}
+
+func execWaitPending(status string) bool {
+	return status == "starting" || status == "running"
 }
 func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func()) {
 	err := command.Wait()

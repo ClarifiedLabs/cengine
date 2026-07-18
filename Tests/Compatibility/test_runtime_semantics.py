@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import pathlib
 import tarfile
+import threading
 import time
 
 import docker
@@ -337,6 +338,60 @@ def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
         assert surviving_exec["Pid"] == inspect["Pid"]
         orphan = container.exec_run(["test", "-e", "/tmp/orphaned-healthcheck"])
         assert orphan.exit_code == 1, "a timed-out healthcheck target or descendant survived its exec cgroup"
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-009")
+def test_attached_exec_inspect_publishes_pid_and_terminal_status(
+    client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+    )
+    try:
+        exec_id = client.api.exec_create(
+            container.id,
+            [
+                "sh", "-ec",
+                "rm -f /tmp/release-attached-exec; "
+                "while [ ! -e /tmp/release-attached-exec ]; do sleep 1; done; exit 23",
+            ],
+            stdout=True,
+            stderr=True,
+        )["Id"]
+        results: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def start_attached() -> None:
+            try:
+                results.append(client.api.exec_start(exec_id, detach=False, tty=False))
+            except BaseException as error:  # surfaced after joining the worker
+                errors.append(error)
+
+        starter = threading.Thread(target=start_attached)
+        starter.start()
+        deadline = time.monotonic() + 10
+        running = None
+        while time.monotonic() < deadline:
+            running = client.api.exec_inspect(exec_id)
+            if running["Running"] and running["Pid"] > 0:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"attached exec did not publish a running PID: {running}")
+
+        released = container.exec_run(["touch", "/tmp/release-attached-exec"])
+        assert released.exit_code == 0, released.output
+        starter.join(timeout=30)
+        assert not starter.is_alive(), "attached exec stream did not close after process exit"
+        assert not errors, errors
+        assert results == [b""]
+
+        completed = client.api.exec_inspect(exec_id)
+        assert completed["Running"] is False
+        assert completed["ExitCode"] == 23
+        assert completed["Pid"] == running["Pid"]
     finally:
         container.remove(force=True)
 

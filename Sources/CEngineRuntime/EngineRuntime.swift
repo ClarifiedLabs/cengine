@@ -296,6 +296,9 @@ public actor EngineRuntime {
                                 pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
+        guard !startingContainerIDs.contains(old.id) else {
+            throw EngineError(.conflict, "container \(identifier) is starting")
+        }
         let intent = try beginLifecycleIntent(.update, for: old.id)
         do {
             var updated = old
@@ -403,7 +406,8 @@ public actor EngineRuntime {
         if value.running, let code = await backend.execStatus(value) {
             value.running = false
             value.exitCode = code
-            value.pid = await backend.execPID(value)
+            let refreshedPID = await backend.execPID(value)
+            if refreshedPID > 0 { value.pid = refreshedPID }
             execs[identifier] = value
         }
         return value
@@ -422,8 +426,9 @@ public actor EngineRuntime {
         defer { startingExecIDs.remove(identifier) }
         try await backend.startExec(exec)
         exec.running = true
-        exec.pid = await backend.execPID(exec)
         execs[identifier] = exec
+        let pid = await backend.execPID(exec)
+        if pid > 0 { execs[identifier]?.pid = pid }
         Task { [weak self] in await self?.monitorExec(identifier) }
     }
 
@@ -438,8 +443,9 @@ public actor EngineRuntime {
         defer { startingExecIDs.remove(identifier) }
         guard let descriptor = try await backend.startAttachedExec(exec) else { return nil }
         exec.running = true
-        exec.pid = await backend.execPID(exec)
         execs[identifier] = exec
+        let pid = await backend.execPID(exec)
+        if pid > 0 { execs[identifier]?.pid = pid }
         Task { [weak self] in await self?.monitorExec(identifier) }
         return descriptor
     }
@@ -1141,7 +1147,7 @@ public actor EngineRuntime {
         snapshot.containers[index].finishedAt = Date()
         resumeExitWaiters(identifier, code: code)
         let record = snapshot.containers[index]
-        let intent = lifecycleIntents[identifier]?.operation
+        let intent = lifecycleIntents[identifier]
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
         await reconcileCompletedContainer(identifier, code: code, suppressing: intent)
@@ -1158,36 +1164,101 @@ public actor EngineRuntime {
     private func reconcileCompletedContainer(
         _ identifier: String,
         code: Int32,
-        suppressing intent: LifecycleIntent.Operation?
+        suppressing intent: LifecycleIntent?
     ) async {
         guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .exited else { return }
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
         if intent == nil, !autoRemove, Self.shouldRestart(record, exitCode: code) {
+            let restartIntent: LifecycleIntent
+            do {
+                restartIntent = try beginLifecycleIntent(.restart, for: identifier)
+            } catch {
+                return
+            }
+            guard startingContainerIDs.insert(identifier).inserted else {
+                endLifecycleIntent(restartIntent, for: identifier)
+                return
+            }
+            defer {
+                startingContainerIDs.remove(identifier)
+                endLifecycleIntent(restartIntent, for: identifier)
+            }
             do {
                 var restarted = record; restarted.restartCount += 1
-                try await backend.delete(record); try await backend.prepare(restarted)
+                try await backend.delete(record)
+                guard ownsReconciliation(restartIntent, record: record) else { return }
+                try await backend.prepare(restarted)
+                guard ownsReconciliation(restartIntent, record: record) else { return }
                 restarted.ports = try await backend.start(restarted)
+                guard ownsReconciliation(restartIntent, record: record) else {
+                    _ = try? await backend.stop(restarted, timeoutSeconds: 0)
+                    try? await backend.delete(restarted)
+                    return
+                }
                 restarted = await applyingEndpointAddresses(to: restarted)
+                guard ownsReconciliation(restartIntent, record: record),
+                      let current = try? containerIndex(identifier) else {
+                    _ = try? await backend.stop(restarted, timeoutSeconds: 0)
+                    try? await backend.delete(restarted)
+                    return
+                }
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let restartedAt = Date(); restarted.startedAt = restartedAt
-                if let current = try? containerIndex(identifier) { snapshot.containers[current] = restarted }
+                snapshot.containers[current] = restarted
                 try await persist(); emit(containerEvent("restart", restarted)); startHealthMonitor(identifier)
                 Task { [weak self] in await self?.monitorContainer(identifier, startedAt: restartedAt) }
                 return
             } catch {
-                if let current = try? containerIndex(identifier) { snapshot.containers[current].phase = .dead }
+                if ownsReconciliation(restartIntent, record: record),
+                   let current = try? containerIndex(identifier) {
+                    snapshot.containers[current].phase = .dead
+                }
             }
+            try? await persist()
+            return
         }
-        if autoRemove, intent == nil || intent == .stop {
+
+        if autoRemove, intent == nil || intent?.operation == .stop {
+            let removeIntent: LifecycleIntent
+            let ownsIntent: Bool
+            if let intent {
+                guard lifecycleIntents[identifier] == intent else { return }
+                removeIntent = intent
+                ownsIntent = false
+            } else {
+                do {
+                    removeIntent = try beginLifecycleIntent(.remove, for: identifier)
+                } catch {
+                    return
+                }
+                ownsIntent = true
+            }
+            defer {
+                if ownsIntent { endLifecycleIntent(removeIntent, for: identifier) }
+            }
+            guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.delete(record)
+            guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.deleteLogs(for: record)
+            guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await removeAnonymousVolumes(usedBy: record)
-            if let current = try? containerIndex(identifier) { snapshot.containers.remove(at: current) }
+            guard ownsReconciliation(removeIntent, record: record),
+                  let current = try? containerIndex(identifier) else { return }
+            snapshot.containers.remove(at: current)
             resumeRemovalWaiters(identifier, code: code)
             emit(containerEvent("destroy", record))
         }
         try? await persist()
+    }
+
+    private func ownsReconciliation(_ intent: LifecycleIntent, record: ContainerRecord) -> Bool {
+        guard lifecycleIntents[record.id] == intent,
+              let index = try? containerIndex(record.id) else { return false }
+        let current = snapshot.containers[index]
+        return current.phase == .exited
+            && current.startedAt == record.startedAt
+            && current.exitCode == record.exitCode
     }
 
     private func beginLifecycleIntent(_ operation: LifecycleIntent.Operation, for identifier: String) throws -> LifecycleIntent {
@@ -1260,10 +1331,11 @@ public actor EngineRuntime {
 
     private func monitorExec(_ identifier: String) async {
         guard let exec = try? exec(identifier), let code = await backend.execCompletion(exec) else { return }
+        let refreshedPID = await backend.execPID(exec)
         guard var current = execs[identifier] else { return }
         current.running = false
         current.exitCode = code
-        current.pid = await backend.execPID(current)
+        if refreshedPID > 0 { current.pid = refreshedPID }
         execs[identifier] = current
     }
 }

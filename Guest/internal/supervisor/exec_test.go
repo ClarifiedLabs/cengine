@@ -104,6 +104,22 @@ func TestExecStartReservationExcludesAttachedAndDetachedLaunches(t *testing.T) {
 	}
 }
 
+func TestWaitExecTreatsStartingAndRunningAsNonterminalStates(t *testing.T) {
+	for _, test := range []struct {
+		status  string
+		pending bool
+	}{
+		{status: "created", pending: false},
+		{status: "starting", pending: true},
+		{status: "running", pending: true},
+		{status: "exited", pending: false},
+	} {
+		if actual := execWaitPending(test.status); actual != test.pending {
+			t.Fatalf("exec status %q pending = %t, want %t", test.status, actual, test.pending)
+		}
+	}
+}
+
 func TestSignalExecKillsItsDedicatedCgroupSubtree(t *testing.T) {
 	cgroup := t.TempDir()
 	killFile := filepath.Join(cgroup, "cgroup.kill")

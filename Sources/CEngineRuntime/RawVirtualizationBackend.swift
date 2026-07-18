@@ -434,8 +434,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge { guard let bridge = execBridges[exec.id] else { throw EngineError(.notFound, "exec I/O is unavailable") }; return bridge }
 
     public func execPID(_ exec: ExecRecord) async -> Int32 {
-        guard let shim = execShims[exec.id] else { return 0 }; struct Request: Encodable { let id: String }; struct Status: Decodable { let pid: Int? }
-        let value: Status? = try? await shim.guest(operation: "exec-status", payload: Request(id: exec.id), response: Status.self); return Int32(value?.pid ?? 0)
+        guard let shim = execShims[exec.id] else { return 0 }
+        struct Request: Encodable { let id: String }
+        struct Status: Decodable { let status: String; let pid: Int? }
+        for _ in 0..<1_000 where !Task.isCancelled {
+            guard let value: Status = try? await shim.guest(
+                operation: "exec-status", payload: Request(id: exec.id), response: Status.self
+            ) else { return 0 }
+            if let pid = value.pid, pid > 0 { return Int32(pid) }
+            guard value.status == "created" || value.status == "starting" else { return 0 }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return 0
     }
 
     public func execStatus(_ exec: ExecRecord) async -> Int32? {
