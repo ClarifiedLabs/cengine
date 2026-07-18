@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesVersionFiveIdentityAndSecurityContext() throws {
-        #expect(GuestProtocol.version == 5)
+        #expect(GuestProtocol.version == 6)
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
             workingDirectory: "/work",

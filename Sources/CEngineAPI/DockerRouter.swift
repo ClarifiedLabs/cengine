@@ -108,6 +108,7 @@ public struct DockerRouter: Sendable {
             })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
+            try rejectUnsupportedSecurityConfiguration(input.HostConfig)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
             let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
@@ -122,11 +123,15 @@ public struct DockerRouter: Sendable {
             if let hostname = input.Hostname, !hostname.isEmpty { record.hostname = hostname }
             record.labels = input.Labels ?? [:]
             record.tty = input.Tty ?? false
+            record.attachStdin = input.AttachStdin ?? false
             record.openStdin = input.OpenStdin ?? false
             record.autoRemove = input.HostConfig?.AutoRemove ?? false
             record.privileged = input.HostConfig?.Privileged ?? false
+            record.capabilityAdd = try normalizedCapabilities(input.HostConfig?.CapAdd ?? [])
+            record.capabilityDrop = try normalizedCapabilities(input.HostConfig?.CapDrop ?? [])
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.useInit = input.HostConfig?.Init ?? false
+            record.pidsLimit = try validatedPidsLimit(input.HostConfig?.PidsLimit) ?? 0
             if let memory = input.HostConfig?.Memory, memory > 0 { record.memoryBytes = UInt64(memory) }
             if let nano = input.HostConfig?.NanoCpus, nano > 0 {
                 record.cpus = max(1, Int((nano + 999_999_999) / 1_000_000_000))
@@ -139,6 +144,9 @@ public struct DockerRouter: Sendable {
             record.stopSignal = input.StopSignal ?? "SIGTERM"
             record.stopTimeoutSeconds = input.StopTimeout ?? 10
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)
+            if let startInterval = input.Healthcheck?.StartInterval, startInterval != 0 {
+                throw EngineError(.unsupported, "Healthcheck.StartInterval is not supported")
+            }
             if let health = input.Healthcheck, let test = health.Test, test.first != "NONE" {
                 record.healthcheck = .init(
                     test: test, intervalNanoseconds: health.Interval ?? 30_000_000_000,
@@ -289,11 +297,17 @@ public struct DockerRouter: Sendable {
                 guard !overflow else { throw EngineError(.badRequest, "CPU quota is too large") }
                 return scaled / period + (scaled % period == 0 ? 0 : 1)
             }()
-            _ = try await runtime.updateContainer(id, memoryBytes: input.Memory, nanoCPUs: nanoCPUs, restartPolicy: policy)
+            _ = try await runtime.updateContainer(
+                id, memoryBytes: input.Memory, nanoCPUs: nanoCPUs,
+                pidsLimit: try validatedPidsLimit(input.PidsLimit), restartPolicy: policy
+            )
             return json(status: .ok, ContainerUpdateResponse(Warnings: []))
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
             let input = try decoder.decode(ExecCreateRequest.self, from: request.body)
+            if let detachKeys = input.DetachKeys, !detachKeys.isEmpty {
+                throw EngineError(.unsupported, "exec DetachKeys is not supported")
+            }
             let exec = try await runtime.createExec(container: id, configuration: .init(
                 arguments: input.Cmd, environment: input.Env ?? [], workingDirectory: input.WorkingDir ?? "",
                 user: input.User ?? "", tty: input.Tty ?? false, attachStdin: input.AttachStdin ?? false,
@@ -305,6 +319,10 @@ public struct DockerRouter: Sendable {
             let id = String(value.dropFirst("/exec/".count).dropLast("/start".count))
             let input = try decoder.decode(ExecStartRequest.self, from: request.body)
             guard input.Detach == true else { throw EngineError(.badRequest, "attached exec requires a connection upgrade") }
+            let exec = try await runtime.inspectExec(id)
+            if let tty = input.Tty, tty != exec.configuration.tty {
+                throw EngineError(.badRequest, "exec start Tty must match the exec configuration")
+            }
             try await runtime.startExec(id)
             return APIResponse(status: .ok)
         case (.GET, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/json"):
@@ -358,7 +376,10 @@ public struct DockerRouter: Sendable {
         case (.POST, "/networks/prune"):
             return json(status: .ok, PruneResponse(networks: try await runtime.pruneNetworks()))
         case (.POST, "/containers/prune"):
-            return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers()))
+            let candidates = try containerPruneCandidates(
+                await runtime.listContainers(all: true), filters: query["filters"]
+            )
+            return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers(ids: candidates)))
         case (.POST, "/images/prune"):
             return json(status: .ok, PruneResponse(images: try await runtime.pruneImages()))
         case (.POST, "/volumes/prune"):
@@ -602,6 +623,113 @@ public struct DockerRouter: Sendable {
         }
     }
 
+    private func containerPruneCandidates(
+        _ containers: [ContainerRecord], filters encoded: String?, now: Date = Date()
+    ) throws -> Set<String> {
+        let filters = try decodedContainerPruneFilters(encoded)
+        let positiveLabels = filters["label"] ?? []
+        let negativeLabels = filters["label!"] ?? []
+        let labelExpressions = positiveLabels + negativeLabels
+        guard labelExpressions.allSatisfy({
+            $0.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first?.isEmpty == false
+        }) else {
+            throw EngineError(.badRequest, "container prune label filters require a label name")
+        }
+        let cutoffs = try (filters["until"] ?? []).map { value -> Date in
+            guard let cutoff = pruneCutoff(value, now: now) else {
+                throw EngineError(.badRequest, "invalid container prune until filter: \(value)")
+            }
+            return cutoff
+        }
+
+        return Set(containers.compactMap { container in
+            let positiveMatches = positiveLabels.isEmpty || positiveLabels.contains {
+                pruneLabel($0, matches: container.labels)
+            }
+            // Docker combines negated label filters into one negative constraint. A container is
+            // excluded only when it matches every negated expression.
+            let negativeMatches = negativeLabels.isEmpty || !negativeLabels.allSatisfy {
+                pruneLabel($0, matches: container.labels)
+            }
+            let untilMatches = cutoffs.isEmpty || cutoffs.contains { container.createdAt < $0 }
+            return positiveMatches && negativeMatches && untilMatches ? container.id : nil
+        })
+    }
+
+    private func decodedContainerPruneFilters(_ encoded: String?) throws -> [String: [String]] {
+        guard let encoded, !encoded.isEmpty else { return [:] }
+        let normalized = encoded.replacingOccurrences(of: "+", with: " ")
+        guard let data = normalized.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw EngineError(.badRequest, "invalid container prune filters")
+        }
+        let allowed = Set(["until", "label", "label!"])
+        if let key = object.keys.first(where: { !allowed.contains($0) }) {
+            throw EngineError(.badRequest, "unsupported container prune filter: \(key)")
+        }
+        var result: [String: [String]] = [:]
+        for (key, raw) in object {
+            if let values = raw as? [String] {
+                result[key] = values
+            } else if let values = raw as? [String: Bool] {
+                result[key] = values.compactMap { $0.value ? $0.key : nil }
+            } else {
+                throw EngineError(.badRequest, "invalid values for container prune filter: \(key)")
+            }
+        }
+        return result
+    }
+
+    private func pruneLabel(_ expression: String, matches labels: [String: String]) -> Bool {
+        let parts = expression.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard let actual = labels[parts[0]] else { return false }
+        return parts.count == 1 || actual == parts[1]
+    }
+
+    private func pruneCutoff(_ value: String, now: Date) -> Date? {
+        if let timestamp = parseDockerTimestamp(value) { return timestamp }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        for format in ["yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) { return date }
+        }
+        guard let duration = goDurationSeconds(value) else { return nil }
+        return now.addingTimeInterval(-duration)
+    }
+
+    private func goDurationSeconds(_ value: String) -> TimeInterval? {
+        var input = value
+        var sign = 1.0
+        if input.first == "+" { input.removeFirst() }
+        else if input.first == "-" { sign = -1; input.removeFirst() }
+        guard !input.isEmpty,
+              let expression = try? NSRegularExpression(
+                pattern: #"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)"#
+              ) else { return nil }
+        let range = NSRange(input.startIndex..<input.endIndex, in: input)
+        let matches = expression.matches(in: input, range: range)
+        guard !matches.isEmpty else { return nil }
+        var offset = 0
+        var seconds = 0.0
+        let factors: [String: Double] = [
+            "ns": 1e-9, "us": 1e-6, "µs": 1e-6, "μs": 1e-6,
+            "ms": 1e-3, "s": 1, "m": 60, "h": 3_600,
+        ]
+        for match in matches {
+            guard match.range.location == offset,
+                  let amountRange = Range(match.range(at: 1), in: input),
+                  let unitRange = Range(match.range(at: 2), in: input),
+                  let amount = Double(input[amountRange]),
+                  let factor = factors[String(input[unitRange])] else { return nil }
+            seconds += amount * factor
+            offset = match.range.location + match.range.length
+        }
+        guard offset == range.length else { return nil }
+        return sign * seconds
+    }
+
     private func filterValues(_ encoded: String?, key: String) -> [String] {
         guard let encoded, let data = encoded.replacingOccurrences(of: "+", with: " ").data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
@@ -687,6 +815,23 @@ public struct DockerRouter: Sendable {
 
     private func mounts(from input: ContainerCreateRequest) throws -> [MountRecord] {
         var result = try ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
+            guard let kind = MountRecord.Kind(rawValue: mount.Type) else {
+                throw EngineError(.badRequest, "unsupported mount type: \(mount.Type)")
+            }
+            if mount.BindOptions != nil, kind != .bind {
+                throw EngineError(.badRequest, "BindOptions is only valid for bind mounts")
+            }
+            if mount.VolumeOptions != nil, kind != .volume {
+                throw EngineError(.badRequest, "VolumeOptions is only valid for volume mounts")
+            }
+            if mount.TmpfsOptions != nil, kind != .tmpfs {
+                throw EngineError(.badRequest, "TmpfsOptions is only valid for tmpfs mounts")
+            }
+            let bindOptions = mount.BindOptions
+            if bindOptions?.NonRecursive == true || bindOptions?.ReadOnlyNonRecursive == true
+                || bindOptions?.ReadOnlyForceRecursive == true {
+                throw EngineError(.unsupported, "non-recursive bind mount options are not supported")
+            }
             if let subpath = mount.VolumeOptions?.Subpath, !subpath.isEmpty {
                 let components = subpath.split(separator: "/", omittingEmptySubsequences: false)
                 guard !subpath.hasPrefix("/"), !components.contains(".."), !components.contains(".") else {
@@ -694,20 +839,31 @@ public struct DockerRouter: Sendable {
                 }
             }
             return MountRecord(
-                kind: MountRecord.Kind(rawValue: mount.Type) ?? .bind,
+                kind: kind,
                 source: mount.Source ?? "", destination: mount.Target, readOnly: mount.ReadOnly ?? false,
                 noCopy: mount.VolumeOptions?.NoCopy ?? false, subpath: mount.VolumeOptions?.Subpath,
-                tmpfsSizeBytes: mount.TmpfsOptions?.SizeBytes, tmpfsMode: mount.TmpfsOptions?.Mode
+                tmpfsSizeBytes: mount.TmpfsOptions?.SizeBytes, tmpfsMode: mount.TmpfsOptions?.Mode,
+                createSourceIfMissing: kind == .bind ? (bindOptions?.CreateMountpoint ?? false) : nil,
+                propagation: kind == .bind ? try validatedMountPropagation(bindOptions?.Propagation) : nil
             )
         }
         for bind in input.HostConfig?.Binds ?? [] {
             let fields = bind.split(separator: ":", maxSplits: 2).map(String.init)
             guard fields.count >= 2 else { throw EngineError(.badRequest, "invalid bind mount: \(bind)") }
             let kind: MountRecord.Kind = fields[0].hasPrefix("/") ? .bind : .volume
+            let options = fields.count == 3 ? fields[2].split(separator: ",").map(String.init) : []
+            let requestedPropagation = options.filter { MountRecord.Propagation(rawValue: $0) != nil }
+            guard requestedPropagation.count <= 1 else {
+                throw EngineError(.badRequest, "conflicting bind propagation modes: \(fields[2])")
+            }
+            guard kind == .bind || requestedPropagation.isEmpty else {
+                throw EngineError(.badRequest, "mount propagation is only valid for bind mounts")
+            }
             result.append(.init(
                 kind: kind, source: fields[0], destination: fields[1],
-                readOnly: fields.count == 3 && fields[2].split(separator: ",").contains("ro"),
-                createSourceIfMissing: kind == .bind ? true : nil
+                readOnly: options.contains("ro"),
+                createSourceIfMissing: kind == .bind ? true : nil,
+                propagation: try validatedMountPropagation(requestedPropagation.first)
             ))
         }
         for (destination, options) in input.HostConfig?.Tmpfs ?? [:] {
@@ -724,6 +880,49 @@ public struct DockerRouter: Sendable {
             ))
         }
         return result
+    }
+
+    private func validatedPidsLimit(_ value: Int64?) throws -> Int64? {
+        guard let value else { return nil }
+        guard value >= -1 else {
+            throw EngineError(.badRequest, "invalid PID limit: \(value)")
+        }
+        return value
+    }
+
+    private func validatedMountPropagation(_ value: String?) throws -> MountRecord.Propagation {
+        guard let value, !value.isEmpty else { return .rprivate }
+        guard let propagation = MountRecord.Propagation(rawValue: value) else {
+            throw EngineError(.badRequest, "invalid mount propagation mode: \(value)")
+        }
+        return propagation
+    }
+
+    private func normalizedCapabilities(_ values: [String]) throws -> [String] {
+        var seen = Set<String>()
+        return try values.compactMap { raw in
+            var normalized = raw.uppercased()
+            if normalized.hasPrefix("CAP_") { normalized.removeFirst("CAP_".count) }
+            guard normalized == "ALL" || dockerLinuxCapabilities.contains(normalized) else {
+                throw EngineError(.badRequest, "unknown Linux capability: \(raw)")
+            }
+            let result = normalized == "ALL" ? normalized : "CAP_\(normalized)"
+            return seen.insert(result).inserted ? result : nil
+        }
+    }
+
+    private func rejectUnsupportedSecurityConfiguration(_ host: ContainerCreateRequest.HostConfig?) throws {
+        let unsupported: [(Bool, String)] = [
+            (!(host?.SecurityOpt ?? []).isEmpty, "SecurityOpt"),
+            (!(host?.Ulimits ?? []).isEmpty, "Ulimits"),
+            (!(host?.Devices ?? []).isEmpty, "Devices"),
+            (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
+            (!(host?.MaskedPaths ?? []).isEmpty, "MaskedPaths"),
+            (!(host?.ReadonlyPaths ?? []).isEmpty, "ReadonlyPaths"),
+        ]
+        if let field = unsupported.first(where: \.0)?.1 {
+            throw EngineError(.unsupported, "HostConfig.\(field) is not supported")
+        }
     }
 
     private func logOptions(_ components: URLComponents) -> DockerLogOptions {
@@ -751,6 +950,16 @@ public struct DockerRouter: Sendable {
         }
     }
 }
+
+private let dockerLinuxCapabilities: Set<String> = [
+    "AUDIT_CONTROL", "AUDIT_READ", "AUDIT_WRITE", "BLOCK_SUSPEND", "BPF",
+    "CHECKPOINT_RESTORE", "CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID",
+    "IPC_LOCK", "IPC_OWNER", "KILL", "LEASE", "LINUX_IMMUTABLE", "MAC_ADMIN", "MAC_OVERRIDE",
+    "MKNOD", "NET_ADMIN", "NET_BIND_SERVICE", "NET_BROADCAST", "NET_RAW", "PERFMON",
+    "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_ADMIN", "SYS_BOOT", "SYS_CHROOT",
+    "SYS_MODULE", "SYS_NICE", "SYS_PACCT", "SYS_PTRACE", "SYS_RAWIO", "SYS_RESOURCE",
+    "SYS_TIME", "SYS_TTY_CONFIG", "SYSLOG", "WAKE_ALARM",
+]
 
 func parseDockerTimestamp(_ value: String) -> Date? {
     if let seconds = Double(value) { return Date(timeIntervalSince1970: seconds) }
@@ -796,7 +1005,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     }
     public struct HealthStateResponse: Codable, Sendable { let Status: String; let FailingStreak: Int; let Log: [String] }
     public struct ConfigResponse: Codable, Sendable {
-        let Hostname: String; let User: String; let Tty: Bool; let OpenStdin: Bool; let Env: [String]
+        let Hostname: String; let User: String; let Tty: Bool; let AttachStdin: Bool; let OpenStdin: Bool; let Env: [String]
         let Cmd: [String]; let Image: String; let WorkingDir: String; let Labels: [String: String]
         let Healthcheck: HealthcheckResponse?
     }
@@ -804,7 +1013,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Test: [String]; let Interval: Int64; let Timeout: Int64; let Retries: Int; let StartPeriod: Int64
     }
     public struct HostConfigResponse: Codable, Sendable {
-        let Memory: UInt64; let NanoCpus: Int64; let AutoRemove: Bool; let Privileged: Bool
+        let Memory: UInt64; let NanoCpus: Int64; let PidsLimit: Int64
+        let AutoRemove: Bool; let Privileged: Bool
+        let CapAdd: [String]; let CapDrop: [String]
         let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
         let Binds: [String]; let Mounts: [MountResponse]
         let PortBindings: [String: [PortBindingResponse]]
@@ -840,13 +1051,14 @@ public struct ContainerInspectResponse: Codable, Sendable {
         Image = record.imageID.isEmpty ? record.image : record.imageID
         ImageManifestDescriptor = version >= .init(major: 1, minor: 48) ? record.imageManifestDescriptor : nil
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
-        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds) })
+        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, AttachStdin: record.attachStdin, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds) })
         RestartCount = record.restartCount
         let mounts = record.mounts.map { mount in
             MountResponse(
                 Type: mount.kind.rawValue, Name: mount.kind == .volume ? mount.source : nil,
                 Source: mount.source, Destination: mount.destination, Driver: mount.kind == .volume ? "local" : "",
-                Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly, Propagation: "rprivate",
+                Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly,
+                Propagation: mount.propagation?.rawValue ?? "",
                 VolumeOptions: mount.kind == .volume ? .init(NoCopy: mount.noCopy, Subpath: mount.subpath) : nil,
                 TmpfsOptions: mount.kind == .tmpfs ? .init(SizeBytes: mount.tmpfsSizeBytes, Mode: mount.tmpfsMode) : nil
             )
@@ -860,11 +1072,17 @@ public struct ContainerInspectResponse: Codable, Sendable {
             : record.networks.first.flatMap { networkByID[$0.networkID]?.name } ?? "default"
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
+            PidsLimit: record.pidsLimit,
             AutoRemove: record.autoRemove, Privileged: record.privileged,
+            CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,
             ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,
             RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount),
             Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
-                "\($0.source):\($0.destination)\($0.readOnly ? ":ro" : "")"
+                var options = $0.readOnly ? ["ro"] : []
+                if let propagation = $0.propagation, propagation != .rprivate {
+                    options.append(propagation.rawValue)
+                }
+                return "\($0.source):\($0.destination)\(options.isEmpty ? "" : ":" + options.joined(separator: ","))"
             },
             Mounts: mounts, PortBindings: portBindings, NetworkMode: networkMode,
             LogConfig: .init(Type: "json-file", Config: [:])

@@ -549,6 +549,7 @@ private actor AuthImageBackend: ContainerBackend {
         let mounts = try #require(object["Mounts"] as? [[String: Any]])
         #expect(mounts.first?["Destination"] as? String == "/data")
         #expect(mounts.first?["RW"] as? Bool == false)
+        #expect(mounts.first?["Propagation"] as? String == "")
         let host = try #require(object["HostConfig"] as? [String: Any])
         #expect((host["Binds"] as? [String]) == ["data:/data:ro"])
         #expect(host["NetworkMode"] as? String == "default")
@@ -556,6 +557,79 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(logConfig["Type"] as? String == "json-file")
         let bindings = try #require(host["PortBindings"] as? [String: [[String: String]]])
         #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
+    }
+
+    @Test func bindMountPropagationRoundTripsAndValidatesDockerShape() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=propagated-bind",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Binds":["/tmp:/legacy:rshared"],"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/typed","ReadOnly":true,"BindOptions":{"Propagation":"rslave"}}]}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let mounts = try #require(object["Mounts"] as? [[String: Any]])
+        #expect(mounts.first { $0["Destination"] as? String == "/legacy" }?["Propagation"] as? String == "rshared")
+        #expect(mounts.first { $0["Destination"] as? String == "/typed" }?["Propagation"] as? String == "rslave")
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        let binds = try #require(host["Binds"] as? [String])
+        #expect(binds.contains("/tmp:/legacy:rshared"))
+        #expect(binds.contains("/tmp:/typed:ro,rslave"))
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=invalid-propagation",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/data","BindOptions":{"Propagation":"sideways"}}]}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
+
+        let mismatched = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=mismatched-options",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Source":"data","Target":"/data","BindOptions":{"Propagation":"rshared"}}]}}"#.utf8)
+        ))
+        #expect(mismatched.status == .badRequest)
+    }
+
+    @Test func capabilityChangesRoundTripAndUnsupportedSecurityFieldsAreRejected() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=capabilities",
+            body: Data(#"{"Image":"alpine","HostConfig":{"CapAdd":["net_admin","CAP_CHOWN"],"CapDrop":["net_raw","CHOWN"]}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        #expect(host["CapAdd"] as? [String] == ["CAP_NET_ADMIN", "CAP_CHOWN"])
+        #expect(host["CapDrop"] as? [String] == ["CAP_NET_RAW", "CAP_CHOWN"])
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=invalid-capability",
+            body: Data(#"{"Image":"alpine","HostConfig":{"CapAdd":["CAP_SIDEWAYS"]}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
+
+        let unsupportedFields = [
+            #""SecurityOpt":["no-new-privileges"]"#,
+            #""Ulimits":[{"Name":"nofile","Soft":1024,"Hard":1024}]"#,
+            #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
+            #""DeviceCgroupRules":["c 1:3 rwm"]"#,
+            #""MaskedPaths":["/proc/kcore"]"#,
+            #""ReadonlyPaths":["/proc/sys"]"#,
+        ]
+        for (index, field) in unsupportedFields.enumerated() {
+            let body = "{\"Image\":\"alpine\",\"HostConfig\":{\(field)}}"
+            let rejected = await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/create?name=unsupported-security-\(index)",
+                body: Data(body.utf8)
+            ))
+            #expect(rejected.status == .notImplemented)
+        }
     }
 
     @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
@@ -573,6 +647,31 @@ private actor AuthImageBackend: ContainerBackend {
 
         #expect(host["Memory"] as? Int == 4 * 1_024 * 1_024 * 1_024)
         #expect(host["NanoCpus"] as? Int == 4_000_000_000)
+    }
+
+    @Test func pidsLimitRoundTripsAndRejectsInvalidValues() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=pids-limited",
+            body: Data(#"{"Image":"alpine","HostConfig":{"PidsLimit":32}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+        let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let id = try #require(created["Id"] as? String)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        #expect(host["PidsLimit"] as? Int == 32)
+        let snapshot = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(snapshot.containers.first { $0.id == id }).pidsLimit == 32)
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=invalid-pids",
+            body: Data(#"{"Image":"alpine","HostConfig":{"PidsLimit":-2}}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
     }
 
     @Test func createUsesConfiguredContainerDefaultsUnlessResourcesAreExplicit() async throws {
@@ -1749,6 +1848,12 @@ private actor AuthImageBackend: ContainerBackend {
         let container = try await runtime.createContainer(ContainerRecord(name: "exec-host", image: "debian"))
         try await runtime.startContainer(container.id)
 
+        let detachKeys = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/\(container.id)/exec",
+            body: Data(#"{"DetachKeys":"ctrl-x,x","Cmd":["true"]}"#.utf8)
+        ))
+        #expect(detachKeys.status == .notImplemented)
+
         let create = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/\(container.id)/exec",
             body: Data(#"{"AttachStdout":true,"AttachStderr":true,"Cmd":["echo","ok"]}"#.utf8)
@@ -1756,6 +1861,11 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(create.status == .created)
         let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
         let execID = try #require(created["Id"] as? String)
+        let mismatchedTTY = await router.route(.init(
+            method: .POST, uri: "/v1.44/exec/\(execID)/start",
+            body: Data(#"{"Detach":true,"Tty":true}"#.utf8)
+        ))
+        #expect(mismatchedTTY.status == .badRequest)
         let start = await router.route(.init(method: .POST, uri: "/v1.44/exec/\(execID)/start", body: Data(#"{"Detach":true,"Tty":false}"#.utf8)))
         #expect(start.status == .ok)
         for _ in 0..<20 {
@@ -1971,6 +2081,64 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((pruneJSON["ContainersDeleted"] as? [String])?.contains(record.id) == true)
     }
 
+    @Test func containerPruneFiltersLimitDeletionAndRejectUnknownKeys() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: CompletionBackend(completionEnabled: false))
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        var selected = ContainerRecord(name: "selected", image: "debian")
+        selected.labels = ["prune": "yes"]
+        selected.createdAt = Date(timeIntervalSince1970: 100)
+        selected = try await runtime.createContainer(selected)
+        var wrongLabel = ContainerRecord(name: "wrong-label", image: "debian")
+        wrongLabel.labels = ["prune": "no"]
+        wrongLabel.createdAt = Date(timeIntervalSince1970: 100)
+        wrongLabel = try await runtime.createContainer(wrongLabel)
+        var tooNew = ContainerRecord(name: "too-new", image: "debian")
+        tooNew.labels = ["prune": "yes"]
+        tooNew.createdAt = Date(timeIntervalSince1970: 200)
+        tooNew = try await runtime.createContainer(tooNew)
+
+        let unsupported = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/prune?filters=%7B%22name%22%3A%5B%22selected%22%5D%7D"
+        ))
+        #expect(unsupported.status == .badRequest)
+        #expect(await runtime.listContainers(all: true).count == 3)
+
+        let filtered = await router.route(.init(
+            method: .POST,
+            uri: "/v1.44/containers/prune?filters=%7B%22label%22%3A+%5B%22prune%3Dyes%22%5D%2C+%22until%22%3A+%5B%22150%22%5D%7D"
+        ))
+        #expect(filtered.status == .ok)
+        let payload = try #require(JSONSerialization.jsonObject(with: filtered.body) as? [String: Any])
+        #expect(payload["ContainersDeleted"] as? [String] == [selected.id])
+        let remaining = await runtime.listContainers(all: true)
+        #expect(Set(remaining.map(\.id)) == Set([wrongLabel.id, tooNew.id]))
+    }
+
+    @Test func createPreservesAttachStdinAndRejectsUnsupportedHealthStartInterval() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=stdin-config",
+            body: Data(#"{"Image":"debian","AttachStdin":true,"OpenStdin":true}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/stdin-config/json"))
+        let payload = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let config = try #require(payload["Config"] as? [String: Any])
+        #expect(config["AttachStdin"] as? Bool == true)
+        #expect(config["OpenStdin"] as? Bool == true)
+
+        let health = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=start-interval",
+            body: Data(#"{"Image":"debian","Healthcheck":{"Test":["CMD","true"],"StartInterval":1000000000}}"#.utf8)
+        ))
+        #expect(health.status == .notImplemented)
+    }
+
     @Test func restartPolicyUpdateDoesNotRecreateRunningContainer() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2016,7 +2184,7 @@ private actor AuthImageBackend: ContainerBackend {
 
         let response = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/live-resources/update",
-            body: Data(#"{"Memory":536870912,"NanoCpus":0,"CpuQuota":200000,"CpuPeriod":100000}"#.utf8)
+            body: Data(#"{"Memory":536870912,"NanoCpus":0,"CpuQuota":200000,"CpuPeriod":100000,"PidsLimit":64}"#.utf8)
         ))
 
         #expect(response.status == .ok)
@@ -2025,8 +2193,10 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(updated.startedAt == startedAt)
         #expect(updated.memoryBytes == 512 * 1_024 * 1_024)
         #expect(updated.cpus == 2)
+        #expect(updated.pidsLimit == 64)
         #expect(await backend.lastResourceUpdate()?.memoryBytes == updated.memoryBytes)
         #expect(await backend.lastResourceUpdate()?.cpus == updated.cpus)
+        #expect(await backend.lastResourceUpdate()?.pidsLimit == 64)
         #expect(await backend.startCount() == startCount)
         #expect(await backend.prepareCount() == prepareCount)
         #expect(await backend.deleteCount() == deleteCount)

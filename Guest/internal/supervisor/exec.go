@@ -23,7 +23,10 @@ import (
 
 const execStage1Argument = "cengine-exec-stage1"
 const execStage2Argument = "cengine-exec-stage2"
+const execStage1CgroupFD = 5
 const execStage2MountNamespaceFD = 5
+const execStage2PIDNamespaceFD = 6
+const execStage2CgroupFD = 7
 
 func IsExecStage1(arguments []string) bool {
 	return len(arguments) == 3 && arguments[1] == execStage1Argument
@@ -55,6 +58,21 @@ func RunExecStage1(pid int) error {
 		return errors.New("workload mount namespace is unavailable")
 	}
 	defer mountNamespace.Close()
+	pidNamespaceFD, err := unix.Open(fmt.Sprintf("/proc/%d/ns/pid", pid), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open workload PID namespace: %w", err)
+	}
+	pidNamespace := os.NewFile(uintptr(pidNamespaceFD), "workload-pid-namespace")
+	if pidNamespace == nil {
+		_ = unix.Close(pidNamespaceFD)
+		return errors.New("workload PID namespace is unavailable")
+	}
+	defer pidNamespace.Close()
+	cgroup := os.NewFile(execStage1CgroupFD, "exec-cgroup")
+	if cgroup == nil {
+		return errors.New("exec cgroup file descriptor is unavailable")
+	}
+	defer cgroup.Close()
 	gate := os.NewFile(4, "exec-cgroup-ready")
 	if gate == nil {
 		return errors.New("exec cgroup readiness file descriptor is unavailable")
@@ -64,14 +82,14 @@ func RunExecStage1(pid int) error {
 	if _, err := io.ReadFull(gate, ready[:]); err != nil {
 		return fmt.Errorf("wait for exec cgroup placement: %w", err)
 	}
-	if err := joinWorkloadNonMountNamespaces(pid, namespaceOperations{unshare: unix.Unshare, open: unix.Open, setns: unix.Setns, close: unix.Close}); err != nil {
+	if err := joinWorkloadNamespacesExceptMountAndPID(pid, namespaceOperations{unshare: unix.Unshare, open: unix.Open, setns: unix.Setns, close: unix.Close}); err != nil {
 		return err
 	}
 	spec := os.NewFile(3, "exec-spec")
 	if spec == nil {
 		return errors.New("exec specification is unavailable")
 	}
-	command := execStage2Command(spec, root, mountNamespace)
+	command := execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup)
 	if err := command.Run(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			return exit
@@ -81,9 +99,9 @@ func RunExecStage1(pid int) error {
 	return nil
 }
 
-func execStage2Command(spec, root, mountNamespace *os.File) *exec.Cmd {
+func execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup *os.File) *exec.Cmd {
 	command := exec.Command("/proc/self/exe", execStage2Argument)
-	command.ExtraFiles = []*os.File{spec, root, mountNamespace}
+	command.ExtraFiles = []*os.File{spec, root, mountNamespace, pidNamespace, cgroup}
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
@@ -97,14 +115,14 @@ type namespaceOperations struct {
 	close   func(int) error
 }
 
-func joinWorkloadNonMountNamespaces(pid int, operations namespaceOperations) error {
+func joinWorkloadNamespacesExceptMountAndPID(pid int, operations namespaceOperations) error {
 	if err := operations.unshare(unix.CLONE_FS); err != nil {
 		return fmt.Errorf("unshare filesystem context: %w", err)
 	}
 	for _, namespace := range []struct {
 		name string
 		flag int
-	}{{"uts", unix.CLONE_NEWUTS}, {"ipc", unix.CLONE_NEWIPC}, {"net", unix.CLONE_NEWNET}, {"cgroup", unix.CLONE_NEWCGROUP}, {"pid", unix.CLONE_NEWPID}} {
+	}{{"uts", unix.CLONE_NEWUTS}, {"ipc", unix.CLONE_NEWIPC}, {"net", unix.CLONE_NEWNET}, {"cgroup", unix.CLONE_NEWCGROUP}} {
 		fd, err := operations.open(fmt.Sprintf("/proc/%d/ns/%s", pid, namespace.name), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 		if err != nil {
 			return err
@@ -123,7 +141,9 @@ func RunExecStage2() error {
 	defer runtime.UnlockOSThread()
 	// These descriptors must cross the stage boundary but must not leak into the
 	// requested workload process after the final exec.
-	for _, descriptor := range []int{3, 4, execStage2MountNamespaceFD} {
+	for _, descriptor := range []int{
+		3, 4, execStage2MountNamespaceFD, execStage2PIDNamespaceFD, execStage2CgroupFD,
+	} {
 		unix.CloseOnExec(descriptor)
 	}
 	mountNamespace := os.NewFile(execStage2MountNamespaceFD, "workload-mount-namespace")
@@ -134,6 +154,19 @@ func RunExecStage2() error {
 	if err := enterExecMountNamespace(int(mountNamespace.Fd()), unix.Unshare, unix.Setns); err != nil {
 		return err
 	}
+	pidNamespace := os.NewFile(execStage2PIDNamespaceFD, "workload-pid-namespace")
+	if pidNamespace == nil {
+		return errors.New("workload PID namespace is unavailable")
+	}
+	defer pidNamespace.Close()
+	if err := unix.Setns(int(pidNamespace.Fd()), unix.CLONE_NEWPID); err != nil {
+		return fmt.Errorf("join workload PID namespace for exec child: %w", err)
+	}
+	cgroup := os.NewFile(execStage2CgroupFD, "exec-cgroup")
+	if cgroup == nil {
+		return errors.New("exec cgroup is unavailable")
+	}
+	defer cgroup.Close()
 	file := os.NewFile(3, "exec-spec")
 	if file == nil {
 		return errors.New("exec specification is unavailable")
@@ -166,18 +199,36 @@ func RunExecStage2() error {
 	if err != nil {
 		return err
 	}
+	capabilities, err := capabilityMask(spec.CapabilityAdd, spec.CapabilityDrop, spec.Privileged)
+	if err != nil {
+		return err
+	}
+	if err := applyCapabilityBoundingSet(capabilities, unix.Prctl); err != nil {
+		return err
+	}
 	groups := make([]int, 0, len(spec.User.AdditionalGroups)+len(namedGroups))
 	for _, group := range spec.User.AdditionalGroups {
 		groups = append(groups, int(group))
 	}
 	groups = append(groups, namedGroups...)
-	if err := unix.Setgroups(groups); err != nil {
-		return err
+	var credential *syscall.Credential
+	if uid == 0 {
+		if err := unix.Setgroups(groups); err != nil {
+			return err
+		}
+		if err := unix.Setgid(gid); err != nil {
+			return err
+		}
+	} else {
+		credentialGroups := make([]uint32, len(groups))
+		for index, group := range groups {
+			credentialGroups[index] = uint32(group)
+		}
+		credential = &syscall.Credential{
+			Uid: uint32(uid), Gid: uint32(gid), Groups: credentialGroups,
+		}
 	}
-	if err := unix.Setgid(gid); err != nil {
-		return err
-	}
-	if err := unix.Setuid(uid); err != nil {
+	if err := applyProcessCapabilities(capabilities, uid, unix.Capset); err != nil {
 		return err
 	}
 	if err := applyNoNewPrivileges(spec.NoNewPrivileges, unix.Prctl); err != nil {
@@ -198,8 +249,19 @@ func RunExecStage2() error {
 	if err != nil {
 		return fmt.Errorf("look up exec command %s: %w", spec.Arguments[0], err)
 	}
-	if err := unix.Exec(path, spec.Arguments, environment); err != nil {
-		return fmt.Errorf("execute command %s: %w", path, err)
+	command := exec.Command(path, spec.Arguments[1:]...)
+	command.Args = spec.Arguments
+	command.Env = environment
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{
+		UseCgroupFD: true,
+		CgroupFD:    int(cgroup.Fd()),
+		Credential:  credential,
+	}
+	if err := command.Run(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -218,6 +280,9 @@ func enterExecMountNamespace(fd int, unshare func(int) error, setns func(int, in
 // that could not be executed. Docker clients use 127 to distinguish a missing
 // executable from a command that ran and failed.
 func ExecStageExitCode(err error) int {
+	if exit, ok := err.(*exec.ExitError); ok {
+		return exit.ExitCode()
+	}
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
 		return 127
 	}
@@ -312,12 +377,8 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		return protocol.ProcessStatus{}, err
 	}
 	stdinReader, stdinWriter := io.Pipe()
-	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
-	command.ExtraFiles = []*os.File{reader, gateReader}
-	command.Stdout = stdout
-	command.Stderr = stderr
-	command.Stdin = stdinReader
-	if err := command.Start(); err != nil {
+	cgroup, err := openWorkloadCgroup("/sys/fs/cgroup", workloadID)
+	if err != nil {
 		reader.Close()
 		writer.Close()
 		gateReader.Close()
@@ -328,6 +389,24 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		stdinWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
+	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
+	command.ExtraFiles = []*os.File{reader, gateReader, cgroup}
+	command.Stdout = stdout
+	command.Stderr = stderr
+	command.Stdin = stdinReader
+	if err := command.Start(); err != nil {
+		cgroup.Close()
+		reader.Close()
+		writer.Close()
+		gateReader.Close()
+		gateWriter.Close()
+		stdout.Close()
+		stderr.Close()
+		stdinReader.Close()
+		stdinWriter.Close()
+		return protocol.ProcessStatus{}, err
+	}
+	cgroup.Close()
 	reader.Close()
 	gateReader.Close()
 	stdout.Close()
@@ -340,12 +419,6 @@ func (s *Supervisor) StartExec(id string) (protocol.ProcessStatus, error) {
 		return protocol.ProcessStatus{}, err
 	}
 	writer.Close()
-	if err := placeExecInCgroup("/sys/fs/cgroup", workloadID, id, command.Process.Pid); err != nil {
-		gateWriter.Close()
-		stdinWriter.Close()
-		_ = command.Process.Kill()
-		return protocol.ProcessStatus{}, err
-	}
 	if _, err := gateWriter.Write([]byte{1}); err != nil {
 		gateWriter.Close()
 		stdinWriter.Close()
@@ -396,13 +469,22 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		return protocol.ProcessStatus{}, err
 	}
 	mux := &dockerStreamMux{writer: stream, terminal: spec.Terminal}
+	cgroup, err := openWorkloadCgroup("/sys/fs/cgroup", workloadID)
+	if err != nil {
+		reader.Close()
+		writer.Close()
+		gateReader.Close()
+		gateWriter.Close()
+		return protocol.ProcessStatus{}, err
+	}
 	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
-	command.ExtraFiles = []*os.File{reader, gateReader}
+	command.ExtraFiles = []*os.File{reader, gateReader, cgroup}
 	var stdinFile *os.File
 	var cancelStdin func()
 	if spec.AttachStdin {
 		stdinFile, cancelStdin, err = attachedExecStdin(stream)
 		if err != nil {
+			cgroup.Close()
 			reader.Close()
 			writer.Close()
 			gateReader.Close()
@@ -418,6 +500,7 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		command.Stderr = mux.stream(2)
 	}
 	if err := command.Start(); err != nil {
+		cgroup.Close()
 		if cancelStdin != nil {
 			cancelStdin()
 		}
@@ -430,6 +513,7 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		gateWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
+	cgroup.Close()
 	if stdinFile != nil {
 		stdinFile.Close()
 	}
@@ -446,16 +530,6 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		return protocol.ProcessStatus{}, err
 	}
 	writer.Close()
-	if err := placeExecInCgroup("/sys/fs/cgroup", workloadID, id, command.Process.Pid); err != nil {
-		gateWriter.Close()
-		if cancelStdin != nil {
-			cancelStdin()
-		}
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		return protocol.ProcessStatus{}, err
-	}
-
 	status := protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
 	s.mu.Lock()
 	s.execs[id] = command
@@ -544,15 +618,13 @@ func writeAll(writer io.Writer, data []byte) error {
 	return nil
 }
 
-func placeExecInCgroup(root, workloadID, execID string, pid int) error {
-	path := filepath.Join(root, "cengine", workloadID, "cengine-exec-"+execID)
-	if err := os.MkdirAll(path, 0755); err != nil {
-		return fmt.Errorf("create exec cgroup: %w", err)
+func openWorkloadCgroup(root, workloadID string) (*os.File, error) {
+	path := filepath.Join(root, "cengine", workloadID)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open workload cgroup for exec: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0644); err != nil {
-		return fmt.Errorf("place exec in cgroup: %w", err)
-	}
-	return nil
+	return file, nil
 }
 
 func (s *Supervisor) ExecStatus(id string) protocol.ProcessStatus {

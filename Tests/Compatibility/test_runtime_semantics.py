@@ -134,6 +134,134 @@ def test_read_only_root_applies_to_exec_but_tmpfs_stays_writable(
         container.remove(force=True)
 
 
+@pytest.mark.compat("RTM-004")
+def test_pids_limit_enforces_live_updates_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True, pids_limit=8,
+    )
+    try:
+        container.reload()
+        assert container.attrs["HostConfig"]["PidsLimit"] == 8
+        result = container.exec_run(["cat", "/sys/fs/cgroup/pids.max"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output.strip() == b"8"
+
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={"PidsLimit": 1},
+        )
+        client.api._result(response, True)
+        try:
+            constrained = container.exec_run(["true"])
+        except docker.errors.APIError:
+            pass
+        else:
+            assert constrained.exit_code != 0, "pids.max=1 unexpectedly allowed an exec process"
+
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={"PidsLimit": 12},
+        )
+        client.api._result(response, True)
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        try:
+            value = recovered.containers.get(container.id)
+            value.reload()
+            assert value.attrs["HostConfig"]["PidsLimit"] == 12
+            result = value.exec_run(["cat", "/sys/fs/cgroup/pids.max"])
+            assert result.exit_code == 0, result.output.decode(errors="replace")
+            assert result.output.strip() == b"12"
+        finally:
+            recovered.close()
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-005")
+def test_bind_mount_propagation_is_applied_and_inspected(
+    client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        detach=True,
+        mounts=[Mount(
+            target="/propagated", source=str(tmp_path), type="bind", propagation="rshared",
+        )],
+    )
+    try:
+        container.reload()
+        mount = next(value for value in container.attrs["Mounts"] if value["Destination"] == "/propagated")
+        assert mount["Propagation"] == "rshared"
+        result = container.exec_run([
+            "sh", "-ec",
+            "awk '$5 == \"/propagated\" { for (i=7; i<=NF && $i != \"-\"; i++) "
+            "if ($i ~ /^shared:/) found=1 } END { exit !found }' /proc/self/mountinfo",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-006")
+def test_capability_add_drop_apply_to_init_and_exec(client: docker.DockerClient):
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        [
+            "sh", "-ec",
+            "awk '/^CapEff:/ { print $2 }' /proc/self/status >/tmp/init-cap; "
+            "while :; do sleep 1; done",
+        ],
+        detach=True,
+        cap_drop=["ALL"],
+        cap_add=["CHOWN", "NET_ADMIN"],
+    )
+    try:
+        result = container.exec_run([
+            "sh", "-ec",
+            "cat /tmp/init-cap; awk '/^CapEff:/ { print $2 }' /proc/self/status",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        init_mask, exec_mask = (int(value, 16) for value in result.output.splitlines())
+        expected = (1 << 0) | (1 << 12)  # CAP_CHOWN | CAP_NET_ADMIN
+        assert init_mask == expected
+        assert exec_mask == expected
+        container.reload()
+        assert container.attrs["HostConfig"]["CapDrop"] == ["ALL"]
+        assert container.attrs["HostConfig"]["CapAdd"] == ["CAP_CHOWN", "CAP_NET_ADMIN"]
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-007")
+def test_container_prune_honors_filters_and_rejects_unknown_keys(client: docker.DockerClient):
+    selected = client.containers.create(ALPINE_IMAGE, ["true"], labels={"prune": "yes"})
+    preserved = client.containers.create(ALPINE_IMAGE, ["true"], labels={"prune": "no"})
+    try:
+        with pytest.raises(docker.errors.APIError) as error:
+            client.containers.prune(filters={"name": [selected.name]})
+        assert error.value.status_code == 400
+        client.containers.get(selected.id)
+        client.containers.get(preserved.id)
+
+        response = client.containers.prune(filters={"label": ["prune=yes"]})
+        assert response["ContainersDeleted"] == [selected.id]
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(selected.id)
+        client.containers.get(preserved.id)
+    finally:
+        for container in (selected, preserved):
+            try:
+                container.remove(force=True)
+            except docker.errors.NotFound:
+                pass
+
+
 def archive_file(name: str, contents: bytes) -> bytes:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:") as archive:

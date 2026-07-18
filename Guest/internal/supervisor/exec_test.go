@@ -24,6 +24,10 @@ func TestExecStageExitCodeDistinguishesMissingExecutable(t *testing.T) {
 	if code := ExecStageExitCode(errors.New("exec format error")); code != 126 {
 		t.Fatalf("non-missing exec failure exit code is %d, want 126", code)
 	}
+	err := exec.Command("sh", "-c", "exit 23").Run()
+	if code := ExecStageExitCode(err); code != 23 {
+		t.Fatalf("target process exit code is %d, want 23", code)
+	}
 }
 
 type testReadWriter struct {
@@ -103,7 +107,7 @@ func TestExecLeavesMountNamespaceUntilAfterStage2Starts(t *testing.T) {
 		setns: func(_ int, flag int) error { calls = append(calls, fmt.Sprintf("setns:%d", flag)); return nil },
 		close: func(_ int) error { return nil },
 	}
-	if err := joinWorkloadNonMountNamespaces(42, operations); err != nil {
+	if err := joinWorkloadNamespacesExceptMountAndPID(42, operations); err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
@@ -112,7 +116,6 @@ func TestExecLeavesMountNamespaceUntilAfterStage2Starts(t *testing.T) {
 		"open:/proc/42/ns/ipc", fmt.Sprintf("setns:%d", unix.CLONE_NEWIPC),
 		"open:/proc/42/ns/net", fmt.Sprintf("setns:%d", unix.CLONE_NEWNET),
 		"open:/proc/42/ns/cgroup", fmt.Sprintf("setns:%d", unix.CLONE_NEWCGROUP),
-		"open:/proc/42/ns/pid", fmt.Sprintf("setns:%d", unix.CLONE_NEWPID),
 	}
 	if !reflect.DeepEqual(calls, expected) {
 		t.Fatalf("unexpected namespace sequence %#v", calls)
@@ -173,15 +176,25 @@ func TestExecStage2InheritsRootAndMountNamespaceDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mountNamespace.Close()
+	pidNamespace, err := os.Open("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pidNamespace.Close()
+	cgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cgroup.Close()
 
-	command := execStage2Command(spec, root, mountNamespace)
+	command := execStage2Command(spec, root, mountNamespace, pidNamespace, cgroup)
 	if command.Path != "/proc/self/exe" {
 		t.Fatalf("exec stage 2 path is %q", command.Path)
 	}
 	if !reflect.DeepEqual(command.Args, []string{"/proc/self/exe", execStage2Argument}) {
 		t.Fatalf("unexpected exec stage 2 arguments %#v", command.Args)
 	}
-	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root, mountNamespace}) {
+	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root, mountNamespace, pidNamespace, cgroup}) {
 		t.Fatalf("unexpected exec stage 2 descriptors %#v", command.ExtraFiles)
 	}
 }

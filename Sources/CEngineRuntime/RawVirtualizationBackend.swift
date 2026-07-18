@@ -403,7 +403,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 workingDirectory: context.workingDirectory, user: context.user,
                 terminal: configuration.tty, attachStdin: configuration.attachStdin,
                 attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
-                noNewPrivileges: context.noNewPrivileges
+                noNewPrivileges: context.noNewPrivileges, privileged: configuration.privileged,
+                capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
             ),
             response: Status.self
         )
@@ -505,7 +506,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             memoryBytes: container.memoryBytes,
             cpuQuota: Int64(container.cpus * 100_000),
             cpuPeriod: 100_000,
-            pids: 0
+            pids: container.pidsLimit
         )
         struct Status: Decodable { let status: String }
         let response: Status = try await shim.guest(
@@ -824,7 +825,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 readOnly: mount.readOnly,
                 options: options,
                 subpath: bindSubpath,
-                noCopy: mount.noCopy
+                noCopy: mount.noCopy,
+                propagation: mount.propagation?.rawValue ?? ""
             )
         }
         return GuestProtocol.Workload(
@@ -834,7 +836,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             hostname: container.hostname, user: Self.user(container.user.isEmpty ? config?.user : container.user),
             terminal: container.tty, readOnlyRoot: container.readOnlyRootfs, stopSignal: container.stopSignal,
             volumeServer: volumeModes.values.contains(.shared) ? Self.managementServerAddress : nil,
-            mounts: mounts, networks: networkEndpoints(container), hosts: networkHosts(container), resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: 0), privileged: container.privileged
+            mounts: mounts, networks: networkEndpoints(container), hosts: networkHosts(container), resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: container.pidsLimit), privileged: container.privileged,
+            capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
         )
     }
 

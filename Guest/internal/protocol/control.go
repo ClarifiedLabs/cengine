@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version             = 5
+	Version             = 6
 	ControlPort         = 4100
 	FileSystemPort      = 4101
 	RootFSContentPort   = 4102
@@ -50,6 +50,8 @@ type WorkloadSpec struct {
 	Hosts            map[string]string `json:"hosts,omitempty"`
 	Resources        Resources         `json:"resources"`
 	Privileged       bool              `json:"privileged"`
+	CapabilityAdd    []string          `json:"capabilityAdd,omitempty"`
+	CapabilityDrop   []string          `json:"capabilityDrop,omitempty"`
 }
 
 type User struct {
@@ -68,6 +70,7 @@ type Mount struct {
 	Options     []string `json:"options,omitempty"`
 	Subpath     string   `json:"subpath,omitempty"`
 	NoCopy      bool     `json:"noCopy,omitempty"`
+	Propagation string   `json:"propagation,omitempty"`
 	SocketPort  uint32   `json:"socketPort,omitempty"`
 	SocketMode  uint32   `json:"socketMode,omitempty"`
 	SocketUID   uint32   `json:"socketUID,omitempty"`
@@ -118,6 +121,9 @@ type ExecSpec struct {
 	AttachStdout     bool     `json:"attachStdout"`
 	AttachStderr     bool     `json:"attachStderr"`
 	NoNewPrivileges  bool     `json:"noNewPrivileges"`
+	Privileged       bool     `json:"privileged"`
+	CapabilityAdd    []string `json:"capabilityAdd,omitempty"`
+	CapabilityDrop   []string `json:"capabilityDrop,omitempty"`
 }
 
 type RootFSLayer struct {

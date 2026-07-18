@@ -830,6 +830,13 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err != nil {
 		return err
 	}
+	capabilities, err := capabilityMask(spec.CapabilityAdd, spec.CapabilityDrop, spec.Privileged)
+	if err != nil {
+		return err
+	}
+	if err := applyCapabilityBoundingSet(capabilities, unix.Prctl); err != nil {
+		return err
+	}
 	groups := make([]int, 0, len(spec.User.AdditionalGroups)+len(namedGroups))
 	for index, group := range spec.User.AdditionalGroups {
 		_ = index
@@ -843,6 +850,9 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 		return err
 	}
 	if err := unix.Setuid(uid); err != nil {
+		return err
+	}
+	if err := applyProcessCapabilities(capabilities, uid, unix.Capset); err != nil {
 		return err
 	}
 	if !spec.Privileged {
@@ -1177,10 +1187,7 @@ func applyMount(root string, mount protocol.Mount) error {
 		if err := unix.Mount(source, destination, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 			return err
 		}
-		if mount.ReadOnly {
-			return unix.Mount("", destination, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
-		}
-		return nil
+		return applyBindMountAttributes(destination, mount, unix.Mount)
 	case "socket":
 		return nil
 	case "volume":
@@ -1201,6 +1208,41 @@ func applyMount(root string, mount protocol.Mount) error {
 		return nil
 	default:
 		return fmt.Errorf("unsupported mount kind %q", mount.Kind)
+	}
+}
+
+type mountOperation func(source, target, filesystem string, flags uintptr, data string) error
+
+func applyBindMountAttributes(destination string, spec protocol.Mount, mount mountOperation) error {
+	flags, err := mountPropagationFlags(spec.Propagation)
+	if err != nil {
+		return err
+	}
+	if err := mount("", destination, "", flags, ""); err != nil {
+		return fmt.Errorf("set mount propagation on %s: %w", destination, err)
+	}
+	if spec.ReadOnly {
+		return mount("", destination, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
+	}
+	return nil
+}
+
+func mountPropagationFlags(propagation string) (uintptr, error) {
+	switch propagation {
+	case "", "rprivate":
+		return unix.MS_PRIVATE | unix.MS_REC, nil
+	case "private":
+		return unix.MS_PRIVATE, nil
+	case "rshared":
+		return unix.MS_SHARED | unix.MS_REC, nil
+	case "shared":
+		return unix.MS_SHARED, nil
+	case "rslave":
+		return unix.MS_SLAVE | unix.MS_REC, nil
+	case "slave":
+		return unix.MS_SLAVE, nil
+	default:
+		return 0, fmt.Errorf("invalid mount propagation mode %q", propagation)
 	}
 }
 

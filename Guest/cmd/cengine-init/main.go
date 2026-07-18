@@ -44,7 +44,10 @@ func main() {
 	}
 	if supervisor.IsExecStage2(os.Args) {
 		if err := supervisor.RunExecStage2(); err != nil {
-			log.Print(err)
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				log.Print(err)
+			}
 			os.Exit(supervisor.ExecStageExitCode(err))
 		}
 		return

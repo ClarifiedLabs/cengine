@@ -287,14 +287,16 @@ public actor EngineRuntime {
     }
 
     public func updateContainer(_ identifier: String, memoryBytes: Int64?, nanoCPUs: Int64?,
-                                restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
+                                pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
         var updated = old
         if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
         if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
+        if let pidsLimit { updated.pidsLimit = pidsLimit }
         if let restartPolicy { updated.restartPolicy = restartPolicy }
         let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
+            || old.pidsLimit != updated.pidsLimit
         if resourcesChanged { try await backend.updateResources(updated) }
         snapshot.containers[index] = updated
         try await persist()
@@ -733,8 +735,10 @@ public actor EngineRuntime {
         return removed.map(\.name)
     }
 
-    public func pruneContainers() async throws -> [String] {
-        let removed = snapshot.containers.filter { $0.phase != .running && $0.phase != .paused }
+    public func pruneContainers(ids: Set<String>? = nil) async throws -> [String] {
+        let removed = snapshot.containers.filter {
+            $0.phase != .running && $0.phase != .paused && (ids?.contains($0.id) ?? true)
+        }
         for record in removed { try await backend.delete(record); try await backend.deleteLogs(for: record) }
         let ids = Set(removed.map(\.id)); snapshot.containers.removeAll { ids.contains($0.id) }
         try await persist()
