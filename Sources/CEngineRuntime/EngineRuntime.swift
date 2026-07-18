@@ -47,6 +47,7 @@ public actor EngineRuntime {
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
     private var startingExecIDs = Set<String>()
+    private var activeExecOperations: [String: Int] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
@@ -409,6 +410,9 @@ public actor EngineRuntime {
             try await startContainer(identifier)
             return
         }
+        guard activeExecOperations[record.id, default: 0] == 0 else {
+            throw EngineError(.conflict, "container \(identifier) has an exec operation in progress")
+        }
         let intent = try beginLifecycleIntent(.restart, for: record.id)
         defer { endLifecycleIntent(intent, for: record.id) }
         try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
@@ -434,6 +438,8 @@ public actor EngineRuntime {
         let container = try container(identifier)
         guard container.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         guard !configuration.arguments.isEmpty else { throw EngineError(.badRequest, "exec command cannot be empty") }
+        try beginExecOperation(for: container.id)
+        defer { endExecOperation(for: container.id) }
         let exec = ExecRecord(containerID: container.id, configuration: configuration)
         _ = try await backend.prepareExec(exec, container: container)
         execs[exec.id] = exec
@@ -464,6 +470,8 @@ public actor EngineRuntime {
     public func startExec(_ identifier: String) async throws {
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
+        try beginExecOperation(for: exec.containerID)
+        defer { endExecOperation(for: exec.containerID) }
         guard startingExecIDs.insert(identifier).inserted else {
             throw EngineError(.conflict, "exec instance is already starting")
         }
@@ -485,6 +493,8 @@ public actor EngineRuntime {
         guard !exec.running, exec.exitCode == nil else {
             throw EngineError(.conflict, "exec instance has already run")
         }
+        try beginExecOperation(for: exec.containerID)
+        defer { endExecOperation(for: exec.containerID) }
         guard startingExecIDs.insert(identifier).inserted else {
             throw EngineError(.conflict, "exec instance is already starting")
         }
@@ -1419,6 +1429,19 @@ public actor EngineRuntime {
 
     private func endLifecycleIntent(_ intent: LifecycleIntent, for identifier: String) {
         if lifecycleIntents[identifier] == intent { lifecycleIntents.removeValue(forKey: identifier) }
+    }
+
+    private func beginExecOperation(for containerID: String) throws {
+        guard lifecycleIntents[containerID]?.operation != .restart else {
+            throw EngineError(.conflict, "container \(containerID) is restarting")
+        }
+        activeExecOperations[containerID, default: 0] += 1
+    }
+
+    private func endExecOperation(for containerID: String) {
+        guard let count = activeExecOperations[containerID] else { return }
+        if count == 1 { activeExecOperations.removeValue(forKey: containerID) }
+        else { activeExecOperations[containerID] = count - 1 }
     }
 
     private func waitSubscription(containerID: String, removal: Bool) -> ContainerWaitSubscription {

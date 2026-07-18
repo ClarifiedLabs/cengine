@@ -4,6 +4,11 @@ import Darwin
 import Foundation
 
 public final class VMShimClient: @unchecked Sendable {
+    private struct ProcessIdentity: Equatable, Sendable {
+        let processIdentifier: CInt
+        let startTime: UInt64
+    }
+
     public struct FabricPort: Codable, Hashable, Sendable { public var proto: String; public var externalPort: UInt16; public var internalAddress: String; public var internalPort: UInt16 }
     public struct FabricNetwork: Codable, Hashable, Sendable { public var id: String; public var vlan: UInt16; public var subnet: String; public var gateway: String; public var ipv6Subnet: String; public var internalNetwork: Bool; public var isolated: Bool; public var ports: [FabricPort] }
     public struct GuestCall: Codable, Sendable { public var operation: String; public var payload: Data }
@@ -23,13 +28,29 @@ public final class VMShimClient: @unchecked Sendable {
 
     public let specification: VMShimProtocol.Specification
     private let stateLock = NSLock()
+    private let descriptorInvalidationHook: (@Sendable (CInt) -> Void)?
+    private let descriptorReleaseHook: (@Sendable (CInt) -> Void)?
     private var acceptsRequests = true
     private var activeDescriptors = Set<CInt>()
-    private var processIdentifier: CInt?
+    private var processIdentity: ProcessIdentity?
 
     public init(specification: VMShimProtocol.Specification, processIdentifier: CInt? = nil) {
         self.specification = specification
-        self.processIdentifier = processIdentifier
+        descriptorInvalidationHook = nil
+        descriptorReleaseHook = nil
+        processIdentity = processIdentifier.flatMap(Self.identity(for:))
+    }
+
+    init(
+        specification: VMShimProtocol.Specification,
+        processIdentifier: CInt? = nil,
+        descriptorInvalidationHook: @escaping @Sendable (CInt) -> Void,
+        descriptorReleaseHook: @escaping @Sendable (CInt) -> Void
+    ) {
+        self.specification = specification
+        self.descriptorInvalidationHook = descriptorInvalidationHook
+        self.descriptorReleaseHook = descriptorReleaseHook
+        processIdentity = processIdentifier.flatMap(Self.identity(for:))
     }
 
     public static func launch(specification: VMShimProtocol.Specification, executable: URL = Bundle.main.executableURL ?? URL(filePath: CommandLine.arguments[0])) async throws -> VMShimClient {
@@ -77,11 +98,8 @@ public final class VMShimClient: @unchecked Sendable {
         gracePeriodMilliseconds: Int32 = 5_000,
         forceWaitMilliseconds: Int32 = 1_000
     ) async throws {
-        let identifier = recordedProcessIdentifier()
-        let descriptors = invalidate()
-        for descriptor in descriptors {
-            _ = Darwin.shutdown(descriptor, SHUT_RDWR)
-        }
+        let identity = recordedProcessIdentity()
+        invalidateRequests()
 
         let deadline = Self.deadline(afterMilliseconds: gracePeriodMilliseconds)
         let graceful: Bool = await (try? runBlocking { [self] in
@@ -95,12 +113,12 @@ public final class VMShimClient: @unchecked Sendable {
             return true
         }) ?? false
 
-        if let identifier, graceful,
-           Self.waitForExit(identifier, timeoutMilliseconds: forceWaitMilliseconds) {
+        if let identity, graceful,
+           Self.waitForExit(identity, timeoutMilliseconds: forceWaitMilliseconds) {
             removeStaleControlFiles()
             return
         }
-        guard let identifier else {
+        guard let identity else {
             guard graceful else {
                 throw EngineError(
                     .internalError,
@@ -110,16 +128,23 @@ public final class VMShimClient: @unchecked Sendable {
             removeStaleControlFiles()
             return
         }
-        if Darwin.kill(identifier, SIGKILL) != 0, errno != ESRCH {
+        // Revalidate as close to the destructive syscall as Darwin permits. If
+        // the PID now belongs to another process, the original shim is already
+        // gone and the replacement must not receive our signal.
+        guard Self.identity(for: identity.processIdentifier) == identity else {
+            removeStaleControlFiles()
+            return
+        }
+        if Darwin.kill(identity.processIdentifier, SIGKILL) != 0, errno != ESRCH {
             throw EngineError(
                 .internalError,
-                "could not terminate VM shim \(identifier): \(String(cString: strerror(errno)))"
+                "could not terminate VM shim \(identity.processIdentifier): \(String(cString: strerror(errno)))"
             )
         }
-        guard Self.waitForExit(identifier, timeoutMilliseconds: forceWaitMilliseconds) else {
+        guard Self.waitForExit(identity, timeoutMilliseconds: forceWaitMilliseconds) else {
             throw EngineError(
                 .internalError,
-                "VM shim \(identifier) did not exit after SIGKILL"
+                "VM shim \(identity.processIdentifier) did not exit after SIGKILL"
             )
         }
         removeStaleControlFiles()
@@ -200,10 +225,9 @@ public final class VMShimClient: @unchecked Sendable {
             Darwin.close(descriptor)
             throw error
         }
-        defer { unregister(descriptor) }
+        defer { unregisterAndClose(descriptor) }
         let frame: Data
         if let deadlineNanoseconds {
-            defer { Darwin.close(descriptor) }
             let flags = fcntl(descriptor, F_GETFL)
             guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
                 throw EngineError(.internalError, "could not configure VM shim request deadline")
@@ -213,7 +237,7 @@ public final class VMShimClient: @unchecked Sendable {
             )
             frame = try Self.readFrame(from: descriptor, deadlineNanoseconds: deadlineNanoseconds)
         } else {
-            let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+            let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
             try file.write(contentsOf: VMShimProtocol.encode(envelope))
             frame = try readFrame(file)
         }
@@ -294,40 +318,64 @@ public final class VMShimClient: @unchecked Sendable {
         stateLock.unlock()
     }
 
-    private func invalidate() -> [CInt] {
+    private func unregisterAndClose(_ descriptor: CInt) {
+        descriptorReleaseHook?(descriptor)
+        stateLock.lock()
+        activeDescriptors.remove(descriptor)
+        Darwin.close(descriptor)
+        stateLock.unlock()
+    }
+
+    /// Stops new requests and shuts down every descriptor while the registry
+    /// lock still owns its lifetime. Request cleanup must unregister before its
+    /// FileHandle can close the descriptor, so the integer cannot be recycled
+    /// between selection and shutdown.
+    func invalidateRequests() {
         stateLock.lock()
         acceptsRequests = false
-        let descriptors = Array(activeDescriptors)
+        for descriptor in activeDescriptors {
+            descriptorInvalidationHook?(descriptor)
+            _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+        }
         stateLock.unlock()
-        return descriptors
     }
 
     private func remember(_ status: VMShimProtocol.Status) {
         guard status.containerID == specification.containerID,
-              status.generation == specification.generation else { return }
+              status.generation == specification.generation,
+              let startTime = status.processStartTime else { return }
+        let identity = ProcessIdentity(
+            processIdentifier: status.processIdentifier,
+            startTime: startTime
+        )
+        guard Self.identity(for: status.processIdentifier) == identity else { return }
         stateLock.lock()
-        processIdentifier = status.processIdentifier
+        processIdentity = identity
         stateLock.unlock()
     }
 
-    private func recordedProcessIdentifier() -> CInt? {
+    private func recordedProcessIdentity() -> ProcessIdentity? {
         stateLock.lock()
-        let knownIdentifier = processIdentifier
+        let knownIdentity = processIdentity
         stateLock.unlock()
-        if let knownIdentifier, knownIdentifier > 1 { return knownIdentifier }
+        if let knownIdentity, Self.identity(for: knownIdentity.processIdentifier) == knownIdentity {
+            return knownIdentity
+        }
 
         let statusURL = URL(filePath: specification.socketPath + ".status")
         if let data = try? Data(contentsOf: statusURL),
            let status = try? JSONDecoder().decode(VMShimProtocol.Status.self, from: data),
            status.containerID == specification.containerID,
            status.generation == specification.generation,
-           status.processIdentifier > 1 {
+           status.processIdentifier > 1,
+           status.processStartTime != nil {
             remember(status)
         }
         stateLock.lock()
-        let identifier = processIdentifier
+        let identity = processIdentity
         stateLock.unlock()
-        return identifier.flatMap { $0 > 1 ? $0 : nil }
+        guard let identity, Self.identity(for: identity.processIdentifier) == identity else { return nil }
+        return identity
     }
 
     private func removeStaleControlFiles() {
@@ -347,13 +395,41 @@ public final class VMShimClient: @unchecked Sendable {
         return Int32(min(roundedUp, UInt64(Int32.max)))
     }
 
-    private static func waitForExit(_ identifier: CInt, timeoutMilliseconds: Int32) -> Bool {
+    private static func waitForExit(
+        _ identity: ProcessIdentity,
+        timeoutMilliseconds: Int32
+    ) -> Bool {
         let deadline = deadline(afterMilliseconds: timeoutMilliseconds)
-        while Darwin.kill(identifier, 0) == 0 || errno == EPERM {
+        while Self.identity(for: identity.processIdentifier) == identity {
             if remainingMilliseconds(until: deadline) == 0 { return false }
             usleep(10_000)
         }
-        return errno == ESRCH
+        return true
+    }
+
+    static func processStartTime(for processIdentifier: CInt) -> UInt64? {
+        identity(for: processIdentifier)?.startTime
+    }
+
+    private static func identity(for processIdentifier: CInt) -> ProcessIdentity? {
+        guard processIdentifier > 1 else { return nil }
+        var information = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(
+            processIdentifier,
+            PROC_PIDTBSDINFO,
+            0,
+            &information,
+            size
+        ) == size,
+        information.pbi_start_tvsec >= 0,
+        information.pbi_start_tvusec >= 0 else { return nil }
+        let seconds = UInt64(information.pbi_start_tvsec)
+        let microseconds = UInt64(information.pbi_start_tvusec)
+        return ProcessIdentity(
+            processIdentifier: processIdentifier,
+            startTime: seconds &* 1_000_000 &+ microseconds
+        )
     }
 
     private static func wait(

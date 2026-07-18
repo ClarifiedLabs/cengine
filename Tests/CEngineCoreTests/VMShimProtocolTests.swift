@@ -4,6 +4,22 @@ import Testing
 #if os(macOS)
 import Darwin
 @testable import CEngineRuntime
+
+private final class ShimDescriptorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: CInt?
+
+    func store(_ descriptor: CInt) { lock.withLock { value = descriptor } }
+    func load() -> CInt? { lock.withLock { value } }
+}
+
+private func blockingSemaphoreWait(_ semaphore: DispatchSemaphore) -> Bool {
+    semaphore.wait(timeout: .now() + 2) == .success
+}
+
+private func semaphoreArrives(_ semaphore: DispatchSemaphore) async -> Bool {
+    await Task.detached { blockingSemaphoreWait(semaphore) }.value
+}
 #endif
 
 @Suite struct VMShimProtocolTests {
@@ -236,6 +252,128 @@ import Darwin
         #expect(await iterator.next() != nil)
     }
 
+    @Test func callerCancellationPromptlyEscapesANoncooperativeTimedOperation() async {
+        let (startStream, startContinuation) = AsyncStream<Void>.makeStream()
+        let (releaseStream, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let (observationStream, observationContinuation) = AsyncStream<Bool>.makeStream()
+        let task = Task {
+            try await AsyncTimeout.run(for: .seconds(30)) {
+                startContinuation.yield()
+                var releaseIterator = releaseStream.makeAsyncIterator()
+                _ = await releaseIterator.next() // Deliberately ignores cancellation.
+                observationContinuation.yield(Task.isCancelled)
+                observationContinuation.finish()
+                return true
+            }
+        }
+        var startIterator = startStream.makeAsyncIterator()
+        _ = await startIterator.next()
+
+        let clock = ContinuousClock()
+        let cancelledAt = clock.now
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("cancelled timeout unexpectedly returned a value")
+        } catch is CancellationError {
+            // Expected: caller cancellation wins independently of the child.
+        } catch {
+            Issue.record("cancelled timeout threw \(error) instead of CancellationError")
+        }
+        #expect(clock.now - cancelledAt < .seconds(1))
+
+        releaseContinuation.yield()
+        releaseContinuation.finish()
+        var observationIterator = observationStream.makeAsyncIterator()
+        #expect(await observationIterator.next() == true)
+    }
+
+    @Test func descriptorInvalidationCannotShutdownAReusedUnrelatedSocket() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = try RawVirtualizationBackend.makeRuntimeSocketPath()
+        let listener = try UnixSocket.listen(path: socketPath)
+        defer { Darwin.close(listener) }
+        let requestReceived = DispatchSemaphore(value: 0)
+        let sendResponse = DispatchSemaphore(value: 0)
+        let invalidationEntered = DispatchSemaphore(value: 0)
+        let releaseInvalidation = DispatchSemaphore(value: 0)
+        let descriptorReleaseAttempted = DispatchSemaphore(value: 0)
+        let invalidationFinished = DispatchSemaphore(value: 0)
+        let invalidatedDescriptor = ShimDescriptorBox()
+        let specification = VMShimProtocol.Specification(
+            containerID: "descriptor-owner",
+            generation: 11,
+            token: "test-token",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: "/root.ext4",
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:11",
+            socketPath: socketPath,
+            logPath: root.appending(path: "shim.log").path
+        )
+
+        Thread.detachNewThread {
+            guard let peer = try? UnixSocket.accept(listener) else { return }
+            defer { Darwin.close(peer) }
+            let file = FileHandle(fileDescriptor: peer, closeOnDealloc: false)
+            let prefix = file.readData(ofLength: 4)
+            guard prefix.count == 4 else { return }
+            let size = prefix.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            let body = file.readData(ofLength: Int(size))
+            guard let request = try? VMShimProtocol.decode(prefix + body) else { return }
+            requestReceived.signal()
+            sendResponse.wait()
+            let payload = try! JSONEncoder().encode(true)
+            let response = VMShimProtocol.Envelope(
+                id: request.id,
+                token: specification.token,
+                operation: request.operation,
+                payload: payload
+            )
+            try? file.write(contentsOf: VMShimProtocol.encode(response))
+        }
+
+        let client = VMShimClient(
+            specification: specification,
+            descriptorInvalidationHook: { descriptor in
+                invalidatedDescriptor.store(descriptor)
+                invalidationEntered.signal()
+                releaseInvalidation.wait()
+            },
+            descriptorReleaseHook: { _ in descriptorReleaseAttempted.signal() }
+        )
+        let request = Task {
+            try await client.guest(operation: "descriptor-test", payload: false, response: Bool.self)
+        }
+        #expect(await semaphoreArrives(requestReceived))
+        DispatchQueue.global().async {
+            client.invalidateRequests()
+            invalidationFinished.signal()
+        }
+        #expect(await semaphoreArrives(invalidationEntered))
+        sendResponse.signal()
+        #expect(await semaphoreArrives(descriptorReleaseAttempted))
+
+        var unrelated = [CInt](repeating: -1, count: 2)
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &unrelated) == 0)
+        defer { unrelated.forEach { Darwin.close($0) } }
+        let original = try #require(invalidatedDescriptor.load())
+        #expect(!unrelated.contains(original))
+
+        releaseInvalidation.signal()
+        #expect(await semaphoreArrives(invalidationFinished))
+        #expect(try await request.value)
+        var sent: UInt8 = 0x5a
+        var received: UInt8 = 0
+        #expect(Darwin.write(unrelated[0], &sent, 1) == 1)
+        #expect(Darwin.read(unrelated[1], &received, 1) == 1)
+        #expect(received == sent)
+    }
+
     @Test func unresponsiveShimTerminationAbortsItsSocketAndMeetsTheDeadline() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -277,7 +415,10 @@ import Darwin
             containerID: specification.containerID,
             generation: specification.generation,
             state: .paused,
-            processIdentifier: process.processIdentifier
+            processIdentifier: process.processIdentifier,
+            processStartTime: try #require(
+                VMShimClient.processStartTime(for: process.processIdentifier)
+            )
         )
         try JSONEncoder().encode(status).write(
             to: URL(filePath: socketPath + ".status"), options: .atomic
@@ -290,6 +431,61 @@ import Darwin
 
         #expect(clock.now - started < .seconds(2))
         #expect(!process.isRunning)
+    }
+
+    @Test func staleShimStatusCannotKillAReusedProcessIdentifier() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = try RawVirtualizationBackend.makeRuntimeSocketPath()
+        let listener = try UnixSocket.listen(path: socketPath)
+        defer { Darwin.close(listener) }
+        Thread.detachNewThread {
+            guard let peer = try? UnixSocket.accept(listener) else { return }
+            defer { Darwin.close(peer) }
+            var buffer = [UInt8](repeating: 0, count: 4_096)
+            while Darwin.read(peer, &buffer, buffer.count) > 0 {}
+        }
+
+        let unrelated = Process()
+        unrelated.executableURL = URL(filePath: "/bin/sleep")
+        unrelated.arguments = ["30"]
+        try unrelated.run()
+        defer { if unrelated.isRunning { unrelated.terminate() } }
+        Thread.detachNewThread { unrelated.waitUntilExit() }
+        let actualStart = try #require(
+            VMShimClient.processStartTime(for: unrelated.processIdentifier)
+        )
+        let specification = VMShimProtocol.Specification(
+            containerID: "stale-shim",
+            generation: 17,
+            token: "test-token",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: "/root.ext4",
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:17",
+            socketPath: socketPath,
+            logPath: root.appending(path: "shim.log").path
+        )
+        let stale = VMShimProtocol.Status(
+            containerID: specification.containerID,
+            generation: specification.generation,
+            state: .paused,
+            processIdentifier: unrelated.processIdentifier,
+            processStartTime: actualStart &+ 1
+        )
+        try JSONEncoder().encode(stale).write(
+            to: URL(filePath: socketPath + ".status"), options: .atomic
+        )
+
+        let client = VMShimClient(specification: specification)
+        await #expect(throws: EngineError.self) {
+            try await client.terminate(gracePeriodMilliseconds: 50, forceWaitMilliseconds: 50)
+        }
+        #expect(unrelated.isRunning)
+        #expect(VMShimClient.processStartTime(for: unrelated.processIdentifier) == actualStart)
     }
     #endif
 }

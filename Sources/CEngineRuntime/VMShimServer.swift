@@ -210,7 +210,15 @@ import Foundation
     }
 
     private func status() -> VMShimProtocol.Status {
-        .init(containerID: specification.containerID, generation: specification.generation, state: state, processIdentifier: getpid(), exitCode: exitCode, error: failure)
+        .init(
+            containerID: specification.containerID,
+            generation: specification.generation,
+            state: state,
+            processIdentifier: getpid(),
+            processStartTime: VMShimClient.processStartTime(for: getpid()),
+            exitCode: exitCode,
+            error: failure
+        )
     }
 
     private func persist() throws {

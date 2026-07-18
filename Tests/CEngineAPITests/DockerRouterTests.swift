@@ -269,6 +269,44 @@ private actor BlockingExecStartBackend: ContainerBackend {
     func release() { continuation?.resume(); continuation = nil }
 }
 
+private actor BlockingRestartExecGateBackend: ContainerBackend {
+    private var restartContinuation: CheckedContinuation<Void, Never>?
+    private var replacementReady = false
+    private var preparedExecs = 0
+    private var detachedStarts = 0
+    private var attachedStarts = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func restart(_: ContainerRecord, timeoutSeconds _: Int) async throws {
+        // Model RawVirtualizationBackend after it has installed the replacement
+        // shim but before EngineRuntime has reconciled the old exec generation.
+        replacementReady = true
+        await withCheckedContinuation { restartContinuation = $0 }
+    }
+    func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
+        preparedExecs += 1
+        return ContainerIOBridge(tty: exec.configuration.tty)
+    }
+    func startExec(_: ExecRecord) async throws { detachedStarts += 1 }
+    func startAttachedExec(_: ExecRecord) async throws -> CInt? {
+        attachedStarts += 1
+        return nil
+    }
+    func isReplacementReady() -> Bool { replacementReady }
+    func counts() -> (prepared: Int, detached: Int, attached: Int) {
+        (preparedExecs, detachedStarts, attachedStarts)
+    }
+    func releaseRestart() {
+        restartContinuation?.resume()
+        restartContinuation = nil
+    }
+}
+
 private actor BlockingPrepareBackend: ContainerBackend {
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private var prepares = 0
@@ -2416,6 +2454,44 @@ private actor AuthImageBackend: ContainerBackend {
         for _ in 0..<100 { await Task.yield() }
         #expect(try await runtime.container(container.id).phase == .running)
         await backend.releaseContainerCompletions()
+    }
+
+    @Test func explicitRestartRejectsExecBindingUntilOldGenerationIsReconciled() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = BlockingRestartExecGateBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "restart-exec-gate", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        let detached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["true"])
+        )
+        let attached = try await runtime.createExec(
+            container: container.id, configuration: .init(arguments: ["true"])
+        )
+
+        let restart = Task { try await runtime.restartContainer(container.id, timeoutSeconds: 0) }
+        while !(await backend.isReplacementReady()) { await Task.yield() }
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.createExec(
+                container: container.id, configuration: .init(arguments: ["new-generation"])
+            )
+        }
+        await #expect(throws: EngineError.self) { try await runtime.startExec(detached.id) }
+        await #expect(throws: EngineError.self) { _ = try await runtime.startAttachedExec(attached.id) }
+        let blockedCounts = await backend.counts()
+        #expect(blockedCounts.prepared == 2)
+        #expect(blockedCounts.detached == 0)
+        #expect(blockedCounts.attached == 0)
+
+        await backend.releaseRestart()
+        try await restart.value
+        #expect(try await runtime.container(container.id).restartCount == 1)
+        #expect(try await runtime.inspectExec(detached.id).exitCode == 137)
+        #expect(try await runtime.inspectExec(attached.id).exitCode == 137)
     }
 
     @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
