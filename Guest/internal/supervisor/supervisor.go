@@ -625,6 +625,30 @@ func (s *Supervisor) reap(command *exec.Cmd) {
 	}
 }
 
+type rootSwitchOperations struct {
+	chdir  func(string) error
+	mount  func(string, string, string, uintptr, string) error
+	chroot func(string) error
+}
+
+func switchWorkloadRoot(root string, operations rootSwitchOperations) error {
+	if err := operations.chdir(root); err != nil {
+		return fmt.Errorf("change to workload root: %w", err)
+	}
+	// Nested runtimes resolve exec roots from the mount namespace root, so the
+	// workload filesystem must replace that root rather than only become a chroot.
+	if err := operations.mount(root, "/", "", unix.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move workload root mount: %w", err)
+	}
+	if err := operations.chroot("."); err != nil {
+		return fmt.Errorf("chroot workload: %w", err)
+	}
+	if err := operations.chdir("/"); err != nil {
+		return fmt.Errorf("change to workload root directory: %w", err)
+	}
+	return nil
+}
+
 func enterWorkload(spec protocol.WorkloadSpec) error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
@@ -743,7 +767,9 @@ func enterWorkload(spec protocol.WorkloadSpec) error {
 			return err
 		}
 	}
-	if err := unix.Chroot(root); err != nil {
+	if err := switchWorkloadRoot(root, rootSwitchOperations{
+		chdir: unix.Chdir, mount: unix.Mount, chroot: unix.Chroot,
+	}); err != nil {
 		return err
 	}
 	if err := startSocketProxies(spec.Mounts); err != nil {

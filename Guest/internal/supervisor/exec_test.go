@@ -91,7 +91,7 @@ func TestDockerStreamMuxLeavesTerminalOutputUnframed(t *testing.T) {
 	}
 }
 
-func TestExecUnsharesFilesystemContextBeforeJoiningWorkloadNamespaces(t *testing.T) {
+func TestExecLeavesMountNamespaceUntilAfterStage2Starts(t *testing.T) {
 	var calls []string
 	operations := namespaceOperations{
 		unshare: func(flag int) error { calls = append(calls, fmt.Sprintf("unshare:%d", flag)); return nil },
@@ -102,12 +102,11 @@ func TestExecUnsharesFilesystemContextBeforeJoiningWorkloadNamespaces(t *testing
 		setns: func(_ int, flag int) error { calls = append(calls, fmt.Sprintf("setns:%d", flag)); return nil },
 		close: func(_ int) error { return nil },
 	}
-	if err := joinWorkloadNamespaces(42, operations); err != nil {
+	if err := joinWorkloadNonMountNamespaces(42, operations); err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
 		fmt.Sprintf("unshare:%d", unix.CLONE_FS),
-		"open:/proc/42/ns/mnt", fmt.Sprintf("setns:%d", unix.CLONE_NEWNS),
 		"open:/proc/42/ns/uts", fmt.Sprintf("setns:%d", unix.CLONE_NEWUTS),
 		"open:/proc/42/ns/ipc", fmt.Sprintf("setns:%d", unix.CLONE_NEWIPC),
 		"open:/proc/42/ns/net", fmt.Sprintf("setns:%d", unix.CLONE_NEWNET),
@@ -116,6 +115,27 @@ func TestExecUnsharesFilesystemContextBeforeJoiningWorkloadNamespaces(t *testing
 	}
 	if !reflect.DeepEqual(calls, expected) {
 		t.Fatalf("unexpected namespace sequence %#v", calls)
+	}
+}
+
+func TestExecStage2JoinsWorkloadMountNamespace(t *testing.T) {
+	var calls []string
+	err := enterExecMountNamespace(5, func(flag int) error {
+		calls = append(calls, fmt.Sprintf("unshare:%d", flag))
+		return nil
+	}, func(fd, flag int) error {
+		calls = append(calls, fmt.Sprintf("setns:%d:%d", fd, flag))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{
+		fmt.Sprintf("unshare:%d", unix.CLONE_FS),
+		fmt.Sprintf("setns:5:%d", unix.CLONE_NEWNS),
+	}
+	if !reflect.DeepEqual(calls, expected) {
+		t.Fatalf("unexpected mount namespace sequence %#v", calls)
 	}
 }
 
@@ -133,5 +153,65 @@ func TestExecEntersRootThroughDescriptorCapturedBeforeNamespaceChanges(t *testin
 	}
 	if !reflect.DeepEqual(calls, []string{"fchdir:4", "chroot:."}) {
 		t.Fatalf("unexpected root entry sequence %#v", calls)
+	}
+}
+
+func TestExecStage2InheritsRootAndMountNamespaceDescriptors(t *testing.T) {
+	spec, err := os.CreateTemp(t.TempDir(), "exec-spec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spec.Close()
+	root, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	mountNamespace, err := os.Open("/proc/self/ns/mnt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mountNamespace.Close()
+
+	command := execStage2Command(spec, root, mountNamespace)
+	if command.Path != "/proc/self/exe" {
+		t.Fatalf("exec stage 2 path is %q", command.Path)
+	}
+	if !reflect.DeepEqual(command.Args, []string{"/proc/self/exe", execStage2Argument}) {
+		t.Fatalf("unexpected exec stage 2 arguments %#v", command.Args)
+	}
+	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root, mountNamespace}) {
+		t.Fatalf("unexpected exec stage 2 descriptors %#v", command.ExtraFiles)
+	}
+}
+
+func TestWorkloadRootBecomesMountNamespaceRoot(t *testing.T) {
+	var calls []string
+	operations := rootSwitchOperations{
+		chdir: func(path string) error {
+			calls = append(calls, "chdir:"+path)
+			return nil
+		},
+		mount: func(source, target, kind string, flags uintptr, data string) error {
+			calls = append(calls, fmt.Sprintf("mount:%s:%s:%s:%d:%s", source, target, kind, flags, data))
+			return nil
+		},
+		chroot: func(path string) error {
+			calls = append(calls, "chroot:"+path)
+			return nil
+		},
+	}
+
+	if err := switchWorkloadRoot("/run/cengine/rootfs", operations); err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{
+		"chdir:/run/cengine/rootfs",
+		fmt.Sprintf("mount:/run/cengine/rootfs:/::%d:", unix.MS_MOVE),
+		"chroot:.",
+		"chdir:/",
+	}
+	if !reflect.DeepEqual(calls, expected) {
+		t.Fatalf("unexpected root switch sequence %#v", calls)
 	}
 }

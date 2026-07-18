@@ -23,6 +23,7 @@ import (
 
 const execStage1Argument = "cengine-exec-stage1"
 const execStage2Argument = "cengine-exec-stage2"
+const execStage2MountNamespaceFD = 5
 
 func IsExecStage1(arguments []string) bool {
 	return len(arguments) == 3 && arguments[1] == execStage1Argument
@@ -44,6 +45,16 @@ func RunExecStage1(pid int) error {
 		return errors.New("workload root is unavailable")
 	}
 	defer root.Close()
+	mountNamespaceFD, err := unix.Open(fmt.Sprintf("/proc/%d/ns/mnt", pid), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open workload mount namespace: %w", err)
+	}
+	mountNamespace := os.NewFile(uintptr(mountNamespaceFD), "workload-mount-namespace")
+	if mountNamespace == nil {
+		_ = unix.Close(mountNamespaceFD)
+		return errors.New("workload mount namespace is unavailable")
+	}
+	defer mountNamespace.Close()
 	gate := os.NewFile(4, "exec-cgroup-ready")
 	if gate == nil {
 		return errors.New("exec cgroup readiness file descriptor is unavailable")
@@ -53,25 +64,30 @@ func RunExecStage1(pid int) error {
 	if _, err := io.ReadFull(gate, ready[:]); err != nil {
 		return fmt.Errorf("wait for exec cgroup placement: %w", err)
 	}
-	if err := joinWorkloadNamespaces(pid, namespaceOperations{unshare: unix.Unshare, open: unix.Open, setns: unix.Setns, close: unix.Close}); err != nil {
+	if err := joinWorkloadNonMountNamespaces(pid, namespaceOperations{unshare: unix.Unshare, open: unix.Open, setns: unix.Setns, close: unix.Close}); err != nil {
 		return err
 	}
 	spec := os.NewFile(3, "exec-spec")
 	if spec == nil {
 		return errors.New("exec specification is unavailable")
 	}
-	command := exec.Command("/proc/self/exe", execStage2Argument)
-	command.ExtraFiles = []*os.File{spec, root}
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
+	command := execStage2Command(spec, root, mountNamespace)
 	if err := command.Run(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			return exit
 		}
-		return err
+		return fmt.Errorf("run exec stage 2: %w", err)
 	}
 	return nil
+}
+
+func execStage2Command(spec, root, mountNamespace *os.File) *exec.Cmd {
+	command := exec.Command("/proc/self/exe", execStage2Argument)
+	command.ExtraFiles = []*os.File{spec, root, mountNamespace}
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	return command
 }
 
 type namespaceOperations struct {
@@ -81,14 +97,14 @@ type namespaceOperations struct {
 	close   func(int) error
 }
 
-func joinWorkloadNamespaces(pid int, operations namespaceOperations) error {
+func joinWorkloadNonMountNamespaces(pid int, operations namespaceOperations) error {
 	if err := operations.unshare(unix.CLONE_FS); err != nil {
 		return fmt.Errorf("unshare filesystem context: %w", err)
 	}
 	for _, namespace := range []struct {
 		name string
 		flag int
-	}{{"mnt", unix.CLONE_NEWNS}, {"uts", unix.CLONE_NEWUTS}, {"ipc", unix.CLONE_NEWIPC}, {"net", unix.CLONE_NEWNET}, {"cgroup", unix.CLONE_NEWCGROUP}, {"pid", unix.CLONE_NEWPID}} {
+	}{{"uts", unix.CLONE_NEWUTS}, {"ipc", unix.CLONE_NEWIPC}, {"net", unix.CLONE_NEWNET}, {"cgroup", unix.CLONE_NEWCGROUP}, {"pid", unix.CLONE_NEWPID}} {
 		fd, err := operations.open(fmt.Sprintf("/proc/%d/ns/%s", pid, namespace.name), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 		if err != nil {
 			return err
@@ -103,6 +119,21 @@ func joinWorkloadNamespaces(pid int, operations namespaceOperations) error {
 }
 
 func RunExecStage2() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	// These descriptors must cross the stage boundary but must not leak into the
+	// requested workload process after the final exec.
+	for _, descriptor := range []int{3, 4, execStage2MountNamespaceFD} {
+		unix.CloseOnExec(descriptor)
+	}
+	mountNamespace := os.NewFile(execStage2MountNamespaceFD, "workload-mount-namespace")
+	if mountNamespace == nil {
+		return errors.New("workload mount namespace is unavailable")
+	}
+	defer mountNamespace.Close()
+	if err := enterExecMountNamespace(int(mountNamespace.Fd()), unix.Unshare, unix.Setns); err != nil {
+		return err
+	}
 	file := os.NewFile(3, "exec-spec")
 	if file == nil {
 		return errors.New("exec specification is unavailable")
@@ -129,7 +160,7 @@ func RunExecStage2() error {
 		working = "/"
 	}
 	if err := os.Chdir(working); err != nil {
-		return err
+		return fmt.Errorf("change to exec working directory %s: %w", working, err)
 	}
 	uid, gid, err := parseExecUser(spec.User)
 	if err != nil {
@@ -157,9 +188,22 @@ func RunExecStage2() error {
 	}
 	path, err := exec.LookPath(spec.Arguments[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("look up exec command %s: %w", spec.Arguments[0], err)
 	}
-	return unix.Exec(path, spec.Arguments, environment)
+	if err := unix.Exec(path, spec.Arguments, environment); err != nil {
+		return fmt.Errorf("execute command %s: %w", path, err)
+	}
+	return nil
+}
+
+func enterExecMountNamespace(fd int, unshare func(int) error, setns func(int, int) error) error {
+	if err := unshare(unix.CLONE_FS); err != nil {
+		return fmt.Errorf("unshare exec filesystem context: %w", err)
+	}
+	if err := setns(fd, unix.CLONE_NEWNS); err != nil {
+		return fmt.Errorf("join workload mount namespace: %w", err)
+	}
+	return nil
 }
 
 // ExecStageExitCode returns the conventional shell exit status for a command

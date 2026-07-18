@@ -133,6 +133,27 @@ def wait_for_cluster_network_ready(
     )
 
 
+def verify_cluster_pod_exec(client: docker.DockerClient, name: str) -> str | None:
+    node = client.containers.get(f"{name}-control-plane")
+    selected = node.exec_run([
+        "kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "-n", "kube-system",
+        "get", "pods", "-l", "k8s-app=kube-dns",
+        "-o=jsonpath={.items[0].metadata.name}",
+    ])
+    if selected.exit_code != 0:
+        return f"could not select a CoreDNS pod for exec: {selected.output!r}"
+    pod = selected.output.decode(errors="replace").strip()
+    if not pod:
+        return "could not select a CoreDNS pod for exec: no pods returned"
+    executed = node.exec_run([
+        "kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", "-n", "kube-system",
+        "exec", pod, "--", "/coredns", "-version",
+    ])
+    if executed.exit_code != 0:
+        return f"exec into CoreDNS pod {pod} failed: {executed.output!r}"
+    return None
+
+
 def verify_docker_host_resolution(
     client: docker.DockerClient, name: str, network: str, timeout: int = 60,
 ) -> str | None:
@@ -190,6 +211,8 @@ def test_kind_create_cluster(daemon, client: docker.DockerClient):
             failure = wait_for_control_plane_ready(client, name)
             if failure is None:
                 failure = wait_for_cluster_network_ready(client, name)
+            if failure is None:
+                failure = verify_cluster_pod_exec(client, name)
             if failure is None:
                 failure = verify_docker_host_resolution(client, name, network)
         if failure is not None:
