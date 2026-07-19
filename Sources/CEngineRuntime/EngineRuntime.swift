@@ -100,6 +100,7 @@ public actor EngineRuntime {
         // boundary. It is the first recovered state: no other backend await may
         // trust or mutate the persisted execution until teardown is verified.
         let pendingCleanup = snapshot.cleanupPendingContainerIDs ?? []
+        var verifiedCleanupIDs = Set<String>()
         if !pendingCleanup.isEmpty {
             for identifier in pendingCleanup {
                 guard let index = try? containerIndex(identifier) else {
@@ -109,7 +110,14 @@ public actor EngineRuntime {
                     )
                 }
                 let pending = snapshot.containers[index]
-                try await cleanupBackendExecution(pending)
+                do {
+                    try await cleanupBackendExecution(pending)
+                } catch {
+                    quarantineCleanupPendingContainer(identifier)
+                    try? await persist()
+                    throw error
+                }
+                verifiedCleanupIDs.insert(identifier)
                 switch pending.phase {
                 case .running, .paused:
                     snapshot.containers[index].phase = .exited
@@ -182,6 +190,7 @@ public actor EngineRuntime {
                 try? await persist()
                 throw error
             }
+            verifiedCleanupIDs.insert(quarantined.id)
             if quarantined.startedAt == nil {
                 snapshot.containers[index].phase = .created
                 snapshot.containers[index].finishedAt = nil
@@ -191,6 +200,25 @@ public actor EngineRuntime {
                 snapshot.containers[index].finishedAt = quarantined.finishedAt ?? Date()
                 snapshot.containers[index].exitCode = quarantined.exitCode ?? 127
             }
+        }
+        // A recovered auto-remove execution is terminal only after cleanup and
+        // marker clearing are durable. Remove it before considering restart
+        // policy so `--rm` remains authoritative across a daemon crash.
+        let recoveredAutoRemoveIDs = snapshot.containers.compactMap { record in
+            record.autoRemove && record.phase == .exited ? record.id : nil
+        }
+        for identifier in recoveredAutoRemoveIDs {
+            guard let index = try? containerIndex(identifier) else { continue }
+            let removed = snapshot.containers[index]
+            if !verifiedCleanupIDs.contains(identifier) {
+                try await cleanupBackendExecution(removed)
+                verifiedCleanupIDs.insert(identifier)
+            }
+            try await backend.deleteLogs(for: removed)
+            try await removeAnonymousVolumes(usedBy: removed)
+            guard let current = try? containerIndex(identifier) else { continue }
+            snapshot.containers.remove(at: current)
+            try await persist()
         }
         var recovered: [(String, Date)] = []
         for index in snapshot.containers.indices {
@@ -251,6 +279,7 @@ public actor EngineRuntime {
                 do {
                     try await cleanupBackendExecution(snapshot.containers[index])
                 } catch {
+                    quarantineCleanupPendingContainer(stale.id)
                     try? await persist()
                     throw error
                 }
@@ -464,11 +493,15 @@ public actor EngineRuntime {
     }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
-        try await backend.io(for: container(identifier))
+        let record = try container(identifier)
+        try requireBackendExecutionAvailable(record)
+        return try await backend.io(for: record)
     }
 
     public func resizeContainer(_ identifier: String, width: UInt16, height: UInt16) async throws {
-        try await backend.resize(container(identifier), width: width, height: height)
+        let record = try container(identifier)
+        try requireBackendExecutionAvailable(record)
+        try await backend.resize(record, width: width, height: height)
     }
 
     public func containerLogs(_ identifier: String, options: DockerLogOptions = .init()) async throws -> Data {
@@ -477,12 +510,14 @@ public actor EngineRuntime {
 
     public func containerStatistics(_ identifier: String) async throws -> BackendStatistics {
         let record = try container(identifier)
+        try requireBackendExecutionAvailable(record)
         guard record.phase == .running else { throw EngineError(.conflict, "Container is not running") }
         return try await backend.statistics(record)
     }
 
     public func containerTop(_ identifier: String, arguments: [String]) async throws -> (titles: [String], processes: [[String]]) {
         let record = try container(identifier)
+        try requireBackendExecutionAvailable(record)
         guard record.phase == .running else { throw EngineError(.conflict, "Container is not running") }
         return try await backend.top(record, arguments: arguments)
     }
@@ -491,6 +526,7 @@ public actor EngineRuntime {
                                 pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
+        try requireBackendExecutionAvailable(old)
         guard !startingContainerIDs.contains(old.id) else {
             throw EngineError(.conflict, "container \(identifier) is starting")
         }
@@ -529,6 +565,7 @@ public actor EngineRuntime {
 
     public func killContainer(_ identifier: String, signal: String) async throws {
         let record = try container(identifier)
+        try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
             throw EngineError(.conflict, "container \(identifier) is starting")
         }
@@ -545,6 +582,7 @@ public actor EngineRuntime {
     public func pauseContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
             throw EngineError(.conflict, "container \(identifier) is starting")
         }
@@ -574,6 +612,7 @@ public actor EngineRuntime {
     public func resumeContainer(_ identifier: String) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
             throw EngineError(.conflict, "container \(identifier) is starting")
         }
@@ -721,6 +760,7 @@ public actor EngineRuntime {
 
     public func createExec(container identifier: String, configuration: ExecConfiguration) async throws -> ExecRecord {
         let container = try container(identifier)
+        try requireBackendExecutionAvailable(container)
         guard container.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         guard !configuration.arguments.isEmpty else { throw EngineError(.badRequest, "exec command cannot be empty") }
         try beginExecOperation(for: container.id)
@@ -751,18 +791,23 @@ public actor EngineRuntime {
 
     public func inspectExec(_ identifier: String) async throws -> ExecRecord {
         var value = try exec(identifier)
-        if value.running, let code = await backend.execStatus(value) {
-            value.running = false
-            value.exitCode = code
-            let refreshedPID = await backend.execPID(value)
-            if refreshedPID > 0 { value.pid = refreshedPID }
-            execs[identifier] = value
+        if value.running {
+            try requireBackendExecutionAvailable(container(value.containerID))
+            if let code = await backend.execStatus(value) {
+                value.running = false
+                value.exitCode = code
+                let refreshedPID = await backend.execPID(value)
+                if refreshedPID > 0 { value.pid = refreshedPID }
+                execs[identifier] = value
+            }
         }
         return value
     }
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge {
-        try await backend.execIO(exec(identifier))
+        let value = try exec(identifier)
+        try requireBackendExecutionAvailable(container(value.containerID))
+        return try await backend.execIO(value)
     }
 
     public func startExec(_ identifier: String) async throws {
@@ -812,12 +857,15 @@ public actor EngineRuntime {
     }
 
     public func resizeExec(_ identifier: String, width: UInt16, height: UInt16) async throws {
-        try await backend.resizeExec(exec(identifier), width: width, height: height)
+        let value = try exec(identifier)
+        try requireBackendExecutionAvailable(container(value.containerID))
+        try await backend.resizeExec(value, width: width, height: height)
     }
 
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
             throw EngineError(.conflict, "container \(identifier) is starting")
         }
@@ -1165,6 +1213,7 @@ public actor EngineRuntime {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
             throw EngineError(.conflict, "container \(containerIdentifier) is starting")
         }
@@ -1225,6 +1274,7 @@ public actor EngineRuntime {
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
             throw EngineError(.conflict, "container \(containerIdentifier) is starting")
         }
@@ -1805,6 +1855,24 @@ public actor EngineRuntime {
         snapshot.cleanupPendingContainerIDs?.contains(identifier) == true
     }
 
+    /// Reject every backend operation that could attach to or mutate an
+    /// execution while its identity is unverifiable. The durable marker is the
+    /// primary fence during actor reentrancy; `.dead` keeps the public record in
+    /// quarantine after cleanup returns an error.
+    func requireBackendExecutionAvailable(_ record: ContainerRecord) throws {
+        guard !cleanupIsPending(record.id), record.phase != .dead else {
+            throw EngineError(.conflict, "container \(record.id) has backend cleanup pending")
+        }
+    }
+
+    private func quarantineCleanupPendingContainer(_ identifier: String) {
+        guard let index = try? containerIndex(identifier) else { return }
+        // Preserve the generation's timestamps and exit result. In particular,
+        // the old generation may have completed while an explicit restart was
+        // suspended, and that real result must remain the sole die event.
+        snapshot.containers[index].phase = .dead
+    }
+
     /// A backend start can partially launch before throwing, or succeed before
     /// publishing the running record fails. The pre-launch cleanup marker stays
     /// set until definitive teardown and restoration are both durable.
@@ -1825,6 +1893,7 @@ public actor EngineRuntime {
         do {
             try await cleanupBackendExecution(started)
         } catch {
+            quarantineCleanupPendingContainer(original.id)
             // The original pre-launch save is the safety boundary. These
             // bounded retries improve diagnostics/durability when storage
             // transiently recovers, but correctness does not depend on them.
@@ -1867,6 +1936,7 @@ public actor EngineRuntime {
         do {
             try await cleanupBackendExecution(original)
         } catch {
+            quarantineCleanupPendingContainer(original.id)
             try? await persist()
             throw error
         }
@@ -2213,6 +2283,7 @@ public actor EngineRuntime {
                 } catch {
                     // The pre-launch marker is already durable. Recovery must
                     // verify teardown before this record can launch again.
+                    quarantineCleanupPendingContainer(identifier)
                     try? await persist()
                 }
             }
@@ -2312,6 +2383,11 @@ public actor EngineRuntime {
     }
 
     private func beginExecOperation(for containerID: String) throws {
+        let record = try container(containerID)
+        try requireBackendExecutionAvailable(record)
+        guard record.phase == .running else {
+            throw EngineError(.conflict, "Container \(containerID) is not running")
+        }
         guard lifecycleIntents[containerID]?.operation != .restart else {
             throw EngineError(.conflict, "container \(containerID) is restarting")
         }

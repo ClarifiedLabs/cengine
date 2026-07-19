@@ -4,6 +4,7 @@ import Foundation
 extension EngineRuntime {
     public func copyArchiveIntoContainer(_ identifier: String, path: String, archive: Data) async throws {
         let container = try container(identifier)
+        try requireBackendExecutionAvailable(container)
         guard container.phase == .created || container.phase == .running else { throw EngineError(.conflict, "archive copy requires a created or running container") }
         guard path.hasPrefix("/") else { throw EngineError(.badRequest, "container path must be absolute") }
         if archive.count >= 1_024 && archive.allSatisfy({ $0 == 0 }) { return }
@@ -20,6 +21,7 @@ extension EngineRuntime {
 
     public func copyArchiveOutOfContainer(_ identifier: String, path: String) async throws -> Data {
         let container = try container(identifier)
+        try requireBackendExecutionAvailable(container)
         guard container.phase == .running else { throw EngineError(.conflict, "archive copy requires a running container") }
         guard path.hasPrefix("/") else { throw EngineError(.badRequest, "container path must be absolute") }
         let temporary = FileManager.default.temporaryDirectory.appending(path: "cengine-copyout-\(UUID().uuidString)", directoryHint: .isDirectory)
