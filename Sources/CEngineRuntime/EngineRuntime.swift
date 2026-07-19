@@ -45,6 +45,7 @@ public actor EngineRuntime {
     private let endpointAllocationStore: AtomicStore<[String: Int]>
     private let beforePersistence: (@Sendable () async throws -> Void)?
     private let beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)?
+    private let beforeCompletionMonitoring: (@Sendable () async -> Void)?
     let backend: any ContainerBackend
     private var endpointAllocationCursors: [String: Int]
     private var execs: [String: ExecRecord] = [:]
@@ -67,7 +68,8 @@ public actor EngineRuntime {
             root: root,
             backend: backend,
             beforePersistence: nil,
-            beforeEndpointAllocationPersistence: nil
+            beforeEndpointAllocationPersistence: nil,
+            beforeCompletionMonitoring: nil
         )
     }
 
@@ -75,12 +77,14 @@ public actor EngineRuntime {
         root: URL,
         backend: any ContainerBackend,
         beforePersistence: (@Sendable () async throws -> Void)? = nil,
-        beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)? = nil
+        beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)? = nil,
+        beforeCompletionMonitoring: (@Sendable () async -> Void)? = nil
     ) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
         self.endpointAllocationStore = AtomicStore(url: root.appending(path: "endpoint-allocation.json"))
         self.beforePersistence = beforePersistence
         self.beforeEndpointAllocationPersistence = beforeEndpointAllocationPersistence
+        self.beforeCompletionMonitoring = beforeCompletionMonitoring
         self.backend = backend
         self.snapshot = try await store.load(default: EngineSnapshot())
         self.endpointAllocationCursors = try await endpointAllocationStore.load(default: [:])
@@ -284,7 +288,17 @@ public actor EngineRuntime {
             guard ownsLifecycleExecution(intent, record: record) else {
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
-            let resolvedPorts = try await backend.start(record)
+            let resolvedPorts: [PortBinding]
+            do {
+                resolvedPorts = try await backend.start(record)
+            } catch {
+                // `start` may fail after installing a partially-running backend
+                // execution. Preparation failures have not crossed that boundary
+                // and remain available for a later retry, but every attempted
+                // start must reset both the execution and its preparation.
+                await rollbackFailedStart(original: record, started: record)
+                throw error
+            }
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
                 _ = try? await backend.stop(record, timeoutSeconds: 0)
@@ -1626,9 +1640,10 @@ public actor EngineRuntime {
         try await store.save(snapshot)
     }
 
-    /// A backend start can succeed before publishing the running record fails.
-    /// Restore the last durable generation before suspending for backend cleanup
-    /// so unrelated persistence cannot capture an unmonitored execution.
+    /// A backend start can partially launch before throwing, or succeed before
+    /// publishing the running record fails. Restore the last durable generation
+    /// before suspending for backend cleanup so unrelated persistence cannot
+    /// capture an unmonitored execution.
     private func rollbackFailedStart(original: ContainerRecord, started: ContainerRecord) async {
         healthTasks.removeValue(forKey: original.id)?.cancel()
         cancelCompletionMonitor(original.id)
@@ -1818,7 +1833,9 @@ public actor EngineRuntime {
     private func startCompletionMonitor(_ identifier: String, startedAt: Date) {
         cancelCompletionMonitor(identifier)
         let token = UUID()
+        let beforeCompletionMonitoring = beforeCompletionMonitoring
         let task = Task<Void, Never> { [weak self] in
+            await beforeCompletionMonitoring?()
             guard let self else { return }
             await self.monitorContainer(identifier, startedAt: startedAt, token: token)
         }
@@ -1826,6 +1843,10 @@ public actor EngineRuntime {
     }
 
     private func monitorContainer(_ identifier: String, startedAt: Date, token: UUID) async {
+        guard !Task.isCancelled else {
+            removeCompletionMonitor(identifier, token: token)
+            return
+        }
         guard let record = try? container(identifier),
               let code = await backend.completion(record),
               !Task.isCancelled else {

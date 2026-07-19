@@ -1025,6 +1025,115 @@ private actor LifecycleRaceBackend: ContainerBackend {
     func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
 }
 
+private actor PartialStartFailureBackend: ContainerBackend {
+    enum Failure: Error { case duringPrepare, afterLaunch }
+
+    private var preparedContainers = Set<String>()
+    private var runningContainers = Set<String>()
+    private var shouldFailPrepare = false
+    private var shouldFailStart: Bool
+    private var starts = 0
+    private var stops = 0
+    private var deletes = 0
+    private var completionRegistrations = 0
+    private var healthchecks = 0
+
+    init(failStartAfterLaunch: Bool = true) {
+        shouldFailStart = failStartAfterLaunch
+    }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        if shouldFailPrepare {
+            shouldFailPrepare = false
+            throw Failure.duringPrepare
+        }
+        preparedContainers.insert(container.id)
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        runningContainers.insert(container.id)
+        if shouldFailStart {
+            shouldFailStart = false
+            throw Failure.afterLaunch
+        }
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        stops += 1
+        runningContainers.remove(container.id)
+        return 127
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+    }
+    func completion(_: ContainerRecord) async -> Int32? {
+        completionRegistrations += 1
+        return nil
+    }
+    func runHealthcheck(
+        _: ContainerRecord,
+        arguments _: [String],
+        timeoutSeconds _: Int64
+    ) async throws -> (exitCode: Int32, output: String) {
+        healthchecks += 1
+        return (0, "healthy")
+    }
+
+    func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
+    func isPrepared(_ identifier: String) -> Bool { preparedContainers.contains(identifier) }
+    func failNextPrepare() { shouldFailPrepare = true }
+    func counts() -> (starts: Int, stops: Int, deletes: Int, completions: Int, healthchecks: Int) {
+        (starts, stops, deletes, completionRegistrations, healthchecks)
+    }
+}
+
+private actor CompletionMonitorEntryGate {
+    private var entries = 0
+    private var firstEntryContinuation: CheckedContinuation<Void, Never>?
+
+    func enter() async {
+        entries += 1
+        guard entries == 1 else { return }
+        await withCheckedContinuation { firstEntryContinuation = $0 }
+    }
+
+    func firstEntryIsBlocked() -> Bool { firstEntryContinuation != nil }
+    func releaseFirstEntry() {
+        firstEntryContinuation?.resume()
+        firstEntryContinuation = nil
+    }
+}
+
+private actor GenerationCompletionBackend: ContainerBackend {
+    private var completionContinuation: CheckedContinuation<Int32?, Never>?
+    private var completionRegistrations = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {
+        completionContinuation?.resume(returning: nil)
+        completionContinuation = nil
+    }
+    func restart(_: ContainerRecord, timeoutSeconds _: Int) async throws {}
+    func completion(_: ContainerRecord) async -> Int32? {
+        completionRegistrations += 1
+        return await withCheckedContinuation { completionContinuation = $0 }
+    }
+
+    func registrationCount() -> Int { completionRegistrations }
+    func complete(code: Int32) {
+        completionContinuation?.resume(returning: code)
+        completionContinuation = nil
+    }
+}
+
 private actor AuthImageBackend: ContainerBackend {
     private var credentials: RegistryCredentials?
     private var pulled = false
@@ -3771,6 +3880,50 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(restarted.healthFailingStreak == 0)
     }
 
+    @Test func canceledCompletionMonitorCannotRegisterAgainstRestartedGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = GenerationCompletionBackend()
+        let entryGate = CompletionMonitorEntryGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforeCompletionMonitoring: { await entryGate.enter() }
+        )
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "completion-monitor-generation", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        while !(await entryGate.firstEntryIsBlocked()) { await Task.yield() }
+        let originalStartedAt = try #require(try await runtime.container(record.id).startedAt)
+
+        // The first generation's task is suspended before entering
+        // monitorContainer. Restart cancels it and publishes a replacement whose
+        // monitor passes the gate and owns the backend completion waiter.
+        try await runtime.restartContainer(record.id, timeoutSeconds: 0)
+        while await backend.registrationCount() != 1 { await Task.yield() }
+        let restarted = try await runtime.container(record.id)
+        #expect(restarted.phase == .running)
+        #expect(restarted.startedAt != originalStartedAt)
+
+        // Releasing a checked continuation does not clear task cancellation. A
+        // stale monitor that reads the replacement record before checking that
+        // flag would register a second completion and displace its waiter.
+        await entryGate.releaseFirstEntry()
+        for _ in 0..<100 { await Task.yield() }
+        #expect(await backend.registrationCount() == 1)
+
+        await backend.complete(code: 23)
+        for _ in 0..<1_000 {
+            if try await runtime.container(record.id).phase == .exited { break }
+            await Task.yield()
+        }
+        let completed = try await runtime.container(record.id)
+        #expect(completed.phase == .exited)
+        #expect(completed.exitCode == 23)
+        #expect(completed.startedAt == restarted.startedAt)
+    }
+
     @Test func restartFailureAfterStoppingOldExecutionCleansAndTerminalizesItsGeneration() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3902,6 +4055,81 @@ private actor AuthImageBackend: ContainerBackend {
         try await runtime.startContainer(record.id)
         #expect(try await runtime.container(record.id).phase == .running)
         #expect(await backend.isRunning(record.id))
+    }
+
+    @Test func partialBackendStartFailureIsCompensatedAndRetryableAfterReload() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = PartialStartFailureBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var input = ContainerRecord(name: "partial-start-failure", image: "debian")
+        input.healthcheck = .init(
+            test: ["CMD", "true"], intervalNanoseconds: 1_000_000,
+            timeoutNanoseconds: 1_000_000_000, retries: 1, startPeriodNanoseconds: 0
+        )
+        let record = try await runtime.createContainer(input)
+
+        await #expect(throws: PartialStartFailureBackend.Failure.self) {
+            try await runtime.startContainer(record.id)
+        }
+
+        #expect(try await runtime.container(record.id).phase == .created)
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(!(await backend.isPrepared(record.id)))
+        let failedCounts = await backend.counts()
+        #expect(failedCounts.starts == 1)
+        #expect(failedCounts.stops == 1)
+        #expect(failedCounts.deletes == 1)
+        #expect(failedCounts.completions == 0)
+        #expect(failedCounts.healthchecks == 0)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durable.containers.first(where: { $0.id == record.id })?.phase == .created)
+
+        let history = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var historyIterator = history.makeAsyncIterator()
+        var actions: [String] = []
+        while let event = await historyIterator.next() {
+            if event.id == record.id { actions.append(event.action) }
+        }
+        #expect(!actions.contains("start"))
+
+        await runtime.shutdown()
+        let reloaded = try await EngineRuntime(root: root, backend: backend)
+        #expect(try await reloaded.container(record.id).phase == .created)
+        try await reloaded.startContainer(record.id)
+        #expect(try await reloaded.container(record.id).phase == .running)
+        #expect(await backend.isRunning(record.id))
+        #expect(await backend.counts().starts == 2)
+        await reloaded.shutdown()
+    }
+
+    @Test func preparationFailureRetainsPreparedBackendForSafeRetry() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = PartialStartFailureBackend(failStartAfterLaunch: false)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "prepare-retry-boundary", image: "debian")
+        )
+        await backend.failNextPrepare()
+
+        await #expect(throws: PartialStartFailureBackend.Failure.self) {
+            try await runtime.startContainer(record.id)
+        }
+
+        let failedCounts = await backend.counts()
+        #expect(failedCounts.starts == 0)
+        #expect(failedCounts.stops == 0)
+        #expect(failedCounts.deletes == 0)
+        #expect(await backend.isPrepared(record.id))
+        #expect(try await runtime.container(record.id).phase == .created)
+
+        try await runtime.startContainer(record.id)
+        #expect(await backend.counts().starts == 1)
+        #expect(await backend.isRunning(record.id))
+        #expect(try await runtime.container(record.id).phase == .running)
+        await runtime.shutdown()
     }
 
     @Test func restartPersistenceFailureCleansReplacementAndAllowsRetry() async throws {
