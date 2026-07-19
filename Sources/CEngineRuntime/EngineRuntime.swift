@@ -43,6 +43,7 @@ public actor EngineRuntime {
     var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
     private let endpointAllocationStore: AtomicStore<[String: Int]>
+    private let beforePersistence: (@Sendable () async throws -> Void)?
     private let beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)?
     let backend: any ContainerBackend
     private var endpointAllocationCursors: [String: Int]
@@ -50,6 +51,7 @@ public actor EngineRuntime {
     private var eventContinuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
     private var eventHistory: [RuntimeEvent] = []
     private var healthTasks: [String: Task<Void, Never>] = [:]
+    private var completionMonitorTasks: [String: (token: UUID, task: Task<Void, Never>)] = [:]
     private var exitWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var removalWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var lifecycleIntents: [String: LifecycleIntent] = [:]
@@ -61,16 +63,23 @@ public actor EngineRuntime {
     private var activeExecOperations: [String: Int] = [:]
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
-        try await self.init(root: root, backend: backend, beforeEndpointAllocationPersistence: nil)
+        try await self.init(
+            root: root,
+            backend: backend,
+            beforePersistence: nil,
+            beforeEndpointAllocationPersistence: nil
+        )
     }
 
     init(
         root: URL,
         backend: any ContainerBackend,
-        beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)?
+        beforePersistence: (@Sendable () async throws -> Void)? = nil,
+        beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)? = nil
     ) async throws {
         self.store = AtomicStore(url: root.appending(path: "engine.json"))
         self.endpointAllocationStore = AtomicStore(url: root.appending(path: "endpoint-allocation.json"))
+        self.beforePersistence = beforePersistence
         self.beforeEndpointAllocationPersistence = beforeEndpointAllocationPersistence
         self.backend = backend
         self.snapshot = try await store.load(default: EngineSnapshot())
@@ -168,7 +177,7 @@ public actor EngineRuntime {
         }
         try await persist()
         for (id, startedAt) in recovered {
-            Task { [weak self] in await self?.monitorContainer(id, startedAt: startedAt) }
+            startCompletionMonitor(id, startedAt: startedAt)
             startHealthMonitor(id)
         }
     }
@@ -176,6 +185,8 @@ public actor EngineRuntime {
     public func shutdown() async {
         healthTasks.values.forEach { $0.cancel() }
         healthTasks.removeAll()
+        completionMonitorTasks.values.forEach { $0.task.cancel() }
+        completionMonitorTasks.removeAll()
         await backend.shutdown()
     }
 
@@ -296,7 +307,12 @@ public actor EngineRuntime {
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
             snapshot.containers[current] = started
-            try await persist()
+            do {
+                try await persist()
+            } catch {
+                await rollbackFailedStart(original: record, started: started)
+                throw error
+            }
             guard lifecycleIntents[record.id] == intent,
                   let published = try? container(record.id),
                   published.phase == .running,
@@ -307,7 +323,7 @@ public actor EngineRuntime {
             }
             emit(containerEvent("start", published))
             startHealthMonitor(record.id)
-            Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
+            startCompletionMonitor(record.id, startedAt: startedAt)
             startingContainerIDs.remove(record.id)
             endLifecycleIntent(intent, for: record.id)
             await reconcileDeferredCompletion(record.id)
@@ -471,7 +487,6 @@ public actor EngineRuntime {
             endLifecycleIntent(intent, for: record.id)
             throw EngineError(.conflict, "container \(identifier) is already starting")
         }
-        var cancelledHealthMonitor = false
         do {
             try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
             guard ownsRestartExecution(intent, record: record) else {
@@ -481,8 +496,8 @@ public actor EngineRuntime {
             // began against that generation must not publish into the new one.
             if let task = healthTasks.removeValue(forKey: record.id) {
                 task.cancel()
-                cancelledHealthMonitor = true
             }
+            cancelCompletionMonitor(record.id)
             // A restart creates a new container execution generation. Terminalize
             // every child of the old generation before publishing the new start
             // time; its completion monitor may still be suspended in the backend.
@@ -529,18 +544,14 @@ public actor EngineRuntime {
             }
             emit(containerEvent("restart", published))
             startHealthMonitor(record.id)
-            Task { [weak self] in await self?.monitorContainer(record.id, startedAt: startedAt) }
+            startCompletionMonitor(record.id, startedAt: startedAt)
             startingContainerIDs.remove(record.id)
             endLifecycleIntent(intent, for: record.id)
             await reconcileDeferredCompletion(record.id)
         } catch {
+            await terminalizeFailedRestart(record, intent: intent)
             startingContainerIDs.remove(record.id)
             endLifecycleIntent(intent, for: record.id)
-            if cancelledHealthMonitor,
-               let current = try? container(record.id),
-               current.phase == .running || current.phase == .paused {
-                startHealthMonitor(record.id)
-            }
             await reconcileDeferredCompletion(record.id)
             throw error
         }
@@ -705,6 +716,7 @@ public actor EngineRuntime {
         await reconcileExecs(for: removed.id)
         resumeExitWaiters(removed.id, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: removed.id)?.cancel()
+        cancelCompletionMonitor(removed.id)
         try await backend.delete(removed)
         try await backend.deleteLogs(for: removed)
         guard let current = try? containerIndex(removed.id) else { return }
@@ -1609,7 +1621,60 @@ public actor EngineRuntime {
         address.isEmpty ? nil : address
     }
 
-    func persist() async throws { try await store.save(snapshot) }
+    func persist() async throws {
+        try await beforePersistence?()
+        try await store.save(snapshot)
+    }
+
+    /// A backend start can succeed before publishing the running record fails.
+    /// Restore the last durable generation before suspending for backend cleanup
+    /// so unrelated persistence cannot capture an unmonitored execution.
+    private func rollbackFailedStart(original: ContainerRecord, started: ContainerRecord) async {
+        healthTasks.removeValue(forKey: original.id)?.cancel()
+        cancelCompletionMonitor(original.id)
+        if let current = try? containerIndex(original.id) {
+            snapshot.containers[current] = original
+        }
+        _ = try? await backend.stop(started, timeoutSeconds: 0)
+        try? await backend.delete(started)
+        try? await persist()
+    }
+
+    /// `ContainerBackend.restart` may have already stopped the old execution or
+    /// launched its replacement before throwing. Compensate by publishing a
+    /// terminal generation under the restart claim, then cleaning every backend
+    /// execution. Restart-policy and auto-remove reconciliation runs only after
+    /// the caller releases that claim.
+    private func terminalizeFailedRestart(_ original: ContainerRecord, intent: LifecycleIntent) async {
+        healthTasks.removeValue(forKey: original.id)?.cancel()
+        cancelCompletionMonitor(original.id)
+
+        var emittedCompletion = false
+        if lifecycleIntents[original.id] == intent,
+           let current = try? containerIndex(original.id) {
+            let alreadyCompleted = snapshot.containers[current].phase == .exited
+                && snapshot.containers[current].startedAt == original.startedAt
+            if !alreadyCompleted {
+                var failed = snapshot.containers[current]
+                failed.phase = .exited
+                failed.startedAt = original.startedAt
+                failed.finishedAt = Date()
+                failed.exitCode = 127
+                failed.restartCount = original.restartCount
+                snapshot.containers[current] = failed
+                resumeExitWaiters(original.id, code: 127)
+                emit(containerEvent("die", failed, extra: ["exitCode": "127"]))
+                emittedCompletion = true
+            }
+        }
+
+        _ = try? await backend.stop(original, timeoutSeconds: 0)
+        try? await backend.delete(original)
+        await reconcileExecs(for: original.id)
+        if emittedCompletion || (try? container(original.id).phase) == .exited {
+            try? await persist()
+        }
+    }
 
     public func events(since: Date? = nil, until: Date? = nil) -> AsyncStream<RuntimeEvent> {
         let id = UUID()
@@ -1750,15 +1815,47 @@ public actor EngineRuntime {
         }.sorted { $0.references.first ?? "" < $1.references.first ?? "" }
     }
 
-    private func monitorContainer(_ identifier: String, startedAt: Date) async {
-        guard let record = try? container(identifier), let code = await backend.completion(record) else { return }
-        await recordCompletion(identifier, startedAt: startedAt, code: code)
+    private func startCompletionMonitor(_ identifier: String, startedAt: Date) {
+        cancelCompletionMonitor(identifier)
+        let token = UUID()
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.monitorContainer(identifier, startedAt: startedAt, token: token)
+        }
+        completionMonitorTasks[identifier] = (token, task)
     }
 
-    private func recordCompletion(_ identifier: String, startedAt: Date?, code: Int32) async {
+    private func monitorContainer(_ identifier: String, startedAt: Date, token: UUID) async {
+        guard let record = try? container(identifier),
+              let code = await backend.completion(record),
+              !Task.isCancelled else {
+            removeCompletionMonitor(identifier, token: token)
+            return
+        }
+        await recordCompletion(identifier, startedAt: startedAt, code: code, monitorToken: token)
+        removeCompletionMonitor(identifier, token: token)
+    }
+
+    private func cancelCompletionMonitor(_ identifier: String, preserving token: UUID? = nil) {
+        guard let monitor = completionMonitorTasks.removeValue(forKey: identifier) else { return }
+        if monitor.token != token { monitor.task.cancel() }
+    }
+
+    private func removeCompletionMonitor(_ identifier: String, token: UUID) {
+        guard completionMonitorTasks[identifier]?.token == token else { return }
+        completionMonitorTasks.removeValue(forKey: identifier)
+    }
+
+    private func recordCompletion(
+        _ identifier: String,
+        startedAt: Date?,
+        code: Int32,
+        monitorToken: UUID? = nil
+    ) async {
         guard let index = try? containerIndex(identifier),
               snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused,
               snapshot.containers[index].startedAt == startedAt else { return }
+        cancelCompletionMonitor(identifier, preserving: monitorToken)
         snapshot.containers[index].phase = .exited
         snapshot.containers[index].exitCode = code
         snapshot.containers[index].finishedAt = Date()
@@ -1825,7 +1922,7 @@ public actor EngineRuntime {
                 let restartedAt = Date(); restarted.startedAt = restartedAt
                 snapshot.containers[current] = restarted
                 try await persist(); emit(containerEvent("restart", restarted)); startHealthMonitor(identifier)
-                Task { [weak self] in await self?.monitorContainer(identifier, startedAt: restartedAt) }
+                startCompletionMonitor(identifier, startedAt: restartedAt)
                 return
             } catch {
                 if ownsReconciliation(restartIntent, record: record),

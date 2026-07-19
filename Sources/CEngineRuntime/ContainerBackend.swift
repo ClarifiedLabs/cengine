@@ -66,6 +66,9 @@ public protocol ContainerBackend: Sendable {
     func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
+    /// Restart implementations may stop the old execution before throwing.
+    /// They must tolerate EngineRuntime following any failure with idempotent
+    /// `stop` and `delete` calls to remove a partial replacement.
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
     func updateResources(_ container: ContainerRecord) async throws
     func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress]
