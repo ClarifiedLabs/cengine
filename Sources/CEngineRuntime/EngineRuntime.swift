@@ -7,12 +7,20 @@ public struct EngineSnapshot: Codable, Sendable {
     public var networks: [NetworkRecord]
     public var volumes: [VolumeRecord]
     public var images: [ImageRecord]
+    /// Container executions that crossed, or may have crossed, a backend
+    /// launch boundary without durably publishing the resulting generation.
+    /// Optional so snapshots written before launch-intent tracking still load.
+    public var cleanupPendingContainerIDs: Set<String>?
 
-    public init(containers: [ContainerRecord] = [], networks: [NetworkRecord] = [], volumes: [VolumeRecord] = [], images: [ImageRecord] = []) {
+    public init(
+        containers: [ContainerRecord] = [], networks: [NetworkRecord] = [], volumes: [VolumeRecord] = [],
+        images: [ImageRecord] = [], cleanupPendingContainerIDs: Set<String>? = nil
+    ) {
         self.containers = containers
         self.networks = networks
         self.volumes = volumes
         self.images = images
+        self.cleanupPendingContainerIDs = cleanupPendingContainerIDs
     }
 }
 
@@ -86,7 +94,44 @@ public actor EngineRuntime {
         self.beforeEndpointAllocationPersistence = beforeEndpointAllocationPersistence
         self.beforeCompletionMonitoring = beforeCompletionMonitoring
         self.backend = backend
+        self.endpointAllocationCursors = [:]
         self.snapshot = try await store.load(default: EngineSnapshot())
+        // A cleanup-pending marker is written before every backend launch
+        // boundary. It is the first recovered state: no other backend await may
+        // trust or mutate the persisted execution until teardown is verified.
+        let pendingCleanup = snapshot.cleanupPendingContainerIDs ?? []
+        if !pendingCleanup.isEmpty {
+            for identifier in pendingCleanup {
+                guard let index = try? containerIndex(identifier) else {
+                    throw EngineError(
+                        .internalError,
+                        "backend cleanup is pending for missing container record \(identifier)"
+                    )
+                }
+                let pending = snapshot.containers[index]
+                try await cleanupBackendExecution(pending)
+                switch pending.phase {
+                case .running, .paused:
+                    snapshot.containers[index].phase = .exited
+                    snapshot.containers[index].finishedAt = pending.finishedAt ?? Date()
+                    snapshot.containers[index].exitCode = pending.exitCode ?? 137
+                case .dead where pending.startedAt == nil:
+                    snapshot.containers[index].phase = .created
+                    snapshot.containers[index].finishedAt = nil
+                    snapshot.containers[index].exitCode = nil
+                case .dead:
+                    snapshot.containers[index].phase = .exited
+                    snapshot.containers[index].finishedAt = pending.finishedAt ?? Date()
+                    snapshot.containers[index].exitCode = pending.exitCode ?? 127
+                case .created, .exited:
+                    break
+                }
+                clearCleanupPending(identifier)
+            }
+            // Do not proceed to restore networks or another policy-driven
+            // launch until the safe phase and cleared marker are durable.
+            try await persist()
+        }
         self.endpointAllocationCursors = try await endpointAllocationStore.load(default: [:])
         let persistedNetworks = Dictionary(uniqueKeysWithValues: snapshot.networks.map { ($0.id, $0) })
         self.snapshot.networks = try await backend.restoreNetworks(snapshot.networks)
@@ -127,8 +172,8 @@ public actor EngineRuntime {
         // `.dead` is a durable quarantine for an execution whose cleanup could
         // not be verified. It must never be treated as an inert record: a
         // backend process may still be live even though no monitor survived the
-        // previous daemon. Refuse to finish recovery until both stopping and
-        // deleting that execution succeed.
+        // previous daemon. Refuse to finish recovery until definitive deletion
+        // succeeds; stop is best-effort diagnostic context for delete failure.
         for index in snapshot.containers.indices where snapshot.containers[index].phase == .dead {
             let quarantined = snapshot.containers[index]
             do {
@@ -170,10 +215,19 @@ public actor EngineRuntime {
             } else {
                 guard stale.phase == .exited, stale.restartPolicy.name == "always" else { continue }
             }
+            var launchAttempted = false
             do {
                 var restarted = snapshot.containers[index]
                 restarted.restartCount += 1
                 try await backend.prepare(restarted)
+                markCleanupPending(restarted.id)
+                do {
+                    try await persist()
+                } catch {
+                    clearCleanupPending(restarted.id)
+                    throw error
+                }
+                launchAttempted = true
                 restarted.ports = try await backend.start(restarted)
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let addresses = await backend.endpointAddresses(for: restarted)
@@ -184,10 +238,32 @@ public actor EngineRuntime {
                 }
                 let startedAt = Date(); restarted.startedAt = startedAt
                 snapshot.containers[index] = restarted
+                clearCleanupPending(restarted.id)
+                try await persist()
                 recovered.append((restarted.id, startedAt))
             } catch {
-                snapshot.containers[index].phase = .dead
+                guard launchAttempted else {
+                    snapshot.containers[index].phase = .dead
+                    snapshot.containers[index].exitCode = 127
+                    continue
+                }
+                markCleanupPending(stale.id)
+                do {
+                    try await cleanupBackendExecution(snapshot.containers[index])
+                } catch {
+                    try? await persist()
+                    throw error
+                }
+                snapshot.containers[index].phase = .exited
+                snapshot.containers[index].finishedAt = Date()
                 snapshot.containers[index].exitCode = 127
+                clearCleanupPending(stale.id)
+                do {
+                    try await persist()
+                } catch {
+                    markCleanupPending(stale.id)
+                    throw error
+                }
             }
         }
         if let backendImages = try await backend.listImages() {
@@ -294,6 +370,9 @@ public actor EngineRuntime {
         guard lifecycleIntents[record.id] == nil else {
             throw EngineError(.conflict, "container \(identifier) has a lifecycle operation in progress")
         }
+        guard !cleanupIsPending(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) has backend cleanup pending")
+        }
         guard record.phase != .running else { return }
         let intent = try beginLifecycleIntent(.start, for: record.id)
         guard startingContainerIDs.insert(record.id).inserted else {
@@ -311,6 +390,18 @@ public actor EngineRuntime {
             guard ownsLifecycleExecution(intent, record: record) else {
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
+            markCleanupPending(record.id)
+            do {
+                try await persist()
+            } catch {
+                clearCleanupPending(record.id)
+                throw error
+            }
+            guard ownsLifecycleExecution(intent, record: record) else {
+                clearCleanupPending(record.id)
+                try await persist()
+                throw EngineError(.conflict, "container was removed or changed while it was starting")
+            }
             let resolvedPorts: [PortBinding]
             do {
                 resolvedPorts = try await backend.start(record)
@@ -325,8 +416,7 @@ public actor EngineRuntime {
             }
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
-                _ = try? await backend.stop(record, timeoutSeconds: 0)
-                try? await backend.delete(record)
+                try await rollbackFailedStart(original: record, started: record)
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
 
@@ -340,11 +430,11 @@ public actor EngineRuntime {
             started = await applyingEndpointAddresses(to: started)
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
-                _ = try? await backend.stop(started, timeoutSeconds: 0)
-                try? await backend.delete(started)
+                try await rollbackFailedStart(original: record, started: started)
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
             snapshot.containers[current] = started
+            clearCleanupPending(record.id)
             do {
                 try await persist()
             } catch {
@@ -356,8 +446,7 @@ public actor EngineRuntime {
                   let published = try? container(record.id),
                   published.phase == .running,
                   published.startedAt == startedAt else {
-                _ = try? await backend.stop(started, timeoutSeconds: 0)
-                try? await backend.delete(started)
+                try await rollbackFailedStart(original: record, started: started)
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
             emit(containerEvent("start", published))
@@ -517,6 +606,9 @@ public actor EngineRuntime {
         guard activeExecOperations[record.id, default: 0] == 0 else {
             throw EngineError(.conflict, "container \(identifier) has an exec operation in progress")
         }
+        guard !cleanupIsPending(record.id) else {
+            throw EngineError(.conflict, "container \(identifier) has backend cleanup pending")
+        }
         guard record.phase == .running || record.phase == .paused else {
             try await startContainer(identifier)
             return
@@ -525,6 +617,28 @@ public actor EngineRuntime {
         guard startingContainerIDs.insert(record.id).inserted else {
             endLifecycleIntent(intent, for: record.id)
             throw EngineError(.conflict, "container \(identifier) is already starting")
+        }
+        markCleanupPending(record.id)
+        do {
+            try await persist()
+        } catch {
+            clearCleanupPending(record.id)
+            startingContainerIDs.remove(record.id)
+            endLifecycleIntent(intent, for: record.id)
+            throw error
+        }
+        guard ownsRestartExecution(intent, record: record) else {
+            clearCleanupPending(record.id)
+            do {
+                try await persist()
+            } catch {
+                startingContainerIDs.remove(record.id)
+                endLifecycleIntent(intent, for: record.id)
+                throw error
+            }
+            startingContainerIDs.remove(record.id)
+            endLifecycleIntent(intent, for: record.id)
+            throw EngineError(.conflict, "container was removed or changed while it was restarting")
         }
         do {
             try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
@@ -574,6 +688,7 @@ public actor EngineRuntime {
                 restarted.networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
             }
             snapshot.containers[current] = restarted
+            clearCleanupPending(record.id)
             try await persist()
             guard lifecycleIntents[record.id] == intent,
                   let published = try? container(record.id),
@@ -768,6 +883,7 @@ public actor EngineRuntime {
         try await backend.deleteLogs(for: removed)
         guard let current = try? containerIndex(removed.id) else { return }
         snapshot.containers.remove(at: current)
+        clearCleanupPending(removed.id)
         if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
         resumeRemovalWaiters(removed.id, code: removed.exitCode ?? 0)
         try await persist()
@@ -1673,54 +1789,59 @@ public actor EngineRuntime {
         try await store.save(snapshot)
     }
 
+    private func markCleanupPending(_ identifier: String) {
+        var pending = snapshot.cleanupPendingContainerIDs ?? []
+        pending.insert(identifier)
+        snapshot.cleanupPendingContainerIDs = pending
+    }
+
+    private func clearCleanupPending(_ identifier: String) {
+        guard var pending = snapshot.cleanupPendingContainerIDs else { return }
+        pending.remove(identifier)
+        snapshot.cleanupPendingContainerIDs = pending.isEmpty ? nil : pending
+    }
+
+    private func cleanupIsPending(_ identifier: String) -> Bool {
+        snapshot.cleanupPendingContainerIDs?.contains(identifier) == true
+    }
+
     /// A backend start can partially launch before throwing, or succeed before
-    /// publishing the running record fails. Persist a quarantine before cleanup
-    /// and restore the previous generation only after cleanup is verified.
+    /// publishing the running record fails. The pre-launch cleanup marker stays
+    /// set until definitive teardown and restoration are both durable.
     private func rollbackFailedStart(original: ContainerRecord, started: ContainerRecord) async throws {
         healthTasks.removeValue(forKey: original.id)?.cancel()
         cancelCompletionMonitor(original.id)
-        guard let current = try? containerIndex(original.id) else {
+        markCleanupPending(original.id)
+        // This is normally a repeat of the marker save performed before launch.
+        // Best-effort persistence also covers a failure detected after a
+        // successful running publication.
+        try? await persist()
+        guard (try? containerIndex(original.id)) != nil else {
             try await cleanupBackendExecution(started)
+            clearCleanupPending(original.id)
+            try await persist()
             return
         }
-        var quarantined = snapshot.containers[current]
-        quarantined.phase = .dead
-        quarantined.finishedAt = Date()
-        quarantined.exitCode = 127
-        snapshot.containers[current] = quarantined
-        // Even a persistence failure must not prevent the immediate cleanup
-        // attempt. A successful final save below makes the intermediate failure
-        // irrelevant; a cleanup failure retries the quarantine save.
-        var quarantinePersistenceFailure: String?
-        do {
-            try await persist()
-        } catch {
-            quarantinePersistenceFailure = EngineError.message(for: error)
-        }
         do {
             try await cleanupBackendExecution(started)
         } catch {
-            let cleanupFailure = EngineError.message(for: error)
-            do {
-                try await persist()
-            } catch {
-                let persistenceFailures = [quarantinePersistenceFailure, EngineError.message(for: error)]
-                    .compactMap { $0 }
-                    .joined(separator: "; retry: ")
-                throw EngineError(
-                    .internalError,
-                    "\(cleanupFailure); durable cleanup quarantine could not be saved (\(persistenceFailures))"
-                )
-            }
-            throw EngineError(.internalError, cleanupFailure)
+            // The original pre-launch save is the safety boundary. These
+            // bounded retries improve diagnostics/durability when storage
+            // transiently recovers, but correctness does not depend on them.
+            try? await persist()
+            throw error
         }
-        guard let restored = try? containerIndex(original.id) else { return }
+        guard let restored = try? containerIndex(original.id) else {
+            clearCleanupPending(original.id)
+            try await persist()
+            return
+        }
         snapshot.containers[restored] = original
+        clearCleanupPending(original.id)
         do {
             try await persist()
         } catch {
-            snapshot.containers[restored] = quarantined
-            try? await persist()
+            markCleanupPending(original.id)
             throw error
         }
     }
@@ -1733,61 +1854,52 @@ public actor EngineRuntime {
     private func terminalizeFailedRestart(_ original: ContainerRecord, intent: LifecycleIntent) async throws {
         healthTasks.removeValue(forKey: original.id)?.cancel()
         cancelCompletionMonitor(original.id)
+        markCleanupPending(original.id)
+        try? await persist()
 
         guard lifecycleIntents[original.id] == intent,
-              let current = try? containerIndex(original.id) else {
+              (try? containerIndex(original.id)) != nil else {
             try await cleanupBackendExecution(original)
+            clearCleanupPending(original.id)
+            try await persist()
             return
         }
-        var quarantined = snapshot.containers[current]
-        quarantined.phase = .dead
-        quarantined.startedAt = original.startedAt
-        quarantined.finishedAt = Date()
-        quarantined.exitCode = 127
-        quarantined.restartCount = original.restartCount
-        snapshot.containers[current] = quarantined
-        var quarantinePersistenceFailure: String?
-        do {
-            try await persist()
-        } catch {
-            quarantinePersistenceFailure = EngineError.message(for: error)
-        }
         do {
             try await cleanupBackendExecution(original)
         } catch {
-            let cleanupFailure = EngineError.message(for: error)
-            do {
-                try await persist()
-            } catch {
-                let persistenceFailures = [quarantinePersistenceFailure, EngineError.message(for: error)]
-                    .compactMap { $0 }
-                    .joined(separator: "; retry: ")
-                throw EngineError(
-                    .internalError,
-                    "\(cleanupFailure); durable cleanup quarantine could not be saved (\(persistenceFailures))"
-                )
-            }
-            throw EngineError(.internalError, cleanupFailure)
-        }
-
-        await reconcileExecs(for: original.id)
-        guard let terminal = try? containerIndex(original.id) else { return }
-        var failed = snapshot.containers[terminal]
-        failed.phase = .exited
-        failed.startedAt = original.startedAt
-        failed.finishedAt = Date()
-        failed.exitCode = 127
-        failed.restartCount = original.restartCount
-        snapshot.containers[terminal] = failed
-        do {
-            try await persist()
-        } catch {
-            snapshot.containers[terminal] = quarantined
             try? await persist()
             throw error
         }
-        resumeExitWaiters(original.id, code: 127)
-        emit(containerEvent("die", failed, extra: ["exitCode": "127"]))
+
+        await reconcileExecs(for: original.id)
+        guard let terminal = try? containerIndex(original.id) else {
+            clearCleanupPending(original.id)
+            try await persist()
+            return
+        }
+        let completedOldGeneration = snapshot.containers[terminal].phase == .exited
+            && snapshot.containers[terminal].startedAt == original.startedAt
+            && snapshot.containers[terminal].exitCode != nil
+        var failed = snapshot.containers[terminal]
+        if !completedOldGeneration {
+            failed.phase = .exited
+            failed.startedAt = original.startedAt
+            failed.finishedAt = Date()
+            failed.exitCode = 127
+            failed.restartCount = original.restartCount
+            snapshot.containers[terminal] = failed
+        }
+        clearCleanupPending(original.id)
+        do {
+            try await persist()
+        } catch {
+            markCleanupPending(original.id)
+            throw error
+        }
+        if !completedOldGeneration {
+            resumeExitWaiters(original.id, code: 127)
+            emit(containerEvent("die", failed, extra: ["exitCode": "127"]))
+        }
     }
 
     /// `delete` is the backend's definitive teardown operation. Always attempt
@@ -2014,6 +2126,7 @@ public actor EngineRuntime {
 
     private func reconcileDeferredCompletion(_ identifier: String) async {
         guard lifecycleIntents[identifier] == nil,
+              !cleanupIsPending(identifier),
               let index = try? containerIndex(identifier),
               snapshot.containers[index].phase == .exited,
               let code = snapshot.containers[index].exitCode else { return }
@@ -2028,7 +2141,7 @@ public actor EngineRuntime {
         guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .exited else { return }
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
-        if intent == nil, !autoRemove, Self.shouldRestart(record, exitCode: code) {
+        if intent == nil, !autoRemove, !cleanupIsPending(identifier), Self.shouldRestart(record, exitCode: code) {
             let restartIntent: LifecycleIntent
             do {
                 restartIntent = try beginLifecycleIntent(.restart, for: identifier)
@@ -2043,38 +2156,66 @@ public actor EngineRuntime {
                 startingContainerIDs.remove(identifier)
                 endLifecycleIntent(restartIntent, for: identifier)
             }
+            var crossedLaunchBoundary = false
             do {
                 var restarted = record; restarted.restartCount += 1
                 try await backend.delete(record)
                 guard ownsReconciliation(restartIntent, record: record) else { return }
                 try await backend.prepare(restarted)
                 guard ownsReconciliation(restartIntent, record: record) else { return }
+                markCleanupPending(identifier)
+                do {
+                    try await persist()
+                } catch {
+                    clearCleanupPending(identifier)
+                    throw error
+                }
+                guard ownsReconciliation(restartIntent, record: record) else {
+                    clearCleanupPending(identifier)
+                    try await persist()
+                    return
+                }
+                crossedLaunchBoundary = true
                 restarted.ports = try await backend.start(restarted)
                 guard ownsReconciliation(restartIntent, record: record) else {
-                    _ = try? await backend.stop(restarted, timeoutSeconds: 0)
-                    try? await backend.delete(restarted)
-                    return
+                    throw EngineError(.conflict, "container changed while restart policy was launching it")
                 }
                 restarted = await applyingEndpointAddresses(to: restarted)
                 guard ownsReconciliation(restartIntent, record: record),
                       let current = try? containerIndex(identifier) else {
-                    _ = try? await backend.stop(restarted, timeoutSeconds: 0)
-                    try? await backend.delete(restarted)
-                    return
+                    throw EngineError(.conflict, "container changed while restart policy was publishing it")
                 }
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let restartedAt = Date(); restarted.startedAt = restartedAt
                 snapshot.containers[current] = restarted
+                clearCleanupPending(identifier)
                 try await persist(); emit(containerEvent("restart", restarted)); startHealthMonitor(identifier)
                 startCompletionMonitor(identifier, startedAt: restartedAt)
                 return
             } catch {
-                if ownsReconciliation(restartIntent, record: record),
-                   let current = try? containerIndex(identifier) {
-                    snapshot.containers[current].phase = .dead
+                guard crossedLaunchBoundary else { return }
+                markCleanupPending(identifier)
+                do {
+                    try await cleanupBackendExecution(record)
+                    if let current = try? containerIndex(identifier) {
+                        snapshot.containers[current].phase = .exited
+                        snapshot.containers[current].startedAt = record.startedAt
+                        snapshot.containers[current].finishedAt = record.finishedAt
+                        snapshot.containers[current].exitCode = record.exitCode
+                        snapshot.containers[current].restartCount = record.restartCount
+                    }
+                    clearCleanupPending(identifier)
+                    do {
+                        try await persist()
+                    } catch {
+                        markCleanupPending(identifier)
+                    }
+                } catch {
+                    // The pre-launch marker is already durable. Recovery must
+                    // verify teardown before this record can launch again.
+                    try? await persist()
                 }
             }
-            try? await persist()
             return
         }
 
@@ -2097,7 +2238,15 @@ public actor EngineRuntime {
                 if ownsIntent { endLifecycleIntent(removeIntent, for: identifier) }
             }
             guard ownsReconciliation(removeIntent, record: record) else { return }
-            try? await backend.delete(record)
+            if cleanupIsPending(identifier) {
+                do {
+                    try await cleanupBackendExecution(record)
+                } catch {
+                    return
+                }
+            } else {
+                try? await backend.delete(record)
+            }
             guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.deleteLogs(for: record)
             guard ownsReconciliation(removeIntent, record: record) else { return }
@@ -2105,6 +2254,7 @@ public actor EngineRuntime {
             guard ownsReconciliation(removeIntent, record: record),
                   let current = try? containerIndex(identifier) else { return }
             snapshot.containers.remove(at: current)
+            clearCleanupPending(identifier)
             resumeRemovalWaiters(identifier, code: code)
             emit(containerEvent("destroy", record))
         }
