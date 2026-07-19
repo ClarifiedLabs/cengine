@@ -26,20 +26,32 @@ struct RawBackendExecutionFence: Sendable {
         tokens[identifier] == token
     }
 
-    /// Runs a generation-owned publication without permitting suspension
-    /// between the ownership check and its mutations.
-    func publishIfOwned(
-        _ identifier: String,
-        token: Token,
-        _ publication: () -> Void
-    ) -> Bool {
-        guard owns(identifier, token: token) else { return false }
-        publication()
-        return true
-    }
-
     mutating func remove(_ identifier: String) {
         tokens.removeValue(forKey: identifier)
+    }
+}
+
+struct RawCompletionPublication<Value: Sendable>: Sendable {
+    let value: Value
+    let synchronizeFabric: Bool
+}
+
+/// The production ordering boundary for raw workload completion. Generation
+/// validation and every generation-owned mutation supplied by `publish` happen
+/// before the first possible suspension at `synchronizeFabric`.
+enum RawCompletionPublisher {
+    static func run<Value: Sendable>(
+        isolation _: isolated (any Actor) = #isolation,
+        fence: RawBackendExecutionFence,
+        identifier: String,
+        generation: RawBackendExecutionFence.Token,
+        publish: () -> RawCompletionPublication<Value>,
+        synchronizeFabric: () async -> Void
+    ) async -> Value? {
+        guard fence.owns(identifier, token: generation) else { return nil }
+        let publication = publish()
+        if publication.synchronizeFabric { await synchronizeFabric() }
+        return publication.value
     }
 }
 
@@ -855,35 +867,34 @@ public actor RawVirtualizationBackend: ContainerBackend {
         code: Int32,
         generation: RawBackendExecutionFence.Token
     ) async -> Int32 {
-        // This check and every generation-owned teardown must remain in one
-        // non-suspending actor turn. synchronizeFabric() yields; by the time it
-        // returns, start() may have installed replacement ports and log state.
-        let fence = executionFence
-        var publishedCode = code
-        var needsFabricSynchronization = true
-        guard fence.publishIfOwned(container.id, token: generation, {
-            if completionTasks[container.id]?.generation == generation {
-                completionTasks.removeValue(forKey: container.id)
-            }
-            if let existing = completions[container.id] {
-                publishedCode = existing
-                needsFabricSynchronization = false
-                return
-            }
-            completions[container.id] = code
-            activeContainers.removeValue(forKey: container.id)
-            if let shim = shims[container.id] { finishExecSessions(using: shim) }
-            if let forwarding = portForwardingRegistrations[container.id],
-               forwarding.generation == generation {
-                portForwardingRegistrations.removeValue(forKey: container.id)
-                portForwarder.stop(
-                    containerID: container.id, registration: forwarding.registration
-                )
-            }
-            logMonitors.removeValue(forKey: container.id)?.stop()
-        }) else { return code }
-        if needsFabricSynchronization { try? await synchronizeFabric() }
-        return publishedCode
+        await RawCompletionPublisher.run(
+            fence: executionFence,
+            identifier: container.id,
+            generation: generation,
+            publish: {
+                if completionTasks[container.id]?.generation == generation {
+                    completionTasks.removeValue(forKey: container.id)
+                }
+                if let existing = completions[container.id] {
+                    return RawCompletionPublication(
+                        value: existing, synchronizeFabric: false
+                    )
+                }
+                completions[container.id] = code
+                activeContainers.removeValue(forKey: container.id)
+                if let shim = shims[container.id] { finishExecSessions(using: shim) }
+                if let forwarding = portForwardingRegistrations[container.id],
+                   forwarding.generation == generation {
+                    portForwardingRegistrations.removeValue(forKey: container.id)
+                    portForwarder.stop(
+                        containerID: container.id, registration: forwarding.registration
+                    )
+                }
+                logMonitors.removeValue(forKey: container.id)?.stop()
+                return RawCompletionPublication(value: code, synchronizeFabric: true)
+            },
+            synchronizeFabric: { try? await self.synchronizeFabric() }
+        ) ?? code
     }
 
     private func requireExecutionGeneration(

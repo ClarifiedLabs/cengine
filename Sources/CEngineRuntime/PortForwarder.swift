@@ -12,10 +12,14 @@ final class PortForwarder: @unchecked Sendable {
         fileprivate let id = UUID()
     }
 
+    private struct RegistrationState {
+        var channels: [ObjectIdentifier: Channel] = [:]
+    }
+
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     private let privilegedPorts = PrivilegedPortClient()
     private let lock = NSLock()
-    private var listeners: [String: [Registration: [Channel]]] = [:]
+    private var registrations: [String: [Registration: RegistrationState]] = [:]
 
     func start(
         containerID: String,
@@ -23,7 +27,9 @@ final class PortForwarder: @unchecked Sendable {
         bindings: [PortBinding],
         connect: @escaping PortStreamConnector
     ) async throws -> [PortBinding] {
-        var started: [Channel] = []
+        guard begin(containerID: containerID, registration: registration) else {
+            throw EngineError(.conflict, "port forwarding registration is already active")
+        }
         var resolved: [PortBinding] = []
         do {
             for binding in bindings {
@@ -45,7 +51,12 @@ final class PortForwarder: @unchecked Sendable {
                             try await bootstrap.withBoundSocket($0).get()
                         }
                     }
-                    started.append(channel)
+                    guard track(
+                        channel, containerID: containerID, registration: registration
+                    ) else {
+                        channel.close(promise: nil)
+                        throw EngineError(.conflict, "port forwarding registration stopped while binding")
+                    }
                     var value = binding
                     value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
                     resolved.append(value)
@@ -55,22 +66,102 @@ final class PortForwarder: @unchecked Sendable {
                 let bootstrap = ServerBootstrap(group: group)
                     .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                     .childChannelOption(ChannelOptions.autoRead, value: false)
-                    .childChannelInitializer { [group] inbound in
-                        inbound.eventLoop.makeFutureWithTask {
-                            let descriptor = try await connect(binding)
-                            let outbound = try await ClientBootstrap(group: group)
-                                .channelOption(ChannelOptions.autoRead, value: false)
-                                .withConnectedSocket(descriptor).get()
-                            do {
-                                _ = try await inbound.pipeline.addHandler(RelayHandler(peer: outbound)).and(
-                                    outbound.pipeline.addHandler(RelayHandler(peer: inbound))
-                                ).get()
-                                try await inbound.setOption(ChannelOptions.autoRead, value: true).get()
-                                try await outbound.setOption(ChannelOptions.autoRead, value: true).get()
-                            } catch {
-                                outbound.close(promise: nil)
-                                throw error
+                    .childChannelInitializer { [weak self, group] inbound in
+                        guard let self,
+                              self.track(
+                                inbound, containerID: containerID, registration: registration
+                              ) else {
+                            inbound.close(promise: nil)
+                            return inbound.eventLoop.makeFailedFuture(
+                                EngineError(.conflict, "port forwarding registration stopped")
+                            )
+                        }
+                        let lifecycle = PortForwardChannelLifecycleHandler { [weak self, weak inbound] in
+                            guard let self, let inbound else { return }
+                            self.untrack(
+                                inbound, containerID: containerID, registration: registration
+                            )
+                        }
+                        return inbound.pipeline.addHandler(lifecycle).flatMap {
+                            inbound.eventLoop.makeFutureWithTask {
+                                let descriptor = try await connect(binding)
+                                let outbound = try await ClientBootstrap(group: group)
+                                    .channelOption(ChannelOptions.autoRead, value: false)
+                                    .withConnectedSocket(descriptor).get()
+                                do {
+                                    guard self.track(
+                                        outbound,
+                                        containerID: containerID,
+                                        registration: registration
+                                    ) else {
+                                        outbound.close(promise: nil)
+                                        throw EngineError(
+                                            .conflict, "port forwarding registration stopped"
+                                        )
+                                    }
+                                    let outboundLifecycle = PortForwardChannelLifecycleHandler {
+                                        [weak self, weak outbound] in
+                                        guard let self, let outbound else { return }
+                                        self.untrack(
+                                            outbound,
+                                            containerID: containerID,
+                                            registration: registration
+                                        )
+                                    }
+                                    try await outbound.pipeline.addHandler(outboundLifecycle).get()
+                                    guard outbound.isActive,
+                                          self.contains(
+                                            outbound,
+                                            containerID: containerID,
+                                            registration: registration
+                                          ) else {
+                                        self.untrack(
+                                            outbound,
+                                            containerID: containerID,
+                                            registration: registration
+                                        )
+                                        outbound.close(promise: nil)
+                                        throw EngineError(
+                                            .conflict, "port forwarding connection closed"
+                                        )
+                                    }
+                                    _ = try await inbound.pipeline.addHandler(RelayHandler(peer: outbound)).and(
+                                        outbound.pipeline.addHandler(RelayHandler(peer: inbound))
+                                    ).get()
+                                    guard self.contains(
+                                            inbound,
+                                            containerID: containerID,
+                                            registration: registration
+                                          ),
+                                          self.contains(
+                                            outbound,
+                                            containerID: containerID,
+                                            registration: registration
+                                          ) else {
+                                        inbound.close(promise: nil)
+                                        outbound.close(promise: nil)
+                                        throw EngineError(
+                                            .conflict, "port forwarding registration stopped"
+                                        )
+                                    }
+                                    try await inbound.setOption(ChannelOptions.autoRead, value: true).get()
+                                    try await outbound.setOption(ChannelOptions.autoRead, value: true).get()
+                                } catch {
+                                    self.untrack(
+                                        outbound,
+                                        containerID: containerID,
+                                        registration: registration
+                                    )
+                                    outbound.close(promise: nil)
+                                    throw error
+                                }
                             }
+                        }.flatMapError { error in
+                            inbound.close(promise: nil)
+                            self.untrack(
+                                inbound, containerID: containerID, registration: registration
+                            )
+                            return inbound.eventLoop.makeFailedFuture(error)
                         }
                     }
                 let channel: Channel
@@ -84,18 +175,70 @@ final class PortForwarder: @unchecked Sendable {
                         try await bootstrap.withBoundSocket($0).get()
                     }
                 }
-                started.append(channel)
+                guard track(
+                    channel, containerID: containerID, registration: registration
+                ) else {
+                    channel.close(promise: nil)
+                    throw EngineError(.conflict, "port forwarding registration stopped while binding")
+                }
                 var value = binding
                 value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
                 resolved.append(value)
             }
-            lock.withLock {
-                listeners[containerID, default: [:]][registration, default: []].append(contentsOf: started)
+            guard contains(containerID: containerID, registration: registration) else {
+                throw EngineError(.conflict, "port forwarding registration stopped while starting")
             }
             return resolved
         } catch {
-            started.forEach { $0.close(promise: nil) }
+            stop(containerID: containerID, registration: registration)
             throw error
+        }
+    }
+
+    private func begin(containerID: String, registration: Registration) -> Bool {
+        lock.withLock {
+            guard registrations[containerID]?[registration] == nil else { return false }
+            registrations[containerID, default: [:]][registration] = RegistrationState()
+            return true
+        }
+    }
+
+    private func contains(containerID: String, registration: Registration) -> Bool {
+        lock.withLock { registrations[containerID]?[registration] != nil }
+    }
+
+    private func contains(
+        _ channel: Channel,
+        containerID: String,
+        registration: Registration
+    ) -> Bool {
+        lock.withLock {
+            registrations[containerID]?[registration]?
+                .channels[ObjectIdentifier(channel)] != nil
+        }
+    }
+
+    private func track(
+        _ channel: Channel,
+        containerID: String,
+        registration: Registration
+    ) -> Bool {
+        lock.withLock {
+            guard registrations[containerID]?[registration] != nil else { return false }
+            registrations[containerID]?[registration]?.channels[ObjectIdentifier(channel)] = channel
+            return true
+        }
+    }
+
+    private func untrack(
+        _ channel: Channel,
+        containerID: String,
+        registration: Registration
+    ) {
+        _ = lock.withLock {
+            registrations[containerID]?[registration]?.channels.removeValue(
+                forKey: ObjectIdentifier(channel)
+            )
         }
     }
 
@@ -120,15 +263,19 @@ final class PortForwarder: @unchecked Sendable {
 
     func stop(containerID: String) {
         let values = lock.withLock {
-            listeners.removeValue(forKey: containerID)?.values.flatMap { $0 } ?? []
+            registrations.removeValue(forKey: containerID)?.values
+                .flatMap { $0.channels.values } ?? []
         }
         values.forEach { $0.close(promise: nil) }
     }
 
     func stop(containerID: String, registration: Registration) {
         let values = lock.withLock {
-            let values = listeners[containerID]?.removeValue(forKey: registration) ?? []
-            if listeners[containerID]?.isEmpty == true { listeners.removeValue(forKey: containerID) }
+            let values = registrations[containerID]?.removeValue(forKey: registration)
+                .map { Array($0.channels.values) } ?? []
+            if registrations[containerID]?.isEmpty == true {
+                registrations.removeValue(forKey: containerID)
+            }
             return values
         }
         values.forEach { $0.close(promise: nil) }
@@ -136,11 +283,24 @@ final class PortForwarder: @unchecked Sendable {
 
     func stopAll() {
         let values = lock.withLock {
-            let result = listeners.values.flatMap { $0.values }.flatMap { $0 }
-            listeners.removeAll()
+            let result = registrations.values.flatMap { $0.values }
+                .flatMap { $0.channels.values }
+            registrations.removeAll()
             return result
         }
         values.forEach { $0.close(promise: nil) }
+    }
+}
+
+private final class PortForwardChannelLifecycleHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    private let inactive: @Sendable () -> Void
+
+    init(inactive: @escaping @Sendable () -> Void) { self.inactive = inactive }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        inactive()
+        context.fireChannelInactive()
     }
 }
 

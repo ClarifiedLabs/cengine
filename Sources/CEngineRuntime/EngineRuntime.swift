@@ -903,6 +903,14 @@ public actor EngineRuntime {
         let record = snapshot.containers[index]
         switch condition ?? "not-running" {
         case "", "not-running":
+            // Force removal publishes a terminal-looking `.dead` fence before
+            // backend.stop returns. That fence is not an exit result: keep the
+            // default wait attached until the removal path records the
+            // backend's authoritative stop code (or a later retry does so).
+            if snapshot.removalPendingContainerIDs?.contains(record.id) == true,
+               record.exitCode == nil {
+                return waitSubscription(containerID: record.id, removal: false)
+            }
             guard record.phase == .running || record.phase == .paused else {
                 return immediateWaitSubscription(code: record.exitCode ?? 0)
             }
@@ -980,7 +988,9 @@ public actor EngineRuntime {
             throw error
         }
 
-        resumeExitWaiters(identifier, code: removed.exitCode ?? 137)
+        if let exitCode = removed.exitCode {
+            resumeExitWaiters(identifier, code: exitCode)
+        }
         healthTasks.removeValue(forKey: identifier)?.cancel()
         cancelCompletionMonitor(identifier)
         let removedVolumeMetadata = effectiveRemoveVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
@@ -988,7 +998,15 @@ public actor EngineRuntime {
             removed, removedVolumes: removedVolumeMetadata.map(\.element)
         )
         do {
-            try await cleanupBackendExecution(removed)
+            let cleanupCode = try await cleanupBackendExecution(removed)
+            if removed.exitCode == nil {
+                let exitCode = cleanupCode ?? 137
+                if let current = try? containerIndex(identifier) {
+                    snapshot.containers[current].exitCode = exitCode
+                    snapshot.containers[current].finishedAt = Date()
+                }
+                resumeExitWaiters(identifier, code: exitCode)
+            }
             try await backend.deleteLogs(for: removed)
             if effectiveRemoveVolumes { try await removeAnonymousVolumes(usedBy: removed) }
         } catch {
@@ -2166,16 +2184,18 @@ public actor EngineRuntime {
     /// it after a stop failure; a successful delete verifies cleanup on its own,
     /// while a delete failure retains the quarantine and includes any preceding
     /// stop failure as diagnostic context.
-    private func cleanupBackendExecution(_ record: ContainerRecord) async throws {
+    @discardableResult
+    private func cleanupBackendExecution(_ record: ContainerRecord) async throws -> Int32? {
         var stopFailure: String?
+        var stopCode: Int32?
         do {
-            _ = try await backend.stop(record, timeoutSeconds: 0)
+            stopCode = try await backend.stop(record, timeoutSeconds: 0)
         } catch {
             stopFailure = EngineError.message(for: error)
         }
         do {
             try await backend.delete(record)
-            return
+            return stopCode
         } catch {
             let failures = [stopFailure.map { "stop: \($0)" }, "delete: \(EngineError.message(for: error))"]
                 .compactMap { $0 }

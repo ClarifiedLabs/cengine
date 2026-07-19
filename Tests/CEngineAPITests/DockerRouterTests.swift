@@ -951,6 +951,7 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
     private var preparedContainers = Set<String>()
     private var runningContainers = Set<String>()
     private var failAndBlockNextStop = false
+    private var blockedStopCode: Int32?
     private var stopBlocked = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var starts = 0
@@ -969,12 +970,16 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
     func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
         stops += 1
         runningContainers.remove(container.id)
-        guard failAndBlockNextStop else { return 137 }
+        guard failAndBlockNextStop || blockedStopCode != nil else { return 137 }
+        let shouldFail = failAndBlockNextStop
+        let code = blockedStopCode ?? 137
         failAndBlockNextStop = false
+        blockedStopCode = nil
         stopBlocked = true
         await withCheckedContinuation { stopContinuation = $0 }
         stopBlocked = false
-        throw Failure.stopAfterSideEffect
+        if shouldFail { throw Failure.stopAfterSideEffect }
+        return code
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
     func delete(_ container: ContainerRecord) async throws {
@@ -985,6 +990,7 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
     func completion(_: ContainerRecord) async -> Int32? { nil }
 
     func blockAndFailNextStopAfterSideEffect() { failAndBlockNextStop = true }
+    func blockNextStop(returning code: Int32) { blockedStopCode = code }
     func isStopBlocked() -> Bool { stopBlocked }
     func releaseStop() {
         stopContinuation?.resume()
@@ -997,11 +1003,14 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
 
 private actor WaitObservation {
     private var didComplete = false
+    private var result: Int32?
 
-    func record(_: Int32?) {
+    func record(_ value: Int32?) {
         didComplete = true
+        result = value
     }
     func completed() -> Bool { didComplete }
+    func value() -> Int32? { result }
 }
 
 /// Models a backend whose restart first stops the old execution and can then
@@ -1555,18 +1564,18 @@ private actor RawCompletionPublicationHarness {
         generation: RawBackendExecutionFence.Token,
         fabricBoundary: FinalPersistenceGate
     ) async -> Bool {
-        // This is the production primitive used by recordCompletion: the
-        // ownership decision and all ID-keyed teardown are synchronous.
-        let snapshot = fence
-        guard snapshot.publishIfOwned(identifier, token: generation, {
-            destructivePublications += 1
-            hasPortForwarding = false
-            hasLogMonitor = false
-        }) else { return false }
-
-        // synchronizeFabric() is the first suspension after publication.
-        await fabricBoundary.blockWhenArmed()
-        return true
+        await RawCompletionPublisher.run(
+            fence: fence,
+            identifier: identifier,
+            generation: generation,
+            publish: {
+                destructivePublications += 1
+                hasPortForwarding = false
+                hasLogMonitor = false
+                return RawCompletionPublication(value: true, synchronizeFabric: true)
+            },
+            synchronizeFabric: { await fabricBoundary.blockWhenArmed() }
+        ) ?? false
     }
 
     func publicationCount() -> Int { destructivePublications }
@@ -5670,6 +5679,73 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(durable.cleanupPendingContainerIDs == nil)
         #expect(durable.removalPendingContainerIDs == nil)
         await recovered.shutdown()
+    }
+
+    @Test func forceRemovalWaitsForAuthoritativeStopResultWhileRemovalIsFenced() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ForceRemovalStopFailureBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "force-removal-wait", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        await backend.blockNextStop(returning: 42)
+
+        let removal = Task {
+            try await runtime.removeContainer(record.id, force: true)
+        }
+        while !(await backend.isStopBlocked()) { await Task.yield() }
+
+        let subscription = try await runtime.subscribeContainerWait(record.id)
+        let observation = WaitObservation()
+        let waiter = Task {
+            var iterator = subscription.stream.makeAsyncIterator()
+            await observation.record(await iterator.next())
+        }
+        for _ in 0..<100 { await Task.yield() }
+        #expect(!(await observation.completed()))
+
+        await backend.releaseStop()
+        try await removal.value
+        await waiter.value
+        #expect(await observation.value() == 42)
+        await runtime.shutdown()
+    }
+
+    @Test func forceRemovalWaitSurvivesSideEffectingStopFailureUntilRetry() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ForceRemovalStopFailureBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "force-removal-failed-wait", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        await backend.blockAndFailNextStopAfterSideEffect()
+
+        let removal = Task {
+            try await runtime.removeContainer(record.id, force: true)
+        }
+        while !(await backend.isStopBlocked()) { await Task.yield() }
+        let subscription = try await runtime.subscribeContainerWait(record.id)
+        let observation = WaitObservation()
+        let waiter = Task {
+            var iterator = subscription.stream.makeAsyncIterator()
+            await observation.record(await iterator.next())
+        }
+
+        await backend.releaseStop()
+        await #expect(throws: ForceRemovalStopFailureBackend.Failure.self) {
+            try await removal.value
+        }
+        for _ in 0..<100 { await Task.yield() }
+        #expect(!(await observation.completed()))
+
+        try await runtime.removeContainer(record.id, force: true)
+        await waiter.value
+        #expect(await observation.value() == 137)
+        await runtime.shutdown()
     }
 
     @Test func forceRemovalStopFailureStaysQuarantinedAndCannotRestartAcrossReload() async throws {
