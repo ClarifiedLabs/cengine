@@ -83,7 +83,7 @@ public actor EngineRuntime {
     private var lifecycleIntents: [String: LifecycleIntent] = [:]
     private var pendingContainerNames: [String: String] = [:]
     private var pendingContainerIDs = Set<String>()
-    private var pendingVolumeNames = Set<String>()
+    private var pendingVolumeNames: [String: Int] = [:]
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
     private var startingExecIDs = Set<String>()
@@ -998,13 +998,17 @@ public actor EngineRuntime {
             removed, removedVolumes: removedVolumeMetadata.map(\.element)
         )
         do {
-            let cleanupCode = try await cleanupBackendExecution(removed)
-            if removed.exitCode == nil {
+            let cleanupCode = try await cleanupBackendExecution(
+                removed, publishRemovalStopResult: true
+            )
+            if let current = try? containerIndex(identifier),
+               snapshot.containers[current].exitCode == nil {
+                // A failed stop followed by a successful definitive delete has
+                // no backend exit result. Publish Docker's explicit forced
+                // cleanup fallback only after deletion verifies teardown.
                 let exitCode = cleanupCode ?? 137
-                if let current = try? containerIndex(identifier) {
-                    snapshot.containers[current].exitCode = exitCode
-                    snapshot.containers[current].finishedAt = Date()
-                }
+                snapshot.containers[current].exitCode = exitCode
+                snapshot.containers[current].finishedAt = Date()
                 resumeExitWaiters(identifier, code: exitCode)
             }
             try await backend.deleteLogs(for: removed)
@@ -1042,8 +1046,8 @@ public actor EngineRuntime {
             try? await persist()
             throw error
         }
-        resumeRemovalWaiters(identifier, code: removed.exitCode ?? 0)
-        emit(containerEvent("destroy", removed))
+        resumeRemovalWaiters(identifier, code: durableRemovalRecord.exitCode ?? 0)
+        emit(containerEvent("destroy", durableRemovalRecord))
     }
 
     public func renameContainer(_ identifier: String, name: String) async throws {
@@ -1496,7 +1500,7 @@ public actor EngineRuntime {
 
     public func createVolume(name: String, sizeBytes: UInt64 = VolumeRecord.defaultSizeBytes, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
-        guard !pendingVolumeNames.contains(name) else {
+        guard pendingVolumeNames[name, default: 0] == 0 else {
             throw EngineError(.conflict, "volume \(name) is being removed")
         }
         if let existing = snapshot.volumes.first(where: { $0.name == name }) { return existing }
@@ -1993,7 +1997,9 @@ public actor EngineRuntime {
         let volumeNames = Set(removedVolumes.map(\.name))
         pendingContainerNames[record.name] = record.id
         pendingContainerIDs.insert(record.id)
-        pendingVolumeNames.formUnion(volumeNames)
+        for name in volumeNames {
+            pendingVolumeNames[name, default: 0] += 1
+        }
         return RemovalPublicationReservation(
             containerID: record.id,
             containerName: record.name,
@@ -2006,7 +2012,11 @@ public actor EngineRuntime {
             pendingContainerNames.removeValue(forKey: reservation.containerName)
         }
         pendingContainerIDs.remove(reservation.containerID)
-        pendingVolumeNames.subtract(reservation.volumeNames)
+        for name in reservation.volumeNames {
+            guard let count = pendingVolumeNames[name] else { continue }
+            if count == 1 { pendingVolumeNames.removeValue(forKey: name) }
+            else { pendingVolumeNames[name] = count - 1 }
+        }
     }
 
     private func cleanupIsPending(_ identifier: String) -> Bool {
@@ -2185,11 +2195,25 @@ public actor EngineRuntime {
     /// while a delete failure retains the quarantine and includes any preceding
     /// stop failure as diagnostic context.
     @discardableResult
-    private func cleanupBackendExecution(_ record: ContainerRecord) async throws -> Int32? {
+    private func cleanupBackendExecution(
+        _ record: ContainerRecord,
+        publishRemovalStopResult: Bool = false
+    ) async throws -> Int32? {
         var stopFailure: String?
         var stopCode: Int32?
         do {
             stopCode = try await backend.stop(record, timeoutSeconds: 0)
+            if publishRemovalStopResult, let stopCode,
+               let current = try? containerIndex(record.id),
+               snapshot.containers[current].exitCode == nil {
+                // A successful stop is authoritative even if the following
+                // delete fails. Publish it before crossing that second backend
+                // boundary so default waiters cannot remain stranded in a
+                // quarantined, already-stopped generation.
+                snapshot.containers[current].exitCode = stopCode
+                snapshot.containers[current].finishedAt = Date()
+                resumeExitWaiters(record.id, code: stopCode)
+            }
         } catch {
             stopFailure = EngineError.message(for: error)
         }
