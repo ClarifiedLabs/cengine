@@ -70,6 +70,12 @@ final class BidirectionalDescriptorRelay: @unchecked Sendable {
         startRightToLeft()
     }
 
+    func start(afterActivationByte expected: UInt8) {
+        left.readabilityHandler = { [weak self] source in
+            self?.consumeActivation(from: source, expected: expected)
+        }
+    }
+
     func startLeftToRight() {
         left.readabilityHandler = { [weak self] in self?.forward(from: $0, to: self?.right, leftToRight: true) }
     }
@@ -79,6 +85,15 @@ final class BidirectionalDescriptorRelay: @unchecked Sendable {
     }
 
     func cancel() { finish() }
+
+    private func consumeActivation(from source: FileHandle, expected: UInt8) {
+        var actual: UInt8 = 0
+        let count = Darwin.read(source.fileDescriptor, &actual, 1)
+        if count < 0, errno == EINTR || errno == EAGAIN { return }
+        guard count == 1, actual == expected else { finish(); return }
+        source.readabilityHandler = nil
+        start()
+    }
 
     private func forward(from source: FileHandle, to target: FileHandle?, leftToRight: Bool) {
         guard let target else { finish(); return }

@@ -201,6 +201,112 @@ def test_default_routes_are_selected_per_address_family(client: docker.DockerCli
         ipv6.remove()
 
 
+@pytest.mark.compat("RTM-013")
+def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    cases = [
+        {
+            "Image": ALPINE_IMAGE,
+            "Volumes": {"/data": {}},
+            "HostConfig": {"CpuShares": 1024},
+        },
+        {"Image": ALPINE_IMAGE, "HostConfig": {"PidMode": "host"}},
+        {
+            "Image": ALPINE_IMAGE,
+            "Mounts": [{
+                "Type": "tmpfs",
+                "Target": "/run",
+                "TmpfsOptions": {"Options": [["uid", "1000"]]},
+            }],
+        },
+        {
+            "Image": ALPINE_IMAGE,
+            "Healthcheck": {
+                "Test": ["CMD", "true"],
+                "StartInterval": 1_000_000,
+            },
+        },
+    ]
+    for index, body in enumerate(cases):
+        name = f"runtime-input-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/create"), params={"name": name}, data=body,
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(name)
+    assert {volume.name for volume in client.volumes.list()} == initial_volumes
+
+    inert = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"runtime-inert-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "AttachStdout": False,
+            "AttachStderr": False,
+            "StdinOnce": True,
+            "HostConfig": {
+                "Init": True,
+                "CpuShares": 0,
+                "CgroupParent": "/docker/buildx",
+                "BlkioWeightDevice": [],
+                "DeviceRequests": [],
+                "MemorySwappiness": -1,
+                "CgroupnsMode": "private",
+                "IpcMode": "private",
+                "ConsoleSize": [0, 0],
+                "ShmSize": 64 * 1024 * 1024,
+            },
+        },
+    )
+    client.api._raise_for_status(inert)
+    inert_container = client.containers.get(inert.json()["Id"])
+
+    container = client.containers.create(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        name=f"runtime-update-{suffix}",
+        mem_limit=1024 * 1024 * 1024,
+    )
+    try:
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/{0}/update", container.id),
+                data={
+                    "Memory": 2 * 1024 * 1024 * 1024,
+                    "BlkioWeightDevice": [{"Path": "/dev/vda", "Weight": 500}],
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+        container.reload()
+        assert container.attrs["HostConfig"]["Memory"] == 1024 * 1024 * 1024
+
+        container.start()
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/{0}/exec", container.id),
+                data={"Cmd": ["true"], "ConsoleSize": [24, 80]},
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+
+        exec_id = client.api.exec_create(container.id, ["true"])["Id"]
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/exec/{0}/start", exec_id),
+                data={"Detach": True, "ConsoleSize": [24, 80]},
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+    finally:
+        inert_container.remove(force=True)
+        container.remove(force=True)
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,
@@ -359,7 +465,7 @@ def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
             [
                 "sh",
                 "-c",
-                "awk '/^NSpid:/{print $2}' /proc/self/status > /tmp/exec-target-pid; sleep 30",
+                "printf '%s' \"$$\" > /tmp/exec-target-pid; sleep 30",
             ],
         )["Id"]
         client.api.exec_start(inspected_exec, detach=True)
@@ -370,7 +476,7 @@ def test_exec_stage_proxies_preserve_status_and_kill_timed_out_healthchecks(
                 break
             time.sleep(0.1)
         else:
-            pytest.fail("exec target did not publish its outer-namespace PID")
+            pytest.fail("exec target did not publish its workload-namespace PID")
         inspect = client.api.exec_inspect(inspected_exec)
         assert inspect["Running"] is True
         assert inspect["Pid"] == int(observed.output.strip())

@@ -138,8 +138,7 @@ public struct DockerRouter: Sendable {
             })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
-            try validateVolumeDrivers(in: input)
-            try rejectUnsupportedSecurityConfiguration(input.HostConfig)
+            let parsedMounts = try validateRuntimeInput(input)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
             let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
@@ -178,9 +177,6 @@ public struct DockerRouter: Sendable {
             record.stopSignal = input.StopSignal ?? "SIGTERM"
             record.stopTimeoutSeconds = input.StopTimeout ?? 10
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)
-            if let startInterval = input.Healthcheck?.StartInterval, startInterval != 0 {
-                throw EngineError(.unsupported, "Healthcheck.StartInterval is not supported")
-            }
             if let health = input.Healthcheck, let test = health.Test, test.first != "NONE" {
                 record.healthcheck = .init(
                     test: test, intervalNanoseconds: health.Interval ?? 30_000_000_000,
@@ -189,7 +185,7 @@ public struct DockerRouter: Sendable {
                 )
                 record.healthStatus = "starting"; record.healthFailingStreak = 0
             }
-            record.mounts = try mounts(from: input)
+            record.mounts = parsedMounts
             for destination in (input.Volumes ?? [:]).keys.sorted()
                 where !record.mounts.contains(where: { $0.destination == destination }) {
                 record.mounts.append(.init(kind: .volume, source: "", destination: destination))
@@ -321,8 +317,9 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/update"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/update".count))
             let input = try decoder.decode(ContainerUpdateRequest.self, from: request.body)
+            try validateRuntimeInput(input)
             let policy = input.RestartPolicy.map {
-                RestartPolicyRecord(name: $0.Name, maximumRetryCount: $0.MaximumRetryCount ?? 0)
+                RestartPolicyRecord(name: $0.Name ?? "no", maximumRetryCount: $0.MaximumRetryCount ?? 0)
             }
             let nanoCPUs: Int64? = try {
                 if let value = input.NanoCpus, value > 0 { return value }
@@ -340,9 +337,7 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
             let input = try decoder.decode(ExecCreateRequest.self, from: request.body)
-            if let detachKeys = input.DetachKeys, !detachKeys.isEmpty {
-                throw EngineError(.unsupported, "exec DetachKeys is not supported")
-            }
+            try validateRuntimeInput(input)
             let exec = try await runtime.createExec(container: id, configuration: .init(
                 arguments: input.Cmd, environment: input.Env ?? [], workingDirectory: input.WorkingDir ?? "",
                 user: input.User ?? "", tty: input.Tty ?? false, attachStdin: input.AttachStdin ?? false,
@@ -353,6 +348,7 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/start"):
             let id = String(value.dropFirst("/exec/".count).dropLast("/start".count))
             let input = try decoder.decode(ExecStartRequest.self, from: request.body)
+            try validateRuntimeInput(input)
             guard input.Detach == true else { throw EngineError(.badRequest, "attached exec requires a connection upgrade") }
             let exec = try await runtime.inspectExec(id)
             if let tty = input.Tty, tty != exec.configuration.tty {
@@ -1007,6 +1003,7 @@ public struct DockerRouter: Sendable {
     public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
     public func validateAttachedExecStart(_ identifier: String, body: Data) async throws {
         let input = try decoder.decode(ExecStartRequest.self, from: body)
+        try validateRuntimeInput(input)
         guard input.Detach != true else {
             throw EngineError(.badRequest, "attached exec start requires Detach=false")
         }
@@ -1020,10 +1017,446 @@ public struct DockerRouter: Sendable {
         try await runtime.subscribeContainerWait(identifier, condition: condition)
     }
 
+    private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> [MountRecord] {
+        try rejectActiveRuntimeFields([
+            (!(input.Domainname ?? "").isEmpty, "Domainname"),
+            (input.ArgsEscaped == true, "ArgsEscaped"),
+            (input.NetworkDisabled == true, "NetworkDisabled"),
+            (!(input.Shell ?? []).isEmpty, "Shell"),
+        ], prefix: "ContainerConfig")
+        if let timeout = input.StopTimeout, timeout < 0 {
+            throw EngineError(.badRequest, "StopTimeout must not be negative")
+        }
+        try validateStopSignal(input.StopSignal)
+        try validateHealthcheck(input.Healthcheck)
+        try validateHostRuntimeInput(input.HostConfig)
+        try validateVolumeDrivers(in: input)
+        return try mounts(from: input)
+    }
+
+    private func validateRuntimeInput(_ input: ContainerUpdateRequest) throws {
+        try validateResourceValues(
+            memory: input.Memory, nanoCPUs: input.NanoCpus,
+            cpuPeriod: input.CpuPeriod, cpuQuota: input.CpuQuota,
+            pidsLimit: input.PidsLimit
+        )
+        try validateUnsupportedResourceValues(
+            memory: input.Memory, cpuShares: input.CpuShares, blkioWeight: input.BlkioWeight,
+            weightDevices: input.BlkioWeightDevice,
+            throttleDevices: [
+                input.BlkioDeviceReadBps, input.BlkioDeviceWriteBps,
+                input.BlkioDeviceReadIOps, input.BlkioDeviceWriteIOps,
+            ],
+            cpuRealtimePeriod: input.CpuRealtimePeriod,
+            cpuRealtimeRuntime: input.CpuRealtimeRuntime,
+            memoryReservation: input.MemoryReservation, memorySwap: input.MemorySwap,
+            update: true
+        )
+        if let swappiness = input.MemorySwappiness,
+           swappiness != -1, !(0...100).contains(swappiness) {
+            throw EngineError(.badRequest, "MemorySwappiness must be -1 or between 0 and 100")
+        }
+        try rejectActiveRuntimeFields([
+            (input.CpuShares != nil && input.CpuShares != 0, "CpuShares"),
+            (!(input.CgroupParent ?? "").isEmpty, "CgroupParent"),
+            (input.BlkioWeight != nil && input.BlkioWeight != 0, "BlkioWeight"),
+            (!(input.BlkioWeightDevice ?? []).isEmpty, "BlkioWeightDevice"),
+            (!(input.BlkioDeviceReadBps ?? []).isEmpty, "BlkioDeviceReadBps"),
+            (!(input.BlkioDeviceWriteBps ?? []).isEmpty, "BlkioDeviceWriteBps"),
+            (!(input.BlkioDeviceReadIOps ?? []).isEmpty, "BlkioDeviceReadIOps"),
+            (!(input.BlkioDeviceWriteIOps ?? []).isEmpty, "BlkioDeviceWriteIOps"),
+            (input.CpuRealtimePeriod != nil && input.CpuRealtimePeriod != 0, "CpuRealtimePeriod"),
+            (input.CpuRealtimeRuntime != nil && input.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
+            (!(input.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
+            (!(input.CpusetMems ?? "").isEmpty, "CpusetMems"),
+            (!(input.Devices ?? []).isEmpty, "Devices"),
+            (!(input.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
+            (!(input.DeviceRequests ?? []).isEmpty, "DeviceRequests"),
+            (input.MemoryReservation != nil && input.MemoryReservation != 0, "MemoryReservation"),
+            (input.MemorySwap != nil && input.MemorySwap != 0, "MemorySwap"),
+            (input.MemorySwappiness != nil && input.MemorySwappiness != -1, "MemorySwappiness"),
+            (input.OomKillDisable == true, "OomKillDisable"),
+            (!(input.Ulimits ?? []).isEmpty, "Ulimits"),
+            (input.CpuCount != nil && input.CpuCount != 0, "CpuCount"),
+            (input.CpuPercent != nil && input.CpuPercent != 0, "CpuPercent"),
+            (input.IOMaximumIOps != nil && input.IOMaximumIOps != 0, "IOMaximumIOps"),
+            (input.IOMaximumBandwidth != nil && input.IOMaximumBandwidth != 0, "IOMaximumBandwidth"),
+        ], prefix: "ContainerUpdate")
+        try validateRestartPolicy(
+            name: input.RestartPolicy?.Name,
+            maximumRetryCount: input.RestartPolicy?.MaximumRetryCount
+        )
+    }
+
+    private func validateRuntimeInput(_ input: ExecCreateRequest) throws {
+        if let detachKeys = input.DetachKeys, !detachKeys.isEmpty {
+            throw EngineError(.unsupported, "ExecConfig.DetachKeys is not supported")
+        }
+        try validateConsoleSize(input.ConsoleSize, field: "ExecConfig.ConsoleSize")
+    }
+
+    private func validateRuntimeInput(_ input: ExecStartRequest) throws {
+        try validateConsoleSize(input.ConsoleSize, field: "ExecStartConfig.ConsoleSize")
+    }
+
+    private func validateHostRuntimeInput(_ host: ContainerCreateRequest.HostConfig?) throws {
+        try validateResourceValues(
+            memory: host?.Memory, nanoCPUs: host?.NanoCpus,
+            cpuPeriod: host?.CpuPeriod, cpuQuota: host?.CpuQuota,
+            pidsLimit: host?.PidsLimit
+        )
+        try validateUnsupportedResourceValues(
+            memory: host?.Memory, cpuShares: host?.CpuShares, blkioWeight: host?.BlkioWeight,
+            weightDevices: host?.BlkioWeightDevice,
+            throttleDevices: [
+                host?.BlkioDeviceReadBps, host?.BlkioDeviceWriteBps,
+                host?.BlkioDeviceReadIOps, host?.BlkioDeviceWriteIOps,
+            ],
+            cpuRealtimePeriod: host?.CpuRealtimePeriod,
+            cpuRealtimeRuntime: host?.CpuRealtimeRuntime,
+            memoryReservation: host?.MemoryReservation, memorySwap: host?.MemorySwap,
+            update: false
+        )
+        if let swappiness = host?.MemorySwappiness,
+           swappiness != -1, !(0...100).contains(swappiness) {
+            throw EngineError(.badRequest, "HostConfig.MemorySwappiness must be -1 or between 0 and 100")
+        }
+        try rejectActiveRuntimeFields([
+            (host?.CpuShares != nil && host?.CpuShares != 0, "CpuShares"),
+            (!(host?.CgroupParent ?? "").isEmpty && host?.CgroupParent != "/docker/buildx", "CgroupParent"),
+            (host?.BlkioWeight != nil && host?.BlkioWeight != 0, "BlkioWeight"),
+            (!(host?.BlkioWeightDevice ?? []).isEmpty, "BlkioWeightDevice"),
+            (!(host?.BlkioDeviceReadBps ?? []).isEmpty, "BlkioDeviceReadBps"),
+            (!(host?.BlkioDeviceWriteBps ?? []).isEmpty, "BlkioDeviceWriteBps"),
+            (!(host?.BlkioDeviceReadIOps ?? []).isEmpty, "BlkioDeviceReadIOps"),
+            (!(host?.BlkioDeviceWriteIOps ?? []).isEmpty, "BlkioDeviceWriteIOps"),
+            (host?.CpuRealtimePeriod != nil && host?.CpuRealtimePeriod != 0, "CpuRealtimePeriod"),
+            (host?.CpuRealtimeRuntime != nil && host?.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
+            (!(host?.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
+            (!(host?.CpusetMems ?? "").isEmpty, "CpusetMems"),
+            (!(host?.DeviceRequests ?? []).isEmpty, "DeviceRequests"),
+            (host?.MemoryReservation != nil && host?.MemoryReservation != 0, "MemoryReservation"),
+            (host?.MemorySwap != nil && host?.MemorySwap != 0, "MemorySwap"),
+            (host?.MemorySwappiness != nil && host?.MemorySwappiness != -1, "MemorySwappiness"),
+            (host?.OomKillDisable == true, "OomKillDisable"),
+            (host?.CpuCount != nil && host?.CpuCount != 0, "CpuCount"),
+            (host?.CpuPercent != nil && host?.CpuPercent != 0, "CpuPercent"),
+            (host?.IOMaximumIOps != nil && host?.IOMaximumIOps != 0, "IOMaximumIOps"),
+            (host?.IOMaximumBandwidth != nil && host?.IOMaximumBandwidth != 0, "IOMaximumBandwidth"),
+            (!(host?.Ulimits ?? []).isEmpty, "Ulimits"),
+            (!(host?.Devices ?? []).isEmpty, "Devices"),
+            (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
+            (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
+            (!(host?.MaskedPaths ?? []).isEmpty, "MaskedPaths"),
+            (!(host?.ReadonlyPaths ?? []).isEmpty, "ReadonlyPaths"),
+            (!(host?.VolumesFrom ?? []).isEmpty, "VolumesFrom"),
+            (!(host?.GroupAdd ?? []).isEmpty, "GroupAdd"),
+            (!(host?.StorageOpt ?? [:]).isEmpty, "StorageOpt"),
+            (!(host?.Runtime ?? "").isEmpty, "Runtime"),
+        ])
+        try validateSecurityOptions(host?.SecurityOpt, privileged: host?.Privileged == true)
+        try validateConsoleSize(host?.ConsoleSize, field: "HostConfig.ConsoleSize")
+        try validateNamespaceModes(host)
+        try validateOOMScore(host?.OomScoreAdj)
+        try validateSharedMemorySize(host?.ShmSize)
+        try validateIsolation(host?.Isolation)
+        try validateRestartPolicy(
+            name: host?.RestartPolicy?.Name,
+            maximumRetryCount: host?.RestartPolicy?.MaximumRetryCount
+        )
+        let restartName = host?.RestartPolicy?.Name ?? "no"
+        if host?.AutoRemove == true && restartName != "" && restartName != "no" {
+            throw EngineError(.badRequest, "AutoRemove cannot be combined with a restart policy")
+        }
+    }
+
+    private func validateSecurityOptions(_ values: [String]?, privileged: Bool) throws {
+        guard let values, !values.isEmpty else { return }
+        let privilegedDefaults: Set<String> = ["seccomp=unconfined", "apparmor=unconfined"]
+        if privileged, values.allSatisfy(privilegedDefaults.contains) { return }
+        throw EngineError(.unsupported, "HostConfig.SecurityOpt is not supported")
+    }
+
+    private func validateResourceValues(
+        memory: Int64?, nanoCPUs: Int64?, cpuPeriod: Int64?, cpuQuota: Int64?, pidsLimit: Int64?
+    ) throws {
+        if let memory, memory < 0 { throw EngineError(.badRequest, "Memory must not be negative") }
+        if let memory, memory > 0, memory < 6 * 1_024 * 1_024 {
+            throw EngineError(.badRequest, "Memory must be at least 6 MiB")
+        }
+        if let nanoCPUs, nanoCPUs < 0 { throw EngineError(.badRequest, "NanoCpus must not be negative") }
+        if let cpuPeriod, cpuPeriod < 0 { throw EngineError(.badRequest, "CpuPeriod must not be negative") }
+        if let cpuQuota, cpuQuota < -1 { throw EngineError(.badRequest, "CpuQuota is invalid") }
+        if let cpuPeriod, cpuPeriod != 0, !(1_000...1_000_000).contains(cpuPeriod) {
+            throw EngineError(.badRequest, "CpuPeriod must be between 1000 and 1000000 microseconds")
+        }
+        if let cpuQuota, cpuQuota > 0, cpuQuota < 1_000 {
+            throw EngineError(.badRequest, "CpuQuota must be at least 1000 microseconds")
+        }
+        if cpuQuota == -1 { throw EngineError(.unsupported, "unlimited CpuQuota is not supported") }
+        if let nanoCPUs, nanoCPUs > 0, let cpuPeriod, cpuPeriod > 0 {
+            throw EngineError(.badRequest, "NanoCpus and CpuPeriod cannot both be set")
+        }
+        if let nanoCPUs, nanoCPUs > 0, let cpuQuota, cpuQuota > 0 {
+            throw EngineError(.badRequest, "NanoCpus and CpuQuota cannot both be set")
+        }
+        if let cpuPeriod, cpuPeriod > 0, !(cpuQuota.map { $0 > 0 } ?? false) {
+            throw EngineError(.unsupported, "CpuPeriod without a positive CpuQuota is not supported")
+        }
+        _ = try validatedPidsLimit(pidsLimit)
+    }
+
+    private func validateUnsupportedResourceValues(
+        memory: Int64?, cpuShares: Int64?, blkioWeight: UInt16?,
+        weightDevices: [ContainerCreateRequest.HostConfig.WeightDeviceRequest]?,
+        throttleDevices: [[ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?],
+        cpuRealtimePeriod: Int64?, cpuRealtimeRuntime: Int64?,
+        memoryReservation: Int64?, memorySwap: Int64?, update: Bool
+    ) throws {
+        if let cpuShares, cpuShares < 0 {
+            throw EngineError(.badRequest, "CpuShares must not be negative")
+        }
+        if let blkioWeight, blkioWeight != 0, !(10...1_000).contains(blkioWeight) {
+            throw EngineError(.badRequest, "BlkioWeight must be zero or between 10 and 1000")
+        }
+        if let cpuRealtimePeriod, cpuRealtimePeriod < 0 {
+            throw EngineError(.badRequest, "CpuRealtimePeriod must not be negative")
+        }
+        if let cpuRealtimeRuntime, cpuRealtimeRuntime < -1 {
+            throw EngineError(.badRequest, "CpuRealtimeRuntime must be -1 or greater")
+        }
+        if let memoryReservation, memoryReservation < 0 {
+            throw EngineError(.badRequest, "MemoryReservation must not be negative")
+        }
+        if let memoryReservation, memoryReservation > 0,
+           memoryReservation < 6 * 1_024 * 1_024 {
+            throw EngineError(.badRequest, "MemoryReservation must be at least 6 MiB")
+        }
+        if let memory, memory > 0, let memoryReservation, memoryReservation > memory {
+            throw EngineError(.badRequest, "MemoryReservation cannot exceed Memory")
+        }
+        if let memorySwap, memorySwap < -1 {
+            throw EngineError(.badRequest, "MemorySwap must be -1 or greater")
+        }
+        if !update, let memorySwap, memorySwap > 0, !(memory.map { $0 > 0 } ?? false) {
+            throw EngineError(.badRequest, "MemorySwap requires a positive Memory limit")
+        }
+        if let memory, memory > 0, let memorySwap, memorySwap > 0, memorySwap < memory {
+            throw EngineError(.badRequest, "MemorySwap cannot be less than Memory")
+        }
+        for device in weightDevices ?? [] {
+            guard let path = device.Path, path.hasPrefix("/"),
+                  let weight = device.Weight, (10...1_000).contains(weight) else {
+                throw EngineError(.badRequest, "BlkioWeightDevice requires an absolute Path and Weight from 10 to 1000")
+            }
+        }
+        for device in throttleDevices.compactMap({ $0 }).flatMap({ $0 }) {
+            guard let path = device.Path, path.hasPrefix("/"),
+                  let rate = device.Rate, rate > 0 else {
+                throw EngineError(.badRequest, "blkio throttle devices require an absolute Path and positive Rate")
+            }
+        }
+    }
+
+    private func validateNamespaceModes(_ host: ContainerCreateRequest.HostConfig?) throws {
+        try validateMode(
+            host?.CgroupnsMode, field: "HostConfig.CgroupnsMode",
+            supported: ["", "private"], unsupported: ["host"]
+        )
+        try validateMode(
+            host?.IpcMode, field: "HostConfig.IpcMode",
+            supported: ["", "private"], unsupported: ["none", "shareable", "host"],
+            unsupportedPrefix: "container:"
+        )
+        try validateMode(
+            host?.PidMode, field: "HostConfig.PidMode",
+            supported: [""], unsupported: ["host"], unsupportedPrefix: "container:"
+        )
+        try validateMode(
+            host?.UTSMode, field: "HostConfig.UTSMode",
+            supported: [""], unsupported: ["host"]
+        )
+        try validateMode(
+            host?.UsernsMode, field: "HostConfig.UsernsMode",
+            supported: ["", "host"], unsupported: []
+        )
+        if let cgroup = host?.Cgroup, !cgroup.isEmpty {
+            if cgroup.hasPrefix("container:"), cgroup.count > "container:".count {
+                throw EngineError(.unsupported, "HostConfig.Cgroup container sharing is not supported")
+            }
+            throw EngineError(.badRequest, "invalid HostConfig.Cgroup value: \(cgroup)")
+        }
+        if let networkMode = host?.NetworkMode {
+            if networkMode == "host" {
+                throw EngineError(.unsupported, "HostConfig.NetworkMode=host is not supported")
+            }
+            if networkMode.hasPrefix("container:") {
+                guard networkMode.count > "container:".count else {
+                    throw EngineError(.badRequest, "HostConfig.NetworkMode requires a container identifier")
+                }
+                throw EngineError(.unsupported, "HostConfig.NetworkMode container sharing is not supported")
+            }
+        }
+    }
+
+    private func validateMode(
+        _ value: String?, field: String, supported: Set<String>, unsupported: Set<String>,
+        unsupportedPrefix: String? = nil
+    ) throws {
+        guard let value else { return }
+        if supported.contains(value) { return }
+        if unsupported.contains(value) {
+            throw EngineError(.unsupported, "\(field)=\(value) is not supported")
+        }
+        if let prefix = unsupportedPrefix, value.hasPrefix(prefix) {
+            guard value.count > prefix.count else {
+                throw EngineError(.badRequest, "\(field) requires a container identifier")
+            }
+            throw EngineError(.unsupported, "\(field) container sharing is not supported")
+        }
+        throw EngineError(.badRequest, "invalid \(field) value: \(value)")
+    }
+
+    private func validateOOMScore(_ value: Int?) throws {
+        guard let value else { return }
+        guard (-1_000...1_000).contains(value) else {
+            throw EngineError(.badRequest, "HostConfig.OomScoreAdj must be between -1000 and 1000")
+        }
+        if value != 0 { throw EngineError(.unsupported, "HostConfig.OomScoreAdj is not supported") }
+    }
+
+    private func validateSharedMemorySize(_ value: Int64?) throws {
+        guard let value else { return }
+        guard value >= 0 else { throw EngineError(.badRequest, "HostConfig.ShmSize must not be negative") }
+        if value != 0 && value != 64 * 1_024 * 1_024 {
+            throw EngineError(.unsupported, "HostConfig.ShmSize values other than 64 MiB are not supported")
+        }
+    }
+
+    private func validateIsolation(_ value: String?) throws {
+        guard let value else { return }
+        let normalized = value.lowercased()
+        guard !normalized.isEmpty, normalized != "default" else { return }
+        if normalized == "process" || normalized == "hyperv" {
+            throw EngineError(.unsupported, "HostConfig.Isolation=\(value) is not supported")
+        }
+        throw EngineError(.badRequest, "invalid HostConfig.Isolation value: \(value)")
+    }
+
+    private func validateConsoleSize(_ value: [Int]?, field: String) throws {
+        guard let value else { return }
+        guard value.count == 2, value.allSatisfy({ $0 >= 0 }) else {
+            throw EngineError(.badRequest, "\(field) must be [height, width] with non-negative values")
+        }
+        if value.contains(where: { $0 != 0 }) {
+            throw EngineError(.unsupported, "\(field) is not supported")
+        }
+    }
+
+    private func validateRestartPolicy(name: String?, maximumRetryCount: Int?) throws {
+        guard name != nil || maximumRetryCount != nil else { return }
+        let name = name ?? ""
+        guard ["", "no", "always", "unless-stopped", "on-failure"].contains(name) else {
+            throw EngineError(.badRequest, "invalid restart policy: \(name)")
+        }
+        let maximum = maximumRetryCount ?? 0
+        guard maximum >= 0 else {
+            throw EngineError(.badRequest, "restart policy MaximumRetryCount must not be negative")
+        }
+        if maximum != 0 && name != "on-failure" {
+            throw EngineError(.badRequest, "MaximumRetryCount requires the on-failure restart policy")
+        }
+    }
+
+    private func validateHealthcheck(_ health: ContainerCreateRequest.HealthcheckRequest?) throws {
+        guard let health else { return }
+        for (value, field) in [
+            (health.Interval, "Interval"),
+            (health.Timeout, "Timeout"),
+            (health.StartPeriod, "StartPeriod"),
+            (health.StartInterval, "StartInterval"),
+        ] {
+            guard let value else { continue }
+            guard value == 0 || value >= 1_000_000 else {
+                throw EngineError(.badRequest, "Healthcheck.\(field) must be zero or at least 1ms")
+            }
+        }
+        if let retries = health.Retries, retries < 0 {
+            throw EngineError(.badRequest, "Healthcheck.Retries must not be negative")
+        }
+        if let startInterval = health.StartInterval, startInterval != 0 {
+            throw EngineError(.unsupported, "Healthcheck.StartInterval is not supported")
+        }
+        guard let test = health.Test else { return }
+        guard let kind = test.first else {
+            throw EngineError(.unsupported, "inheriting an image healthcheck is not supported")
+        }
+        switch kind {
+        case "NONE":
+            guard test.count == 1 else {
+                throw EngineError(.badRequest, "Healthcheck.NONE does not accept arguments")
+            }
+        case "CMD", "CMD-SHELL":
+            guard test.count > 1 else {
+                throw EngineError(.badRequest, "Healthcheck.\(kind) requires a command")
+            }
+        default:
+            throw EngineError(.badRequest, "invalid healthcheck test form: \(kind)")
+        }
+    }
+
+    private func validateStopSignal(_ value: String?) throws {
+        guard let value, !value.isEmpty else { return }
+        let normalized = value.uppercased().hasPrefix("SIG")
+            ? String(value.uppercased().dropFirst(3))
+            : value.uppercased()
+        if let number = Int(normalized) {
+            guard (1...64).contains(number) else {
+                throw EngineError(.badRequest, "invalid StopSignal: \(value)")
+            }
+            return
+        }
+        if dockerImplementedSignalNames.contains(normalized) { return }
+        if dockerLinuxSignalNames.contains(normalized) || validRealtimeSignalName(normalized) {
+            throw EngineError(.unsupported, "StopSignal \(value) is not supported by the guest runtime")
+        }
+        throw EngineError(.badRequest, "invalid StopSignal: \(value)")
+    }
+
+    private func validRealtimeSignalName(_ value: String) -> Bool {
+        if value == "RTMIN" || value == "RTMAX" { return true }
+        if value.hasPrefix("RTMIN+"), let offset = Int(value.dropFirst("RTMIN+".count)) {
+            return (0...30).contains(offset)
+        }
+        if value.hasPrefix("RTMAX-"), let offset = Int(value.dropFirst("RTMAX-".count)) {
+            return (0...30).contains(offset)
+        }
+        return false
+    }
+
+    private func rejectActiveRuntimeFields(
+        _ fields: [(Bool, String)], prefix: String = "HostConfig"
+    ) throws {
+        if let field = fields.first(where: \.0)?.1 {
+            let qualified = field.contains(".") ? field : "\(prefix).\(field)"
+            throw EngineError(.unsupported, "\(qualified) is not supported")
+        }
+    }
+
     private func mounts(from input: ContainerCreateRequest) throws -> [MountRecord] {
         var result = try ((input.Mounts ?? []) + (input.HostConfig?.Mounts ?? [])).map { mount in
-            guard let kind = MountRecord.Kind(rawValue: mount.Type) else {
-                throw EngineError(.badRequest, "unsupported mount type: \(mount.Type)")
+            guard mount.Target.hasPrefix("/") else {
+                throw EngineError(.badRequest, "mount target must be an absolute path: \(mount.Target)")
+            }
+            let kind: MountRecord.Kind
+            switch mount.Type {
+            case "bind": kind = .bind
+            case "volume": kind = .volume
+            case "tmpfs": kind = .tmpfs
+            case "image", "npipe", "cluster":
+                throw EngineError(.unsupported, "mount type \(mount.Type) is not supported")
+            default:
+                throw EngineError(.badRequest, "invalid mount type: \(mount.Type)")
             }
             if mount.BindOptions != nil, kind != .bind {
                 throw EngineError(.badRequest, "BindOptions is only valid for bind mounts")
@@ -1034,16 +1467,56 @@ public struct DockerRouter: Sendable {
             if mount.TmpfsOptions != nil, kind != .tmpfs {
                 throw EngineError(.badRequest, "TmpfsOptions is only valid for tmpfs mounts")
             }
+            if mount.ImageOptions != nil {
+                throw EngineError(.badRequest, "ImageOptions is only valid for image mounts")
+            }
+            if mount.ClusterOptions != nil {
+                throw EngineError(.badRequest, "ClusterOptions is only valid for cluster mounts")
+            }
+            if let consistency = mount.Consistency {
+                switch consistency {
+                case "", "default", "consistent": break
+                case "cached", "delegated":
+                    throw EngineError(.unsupported, "mount Consistency=\(consistency) is not supported")
+                default:
+                    throw EngineError(.badRequest, "invalid mount Consistency: \(consistency)")
+                }
+            }
+            if kind == .bind {
+                guard let source = mount.Source, source.hasPrefix("/") else {
+                    throw EngineError(.badRequest, "bind mount source must be an absolute path")
+                }
+            } else if kind == .tmpfs, let source = mount.Source, !source.isEmpty {
+                throw EngineError(.badRequest, "tmpfs mounts do not accept a source")
+            } else if kind == .volume, let source = mount.Source,
+                      !source.isEmpty, !Identifier.validateName(source) {
+                throw EngineError(.badRequest, "invalid volume name: \(source)")
+            }
             let bindOptions = mount.BindOptions
             if bindOptions?.NonRecursive == true || bindOptions?.ReadOnlyNonRecursive == true
                 || bindOptions?.ReadOnlyForceRecursive == true {
                 throw EngineError(.unsupported, "non-recursive bind mount options are not supported")
+            }
+            if mount.VolumeOptions?.Labels?.isEmpty == false {
+                throw EngineError(.unsupported, "VolumeOptions.Labels is not supported")
             }
             if let subpath = mount.VolumeOptions?.Subpath, !subpath.isEmpty {
                 let components = subpath.split(separator: "/", omittingEmptySubsequences: false)
                 guard !subpath.hasPrefix("/"), !components.contains(".."), !components.contains(".") else {
                     throw EngineError(.badRequest, "invalid volume subpath: \(subpath)")
                 }
+            }
+            if let size = mount.TmpfsOptions?.SizeBytes, size < 0 {
+                throw EngineError(.badRequest, "TmpfsOptions.SizeBytes must not be negative")
+            }
+            if let mode = mount.TmpfsOptions?.Mode, mode > 0o7777 {
+                throw EngineError(.badRequest, "TmpfsOptions.Mode is invalid")
+            }
+            if let options = mount.TmpfsOptions?.Options, !options.isEmpty {
+                guard options.allSatisfy({ $0.count == 1 || $0.count == 2 }) else {
+                    throw EngineError(.badRequest, "TmpfsOptions.Options entries require one or two values")
+                }
+                throw EngineError(.unsupported, "TmpfsOptions.Options is not supported")
             }
             return MountRecord(
                 kind: kind,
@@ -1058,8 +1531,38 @@ public struct DockerRouter: Sendable {
             let fields = bind.split(separator: ":", maxSplits: 2).map(String.init)
             guard fields.count >= 2 else { throw EngineError(.badRequest, "invalid bind mount: \(bind)") }
             let kind: MountRecord.Kind = fields[0].hasPrefix("/") ? .bind : .volume
-            let options = fields.count == 3 ? fields[2].split(separator: ",").map(String.init) : []
+            guard fields[1].hasPrefix("/") else {
+                throw EngineError(.badRequest, "mount target must be an absolute path: \(fields[1])")
+            }
+            if kind == .volume, !Identifier.validateName(fields[0]) {
+                throw EngineError(.badRequest, "invalid volume name: \(fields[0])")
+            }
+            let options = fields.count == 3
+                ? fields[2].split(separator: ",", omittingEmptySubsequences: false).map(String.init).filter { !$0.isEmpty }
+                : []
+            let recognized = Set([
+                "ro", "rw", "nocopy", "z", "Z",
+                "private", "rprivate", "shared", "rshared", "slave", "rslave",
+            ])
+            if let option = options.first(where: { !recognized.contains($0) }) {
+                throw EngineError(.badRequest, "invalid bind mount option: \(option)")
+            }
+            if options.contains("ro") && options.contains("rw") {
+                throw EngineError(.badRequest, "conflicting bind mount access modes")
+            }
+            if kind == .bind, options.contains("nocopy") {
+                throw EngineError(.badRequest, "nocopy is only valid for volume mounts")
+            }
+            if options.contains("nocopy") {
+                throw EngineError(.unsupported, "legacy bind option nocopy is not supported")
+            }
+            if options.contains("z") || options.contains("Z") {
+                throw EngineError(.unsupported, "SELinux bind relabeling is not supported")
+            }
             let requestedPropagation = options.filter { MountRecord.Propagation(rawValue: $0) != nil }
+            if kind != .bind, !requestedPropagation.isEmpty {
+                throw EngineError(.badRequest, "bind propagation is only valid for bind mounts")
+            }
             guard requestedPropagation.count <= 1 else {
                 throw EngineError(.badRequest, "conflicting bind propagation modes: \(fields[2])")
             }
@@ -1074,17 +1577,51 @@ public struct DockerRouter: Sendable {
             ))
         }
         for (destination, options) in input.HostConfig?.Tmpfs ?? [:] {
-            let values = options.split(separator: ",").map(String.init)
+            guard destination.hasPrefix("/") else {
+                throw EngineError(.badRequest, "tmpfs target must be an absolute path: \(destination)")
+            }
+            let values = options.split(separator: ",", omittingEmptySubsequences: false)
+                .map(String.init).filter { !$0.isEmpty }
+            if values.contains("ro") && values.contains("rw") {
+                throw EngineError(.badRequest, "conflicting tmpfs access modes")
+            }
+            var size: Int64?
+            var mode: UInt32?
+            for value in values {
+                switch value {
+                case "ro", "rw", "exec", "nosuid", "nodev": break
+                case "noexec", "suid", "dev":
+                    throw EngineError(.unsupported, "tmpfs option \(value) is not supported")
+                default:
+                    if value.hasPrefix("size=") {
+                        guard size == nil,
+                              let parsed = parseDockerByteSize(String(value.dropFirst("size=".count))),
+                              parsed >= 0 else {
+                            throw EngineError(.badRequest, "invalid tmpfs size option: \(value)")
+                        }
+                        size = parsed
+                    } else if value.hasPrefix("mode=") {
+                        guard mode == nil,
+                              let parsed = UInt32(value.dropFirst("mode=".count), radix: 8),
+                              parsed <= 0o7777 else {
+                            throw EngineError(.badRequest, "invalid tmpfs mode option: \(value)")
+                        }
+                        mode = parsed
+                    } else {
+                        throw EngineError(.badRequest, "invalid tmpfs option: \(value)")
+                    }
+                }
+            }
             result.append(.init(
                 kind: .tmpfs, source: options, destination: destination,
                 readOnly: values.contains("ro"),
-                tmpfsSizeBytes: values.first(where: { $0.hasPrefix("size=") }).flatMap {
-                    parseDockerByteSize(String($0.dropFirst("size=".count)))
-                },
-                tmpfsMode: values.first(where: { $0.hasPrefix("mode=") }).flatMap {
-                    UInt32($0.dropFirst("mode=".count), radix: 8)
-                }
+                tmpfsSizeBytes: size,
+                tmpfsMode: mode
             ))
+        }
+        if let duplicate = Dictionary(grouping: result, by: \.destination)
+            .first(where: { $0.value.count > 1 })?.key {
+            throw EngineError(.badRequest, "duplicate mount target: \(duplicate)")
         }
         return result
     }
@@ -1124,21 +1661,6 @@ public struct DockerRouter: Sendable {
         }
     }
 
-    private func rejectUnsupportedSecurityConfiguration(_ host: ContainerCreateRequest.HostConfig?) throws {
-        let unsupported: [(Bool, String)] = [
-            (!(host?.SecurityOpt ?? []).isEmpty, "SecurityOpt"),
-            (!(host?.Ulimits ?? []).isEmpty, "Ulimits"),
-            (!(host?.Devices ?? []).isEmpty, "Devices"),
-            (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
-            (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
-            (!(host?.MaskedPaths ?? []).isEmpty, "MaskedPaths"),
-            (!(host?.ReadonlyPaths ?? []).isEmpty, "ReadonlyPaths"),
-        ]
-        if let field = unsupported.first(where: \.0)?.1 {
-            throw EngineError(.unsupported, "HostConfig.\(field) is not supported")
-        }
-    }
-
     private func logOptions(_ components: URLComponents) -> DockerLogOptions {
         let query = queryItems(components)
         let tail: Int? = query["tail"].flatMap { $0 == "all" ? nil : Int($0) }
@@ -1174,6 +1696,17 @@ private let dockerLinuxCapabilities: Set<String> = [
     "SYS_MODULE", "SYS_NICE", "SYS_PACCT", "SYS_PTRACE", "SYS_RAWIO", "SYS_RESOURCE",
     "SYS_TIME", "SYS_TTY_CONFIG", "SYSLOG", "WAKE_ALARM",
 ]
+
+private let dockerImplementedSignalNames: Set<String> = [
+    "HUP", "INT", "QUIT", "KILL", "USR1", "USR2", "PIPE", "ALRM", "TERM",
+    "CHLD", "CONT", "STOP", "TSTP",
+]
+
+private let dockerLinuxSignalNames: Set<String> = dockerImplementedSignalNames.union([
+    "ABRT", "BUS", "FPE", "ILL", "POLL", "PROF", "PWR", "SEGV", "STKFLT",
+    "SYS", "TRAP", "TTIN", "TTOU", "URG", "VTALRM", "WINCH", "XCPU", "XFSZ",
+    "IOT", "IO", "CLD",
+])
 
 func parseDockerTimestamp(_ value: String) -> Date? {
     if let seconds = Double(value) { return Date(timeIntervalSince1970: seconds) }

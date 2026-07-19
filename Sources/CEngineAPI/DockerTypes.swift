@@ -147,19 +147,26 @@ public struct DockerInfoResponse: Encodable, Sendable {
 
 public struct ContainerCreateRequest: Decodable, Sendable {
     public var Hostname: String?
+    public var Domainname: String?
     public var User: String?
     public var AttachStdin: Bool?
+    public var AttachStdout: Bool?
+    public var AttachStderr: Bool?
     public var Tty: Bool?
     public var OpenStdin: Bool?
+    public var StdinOnce: Bool?
     public var Env: [String]?
     public var Cmd: [String]?
+    public var ArgsEscaped: Bool?
     public var Image: String
     public var WorkingDir: String?
     public var Entrypoint: [String]?
+    public var NetworkDisabled: Bool?
     public var Labels: [String: String]?
     public var Volumes: [String: EmptyObject]?
     public var StopSignal: String?
     public var StopTimeout: Int?
+    public var Shell: [String]?
     public var HostConfig: HostConfig?
     public var Mounts: [Mount]?
     public var NetworkingConfig: NetworkingConfigRequest?
@@ -205,9 +212,12 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var Source: String?
         public var Target: String
         public var ReadOnly: Bool?
+        public var Consistency: String?
         public var BindOptions: BindOptionsRequest?
         public var VolumeOptions: VolumeOptionsRequest?
+        public var ImageOptions: ImageOptionsRequest?
         public var TmpfsOptions: TmpfsOptionsRequest?
+        public var ClusterOptions: ClusterOptionsRequest?
         public struct BindOptionsRequest: Decodable, Sendable {
             public var Propagation: String?
             public var NonRecursive: Bool?
@@ -217,14 +227,21 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         }
         public struct VolumeOptionsRequest: Decodable, Sendable {
             public var NoCopy: Bool?
+            public var Labels: [String: String]?
             public var Subpath: String?
             public var DriverConfig: VolumeDriverRequest?
         }
+        public struct ImageOptionsRequest: Decodable, Sendable { public var Subpath: String? }
+        public struct ClusterOptionsRequest: Decodable, Sendable {}
         public struct VolumeDriverRequest: Decodable, Sendable {
             public var Name: String?
             public var Options: [String: String]?
         }
-        public struct TmpfsOptionsRequest: Decodable, Sendable { public var SizeBytes: Int64?; public var Mode: UInt32? }
+        public struct TmpfsOptionsRequest: Decodable, Sendable {
+            public var SizeBytes: Int64?
+            public var Mode: UInt32?
+            public var Options: [[String]]?
+        }
     }
 
     public struct HostConfig: Decodable, Sendable {
@@ -241,24 +258,74 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         public var ReadonlyPaths: [String]?
         public var ReadonlyRootfs: Bool?
         public var Init: Bool?
+        public var CpuShares: Int64?
         public var Memory: Int64?
+        public var CgroupParent: String?
+        public var BlkioWeight: UInt16?
+        public var BlkioWeightDevice: [WeightDeviceRequest]?
+        public var BlkioDeviceReadBps: [ThrottleDeviceRequest]?
+        public var BlkioDeviceWriteBps: [ThrottleDeviceRequest]?
+        public var BlkioDeviceReadIOps: [ThrottleDeviceRequest]?
+        public var BlkioDeviceWriteIOps: [ThrottleDeviceRequest]?
         public var NanoCpus: Int64?
         public var CpuPeriod: Int64?
         public var CpuQuota: Int64?
+        public var CpuRealtimePeriod: Int64?
+        public var CpuRealtimeRuntime: Int64?
+        public var CpusetCpus: String?
+        public var CpusetMems: String?
+        public var DeviceRequests: [DeviceDriverRequest]?
+        public var MemoryReservation: Int64?
+        public var MemorySwap: Int64?
+        public var MemorySwappiness: Int64?
+        public var OomKillDisable: Bool?
         public var PidsLimit: Int64?
+        public var CpuCount: Int64?
+        public var CpuPercent: Int64?
+        public var IOMaximumIOps: UInt64?
+        public var IOMaximumBandwidth: UInt64?
         public var RestartPolicy: RestartPolicy?
         public var NetworkMode: String?
         public var VolumeDriver: String?
+        public var VolumesFrom: [String]?
+        public var ConsoleSize: [Int]?
         public var Binds: [String]?
         public var Mounts: [Mount]?
         public var PortBindings: [String: [PortBindingRequest]]?
         public var Tmpfs: [String: String]?
         public var Annotations: [String: String]?
+        public var CgroupnsMode: String?
+        public var GroupAdd: [String]?
+        public var IpcMode: String?
+        public var Cgroup: String?
+        public var OomScoreAdj: Int?
+        public var PidMode: String?
+        public var StorageOpt: [String: String]?
+        public var UTSMode: String?
+        public var UsernsMode: String?
+        public var ShmSize: Int64?
+        public var Runtime: String?
+        public var Isolation: String?
         public struct UlimitRequest: Decodable, Sendable { public var Name: String; public var Soft: Int64; public var Hard: Int64 }
         public struct DeviceRequest: Decodable, Sendable {
             public var PathOnHost: String
             public var PathInContainer: String
             public var CgroupPermissions: String
+        }
+        public struct WeightDeviceRequest: Decodable, Sendable {
+            public var Path: String?
+            public var Weight: UInt16?
+        }
+        public struct ThrottleDeviceRequest: Decodable, Sendable {
+            public var Path: String?
+            public var Rate: Int64?
+        }
+        public struct DeviceDriverRequest: Decodable, Sendable {
+            public var Driver: String?
+            public var Count: Int?
+            public var DeviceIDs: [String]?
+            public var Capabilities: [[String]]?
+            public var Options: [String: String]?
         }
         public struct RestartPolicy: Decodable, Sendable { public var Name: String?; public var MaximumRetryCount: Int? }
         public struct PortBindingRequest: Decodable, Sendable { public var HostIp: String?; public var HostPort: String? }
@@ -271,10 +338,37 @@ public struct ContainerWaitResponse: Encodable, Sendable {
     public let Error: DockerErrorBody?
 }
 public struct ContainerUpdateRequest: Decodable, Sendable {
-    public var Memory: Int64?; public var NanoCpus: Int64?; public var CpuPeriod: Int64?; public var CpuQuota: Int64?
+    public var CpuShares: Int64?
+    public var Memory: Int64?
+    public var CgroupParent: String?
+    public var BlkioWeight: UInt16?
+    public var BlkioWeightDevice: [ContainerCreateRequest.HostConfig.WeightDeviceRequest]?
+    public var BlkioDeviceReadBps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?
+    public var BlkioDeviceWriteBps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?
+    public var BlkioDeviceReadIOps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?
+    public var BlkioDeviceWriteIOps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?
+    public var NanoCpus: Int64?
+    public var CpuPeriod: Int64?
+    public var CpuQuota: Int64?
+    public var CpuRealtimePeriod: Int64?
+    public var CpuRealtimeRuntime: Int64?
+    public var CpusetCpus: String?
+    public var CpusetMems: String?
+    public var Devices: [ContainerCreateRequest.HostConfig.DeviceRequest]?
+    public var DeviceCgroupRules: [String]?
+    public var DeviceRequests: [ContainerCreateRequest.HostConfig.DeviceDriverRequest]?
+    public var MemoryReservation: Int64?
+    public var MemorySwap: Int64?
+    public var MemorySwappiness: Int64?
+    public var OomKillDisable: Bool?
     public var PidsLimit: Int64?
+    public var Ulimits: [ContainerCreateRequest.HostConfig.UlimitRequest]?
+    public var CpuCount: Int64?
+    public var CpuPercent: Int64?
+    public var IOMaximumIOps: UInt64?
+    public var IOMaximumBandwidth: UInt64?
     public var RestartPolicy: RestartPolicy?
-    public struct RestartPolicy: Decodable, Sendable { public var Name: String; public var MaximumRetryCount: Int? }
+    public struct RestartPolicy: Decodable, Sendable { public var Name: String?; public var MaximumRetryCount: Int? }
 }
 public struct ContainerUpdateResponse: Encodable, Sendable { public let Warnings: [String] }
 public struct ContainerTopResponse: Encodable, Sendable { public let Titles: [String]; public let Processes: [[String]] }
@@ -330,11 +424,15 @@ public struct ContainerStatsResponse: Encodable, Sendable {
 
 public struct ExecCreateRequest: Decodable, Sendable {
     public var AttachStdin: Bool?; public var AttachStdout: Bool?; public var AttachStderr: Bool?
-    public var DetachKeys: String?; public var Tty: Bool?; public var Cmd: [String]
+    public var ConsoleSize: [Int]?; public var DetachKeys: String?; public var Tty: Bool?; public var Cmd: [String]
     public var Env: [String]?; public var WorkingDir: String?; public var Privileged: Bool?; public var User: String?
 }
 public struct ExecCreateResponse: Encodable, Sendable { public let Id: String }
-public struct ExecStartRequest: Decodable, Sendable { public var Detach: Bool?; public var Tty: Bool? }
+public struct ExecStartRequest: Decodable, Sendable {
+    public var Detach: Bool?
+    public var Tty: Bool?
+    public var ConsoleSize: [Int]?
+}
 public struct ExecInspectResponse: Encodable, Sendable {
     public let ID: String; public let Running: Bool; public let ExitCode: Int32; public let ProcessConfig: Process
     public let OpenStdin: Bool; public let OpenStdout: Bool; public let OpenStderr: Bool; public let ContainerID: String

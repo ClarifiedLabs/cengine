@@ -609,6 +609,19 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
                 return pipeline.addHandler(StreamingRelayHandler(peer: stream)).and(
                     stream.pipeline.addHandler(StreamingRelayHandler(peer: channel))
                 ).flatMap { _ in
+                    let activation = {
+                        var buffer = stream.allocator.buffer(capacity: 1)
+                        buffer.writeInteger(VMShimProtocol.execStreamActivationByte)
+                        return buffer
+                    }()
+                    let promise = stream.eventLoop.makePromise(of: Void.self)
+                    // Yield after the 101 response flush so buffered HTTP clients detach
+                    // their raw socket before the first Docker stream frame can arrive.
+                    stream.eventLoop.scheduleTask(in: .milliseconds(10)) {
+                        stream.writeAndFlush(activation, promise: promise)
+                    }
+                    return promise.futureResult
+                }.flatMap {
                     channel.setOption(ChannelOptions.autoRead, value: true).and(
                         stream.setOption(ChannelOptions.autoRead, value: true)
                     )
@@ -638,15 +651,17 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
 private final class StreamingRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private let peer: Channel
+    private var lastWrite: EventLoopFuture<Void>?
 
     init(peer: Channel) { self.peer = peer }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        peer.write(unwrapInboundIn(data), promise: nil)
+        let promise = peer.eventLoop.makePromise(of: Void.self)
+        peer.writeAndFlush(unwrapInboundIn(data), promise: promise)
+        lastWrite = promise.futureResult
     }
 
     func channelReadComplete(context: ChannelHandlerContext) {
-        peer.flush()
         context.fireChannelReadComplete()
     }
 
@@ -659,22 +674,28 @@ private final class StreamingRelayHandler: ChannelInboundHandler, @unchecked Sen
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let event = event as? ChannelEvent, event == .inputClosed {
-            peer.flush()
-            peer.close(mode: .output, promise: nil)
+            closePeerAfterPendingWrites(mode: .output)
             return
         }
         context.fireUserInboundEventTriggered(event)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        peer.flush()
-        peer.close(promise: nil)
+        closePeerAfterPendingWrites(mode: .output)
         context.fireChannelInactive()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         peer.close(promise: nil)
         context.close(promise: nil)
+    }
+
+    private func closePeerAfterPendingWrites(mode: CloseMode) {
+        guard let lastWrite else {
+            peer.close(mode: mode, promise: nil)
+            return
+        }
+        lastWrite.whenComplete { _ in self.peer.close(mode: mode, promise: nil) }
     }
 }
 

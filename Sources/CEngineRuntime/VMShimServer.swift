@@ -464,7 +464,6 @@ import Foundation
                 completion: { [weak self] in Task { @MainActor in self?.serviceRelays.removeValue(forKey: id) } }
             )
             serviceRelays[id] = relay
-            relay.startRightToLeft()
             do {
                 try setup.write(contentsOf: setupData)
                 try setup.close()
@@ -472,7 +471,7 @@ import Foundation
                 relay.cancel()
                 throw error
             }
-            relay.startLeftToRight()
+            relay.start(afterActivationByte: VMShimProtocol.execStreamActivationByte)
         } catch {
             try? setup.close()
             streamConnection.connection.close()

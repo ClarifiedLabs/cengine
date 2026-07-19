@@ -297,7 +297,6 @@ public actor RawVirtualizationBackend: ContainerBackend {
         if let previous = portForwardingRegistrations.removeValue(forKey: container.id) {
             portForwarder.stop(containerID: container.id, registration: previous.registration)
         }
-        logMonitors.removeValue(forKey: container.id)?.stop()
         let portRegistration = PortForwarder.Registration()
         let image = try await resolvedImage(container.image, platform: container.platform)
         try requireExecutionGeneration(container.id, generation: generation)

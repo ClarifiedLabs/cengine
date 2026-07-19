@@ -44,6 +44,14 @@ sysctls, masked paths, non-recursive bind variants, health start intervals, and
 custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
 
+The API v1.55 runtime-input baseline audit is complete (`RTM-013`). Container
+create and update resources, namespace and process configuration, structured and
+legacy mounts, healthchecks, and exec terminal sizing now distinguish inert
+defaults from active requests. Recognized active gaps fail before container,
+volume, or exec state is mutated; malformed and contradictory values return a
+client error. Unknown extension keys remain forward-compatible rather than
+triggering whole-object rejection.
+
 ### Multi-platform and OCI image behavior
 
 The image store now preserves OCI graph roots and all locally available
@@ -84,8 +92,9 @@ reference.
 
 Work in this order:
 
-1. Find supported Docker inputs that are accepted but ignored or insufficiently
-   tested. Apply them, reject them explicitly, or classify them in the ledger.
+1. Maintain the completed API v1.55 runtime-input baseline audit as Docker's
+   request schema evolves. Apply newly supported fields, reject active gaps
+   explicitly, or classify them in the ledger (`RTM-013`).
 2. Close namespace, cgroup-v2 IO/device, device, rlimit,
    seccomp/security-option, masked-path, and remaining mount-matrix gaps for
    functionality cengine already exposes. PID limits, private bind isolation,

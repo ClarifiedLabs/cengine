@@ -1,6 +1,7 @@
 import Foundation
 
 public enum VMShimProtocol {
+    public static let execStreamActivationByte: UInt8 = 1
     public static let version: UInt32 = 4
     public static let maximumFrameSize = 16 * 1_024 * 1_024
     public static let managementVLAN: UInt16 = 4_094

@@ -570,7 +570,7 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
 	}
-	status = protocol.ProcessStatus{Status: "running", PID: targetPID}
+	status = protocol.ProcessStatus{Status: "running", PID: execInspectPID(targetPID)}
 	s.mu.Lock()
 	s.execs[id] = command
 	s.execTargets[id] = targetPID
@@ -766,17 +766,18 @@ func (s *Supervisor) failAttachedExecStart(id string, err error) {
 }
 
 func (s *Supervisor) publishExecTargetPID(id string, command *exec.Cmd, targetPID int) protocol.ProcessStatus {
+	inspectPID := execInspectPID(targetPID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.execs[id] == command {
 		s.execTargets[id] = targetPID
-		status := protocol.ProcessStatus{Status: "running", PID: targetPID}
+		status := protocol.ProcessStatus{Status: "running", PID: inspectPID}
 		s.execStatus[id] = status
 		return status
 	}
 	status := s.execStatus[id]
 	if status.Status == "exited" {
-		status.PID = targetPID
+		status.PID = inspectPID
 		s.execStatus[id] = status
 	}
 	return status
@@ -880,6 +881,28 @@ func readExecTargetPID(reader io.Reader) (int, error) {
 	return pid, nil
 }
 
+func execInspectPID(targetPID int) int {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", targetPID))
+	if err != nil {
+		return targetPID
+	}
+	return execInspectPIDFromStatus(status, targetPID)
+}
+
+func execInspectPIDFromStatus(status []byte, fallback int) int {
+	for _, line := range strings.Split(string(status), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "NSpid:" {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[len(fields)-1])
+		if err == nil && pid > 0 {
+			return pid
+		}
+	}
+	return fallback
+}
+
 func (s *Supervisor) ExecStatus(id string) protocol.ProcessStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -950,14 +973,14 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	}
 	s.mu.Lock()
 	cgroup := s.execCgroups[id]
-	targetPID := s.execTargets[id]
-	if targetPID == 0 {
-		targetPID = s.execStatus[id].PID
+	inspectPID := s.execStatus[id].PID
+	if inspectPID == 0 {
+		inspectPID = execInspectPID(s.execTargets[id])
 	}
 	delete(s.execs, id)
 	delete(s.execTargets, id)
 	delete(s.execCgroups, id)
-	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", PID: targetPID, ExitCode: &code}
+	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", PID: inspectPID, ExitCode: &code}
 	s.mu.Unlock()
 	if cgroup != "" {
 		_ = os.Remove(cgroup)

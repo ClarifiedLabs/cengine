@@ -1980,6 +1980,214 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
+    @Test func activeUnsupportedRuntimeCreateInputsFailClosedBeforeSideEffects() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fields = [
+            #""Domainname":"example.test","Volumes":{"/data":{}}"#,
+            #""HostConfig":{"CpuShares":1024}"#,
+            #""HostConfig":{"CgroupParent":"/custom"}"#,
+            #""HostConfig":{"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":500}]}"#,
+            #""HostConfig":{"MemorySwappiness":0}"#,
+            #""HostConfig":{"DeviceRequests":[{"Driver":"cdi","Count":1}]}"#,
+            #""HostConfig":{"PidMode":"host"}"#,
+            #""HostConfig":{"GroupAdd":["1234"]}"#,
+            #""HostConfig":{"OomScoreAdj":100}"#,
+            #""HostConfig":{"ShmSize":33554432}"#,
+            #""HostConfig":{"Isolation":"process"}"#,
+            #""Mounts":[{"Type":"image","Source":"alpine","Target":"/image"}]"#,
+            #""Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["uid","1000"]]}}]"#,
+            #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","VolumeOptions":{"Labels":{"owner":"test"}}}]"#,
+            #""Mounts":[{"Type":"bind","Source":"/tmp","Target":"/data","Consistency":"cached"}]"#,
+            #""Healthcheck":{"Test":["CMD","true"],"StartInterval":1000000}"#,
+        ]
+        for (index, field) in fields.enumerated() {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=unsupported-runtime-\(index)",
+                body: Data("{\"Image\":\"alpine\",\(field)}".utf8)
+            ))
+            #expect(response.status == .notImplemented)
+        }
+
+        let containers = await router.route(.init(method: .GET, uri: "/v1.55/containers/json?all=true"))
+        let containerList = try #require(JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]])
+        #expect(containerList.isEmpty)
+        let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
+        let volumeEnvelope = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
+        #expect((volumeEnvelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+    }
+
+    @Test func inertRuntimeDefaultsRemainAcceptedAcrossSupportedAPIVersions() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let body = Data(#"""
+        {
+            "Image":"alpine",
+            "Domainname":"",
+            "AttachStdout":false,
+            "AttachStderr":false,
+            "StdinOnce":true,
+            "ArgsEscaped":false,
+            "NetworkDisabled":false,
+            "Shell":[],
+            "FutureRuntimeExtension":{"Enabled":true},
+            "HostConfig":{
+                "Init":true,
+                "CpuShares":0,
+                "CgroupParent":"/docker/buildx",
+                "BlkioWeight":0,
+                "BlkioWeightDevice":[],
+                "BlkioDeviceReadBps":[],
+                "BlkioDeviceWriteBps":[],
+                "BlkioDeviceReadIOps":[],
+                "BlkioDeviceWriteIOps":[],
+                "CpuRealtimePeriod":0,
+                "CpuRealtimeRuntime":0,
+                "CpusetCpus":"",
+                "CpusetMems":"",
+                "DeviceRequests":[],
+                "MemoryReservation":0,
+                "MemorySwap":0,
+                "MemorySwappiness":-1,
+                "OomKillDisable":false,
+                "Ulimits":[],
+                "CpuCount":0,
+                "CpuPercent":0,
+                "IOMaximumIOps":0,
+                "IOMaximumBandwidth":0,
+                "VolumesFrom":[],
+                "ConsoleSize":[0,0],
+                "CgroupnsMode":"private",
+                "GroupAdd":[],
+                "IpcMode":"private",
+                "Cgroup":"",
+                "OomScoreAdj":0,
+                "PidMode":"",
+                "StorageOpt":{},
+                "UTSMode":"",
+                "UsernsMode":"host",
+                "ShmSize":67108864,
+                "Runtime":"",
+                "Isolation":"Default",
+                "FutureResource":{"Limit":1}
+            },
+            "Mounts":[{
+                "Type":"tmpfs",
+                "Target":"/run",
+                "Consistency":"consistent",
+                "TmpfsOptions":{"SizeBytes":0,"Mode":0,"Options":[]}
+            }],
+            "Healthcheck":{
+                "Test":["NONE"],
+                "Interval":0,
+                "Timeout":0,
+                "Retries":0,
+                "StartPeriod":0,
+                "StartInterval":0
+            }
+        }
+        """#.utf8)
+
+        for version in ["1.44", "1.55"] {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v\(version)/containers/create?name=inert-runtime-\(version)",
+                body: body
+            ))
+            #expect(response.status == .created)
+        }
+    }
+
+    @Test func privilegedUnconfinedSecurityDefaultsRemainAcceptedForKind() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let accepted = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=kind-security-defaults",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Privileged":true,"SecurityOpt":["seccomp=unconfined","apparmor=unconfined"]}}"#.utf8)
+        ))
+        #expect(accepted.status == .created)
+
+        for (index, hostConfig) in [
+            #"{"SecurityOpt":["seccomp=unconfined"]}"#,
+            #"{"Privileged":true,"SecurityOpt":["seccomp=default"]}"#,
+        ].enumerated() {
+            let rejected = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=rejected-security-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
+            ))
+            #expect(rejected.status == .notImplemented)
+        }
+    }
+
+    @Test func malformedRuntimeInputsReturnBadRequest() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fields = [
+            #""HostConfig":{"CgroupnsMode":"shared"}"#,
+            #""HostConfig":{"ConsoleSize":[24]}"#,
+            #""HostConfig":{"OomScoreAdj":1001}"#,
+            #""HostConfig":{"BlkioWeight":1001}"#,
+            #""HostConfig":{"BlkioWeight":1}"#,
+            #""HostConfig":{"MemoryReservation":1024}"#,
+            #""HostConfig":{"MemorySwap":1073741824}"#,
+            #""HostConfig":{"NanoCpus":1000000000,"CpuPeriod":100000}"#,
+            #""HostConfig":{"Memory":1024}"#,
+            #""HostConfig":{"AutoRemove":true,"RestartPolicy":{"Name":"always"}}"#,
+            #""Healthcheck":{"Test":["CMD","true"],"Interval":1}"#,
+            #""StopSignal":"SIGSIDEWAYS""#,
+            #""Mounts":[{"Type":"sideways","Target":"/data"}]"#,
+            #""Mounts":[{"Type":"bind","Source":"relative","Target":"/data"}]"#,
+            #""Mounts":[{"Type":"bind","Source":"/tmp","Target":"relative"}]"#,
+            #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","Consistency":"sideways"}]"#,
+            #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","ClusterOptions":{}}]"#,
+            #""Mounts":[{"Type":"volume","Source":"one","Target":"/data"},{"Type":"volume","Source":"two","Target":"/data"}]"#,
+            #""HostConfig":{"Tmpfs":{"/run":"rw,sideways"}}"#,
+        ]
+        for (index, field) in fields.enumerated() {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=malformed-runtime-\(index)",
+                body: Data("{\"Image\":\"alpine\",\(field)}".utf8)
+            ))
+            #expect(response.status == .badRequest)
+        }
+    }
+
+    @Test func unsupportedUpdateAndExecRuntimeInputsFailBeforeMutationOrLookup() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=runtime-update",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Memory":1073741824}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        let update = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/runtime-update/update",
+            body: Data(#"{"Memory":2147483648,"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":500}]}"#.utf8)
+        ))
+        #expect(update.status == .notImplemented)
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/runtime-update/json"))
+        let inspected = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(inspected["HostConfig"] as? [String: Any])
+        #expect(host["Memory"] as? Int == 1_073_741_824)
+
+        let execCreate = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/missing/exec",
+            body: Data(#"{"Cmd":["true"],"ConsoleSize":[24,80]}"#.utf8)
+        ))
+        #expect(execCreate.status == .notImplemented)
+        let inertExecCreate = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/missing/exec",
+            body: Data(#"{"Cmd":["true"],"ConsoleSize":[0,0]}"#.utf8)
+        ))
+        #expect(inertExecCreate.status == .notFound)
+
+        let execStart = await router.route(.init(
+            method: .POST, uri: "/v1.55/exec/missing/start",
+            body: Data(#"{"Detach":true,"ConsoleSize":[24,80]}"#.utf8)
+        ))
+        #expect(execStart.status == .notImplemented)
+    }
+
     @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -6444,11 +6652,11 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(topJSON["Titles"] as? [String] == ["PID", "CMD"])
         let update = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/observed/update",
-            body: Data(#"{"Memory":8192,"NanoCpus":2000000000,"RestartPolicy":{"Name":"always"}}"#.utf8)
+            body: Data(#"{"Memory":8388608,"NanoCpus":2000000000,"RestartPolicy":{"Name":"always"}}"#.utf8)
         ))
         #expect(update.status == .ok)
         let updated = try await runtime.container(record.id)
-        #expect(updated.memoryBytes == 8_192)
+        #expect(updated.memoryBytes == 8 * 1_024 * 1_024)
         #expect(updated.cpus == 2)
         #expect(updated.restartPolicy.name == "always")
 

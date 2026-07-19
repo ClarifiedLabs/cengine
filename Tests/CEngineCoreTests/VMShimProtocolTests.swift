@@ -20,6 +20,11 @@ private func blockingSemaphoreWait(_ semaphore: DispatchSemaphore) -> Bool {
 private func semaphoreArrives(_ semaphore: DispatchSemaphore) async -> Bool {
     await Task.detached { blockingSemaphoreWait(semaphore) }.value
 }
+
+private func descriptorIsReadable(_ descriptor: CInt, timeoutMilliseconds: CInt) -> Bool {
+    var descriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+    return Darwin.poll(&descriptor, 1, timeoutMilliseconds) > 0
+}
 #endif
 
 @Suite struct VMShimProtocolTests {
@@ -477,6 +482,48 @@ private func semaphoreArrives(_ semaphore: DispatchSemaphore) async -> Bool {
 
         #expect(clock.now - started < .seconds(2))
         #expect(!process.isRunning)
+    }
+
+    @Test func execStreamRelayWaitsForHTTPUpgradeActivation() throws {
+        var clientPair = [CInt](repeating: -1, count: 2)
+        var guestPair = [CInt](repeating: -1, count: 2)
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &clientPair) == 0)
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &guestPair) == 0)
+        defer { (clientPair + guestPair).forEach { Darwin.close($0) } }
+
+        let clientRelayDescriptor = clientPair[1]
+        let guestRelayDescriptor = guestPair[1]
+        let clientRelay = FileHandle(fileDescriptor: clientRelayDescriptor, closeOnDealloc: false)
+        let guestRelay = FileHandle(fileDescriptor: guestRelayDescriptor, closeOnDealloc: false)
+        let relay = BidirectionalDescriptorRelay(
+            left: clientRelay,
+            right: guestRelay,
+            close: {
+                _ = Darwin.shutdown(clientRelayDescriptor, SHUT_RDWR)
+                _ = Darwin.shutdown(guestRelayDescriptor, SHUT_RDWR)
+            },
+            completion: {}
+        )
+        relay.start(afterActivationByte: VMShimProtocol.execStreamActivationByte)
+        defer { relay.cancel() }
+
+        let output = Array("framed-output".utf8)
+        #expect(output.withUnsafeBytes { Darwin.write(guestPair[0], $0.baseAddress, $0.count) } == output.count)
+        #expect(!descriptorIsReadable(clientPair[0], timeoutMilliseconds: 50))
+
+        var activation = VMShimProtocol.execStreamActivationByte
+        #expect(Darwin.write(clientPair[0], &activation, 1) == 1)
+        #expect(descriptorIsReadable(clientPair[0], timeoutMilliseconds: 1_000))
+        var receivedOutput = [UInt8](repeating: 0, count: output.count)
+        #expect(Darwin.read(clientPair[0], &receivedOutput, receivedOutput.count) == output.count)
+        #expect(receivedOutput == output)
+
+        let input = Array("stdin".utf8)
+        #expect(input.withUnsafeBytes { Darwin.write(clientPair[0], $0.baseAddress, $0.count) } == input.count)
+        #expect(descriptorIsReadable(guestPair[0], timeoutMilliseconds: 1_000))
+        var receivedInput = [UInt8](repeating: 0, count: input.count)
+        #expect(Darwin.read(guestPair[0], &receivedInput, receivedInput.count) == input.count)
+        #expect(receivedInput == input)
     }
 
     @Test func staleShimStatusCannotKillAReusedProcessIdentifier() async throws {

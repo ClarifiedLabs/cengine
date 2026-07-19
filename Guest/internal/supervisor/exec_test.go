@@ -80,6 +80,16 @@ func TestExecTargetPIDIsPublishedAcrossStageDescriptors(t *testing.T) {
 	}
 }
 
+func TestExecInspectPIDUsesWorkloadNamespaceIdentity(t *testing.T) {
+	status := []byte("Name:\tsh\nNSpid:\t162\t15\n")
+	if pid := execInspectPIDFromStatus(status, 162); pid != 15 {
+		t.Fatalf("exec inspect PID is %d, want workload namespace PID 15", pid)
+	}
+	if pid := execInspectPIDFromStatus([]byte("Name:\tsh\n"), 162); pid != 162 {
+		t.Fatalf("exec inspect PID fallback is %d, want 162", pid)
+	}
+}
+
 func TestExecStartReservationExcludesAttachedAndDetachedLaunches(t *testing.T) {
 	supervisor := New()
 	supervisor.execStatus["exec-id"] = protocol.ProcessStatus{Status: "created"}
