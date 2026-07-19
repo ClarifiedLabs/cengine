@@ -43,6 +43,8 @@ class GuestBuildScriptTests(unittest.TestCase):
         image = (ROOT / "Configuration" / "kernel-build-image").read_text().strip()
         settings = set(config.splitlines())
         required = {
+            "CONFIG_BLK_CGROUP=y",
+            "CONFIG_BLK_DEV_THROTTLING=y",
             "CONFIG_FUSE_FS=y",
             "CONFIG_VIRTIO_FS=y",
             "CONFIG_OVERLAY_FS=y",
