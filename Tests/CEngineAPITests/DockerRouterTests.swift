@@ -4823,23 +4823,80 @@ private actor AuthImageBackend: ContainerBackend {
         input.autoRemove = true
         let record = try await runtime.createContainer(input)
         try await runtime.startContainer(record.id)
+        let startedAt = try await runtime.container(record.id).startedAt
         while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
 
         await saveFailure.arm()
         await backend.complete(record.id, code: 0)
+        let store = AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
         for _ in 0..<1_000 {
-            if await saveFailure.failureCount() == 1 { break }
+            if await saveFailure.failureCount() == 1,
+               try await runtime.container(record.id).phase == .dead {
+                let durable = try await store.load(default: EngineSnapshot())
+                if durable.containers.first(where: { $0.id == record.id })?.phase == .dead,
+                   durable.cleanupPendingContainerIDs?.contains(record.id) == true { break }
+            }
             await Task.yield()
         }
 
         #expect(await saveFailure.failureCount() == 1)
-        #expect(try await runtime.container(record.id).phase == .exited)
+        let quarantined = try await runtime.container(record.id)
+        #expect(quarantined.phase == .dead)
+        #expect(quarantined.startedAt == startedAt)
+        #expect(quarantined.finishedAt != nil)
+        #expect(quarantined.exitCode == 0)
+        let allContainers = await runtime.listContainers(all: true)
+        let liveContainers = await runtime.listContainers(all: false)
+        #expect(allContainers.first(where: { $0.id == record.id })?.phase == .dead)
+        #expect(!liveContainers.contains(where: { $0.id == record.id }))
         #expect(await backend.hasBackendResource(record.id))
-        #expect(await backend.counts().deletes == 0)
-        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
-            .load(default: EngineSnapshot())
-        #expect(durable.containers.first(where: { $0.id == record.id })?.phase == .exited)
-        #expect(durable.cleanupPendingContainerIDs == nil)
+        let quarantinedCounts = await backend.counts()
+        #expect(quarantinedCounts.starts == 1)
+        #expect(quarantinedCounts.deletes == 0)
+
+        var startWasFenced = false
+        for _ in 0..<1_000 {
+            do {
+                try await runtime.startContainer(record.id)
+                Issue.record("start bypassed auto-remove cleanup quarantine")
+                break
+            } catch let error as EngineError where error.message.contains("backend cleanup pending") {
+                startWasFenced = true
+                break
+            } catch let error as EngineError where error.message.contains("lifecycle operation in progress") {
+                await Task.yield()
+            } catch {
+                Issue.record("unexpected auto-remove quarantine error: \(error)")
+                break
+            }
+        }
+        #expect(startWasFenced)
+        await expectCleanupPendingConflict {
+            try await runtime.restartContainer(record.id, timeoutSeconds: 0)
+        }
+        await expectCleanupPendingConflict { try await runtime.containerIO(record.id) }
+        await expectCleanupPendingConflict { try await runtime.containerStatistics(record.id) }
+        await expectCleanupPendingConflict {
+            try await runtime.createExec(
+                container: record.id, configuration: .init(arguments: ["true"])
+            )
+        }
+        let refusedCounts = await backend.counts()
+        #expect(refusedCounts.starts == quarantinedCounts.starts)
+        #expect(refusedCounts.deletes == quarantinedCounts.deletes)
+
+        let durable = try await store.load(default: EngineSnapshot())
+        let durableRecord = durable.containers.first(where: { $0.id == record.id })
+        #expect(durableRecord?.phase == .dead)
+        #expect(
+            abs((durableRecord?.startedAt?.timeIntervalSince(startedAt ?? .distantPast)) ?? 1) < 1
+        )
+        #expect(
+            abs((durableRecord?.finishedAt?.timeIntervalSince(quarantined.finishedAt ?? .distantPast)) ?? 1)
+                < 1
+        )
+        #expect(durableRecord?.exitCode == 0)
+        #expect(durable.cleanupPendingContainerIDs?.contains(record.id) == true)
 
         let history = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
         var historyIterator = history.makeAsyncIterator()
@@ -4847,6 +4904,7 @@ private actor AuthImageBackend: ContainerBackend {
         while let event = await historyIterator.next() {
             if event.id == record.id { actions.append(event.action) }
         }
+        #expect(actions.contains("die"))
         #expect(!actions.contains("destroy"))
         await runtime.shutdown()
 

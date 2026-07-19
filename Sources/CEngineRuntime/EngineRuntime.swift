@@ -2345,10 +2345,13 @@ public actor EngineRuntime {
                 do {
                     try await persist()
                 } catch {
-                    clearCleanupPending(identifier)
-                    // Persist the already-terminal phase without crossing the
-                    // teardown boundary. Recovery can then re-enter auto-remove
-                    // cleanup and durably publish a fresh marker first.
+                    // Keep the live daemon fenced even when the first durable
+                    // cleanup marker cannot be published. The terminal result
+                    // remains intact while `.dead` prevents any backend
+                    // operation from trusting the residual execution. If this
+                    // bounded retry also fails, startup recovery still sees the
+                    // durable running auto-remove record and must reconcile it.
+                    quarantineCleanupPendingContainer(identifier)
                     try? await persist()
                     return
                 }
