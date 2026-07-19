@@ -914,6 +914,15 @@ private actor ArmedStateSaveFailure {
     func failureCount() -> Int { injectedFailures }
 }
 
+private actor WaitObservation {
+    private var didComplete = false
+
+    func record(_: Int32?) {
+        didComplete = true
+    }
+    func completed() -> Bool { didComplete }
+}
+
 /// Models a backend whose restart first stops the old execution and can then
 /// fail while installing the replacement. It also exposes enough state to
 /// prove EngineRuntime does not leave an orphan execution or health monitor.
@@ -5324,7 +5333,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(await runtime.listContainers(all: true).isEmpty)
     }
 
-    @Test func failedContainerPruneReleasesClaimsAndRetainsMetadata() async throws {
+    @Test func failedContainerPruneQuarantinesRemovalAndReleasesRemainingClaims() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = BlockingContainerDeleteBackend(failBlockedDelete: true)
@@ -5335,11 +5344,144 @@ private actor AuthImageBackend: ContainerBackend {
         while await backend.blockedID() == nil { await Task.yield() }
 
         await backend.releaseDelete()
-        await #expect(throws: BlockingContainerDeleteBackend.Failure.self) { try await prune.value }
+        await #expect(throws: EngineError.self) { try await prune.value }
         #expect(Set(await runtime.listContainers(all: true).map(\.id)) == [first.id, second.id])
+        #expect(try await runtime.container(first.id).phase == .dead)
+        #expect(try await runtime.container(second.id).phase == .created)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durable.cleanupPendingContainerIDs?.contains(first.id) == true)
+        #expect(durable.removalPendingContainerIDs?.contains(first.id) == true)
 
         try await runtime.startContainer(second.id)
         #expect(try await runtime.container(second.id).phase == .running)
+    }
+
+    @Test func explicitRemovalFinalSaveFailureRemainsFencedUntilReloadCompletesRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = RestartFailurePathBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let router = DockerRouter(runtime: runtime, root: root)
+        let volume = try await runtime.createVolume(name: "removal-save-volume", anonymous: true)
+        var input = ContainerRecord(name: "removal-save-failure", image: "debian")
+        input.restartPolicy = .init(name: "always")
+        input.mounts = [
+            .init(kind: .volume, source: volume.name, destination: "/data")
+        ]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        try await runtime.stopContainer(record.id, timeoutSeconds: 0)
+        #expect(await backend.counts().starts == 1)
+
+        let subscription = try await runtime.subscribeContainerWait(record.id, condition: "removed")
+        let observation = WaitObservation()
+        let waiter = Task {
+            var iterator = subscription.stream.makeAsyncIterator()
+            await observation.record(await iterator.next())
+        }
+        await saveFailure.arm(afterSuccessfulSaves: 1)
+
+        let response = await router.route(.init(
+            method: .DELETE,
+            uri: "/v1.44/containers/\(record.id)?v=1"
+        ))
+
+        #expect(response.status == .internalServerError)
+        #expect(await saveFailure.failureCount() == 1)
+        #expect(try await runtime.container(record.id).phase == .dead)
+        #expect(await runtime.listVolumes().contains(where: { $0.name == volume.name }))
+        for _ in 0..<100 { await Task.yield() }
+        #expect(!(await observation.completed()))
+        #expect(await backend.counts().starts == 1)
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(!(await backend.isPrepared(record.id)))
+
+        let durableFailure = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durableFailure.containers.first(where: { $0.id == record.id })?.phase == .dead)
+        #expect(durableFailure.cleanupPendingContainerIDs?.contains(record.id) == true)
+        #expect(durableFailure.removalPendingContainerIDs?.contains(record.id) == true)
+        #expect(durableFailure.removalVolumesPendingContainerIDs?.contains(record.id) == true)
+        #expect(durableFailure.volumes.contains(where: { $0.name == volume.name }))
+
+        let history = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var historyIterator = history.makeAsyncIterator()
+        var actions: [String] = []
+        while let event = await historyIterator.next() {
+            if event.id == record.id { actions.append(event.action) }
+        }
+        #expect(!actions.contains("destroy"))
+        waiter.cancel()
+        await runtime.shutdown()
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        #expect(await backend.counts().starts == 1)
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(!(await backend.isPrepared(record.id)))
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(!durable.containers.contains(where: { $0.id == record.id }))
+        #expect(durable.cleanupPendingContainerIDs == nil)
+        #expect(durable.removalPendingContainerIDs == nil)
+        #expect(durable.removalVolumesPendingContainerIDs == nil)
+        #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
+        await recovered.shutdown()
+    }
+
+    @Test func removalFenceSaveFailureDoesNotCrossBackendCleanupBoundary() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = RestartFailurePathBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let router = DockerRouter(runtime: runtime, root: root)
+        var input = ContainerRecord(name: "removal-fence-failure", image: "debian")
+        input.restartPolicy = .init(name: "always")
+        let record = try await runtime.createContainer(input)
+        await saveFailure.arm()
+
+        let response = await router.route(.init(
+            method: .DELETE,
+            uri: "/v1.44/containers/\(record.id)"
+        ))
+
+        #expect(response.status == .internalServerError)
+        #expect(await saveFailure.failureCount() == 1)
+        #expect(try await runtime.container(record.id).phase == .dead)
+        let countsBeforeReload = await backend.counts()
+        #expect(countsBeforeReload.starts == 0)
+        #expect(countsBeforeReload.stops == 0)
+        #expect(countsBeforeReload.deletes == 0)
+        let durableFailure = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durableFailure.containers.first(where: { $0.id == record.id })?.phase == .dead)
+        #expect(durableFailure.cleanupPendingContainerIDs?.contains(record.id) == true)
+        #expect(durableFailure.removalPendingContainerIDs?.contains(record.id) == true)
+        await runtime.shutdown()
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        let countsAfterReload = await backend.counts()
+        #expect(countsAfterReload.starts == 0)
+        #expect(countsAfterReload.stops == 1)
+        #expect(countsAfterReload.deletes == 1)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durable.containers.isEmpty)
+        #expect(durable.cleanupPendingContainerIDs == nil)
+        #expect(durable.removalPendingContainerIDs == nil)
+        await recovered.shutdown()
     }
 
     @Test func pruneReservesEachContainerAgainstConcurrentStart() async throws {

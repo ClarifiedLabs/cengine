@@ -11,16 +11,27 @@ public struct EngineSnapshot: Codable, Sendable {
     /// launch boundary without durably publishing the resulting generation.
     /// Optional so snapshots written before launch-intent tracking still load.
     public var cleanupPendingContainerIDs: Set<String>?
+    /// Containers whose metadata must not survive verified backend removal.
+    /// Optional so snapshots written before removal-intent tracking still load.
+    public var removalPendingContainerIDs: Set<String>?
+    /// Removal intents that also include anonymous-volume deletion.
+    /// Kept separate from the required removal fence so Docker's `v=0`
+    /// semantics remain recoverable across a daemon restart.
+    public var removalVolumesPendingContainerIDs: Set<String>?
 
     public init(
         containers: [ContainerRecord] = [], networks: [NetworkRecord] = [], volumes: [VolumeRecord] = [],
-        images: [ImageRecord] = [], cleanupPendingContainerIDs: Set<String>? = nil
+        images: [ImageRecord] = [], cleanupPendingContainerIDs: Set<String>? = nil,
+        removalPendingContainerIDs: Set<String>? = nil,
+        removalVolumesPendingContainerIDs: Set<String>? = nil
     ) {
         self.containers = containers
         self.networks = networks
         self.volumes = volumes
         self.images = images
         self.cleanupPendingContainerIDs = cleanupPendingContainerIDs
+        self.removalPendingContainerIDs = removalPendingContainerIDs
+        self.removalVolumesPendingContainerIDs = removalVolumesPendingContainerIDs
     }
 }
 
@@ -96,6 +107,10 @@ public actor EngineRuntime {
         self.backend = backend
         self.endpointAllocationCursors = [:]
         self.snapshot = try await store.load(default: EngineSnapshot())
+        // Explicit remove/prune publishes this intent before crossing backend
+        // teardown. Resolve it before generic cleanup or restart policy so a
+        // container whose backend was already deleted can never be resurrected.
+        try await resolvePendingContainerRemovals()
         // A cleanup-pending marker is written before every backend launch
         // boundary. It is the first recovered state: no other backend await may
         // trust or mutate the persisted execution until teardown is verified.
@@ -904,30 +919,70 @@ public actor EngineRuntime {
             let code = try await backend.stop(removed, timeoutSeconds: 0)
             await recordCompletion(removed.id, startedAt: removed.startedAt, code: code)
         }
-        try await removeClaimedContainer(removed, removeVolumes: removeVolumes, intent: intent)
+        try await removeClaimedContainer(removed.id, removeVolumes: removeVolumes, intent: intent)
     }
 
     private func removeClaimedContainer(
-        _ removed: ContainerRecord,
+        _ identifier: String,
         removeVolumes: Bool,
         intent: LifecycleIntent
     ) async throws {
-        guard lifecycleIntents[removed.id] == intent else {
-            throw EngineError(.conflict, "container \(removed.id) removal reservation was lost")
+        guard lifecycleIntents[identifier] == intent else {
+            throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
         }
-        guard (try? containerIndex(removed.id)) != nil else { return }
-        await reconcileExecs(for: removed.id)
-        resumeExitWaiters(removed.id, code: removed.exitCode ?? 137)
-        healthTasks.removeValue(forKey: removed.id)?.cancel()
-        cancelCompletionMonitor(removed.id)
-        try await backend.delete(removed)
-        try await backend.deleteLogs(for: removed)
-        guard let current = try? containerIndex(removed.id) else { return }
-        snapshot.containers.remove(at: current)
-        clearCleanupPending(removed.id)
-        if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
-        resumeRemovalWaiters(removed.id, code: removed.exitCode ?? 0)
-        try await persist()
+        guard (try? containerIndex(identifier)) != nil else { return }
+        await reconcileExecs(for: identifier)
+        guard lifecycleIntents[identifier] == intent,
+              let fencedIndex = try? containerIndex(identifier) else {
+            throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
+        }
+        // Re-resolve after force-stop/reconciliation. The originally captured
+        // running record may now have authoritative exit metadata.
+        let removed = snapshot.containers[fencedIndex]
+        snapshot.containers[fencedIndex].phase = .dead
+        markCleanupPending(identifier)
+        markRemovalPending(identifier, removeVolumes: removeVolumes)
+        do {
+            try await persist()
+        } catch {
+            // Never cross the backend boundary without a durable fence. Keep a
+            // live-daemon quarantine and make one bounded durability retry.
+            try? await persist()
+            throw error
+        }
+
+        resumeExitWaiters(identifier, code: removed.exitCode ?? 137)
+        healthTasks.removeValue(forKey: identifier)?.cancel()
+        cancelCompletionMonitor(identifier)
+        let removedVolumeMetadata = removeVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+        do {
+            try await cleanupBackendExecution(removed)
+            try await backend.deleteLogs(for: removed)
+            if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
+        } catch {
+            quarantineRemovalPendingContainer(identifier, record: removed, removeVolumes: removeVolumes)
+            try? await persist()
+            throw error
+        }
+
+        guard lifecycleIntents[identifier] == intent,
+              let current = try? containerIndex(identifier) else {
+            throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
+        }
+        let durableRemovalRecord = snapshot.containers.remove(at: current)
+        clearCleanupPending(identifier)
+        clearRemovalPending(identifier)
+        do {
+            try await persist()
+        } catch {
+            restoreRemovalQuarantine(
+                durableRemovalRecord, at: current, removeVolumes: removeVolumes,
+                removedVolumes: removedVolumeMetadata
+            )
+            try? await persist()
+            throw error
+        }
+        resumeRemovalWaiters(identifier, code: removed.exitCode ?? 0)
         emit(containerEvent("destroy", removed))
     }
 
@@ -1342,7 +1397,7 @@ public actor EngineRuntime {
         }
         var removed: [String] = []
         for claim in claims {
-            try await removeClaimedContainer(claim.record, removeVolumes: false, intent: claim.intent)
+            try await removeClaimedContainer(claim.record.id, removeVolumes: false, intent: claim.intent)
             removed.append(claim.record.id)
         }
         return removed
@@ -1844,6 +1899,27 @@ public actor EngineRuntime {
         snapshot.cleanupPendingContainerIDs = pending.isEmpty ? nil : pending
     }
 
+    private func markRemovalPending(_ identifier: String, removeVolumes: Bool) {
+        var pending = snapshot.removalPendingContainerIDs ?? []
+        pending.insert(identifier)
+        snapshot.removalPendingContainerIDs = pending
+        guard removeVolumes else { return }
+        var volumePending = snapshot.removalVolumesPendingContainerIDs ?? []
+        volumePending.insert(identifier)
+        snapshot.removalVolumesPendingContainerIDs = volumePending
+    }
+
+    private func clearRemovalPending(_ identifier: String) {
+        if var pending = snapshot.removalPendingContainerIDs {
+            pending.remove(identifier)
+            snapshot.removalPendingContainerIDs = pending.isEmpty ? nil : pending
+        }
+        if var volumePending = snapshot.removalVolumesPendingContainerIDs {
+            volumePending.remove(identifier)
+            snapshot.removalVolumesPendingContainerIDs = volumePending.isEmpty ? nil : volumePending
+        }
+    }
+
     private func cleanupIsPending(_ identifier: String) -> Bool {
         snapshot.cleanupPendingContainerIDs?.contains(identifier) == true
     }
@@ -1864,6 +1940,24 @@ public actor EngineRuntime {
         // the old generation may have completed while an explicit restart was
         // suspended, and that real result must remain the sole die event.
         snapshot.containers[index].phase = .dead
+    }
+
+    private func quarantineRemovalPendingContainer(
+        _ identifier: String,
+        record: ContainerRecord,
+        removeVolumes: Bool
+    ) {
+        if let index = try? containerIndex(identifier) {
+            var quarantined = snapshot.containers[index]
+            quarantined.phase = .dead
+            snapshot.containers[index] = quarantined
+        } else {
+            var quarantined = record
+            quarantined.phase = .dead
+            snapshot.containers.append(quarantined)
+        }
+        markCleanupPending(identifier)
+        markRemovalPending(identifier, removeVolumes: removeVolumes)
     }
 
     /// A backend start can partially launch before throwing, or succeed before
@@ -1987,6 +2081,88 @@ public actor EngineRuntime {
                 "backend cleanup for container \(record.id) could not be verified (\(failures.joined(separator: "; ")))"
             )
         }
+    }
+
+    /// Drain explicit remove/prune intents before any generic execution
+    /// recovery. The record and both fences remain durable until backend,
+    /// logs, requested anonymous volumes, and metadata have all been removed.
+    private func resolvePendingContainerRemovals() async throws {
+        let pendingRemovalIDs = snapshot.removalPendingContainerIDs ?? []
+        for identifier in pendingRemovalIDs {
+            guard let fencedIndex = try? containerIndex(identifier) else {
+                throw EngineError(
+                    .internalError,
+                    "container removal is pending for missing container record \(identifier)"
+                )
+            }
+            let removed = snapshot.containers[fencedIndex]
+            let removeVolumes = snapshot.removalVolumesPendingContainerIDs?.contains(identifier) == true
+            let removedVolumeMetadata = removeVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+
+            // Normalize partially written/corrupt intent state before teardown.
+            // A failed save here must leave the backend completely untouched.
+            snapshot.containers[fencedIndex].phase = .dead
+            markCleanupPending(identifier)
+            markRemovalPending(identifier, removeVolumes: removeVolumes)
+            try await persist()
+
+            do {
+                try await cleanupBackendExecution(removed)
+                try await backend.deleteLogs(for: removed)
+                if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
+            } catch {
+                quarantineRemovalPendingContainer(identifier, record: removed, removeVolumes: removeVolumes)
+                try? await persist()
+                throw error
+            }
+
+            guard let current = try? containerIndex(identifier) else {
+                throw EngineError(.internalError, "container \(identifier) disappeared during removal recovery")
+            }
+            let durableRemovalRecord = snapshot.containers.remove(at: current)
+            clearCleanupPending(identifier)
+            clearRemovalPending(identifier)
+            do {
+                try await persist()
+            } catch {
+                restoreRemovalQuarantine(
+                    durableRemovalRecord, at: current, removeVolumes: removeVolumes,
+                    removedVolumes: removedVolumeMetadata
+                )
+                try? await persist()
+                throw error
+            }
+        }
+    }
+
+    private func anonymousVolumeMetadata(
+        usedBy record: ContainerRecord
+    ) -> [(offset: Int, element: VolumeRecord)] {
+        let names = Set(record.mounts.filter { $0.kind == .volume }.map(\.source))
+        return snapshot.volumes.enumerated().filter {
+            names.contains($0.element.name) && $0.element.anonymous == true
+        }
+    }
+
+    private func restoreRemovalQuarantine(
+        _ record: ContainerRecord,
+        at index: Int,
+        removeVolumes: Bool,
+        removedVolumes: [(offset: Int, element: VolumeRecord)]
+    ) {
+        var quarantined = record
+        quarantined.phase = .dead
+        if let existing = try? containerIndex(record.id) {
+            snapshot.containers[existing] = quarantined
+        } else {
+            snapshot.containers.insert(quarantined, at: min(index, snapshot.containers.endIndex))
+        }
+        for volume in removedVolumes.sorted(by: { $0.offset < $1.offset })
+            where !snapshot.volumes.contains(where: { $0.name == volume.element.name }) {
+            snapshot.volumes.insert(volume.element, at: min(volume.offset, snapshot.volumes.endIndex))
+        }
+        markCleanupPending(record.id)
+        markRemovalPending(record.id, removeVolumes: removeVolumes)
     }
 
     /// Finish startup reconciliation for terminal auto-remove records. A fresh
