@@ -26,6 +26,18 @@ struct RawBackendExecutionFence: Sendable {
         tokens[identifier] == token
     }
 
+    /// Runs a generation-owned publication without permitting suspension
+    /// between the ownership check and its mutations.
+    func publishIfOwned(
+        _ identifier: String,
+        token: Token,
+        _ publication: () -> Void
+    ) -> Bool {
+        guard owns(identifier, token: token) else { return false }
+        publication()
+        return true
+    }
+
     mutating func remove(_ identifier: String) {
         tokens.removeValue(forKey: identifier)
     }
@@ -60,6 +72,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private var completions: [String: Int32] = [:]
     private var completionTasks: [String: (generation: RawBackendExecutionFence.Token, task: Task<Int32, Never>)] = [:]
     private var executionFence = RawBackendExecutionFence()
+    private var portForwardingRegistrations: [String: (
+        generation: RawBackendExecutionFence.Token,
+        registration: PortForwarder.Registration
+    )] = [:]
     private var networks: [String: NetworkRecord] = [:]
     private var networkVLANs: [String: UInt16] = [:]
     private var appliedNetworks: [String: Set<String>] = [:]
@@ -148,6 +164,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func shutdown() async {
         // Shims own running VMs. Daemon shutdown intentionally only drops control connections.
         portForwarder.stopAll()
+        portForwardingRegistrations.removeAll()
         for monitor in logMonitors.values { monitor.stop(finishOutput: false) }
         logMonitors.removeAll()
         for monitor in execMonitors.values { monitor.stop(finishOutput: false) }
@@ -258,24 +275,36 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func start(_ container: ContainerRecord) async throws -> [PortBinding] {
         guard let preparedShim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
+        // Replace the workload generation before any suspension. A completion
+        // waiter for the previous workload may already be queued to re-enter
+        // this actor while image, shim, or guest setup is in progress.
+        let generation = executionFence.replace(container.id)
+        completionTasks.removeValue(forKey: container.id)?.task.cancel()
+        completions.removeValue(forKey: container.id)
+        activeContainers.removeValue(forKey: container.id)
+        if let previous = portForwardingRegistrations.removeValue(forKey: container.id) {
+            portForwarder.stop(containerID: container.id, registration: previous.registration)
+        }
+        logMonitors.removeValue(forKey: container.id)?.stop()
+        let portRegistration = PortForwarder.Registration()
         let image = try await resolvedImage(container.image, platform: container.platform)
+        try requireExecutionGeneration(container.id, generation: generation)
         let modes = try resolveVolumeStorageModes(for: container)
-        let shim = try await reconfigureVolumeDisks(preparedShim, container: container, modes: modes)
+        let shim = try await reconfigureVolumeDisks(
+            preparedShim, container: container, modes: modes, generation: generation
+        )
+        try requireExecutionGeneration(container.id, generation: generation)
         _ = try ensureIO(container, replacingStoppedSession: true)
         _ = try await shim.boot()
+        try requireExecutionGeneration(container.id, generation: generation)
         struct Prepared: Decodable { let status: String }
         let prepared: Prepared = try await shim.guest(operation: "prepare", payload: try workload(container, image: image, volumeModes: modes), response: Prepared.self)
+        try requireExecutionGeneration(container.id, generation: generation)
         guard prepared.status == "prepared" else { throw EngineError(.internalError, "guest did not prepare workload") }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let pid: Int? }
-        // Fence the previous workload before crossing the replacement launch
-        // boundary. A canceled EngineRuntime monitor may still be suspended in
-        // completion(), and its delayed recordCompletion must not tear down the
-        // workload this call is about to install.
-        _ = executionFence.replace(container.id)
-        completionTasks.removeValue(forKey: container.id)?.task.cancel()
-        completions.removeValue(forKey: container.id)
         let response: Status = try await shim.guest(operation: "start", payload: Empty(), response: Status.self)
+        try requireExecutionGeneration(container.id, generation: generation)
         guard response.status == "running" else { throw EngineError(.internalError, "workload did not start") }
         do {
             var active = container
@@ -286,6 +315,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 }
                 active.ports = try await portForwarder.start(
                     containerID: container.id,
+                    registration: portRegistration,
                     bindings: container.ports,
                     connect: { binding in
                         try await shim.startPortStream(
@@ -295,14 +325,29 @@ public actor RawVirtualizationBackend: ContainerBackend {
                         )
                     }
                 )
+                try requireExecutionGeneration(container.id, generation: generation)
+                portForwardingRegistrations[container.id] = (generation, portRegistration)
             }
             activeContainers[container.id] = active
             try await synchronizeFabric()
+            try requireExecutionGeneration(container.id, generation: generation)
             return active.ports
         } catch {
-            portForwarder.stop(containerID: container.id)
-            activeContainers.removeValue(forKey: container.id)
-            _ = try? await shim.stop()
+            // Listener registrations are generation-specific, so stale failed
+            // starts can always release their own channels without touching a
+            // replacement that reused the container ID.
+            portForwarder.stop(containerID: container.id, registration: portRegistration)
+            // A replacement generation owns all ID-keyed resources once the
+            // fence changes. Only the generation that failed may tear them down.
+            if executionFence.owns(container.id, token: generation) {
+                if portForwardingRegistrations[container.id]?.generation == generation {
+                    portForwardingRegistrations.removeValue(forKey: container.id)
+                }
+                activeContainers.removeValue(forKey: container.id)
+                logMonitors.removeValue(forKey: container.id)?.stop()
+                bridges.removeValue(forKey: container.id)?.finishOutput()
+                _ = try? await shim.stop()
+            }
             throw error
         }
     }
@@ -652,6 +697,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func delete(_ container: ContainerRecord) async throws {
         portForwarder.stop(containerID: container.id)
+        portForwardingRegistrations.removeValue(forKey: container.id)
         if let shim = shims[container.id] { try await terminateShim(container.id, shim: shim) }
         completionTasks.removeValue(forKey: container.id)?.task.cancel()
         completions.removeValue(forKey: container.id)
@@ -666,6 +712,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let orphanIDs = shims.keys.filter { !containerIDs.contains($0) }
         for id in orphanIDs {
             portForwarder.stop(containerID: id)
+            portForwardingRegistrations.removeValue(forKey: id)
             if let shim = shims[id] { try await terminateShim(id, shim: shim) }
             completionTasks.removeValue(forKey: id)?.task.cancel()
             completions.removeValue(forKey: id)
@@ -808,20 +855,44 @@ public actor RawVirtualizationBackend: ContainerBackend {
         code: Int32,
         generation: RawBackendExecutionFence.Token
     ) async -> Int32 {
-        // This check must precede every mutation. In particular, an old waiter
-        // can resume after start() has cleared ID-keyed state for a replacement.
-        guard executionFence.owns(container.id, token: generation) else { return code }
-        if completionTasks[container.id]?.generation == generation {
-            completionTasks.removeValue(forKey: container.id)
+        // This check and every generation-owned teardown must remain in one
+        // non-suspending actor turn. synchronizeFabric() yields; by the time it
+        // returns, start() may have installed replacement ports and log state.
+        let fence = executionFence
+        var publishedCode = code
+        var needsFabricSynchronization = true
+        guard fence.publishIfOwned(container.id, token: generation, {
+            if completionTasks[container.id]?.generation == generation {
+                completionTasks.removeValue(forKey: container.id)
+            }
+            if let existing = completions[container.id] {
+                publishedCode = existing
+                needsFabricSynchronization = false
+                return
+            }
+            completions[container.id] = code
+            activeContainers.removeValue(forKey: container.id)
+            if let shim = shims[container.id] { finishExecSessions(using: shim) }
+            if let forwarding = portForwardingRegistrations[container.id],
+               forwarding.generation == generation {
+                portForwardingRegistrations.removeValue(forKey: container.id)
+                portForwarder.stop(
+                    containerID: container.id, registration: forwarding.registration
+                )
+            }
+            logMonitors.removeValue(forKey: container.id)?.stop()
+        }) else { return code }
+        if needsFabricSynchronization { try? await synchronizeFabric() }
+        return publishedCode
+    }
+
+    private func requireExecutionGeneration(
+        _ identifier: String,
+        generation: RawBackendExecutionFence.Token
+    ) throws {
+        guard executionFence.owns(identifier, token: generation) else {
+            throw EngineError(.conflict, "container \(identifier) execution was replaced while starting")
         }
-        if let existing = completions[container.id] { return existing }
-        completions[container.id] = code
-        activeContainers.removeValue(forKey: container.id)
-        if let shim = shims[container.id] { finishExecSessions(using: shim) }
-        try? await synchronizeFabric()
-        portForwarder.stop(containerID: container.id)
-        logMonitors.removeValue(forKey: container.id)?.stop()
-        return code
     }
 
     private func finishExecSessions(using shim: VMShimClient) {
@@ -884,8 +955,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
             guard hasIPv4 || container.networks.contains(where: { $0.ipv6Address != nil }) else {
                 throw EngineError(.conflict, "published ports require a container network endpoint")
             }
+            let generation = executionFence.currentOrInstall(container.id)
+            let registration = PortForwarder.Registration()
             active.ports = try await portForwarder.start(
                 containerID: container.id,
+                registration: registration,
                 bindings: container.ports,
                 connect: { binding in
                     try await shim.startPortStream(
@@ -895,6 +969,16 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     )
                 }
             )
+            guard executionFence.owns(container.id, token: generation) else {
+                portForwarder.stop(containerID: container.id, registration: registration)
+                try requireExecutionGeneration(container.id, generation: generation)
+                return
+            }
+            if let previous = portForwardingRegistrations.updateValue(
+                (generation, registration), forKey: container.id
+            ) {
+                portForwarder.stop(containerID: container.id, registration: previous.registration)
+            }
         }
         knownContainers[container.id] = active
         activeContainers[container.id] = active
@@ -1092,21 +1176,29 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private func reconfigureVolumeDisks(
         _ shim: VMShimClient,
         container: ContainerRecord,
-        modes: [String: VolumeStorageMode]
+        modes: [String: VolumeStorageMode],
+        generation: RawBackendExecutionFence.Token
     ) async throws -> VMShimClient {
         let desiredNames = Self.volumeNames(in: container.mounts).filter { modes[$0] != .shared }
         if shim.specification.volumeDisks.map(\.name) == desiredNames { return shim }
         let status = try await shim.status()
+        try requireExecutionGeneration(container.id, generation: generation)
         guard status.state != .running && status.state != .paused else {
             throw EngineError(.conflict, "cannot change volume storage while the container VM is running")
         }
         try await terminateShim(container.id, shim: shim)
+        try requireExecutionGeneration(container.id, generation: generation)
         var specification = shim.specification
         specification.generation += 1
         specification.token = Self.randomToken()
         specification.socketPath = try Self.makeRuntimeSocketPath()
         specification.volumeDisks = try ensureVolumeDisks(names: desiredNames)
         let replacement = try await VMShimClient.launch(specification: specification)
+        guard executionFence.owns(container.id, token: generation) else {
+            try? await replacement.terminate()
+            try requireExecutionGeneration(container.id, generation: generation)
+            return replacement
+        }
         shims[container.id] = replacement
         return replacement
     }

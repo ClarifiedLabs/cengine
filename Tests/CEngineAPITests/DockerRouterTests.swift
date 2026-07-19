@@ -1540,21 +1540,37 @@ private actor GenerationCompletionBackend: ContainerBackend {
 private actor RawCompletionPublicationHarness {
     private var fence = RawBackendExecutionFence()
     private var destructivePublications = 0
+    private var hasPortForwarding = false
+    private var hasLogMonitor = false
 
     func install(_ identifier: String) -> RawBackendExecutionFence.Token {
-        fence.replace(identifier)
+        let generation = fence.replace(identifier)
+        hasPortForwarding = true
+        hasLogMonitor = true
+        return generation
     }
 
-    func publishIfCurrent(
+    func publishCompletion(
         _ identifier: String,
-        generation: RawBackendExecutionFence.Token
-    ) -> Bool {
-        guard fence.owns(identifier, token: generation) else { return false }
-        destructivePublications += 1
+        generation: RawBackendExecutionFence.Token,
+        fabricBoundary: FinalPersistenceGate
+    ) async -> Bool {
+        // This is the production primitive used by recordCompletion: the
+        // ownership decision and all ID-keyed teardown are synchronous.
+        let snapshot = fence
+        guard snapshot.publishIfOwned(identifier, token: generation, {
+            destructivePublications += 1
+            hasPortForwarding = false
+            hasLogMonitor = false
+        }) else { return false }
+
+        // synchronizeFabric() is the first suspension after publication.
+        await fabricBoundary.blockWhenArmed()
         return true
     }
 
     func publicationCount() -> Int { destructivePublications }
+    func replacementResourcesAreInstalled() -> Bool { hasPortForwarding && hasLogMonitor }
 }
 
 private actor AuthImageBackend: ContainerBackend {
@@ -4347,7 +4363,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(completed.startedAt == restarted.startedAt)
     }
 
-    @Test func staleRawCompletionCannotPublishAfterReplacementInstallation() async throws {
+    @Test func rawCompletionCannotTearDownReplacementAfterFabricSuspension() async throws {
         let identifier = "raw-completion-generation"
         let harness = RawCompletionPublicationHarness()
         let oldGeneration = await harness.install(identifier)
@@ -4355,18 +4371,22 @@ private actor AuthImageBackend: ContainerBackend {
         await gate.arm(afterSuccessfulSaves: 0)
 
         let oldCompletion = Task {
-            await gate.blockWhenArmed()
-            return await harness.publishIfCurrent(identifier, generation: oldGeneration)
+            await harness.publishCompletion(
+                identifier, generation: oldGeneration, fabricBoundary: gate
+            )
         }
         while !(await gate.isBlocked()) { await Task.yield() }
 
+        // The old completion passed its generation guard and is now suspended
+        // at the production-equivalent synchronizeFabric boundary. Starting a
+        // replacement installs new ID-keyed port and log state while it waits.
         let replacementGeneration = await harness.install(identifier)
         #expect(replacementGeneration != oldGeneration)
+        #expect(await harness.replacementResourcesAreInstalled())
         await gate.release()
 
-        #expect(await oldCompletion.value == false)
-        #expect(await harness.publicationCount() == 0)
-        #expect(await harness.publishIfCurrent(identifier, generation: replacementGeneration))
+        #expect(await oldCompletion.value)
+        #expect(await harness.replacementResourcesAreInstalled())
         #expect(await harness.publicationCount() == 1)
     }
 

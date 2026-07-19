@@ -8,13 +8,18 @@ import NIOPosix
 typealias PortStreamConnector = @Sendable (PortBinding) async throws -> CInt
 
 final class PortForwarder: @unchecked Sendable {
+    struct Registration: Hashable, Sendable {
+        fileprivate let id = UUID()
+    }
+
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     private let privilegedPorts = PrivilegedPortClient()
     private let lock = NSLock()
-    private var listeners: [String: [Channel]] = [:]
+    private var listeners: [String: [Registration: [Channel]]] = [:]
 
     func start(
         containerID: String,
+        registration: Registration = Registration(),
         bindings: [PortBinding],
         connect: @escaping PortStreamConnector
     ) async throws -> [PortBinding] {
@@ -84,7 +89,9 @@ final class PortForwarder: @unchecked Sendable {
                 value.hostPort = UInt16(channel.localAddress?.port ?? Int(binding.hostPort))
                 resolved.append(value)
             }
-            lock.withLock { listeners[containerID, default: []].append(contentsOf: started) }
+            lock.withLock {
+                listeners[containerID, default: [:]][registration, default: []].append(contentsOf: started)
+            }
             return resolved
         } catch {
             started.forEach { $0.close(promise: nil) }
@@ -112,13 +119,24 @@ final class PortForwarder: @unchecked Sendable {
     }
 
     func stop(containerID: String) {
-        let values = lock.withLock { listeners.removeValue(forKey: containerID) ?? [] }
+        let values = lock.withLock {
+            listeners.removeValue(forKey: containerID)?.values.flatMap { $0 } ?? []
+        }
+        values.forEach { $0.close(promise: nil) }
+    }
+
+    func stop(containerID: String, registration: Registration) {
+        let values = lock.withLock {
+            let values = listeners[containerID]?.removeValue(forKey: registration) ?? []
+            if listeners[containerID]?.isEmpty == true { listeners.removeValue(forKey: containerID) }
+            return values
+        }
         values.forEach { $0.close(promise: nil) }
     }
 
     func stopAll() {
         let values = lock.withLock {
-            let result = listeners.values.flatMap { $0 }
+            let result = listeners.values.flatMap { $0.values }.flatMap { $0 }
             listeners.removeAll()
             return result
         }
