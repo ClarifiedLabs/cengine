@@ -59,6 +59,12 @@ public actor EngineRuntime {
         let token = UUID()
     }
 
+    private struct RemovalPublicationReservation {
+        let containerID: String
+        let containerName: String
+        let volumeNames: Set<String>
+    }
+
     var snapshot: EngineSnapshot
     private let store: AtomicStore<EngineSnapshot>
     private let endpointAllocationStore: AtomicStore<[String: Int]>
@@ -77,6 +83,7 @@ public actor EngineRuntime {
     private var lifecycleIntents: [String: LifecycleIntent] = [:]
     private var pendingContainerNames: [String: String] = [:]
     private var pendingContainerIDs = Set<String>()
+    private var pendingVolumeNames = Set<String>()
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
     private var startingExecIDs = Set<String>()
@@ -916,8 +923,26 @@ public actor EngineRuntime {
         defer { endLifecycleIntent(intent, for: removed.id) }
         if removed.phase == .running || removed.phase == .paused {
             guard force else { throw EngineError(.conflict, "You cannot remove a running container. Stop the container before attempting removal or force remove.") }
+            // Force-stop is itself a destructive backend boundary. Publish the
+            // complete removal intent first so a crash or a side-effecting
+            // stop failure can only recover by finishing removal.
+            snapshot.containers[index].phase = .dead
+            markCleanupPending(removed.id)
+            markRemovalPending(removed.id, removeVolumes: removeVolumes)
+            do {
+                try await persist()
+            } catch {
+                try? await persist()
+                throw error
+            }
+            guard lifecycleIntents[removed.id] == intent,
+                  snapshot.containers.contains(where: { $0.id == removed.id }) else {
+                throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
+            }
             let code = try await backend.stop(removed, timeoutSeconds: 0)
-            await recordCompletion(removed.id, startedAt: removed.startedAt, code: code)
+            try await recordForcedRemovalStop(
+                removed.id, startedAt: removed.startedAt, code: code, intent: intent
+            )
         }
         try await removeClaimedContainer(removed.id, removeVolumes: removeVolumes, intent: intent)
     }
@@ -955,18 +980,27 @@ public actor EngineRuntime {
         healthTasks.removeValue(forKey: identifier)?.cancel()
         cancelCompletionMonitor(identifier)
         let removedVolumeMetadata = removeVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+        let publicationReservation = reserveRemovalPublication(
+            removed, removedVolumes: removedVolumeMetadata.map(\.element)
+        )
         do {
             try await cleanupBackendExecution(removed)
             try await backend.deleteLogs(for: removed)
             if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
         } catch {
             quarantineRemovalPendingContainer(identifier, record: removed, removeVolumes: removeVolumes)
+            releaseRemovalPublication(publicationReservation)
             try? await persist()
             throw error
         }
 
         guard lifecycleIntents[identifier] == intent,
               let current = try? containerIndex(identifier) else {
+            restoreRemovalQuarantine(
+                removed, at: fencedIndex, removeVolumes: removeVolumes,
+                removedVolumes: removedVolumeMetadata
+            )
+            releaseRemovalPublication(publicationReservation)
             throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
         }
         let durableRemovalRecord = snapshot.containers.remove(at: current)
@@ -974,11 +1008,13 @@ public actor EngineRuntime {
         clearRemovalPending(identifier)
         do {
             try await persist()
+            releaseRemovalPublication(publicationReservation)
         } catch {
             restoreRemovalQuarantine(
                 durableRemovalRecord, at: current, removeVolumes: removeVolumes,
                 removedVolumes: removedVolumeMetadata
             )
+            releaseRemovalPublication(publicationReservation)
             try? await persist()
             throw error
         }
@@ -993,6 +1029,9 @@ public actor EngineRuntime {
         let record = snapshot.containers[index]
         let intent = try beginLifecycleIntent(.rename, for: record.id)
         do {
+            if let conflictingID = pendingContainerNames[normalized], conflictingID != record.id {
+                throw Self.containerNameConflict(name: normalized, conflictingID: conflictingID)
+            }
             if let conflicting = snapshot.containers.indices.first(where: {
                 $0 != index && snapshot.containers[$0].name == normalized
             }) {
@@ -1433,6 +1472,9 @@ public actor EngineRuntime {
 
     public func createVolume(name: String, sizeBytes: UInt64 = VolumeRecord.defaultSizeBytes, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
+        guard !pendingVolumeNames.contains(name) else {
+            throw EngineError(.conflict, "volume \(name) is being removed")
+        }
         if let existing = snapshot.volumes.first(where: { $0.name == name }) { return existing }
         let record = VolumeRecord(name: name, createdAt: Date(), sizeBytes: sizeBytes, labels: labels, options: options, anonymous: anonymous)
         snapshot.volumes.append(record)
@@ -1920,6 +1962,29 @@ public actor EngineRuntime {
         }
     }
 
+    private func reserveRemovalPublication(
+        _ record: ContainerRecord,
+        removedVolumes: [VolumeRecord]
+    ) -> RemovalPublicationReservation {
+        let volumeNames = Set(removedVolumes.map(\.name))
+        pendingContainerNames[record.name] = record.id
+        pendingContainerIDs.insert(record.id)
+        pendingVolumeNames.formUnion(volumeNames)
+        return RemovalPublicationReservation(
+            containerID: record.id,
+            containerName: record.name,
+            volumeNames: volumeNames
+        )
+    }
+
+    private func releaseRemovalPublication(_ reservation: RemovalPublicationReservation) {
+        if pendingContainerNames[reservation.containerName] == reservation.containerID {
+            pendingContainerNames.removeValue(forKey: reservation.containerName)
+        }
+        pendingContainerIDs.remove(reservation.containerID)
+        pendingVolumeNames.subtract(reservation.volumeNames)
+    }
+
     private func cleanupIsPending(_ identifier: String) -> Bool {
         snapshot.cleanupPendingContainerIDs?.contains(identifier) == true
     }
@@ -1958,6 +2023,38 @@ public actor EngineRuntime {
         }
         markCleanupPending(identifier)
         markRemovalPending(identifier, removeVolumes: removeVolumes)
+    }
+
+    /// Publish a successful force-stop without allowing restart policy or
+    /// auto-remove reconciliation to run ahead of the explicit removal claim.
+    /// The container remains publicly quarantined until final removal commits.
+    private func recordForcedRemovalStop(
+        _ identifier: String,
+        startedAt: Date?,
+        code: Int32,
+        intent: LifecycleIntent
+    ) async throws {
+        guard lifecycleIntents[identifier] == intent,
+              let index = snapshot.containers.firstIndex(where: { $0.id == identifier }),
+              snapshot.containers[index].startedAt == startedAt else {
+            throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
+        }
+        cancelCompletionMonitor(identifier)
+        healthTasks.removeValue(forKey: identifier)?.cancel()
+        snapshot.containers[index].phase = .dead
+        snapshot.containers[index].exitCode = code
+        snapshot.containers[index].finishedAt = Date()
+        markCleanupPending(identifier)
+        let stopped = snapshot.containers[index]
+        resumeExitWaiters(identifier, code: code)
+        emit(containerEvent("die", stopped, extra: ["exitCode": String(code)]))
+        await reconcileExecs(for: identifier)
+        guard lifecycleIntents[identifier] == intent,
+              let current = snapshot.containers.firstIndex(where: { $0.id == identifier }) else {
+            throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
+        }
+        snapshot.containers[current].phase = .dead
+        markCleanupPending(identifier)
     }
 
     /// A backend start can partially launch before throwing, or succeed before
@@ -2150,11 +2247,17 @@ public actor EngineRuntime {
         removeVolumes: Bool,
         removedVolumes: [(offset: Int, element: VolumeRecord)]
     ) {
-        var quarantined = record
-        quarantined.phase = .dead
-        if let existing = try? containerIndex(record.id) {
-            snapshot.containers[existing] = quarantined
-        } else {
+        if let existing = snapshot.containers.firstIndex(where: {
+            $0.id == record.id && $0.name == record.name && $0.createdAt == record.createdAt
+        }) {
+            // Preserve mutations to the original object made by unrelated
+            // actor work; removal owns only its quarantine and durable fences.
+            snapshot.containers[existing].phase = .dead
+        } else if !snapshot.containers.contains(where: {
+            $0.id == record.id || $0.name == record.name
+        }) {
+            var quarantined = record
+            quarantined.phase = .dead
             snapshot.containers.insert(quarantined, at: min(index, snapshot.containers.endIndex))
         }
         for volume in removedVolumes.sorted(by: { $0.offset < $1.offset })

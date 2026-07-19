@@ -914,6 +914,87 @@ private actor ArmedStateSaveFailure {
     func failureCount() -> Int { injectedFailures }
 }
 
+private actor FinalPersistenceGate {
+    private var armed = false
+    private var successfulSavesBeforeBlock = 0
+    private var blocked = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func arm(afterSuccessfulSaves: Int) {
+        armed = true
+        successfulSavesBeforeBlock = afterSuccessfulSaves
+    }
+
+    func blockWhenArmed() async {
+        guard armed else { return }
+        guard successfulSavesBeforeBlock == 0 else {
+            successfulSavesBeforeBlock -= 1
+            return
+        }
+        armed = false
+        blocked = true
+        await withCheckedContinuation { continuation = $0 }
+        blocked = false
+    }
+
+    func isBlocked() -> Bool { blocked }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor ForceRemovalStopFailureBackend: ContainerBackend {
+    enum Failure: Error { case stopAfterSideEffect }
+
+    private var preparedContainers = Set<String>()
+    private var runningContainers = Set<String>()
+    private var failAndBlockNextStop = false
+    private var stopBlocked = false
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var starts = 0
+    private var stops = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        preparedContainers.insert(container.id)
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        runningContainers.insert(container.id)
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        stops += 1
+        runningContainers.remove(container.id)
+        guard failAndBlockNextStop else { return 137 }
+        failAndBlockNextStop = false
+        stopBlocked = true
+        await withCheckedContinuation { stopContinuation = $0 }
+        stopBlocked = false
+        throw Failure.stopAfterSideEffect
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+    }
+    func completion(_: ContainerRecord) async -> Int32? { nil }
+
+    func blockAndFailNextStopAfterSideEffect() { failAndBlockNextStop = true }
+    func isStopBlocked() -> Bool { stopBlocked }
+    func releaseStop() {
+        stopContinuation?.resume()
+        stopContinuation = nil
+    }
+    func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
+    func isPrepared(_ identifier: String) -> Bool { preparedContainers.contains(identifier) }
+    func counts() -> (starts: Int, stops: Int, deletes: Int) { (starts, stops, deletes) }
+}
+
 private actor WaitObservation {
     private var didComplete = false
 
@@ -5482,6 +5563,125 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(durable.cleanupPendingContainerIDs == nil)
         #expect(durable.removalPendingContainerIDs == nil)
         await recovered.shutdown()
+    }
+
+    @Test func forceRemovalStopFailureStaysQuarantinedAndCannotRestartAcrossReload() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ForceRemovalStopFailureBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        var input = ContainerRecord(name: "force-removal-stop-failure", image: "debian")
+        input.restartPolicy = .init(name: "always")
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        await backend.blockAndFailNextStopAfterSideEffect()
+
+        let removal = Task {
+            await router.route(.init(
+                method: .DELETE,
+                uri: "/v1.44/containers/\(record.id)?force=1"
+            ))
+        }
+        while !(await backend.isStopBlocked()) { await Task.yield() }
+
+        let quarantined = try await runtime.container(record.id)
+        #expect(quarantined.phase == .dead)
+        #expect(quarantined.exitCode == nil)
+        #expect(!(await backend.isRunning(record.id)))
+        let durableWhileBlocked = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durableWhileBlocked.containers.first(where: { $0.id == record.id })?.phase == .dead)
+        #expect(durableWhileBlocked.cleanupPendingContainerIDs?.contains(record.id) == true)
+        #expect(durableWhileBlocked.removalPendingContainerIDs?.contains(record.id) == true)
+
+        await backend.releaseStop()
+        #expect(await removal.value.status == .internalServerError)
+        let failedCounts = await backend.counts()
+        #expect(failedCounts.starts == 1)
+        #expect(failedCounts.stops == 1)
+        #expect(failedCounts.deletes == 0)
+        await runtime.shutdown()
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        let recoveredCounts = await backend.counts()
+        #expect(recoveredCounts.starts == 1)
+        #expect(recoveredCounts.stops == 2)
+        #expect(recoveredCounts.deletes == 1)
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(!(await backend.isPrepared(record.id)))
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durable.containers.isEmpty)
+        #expect(durable.cleanupPendingContainerIDs == nil)
+        #expect(durable.removalPendingContainerIDs == nil)
+        await recovered.shutdown()
+    }
+
+    @Test func finalRemovalSaveReservesContainerAndVolumeIdentitiesWithoutLosingConcurrentCreates() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let persistenceGate = FinalPersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforePersistence: { await persistenceGate.blockWhenArmed() }
+        )
+        let volume = try await runtime.createVolume(name: "reserved-removal-volume", anonymous: true)
+        var input = ContainerRecord(
+            id: "reserved-removal-container-id",
+            name: "reserved-removal-container",
+            image: "debian"
+        )
+        input.mounts = [.init(kind: .volume, source: volume.name, destination: "/data")]
+        let removed = try await runtime.createContainer(input)
+        let renameCandidate = try await runtime.createContainer(
+            ContainerRecord(name: "rename-removal-candidate", image: "debian")
+        )
+        await persistenceGate.arm(afterSuccessfulSaves: 1)
+
+        let removal = Task {
+            try await runtime.removeContainer(removed.id, force: false, removeVolumes: true)
+        }
+        while !(await persistenceGate.isBlocked()) { await Task.yield() }
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.createContainer(
+                ContainerRecord(name: removed.name, image: "replacement-by-name")
+            )
+        }
+        await #expect(throws: EngineError.self) {
+            try await runtime.createContainer(
+                ContainerRecord(
+                    id: removed.id,
+                    name: "replacement-by-id",
+                    image: "debian"
+                )
+            )
+        }
+        await #expect(throws: EngineError.self) {
+            try await runtime.renameContainer(renameCandidate.id, name: removed.name)
+        }
+        await #expect(throws: EngineError.self) {
+            try await runtime.createVolume(name: volume.name)
+        }
+        let unrelated = try await runtime.createContainer(
+            ContainerRecord(name: "unrelated-final-save-create", image: "debian")
+        )
+
+        await persistenceGate.release()
+        try await removal.value
+        await #expect(throws: EngineError.self) { try await runtime.container(removed.id) }
+        #expect(try await runtime.container(renameCandidate.id).name == renameCandidate.name)
+        #expect(try await runtime.container(unrelated.id).name == unrelated.name)
+        #expect(!(await runtime.listVolumes().contains(where: { $0.name == volume.name })))
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(!durable.containers.contains(where: { $0.id == removed.id }))
+        #expect(durable.containers.contains(where: { $0.id == unrelated.id }))
+        #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
+        await runtime.shutdown()
     }
 
     @Test func pruneReservesEachContainerAgainstConcurrentStart() async throws {
