@@ -201,25 +201,11 @@ public actor EngineRuntime {
                 snapshot.containers[index].exitCode = quarantined.exitCode ?? 127
             }
         }
-        // A recovered auto-remove execution is terminal only after cleanup and
-        // marker clearing are durable. Remove it before considering restart
-        // policy so `--rm` remains authoritative across a daemon crash.
-        let recoveredAutoRemoveIDs = snapshot.containers.compactMap { record in
-            record.autoRemove && record.phase == .exited ? record.id : nil
-        }
-        for identifier in recoveredAutoRemoveIDs {
-            guard let index = try? containerIndex(identifier) else { continue }
-            let removed = snapshot.containers[index]
-            if !verifiedCleanupIDs.contains(identifier) {
-                try await cleanupBackendExecution(removed)
-                verifiedCleanupIDs.insert(identifier)
-            }
-            try await backend.deleteLogs(for: removed)
-            try await removeAnonymousVolumes(usedBy: removed)
-            guard let current = try? containerIndex(identifier) else { continue }
-            snapshot.containers.remove(at: current)
-            try await persist()
-        }
+        // Remove records that were already terminal before recovery before
+        // considering restart policy. Cleanup itself publishes a durable fence.
+        verifiedCleanupIDs = try await removeRecoveredAutoRemoveContainers(
+            verifiedCleanupIDs: verifiedCleanupIDs
+        )
         var recovered: [(String, Date)] = []
         for index in snapshot.containers.indices {
             let stale = snapshot.containers[index]
@@ -239,6 +225,7 @@ public actor EngineRuntime {
                 }
                 snapshot.containers[index].phase = .exited
                 snapshot.containers[index].finishedAt = Date()
+                guard !stale.autoRemove else { continue }
                 guard Self.shouldRestart(stale, exitCode: snapshot.containers[index].exitCode ?? 137) else { continue }
             } else {
                 guard stale.phase == .exited, stale.restartPolicy.name == "always" else { continue }
@@ -295,6 +282,12 @@ public actor EngineRuntime {
                 }
             }
         }
+        // A running auto-remove record can become terminal only after backend
+        // recovery. Remove it now, before any later startup work can publish or
+        // restart that generation.
+        verifiedCleanupIDs = try await removeRecoveredAutoRemoveContainers(
+            verifiedCleanupIDs: verifiedCleanupIDs
+        )
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
         }
@@ -1996,6 +1989,41 @@ public actor EngineRuntime {
         }
     }
 
+    /// Finish startup reconciliation for terminal auto-remove records. A fresh
+    /// record is fenced before teardown; one already cleaned through a pending
+    /// marker reuses that proof so recovery never issues a duplicate delete.
+    private func removeRecoveredAutoRemoveContainers(
+        verifiedCleanupIDs input: Set<String>
+    ) async throws -> Set<String> {
+        var verifiedCleanupIDs = input
+        let recoveredAutoRemoveIDs = snapshot.containers.compactMap { record in
+            record.autoRemove && record.phase == .exited ? record.id : nil
+        }
+        for identifier in recoveredAutoRemoveIDs {
+            guard let index = try? containerIndex(identifier) else { continue }
+            let removed = snapshot.containers[index]
+            if !verifiedCleanupIDs.contains(identifier) {
+                markCleanupPending(identifier)
+                try await persist()
+                do {
+                    try await cleanupBackendExecution(removed)
+                } catch {
+                    quarantineCleanupPendingContainer(identifier)
+                    try? await persist()
+                    throw error
+                }
+                verifiedCleanupIDs.insert(identifier)
+            }
+            try await backend.deleteLogs(for: removed)
+            try await removeAnonymousVolumes(usedBy: removed)
+            guard let current = try? containerIndex(identifier) else { continue }
+            snapshot.containers.remove(at: current)
+            clearCleanupPending(identifier)
+            try await persist()
+        }
+        return verifiedCleanupIDs
+    }
+
     public func events(since: Date? = nil, until: Date? = nil) -> AsyncStream<RuntimeEvent> {
         let id = UUID()
         let (stream, continuation) = AsyncStream.makeStream(of: RuntimeEvent.self)
@@ -2309,14 +2337,32 @@ public actor EngineRuntime {
                 if ownsIntent { endLifecycleIntent(removeIntent, for: identifier) }
             }
             guard ownsReconciliation(removeIntent, record: record) else { return }
-            if cleanupIsPending(identifier) {
+            if !cleanupIsPending(identifier) {
+                // Publish the cleanup fence before crossing the backend
+                // teardown boundary. If the save fails, leave the terminal
+                // record intact and do not risk losing track of its execution.
+                markCleanupPending(identifier)
                 do {
-                    try await cleanupBackendExecution(record)
+                    try await persist()
                 } catch {
+                    clearCleanupPending(identifier)
+                    // Persist the already-terminal phase without crossing the
+                    // teardown boundary. Recovery can then re-enter auto-remove
+                    // cleanup and durably publish a fresh marker first.
+                    try? await persist()
                     return
                 }
-            } else {
-                try? await backend.delete(record)
+            }
+            guard ownsReconciliation(removeIntent, record: record) else { return }
+            do {
+                try await cleanupBackendExecution(record)
+            } catch {
+                // Delete is the definitive cleanup proof. Retain both the
+                // record and marker when it fails so reload must retry before
+                // any restart policy or backend operation can proceed.
+                quarantineCleanupPendingContainer(identifier)
+                try? await persist()
+                return
             }
             guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.deleteLogs(for: record)
@@ -2326,8 +2372,21 @@ public actor EngineRuntime {
                   let current = try? containerIndex(identifier) else { return }
             snapshot.containers.remove(at: current)
             clearCleanupPending(identifier)
+            do {
+                try await persist()
+            } catch {
+                // Backend deletion succeeded, but keep the cleanup fence in
+                // memory when its metadata removal could not be committed.
+                // The durable pending record will finish removal on reload.
+                var quarantined = record
+                quarantined.phase = .dead
+                snapshot.containers.insert(quarantined, at: min(current, snapshot.containers.endIndex))
+                markCleanupPending(identifier)
+                return
+            }
             resumeRemovalWaiters(identifier, code: code)
             emit(containerEvent("destroy", record))
+            return
         }
         try? await persist()
     }

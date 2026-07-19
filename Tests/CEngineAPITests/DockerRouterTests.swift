@@ -1241,6 +1241,53 @@ private actor QuarantinedExecutionBackend: ContainerBackend {
     func executionOperationCount() -> Int { executionOperations }
 }
 
+/// Models an auto-remove container whose execution has completed but remains a
+/// live backend resource until definitive deletion succeeds.
+private actor AutoRemoveCleanupBackend: ContainerBackend {
+    enum Failure: Error { case cleanupStop, cleanupDelete }
+
+    private var completionContinuations: [String: CheckedContinuation<Int32?, Never>] = [:]
+    private var backendResources = Set<String>()
+    private var rejectCleanup = false
+    private var starts = 0
+    private var stops = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        backendResources.insert(container.id)
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        stops += 1
+        if rejectCleanup { throw Failure.cleanupStop }
+        backendResources.remove(container.id)
+        return 0
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        if rejectCleanup { throw Failure.cleanupDelete }
+        backendResources.remove(container.id)
+    }
+    func completion(_ container: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuations[container.id] = $0 }
+    }
+
+    func isWaitingForCompletion(_ identifier: String) -> Bool {
+        completionContinuations[identifier] != nil
+    }
+    func complete(_ identifier: String, code: Int32) {
+        completionContinuations.removeValue(forKey: identifier)?.resume(returning: code)
+    }
+    func failCleanup() { rejectCleanup = true }
+    func allowCleanup() { rejectCleanup = false }
+    func hasBackendResource(_ identifier: String) -> Bool { backendResources.contains(identifier) }
+    func counts() -> (starts: Int, stops: Int, deletes: Int) { (starts, stops, deletes) }
+}
+
 /// Drives both daemon-startup and live restart-policy launches across a partial
 /// start boundary, then makes compensation unverifiable until explicitly
 /// released by the test.
@@ -4683,6 +4730,158 @@ private actor AuthImageBackend: ContainerBackend {
             .load(default: EngineSnapshot())
         #expect(!durable.containers.contains(where: { $0.id == record.id }))
         #expect(!durable.containers.contains(where: { $0.id == preexisting.id }))
+        #expect(durable.cleanupPendingContainerIDs == nil)
+        await recovered.shutdown()
+    }
+
+    @Test func failedLiveAutoRemoveCleanupStaysQuarantinedUntilReloadVerifiesDeletion() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = AutoRemoveCleanupBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        var input = ContainerRecord(name: "auto-remove-cleanup-quarantine", image: "debian")
+        input.autoRemove = true
+        input.restartPolicy = .init(name: "always")
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+
+        await backend.failCleanup()
+        await backend.complete(record.id, code: 0)
+        for _ in 0..<1_000 {
+            if try await runtime.container(record.id).phase == .dead { break }
+            await Task.yield()
+        }
+
+        let quarantined = try await runtime.container(record.id)
+        #expect(quarantined.phase == .dead)
+        #expect(quarantined.exitCode == 0)
+        #expect(await backend.hasBackendResource(record.id))
+        let failedCounts = await backend.counts()
+        #expect(failedCounts.starts == 1)
+        #expect(failedCounts.stops == 1)
+        #expect(failedCounts.deletes == 1)
+        let durableFailure = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durableFailure.containers.first(where: { $0.id == record.id })?.phase == .dead)
+        #expect(durableFailure.cleanupPendingContainerIDs?.contains(record.id) == true)
+
+        let failedHistory = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var failedHistoryIterator = failedHistory.makeAsyncIterator()
+        var failedActions: [String] = []
+        while let event = await failedHistoryIterator.next() {
+            if event.id == record.id { failedActions.append(event.action) }
+        }
+        #expect(!failedActions.contains("restart"))
+        #expect(!failedActions.contains("destroy"))
+
+        await runtime.shutdown()
+        await #expect(throws: EngineError.self) {
+            _ = try await EngineRuntime(root: root, backend: backend)
+        }
+        #expect(await backend.hasBackendResource(record.id))
+        let refusedCounts = await backend.counts()
+        #expect(refusedCounts.starts == 1)
+        #expect(refusedCounts.deletes == 2)
+
+        await backend.allowCleanup()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        #expect(!(await backend.hasBackendResource(record.id)))
+        let recoveredCounts = await backend.counts()
+        #expect(recoveredCounts.starts == 1)
+        // Pending recovery verifies deletion once; auto-remove record cleanup
+        // reuses that proof instead of issuing a second delete.
+        #expect(recoveredCounts.deletes == refusedCounts.deletes + 1)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(!durable.containers.contains(where: { $0.id == record.id }))
+        #expect(durable.cleanupPendingContainerIDs == nil)
+
+        let recoveredHistory = await recovered.events(since: Date().addingTimeInterval(-60), until: Date())
+        var recoveredHistoryIterator = recoveredHistory.makeAsyncIterator()
+        var recoveredActions: [String] = []
+        while let event = await recoveredHistoryIterator.next() {
+            if event.id == record.id { recoveredActions.append(event.action) }
+        }
+        #expect(!recoveredActions.contains("restart"))
+        #expect(!recoveredActions.contains("destroy"))
+        await recovered.shutdown()
+    }
+
+    @Test func liveAutoRemoveDoesNotDeleteBeforeCleanupMarkerIsDurable() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = AutoRemoveCleanupBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        var input = ContainerRecord(name: "auto-remove-marker-failure", image: "debian")
+        input.autoRemove = true
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+
+        await saveFailure.arm()
+        await backend.complete(record.id, code: 0)
+        for _ in 0..<1_000 {
+            if await saveFailure.failureCount() == 1 { break }
+            await Task.yield()
+        }
+
+        #expect(await saveFailure.failureCount() == 1)
+        #expect(try await runtime.container(record.id).phase == .exited)
+        #expect(await backend.hasBackendResource(record.id))
+        #expect(await backend.counts().deletes == 0)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durable.containers.first(where: { $0.id == record.id })?.phase == .exited)
+        #expect(durable.cleanupPendingContainerIDs == nil)
+
+        let history = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        var historyIterator = history.makeAsyncIterator()
+        var actions: [String] = []
+        while let event = await historyIterator.next() {
+            if event.id == record.id { actions.append(event.action) }
+        }
+        #expect(!actions.contains("destroy"))
+        await runtime.shutdown()
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        #expect(!(await backend.hasBackendResource(record.id)))
+        #expect(await backend.counts().deletes == 1)
+        let recoveredDurable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(!recoveredDurable.containers.contains(where: { $0.id == record.id }))
+        #expect(recoveredDurable.cleanupPendingContainerIDs == nil)
+        await recovered.shutdown()
+    }
+
+    @Test func recoveredAutoRemoveCompletionWinsOverRestartPolicy() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = AutoRemoveCleanupBackend()
+        var record = ContainerRecord(name: "recovered-auto-remove", image: "debian")
+        record.phase = .running
+        record.startedAt = Date(timeIntervalSince1970: 10)
+        record.autoRemove = true
+        record.restartPolicy = .init(name: "always")
+        try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .save(EngineSnapshot(containers: [record]))
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        let counts = await backend.counts()
+        #expect(counts.starts == 0)
+        #expect(counts.deletes == 1)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(!durable.containers.contains(where: { $0.id == record.id }))
         #expect(durable.cleanupPendingContainerIDs == nil)
         await recovered.shutdown()
     }
