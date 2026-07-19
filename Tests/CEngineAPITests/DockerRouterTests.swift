@@ -1537,6 +1537,26 @@ private actor GenerationCompletionBackend: ContainerBackend {
     }
 }
 
+private actor RawCompletionPublicationHarness {
+    private var fence = RawBackendExecutionFence()
+    private var destructivePublications = 0
+
+    func install(_ identifier: String) -> RawBackendExecutionFence.Token {
+        fence.replace(identifier)
+    }
+
+    func publishIfCurrent(
+        _ identifier: String,
+        generation: RawBackendExecutionFence.Token
+    ) -> Bool {
+        guard fence.owns(identifier, token: generation) else { return false }
+        destructivePublications += 1
+        return true
+    }
+
+    func publicationCount() -> Int { destructivePublications }
+}
+
 private actor AuthImageBackend: ContainerBackend {
     private var credentials: RegistryCredentials?
     private var pulled = false
@@ -4327,6 +4347,29 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(completed.startedAt == restarted.startedAt)
     }
 
+    @Test func staleRawCompletionCannotPublishAfterReplacementInstallation() async throws {
+        let identifier = "raw-completion-generation"
+        let harness = RawCompletionPublicationHarness()
+        let oldGeneration = await harness.install(identifier)
+        let gate = FinalPersistenceGate()
+        await gate.arm(afterSuccessfulSaves: 0)
+
+        let oldCompletion = Task {
+            await gate.blockWhenArmed()
+            return await harness.publishIfCurrent(identifier, generation: oldGeneration)
+        }
+        while !(await gate.isBlocked()) { await Task.yield() }
+
+        let replacementGeneration = await harness.install(identifier)
+        #expect(replacementGeneration != oldGeneration)
+        await gate.release()
+
+        #expect(await oldCompletion.value == false)
+        #expect(await harness.publicationCount() == 0)
+        #expect(await harness.publishIfCurrent(identifier, generation: replacementGeneration))
+        #expect(await harness.publicationCount() == 1)
+    }
+
     @Test func restartFailureAfterStoppingOldExecutionCleansAndTerminalizesItsGeneration() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5514,6 +5557,50 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(durable.removalVolumesPendingContainerIDs == nil)
         #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
         await recovered.shutdown()
+    }
+
+    @Test(arguments: [false, true])
+    func durableRemoveVolumesIntentSurvivesRetryAndPrune(retryUsingPrune: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: MetadataOnlyBackend(),
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let suffix = retryUsingPrune ? "prune" : "remove"
+        let volume = try await runtime.createVolume(
+            name: "durable-remove-volume-\(suffix)", anonymous: true
+        )
+        var input = ContainerRecord(name: "durable-remove-\(suffix)", image: "debian")
+        input.mounts = [.init(kind: .volume, source: volume.name, destination: "/data")]
+        let record = try await runtime.createContainer(input)
+        await saveFailure.arm(afterSuccessfulSaves: 1)
+
+        await #expect(throws: ArmedStateSaveFailure.Failure.self) {
+            try await runtime.removeContainer(record.id, force: false, removeVolumes: true)
+        }
+        #expect(await runtime.listVolumes().contains(where: { $0.name == volume.name }))
+        let failedSnapshot = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: EngineSnapshot())
+        #expect(failedSnapshot.removalVolumesPendingContainerIDs?.contains(record.id) == true)
+        #expect(failedSnapshot.volumes.contains(where: { $0.name == volume.name }))
+
+        if retryUsingPrune {
+            #expect(try await runtime.pruneContainers(ids: [record.id]) == [record.id])
+        } else {
+            try await runtime.removeContainer(record.id, force: false, removeVolumes: false)
+        }
+
+        await #expect(throws: EngineError.self) { try await runtime.container(record.id) }
+        #expect(!(await runtime.listVolumes().contains(where: { $0.name == volume.name })))
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durable.removalVolumesPendingContainerIDs == nil)
+        #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
+        await runtime.shutdown()
     }
 
     @Test func removalFenceSaveFailureDoesNotCrossBackendCleanupBoundary() async throws {

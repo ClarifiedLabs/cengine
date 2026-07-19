@@ -4,6 +4,33 @@ import CryptoKit
 import Darwin
 import Foundation
 
+struct RawBackendExecutionFence: Sendable {
+    struct Token: Equatable, Sendable {
+        fileprivate let value = UUID()
+    }
+
+    private var tokens: [String: Token] = [:]
+
+    mutating func replace(_ identifier: String) -> Token {
+        let token = Token()
+        tokens[identifier] = token
+        return token
+    }
+
+    mutating func currentOrInstall(_ identifier: String) -> Token {
+        if let token = tokens[identifier] { return token }
+        return replace(identifier)
+    }
+
+    func owns(_ identifier: String, token: Token) -> Bool {
+        tokens[identifier] == token
+    }
+
+    mutating func remove(_ identifier: String) {
+        tokens.removeValue(forKey: identifier)
+    }
+}
+
 public actor RawVirtualizationBackend: ContainerBackend {
     enum VolumeStorageMode: String, Codable, Sendable { case block, shared }
 
@@ -31,7 +58,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private let portForwarder = PortForwarder()
     private var shims: [String: VMShimClient] = [:]
     private var completions: [String: Int32] = [:]
-    private var completionTasks: [String: Task<Int32, Never>] = [:]
+    private var completionTasks: [String: (generation: RawBackendExecutionFence.Token, task: Task<Int32, Never>)] = [:]
+    private var executionFence = RawBackendExecutionFence()
     private var networks: [String: NetworkRecord] = [:]
     private var networkVLANs: [String: UInt16] = [:]
     private var appliedNetworks: [String: Set<String>] = [:]
@@ -240,10 +268,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
         guard prepared.status == "prepared" else { throw EngineError(.internalError, "guest did not prepare workload") }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let pid: Int? }
+        // Fence the previous workload before crossing the replacement launch
+        // boundary. A canceled EngineRuntime monitor may still be suspended in
+        // completion(), and its delayed recordCompletion must not tear down the
+        // workload this call is about to install.
+        _ = executionFence.replace(container.id)
+        completionTasks.removeValue(forKey: container.id)?.task.cancel()
+        completions.removeValue(forKey: container.id)
         let response: Status = try await shim.guest(operation: "start", payload: Empty(), response: Status.self)
         guard response.status == "running" else { throw EngineError(.internalError, "workload did not start") }
-        completionTasks.removeValue(forKey: container.id)?.cancel()
-        completions.removeValue(forKey: container.id)
         do {
             var active = container
             if !container.ports.isEmpty {
@@ -277,6 +310,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func stop(_ container: ContainerRecord, timeoutSeconds: Int) async throws -> Int32 {
         if let code = completions[container.id] { return code }
         guard let shim = shims[container.id] else { return completions[container.id] ?? container.exitCode ?? 0 }
+        let generation = executionFence.currentOrInstall(container.id)
         struct Signal: Encodable { let signal: Int }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let exitCode: Int? }
@@ -287,7 +321,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 }
             } catch {
                 try await terminateShim(container.id, shim: shim)
-                return await recordCompletion(container, code: 137)
+                return await recordCompletion(container, code: 137, generation: generation)
             }
         }
         _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
@@ -297,10 +331,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 response: Status.self
             )
         }
-        if let existing = completionTasks[container.id] {
+        if let existing = completionTasks[container.id], existing.generation == generation {
             let code: Int32
             do {
-                code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) { await existing.value }
+                code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) {
+                    await existing.task.value
+                }
             } catch {
                 _ = try? await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
                     try await shim.guest(
@@ -309,15 +345,16 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 }
                 do {
                     code = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
-                        await existing.value
+                        await existing.task.value
                     }
                 } catch {
                     try await terminateShim(container.id, shim: shim)
                     code = 137
                 }
             }
-            return await recordCompletion(container, code: code)
+            return await recordCompletion(container, code: code, generation: generation)
         }
+        completionTasks.removeValue(forKey: container.id)?.task.cancel()
         let task = Task {
             let code: Int32
             do {
@@ -338,7 +375,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             }
             return code
         }
-        completionTasks[container.id] = task
+        completionTasks[container.id] = (generation, task)
         let code = await task.value
         do {
             _ = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
@@ -347,25 +384,27 @@ public actor RawVirtualizationBackend: ContainerBackend {
         } catch {
             try await terminateShim(container.id, shim: shim)
         }
-        return await recordCompletion(container, code: code)
+        return await recordCompletion(container, code: code, generation: generation)
     }
 
     public func wait(_ container: ContainerRecord) async throws -> Int32 {
         if let code = completions[container.id] { return code }
         guard let shim = shims[container.id] else { return container.exitCode ?? 0 }
+        let generation = executionFence.currentOrInstall(container.id)
         struct Empty: Encodable {}; struct Status: Decodable { let exitCode: Int? }
         let task: Task<Int32, Never>
-        if let existing = completionTasks[container.id] {
-            task = existing
+        if let existing = completionTasks[container.id], existing.generation == generation {
+            task = existing.task
         } else {
+            completionTasks.removeValue(forKey: container.id)?.task.cancel()
             task = Task {
                 let value: Status? = try? await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
                 _ = try? await shim.stop()
                 return value.map { Int32($0.exitCode ?? 0) } ?? container.exitCode ?? 137
             }
-            completionTasks[container.id] = task
+            completionTasks[container.id] = (generation, task)
         }
-        return await recordCompletion(container, code: task.value)
+        return await recordCompletion(container, code: task.value, generation: generation)
     }
 
     public func completion(_ container: ContainerRecord) async -> Int32? {
@@ -375,6 +414,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery {
         guard let shim = shims[container.id] else { return .unavailable }
+        _ = executionFence.currentOrInstall(container.id)
         let status = try await shim.status()
         switch status.state {
         case .running:
@@ -613,8 +653,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func delete(_ container: ContainerRecord) async throws {
         portForwarder.stop(containerID: container.id)
         if let shim = shims[container.id] { try await terminateShim(container.id, shim: shim) }
-        completionTasks.removeValue(forKey: container.id)?.cancel()
+        completionTasks.removeValue(forKey: container.id)?.task.cancel()
         completions.removeValue(forKey: container.id)
+        executionFence.remove(container.id)
         activeContainers.removeValue(forKey: container.id)
         logMonitors.removeValue(forKey: container.id)?.stop()
         bridges.removeValue(forKey: container.id)?.finishOutput()
@@ -626,6 +667,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
         for id in orphanIDs {
             portForwarder.stop(containerID: id)
             if let shim = shims[id] { try await terminateShim(id, shim: shim) }
+            completionTasks.removeValue(forKey: id)?.task.cancel()
+            completions.removeValue(forKey: id)
+            executionFence.remove(id)
         }
     }
 
@@ -759,8 +803,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return try await pull(reference, platform: platform, credentials: nil) { _ in }
     }
 
-    private func recordCompletion(_ container: ContainerRecord, code: Int32) async -> Int32 {
-        completionTasks.removeValue(forKey: container.id)
+    private func recordCompletion(
+        _ container: ContainerRecord,
+        code: Int32,
+        generation: RawBackendExecutionFence.Token
+    ) async -> Int32 {
+        // This check must precede every mutation. In particular, an old waiter
+        // can resume after start() has cleared ID-keyed state for a replacement.
+        guard executionFence.owns(container.id, token: generation) else { return code }
+        if completionTasks[container.id]?.generation == generation {
+            completionTasks.removeValue(forKey: container.id)
+        }
         if let existing = completions[container.id] { return existing }
         completions[container.id] = code
         activeContainers.removeValue(forKey: container.id)
@@ -783,7 +836,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private func terminateShim(_ containerID: String, shim: VMShimClient) async throws {
-        completionTasks.removeValue(forKey: containerID)?.cancel()
+        completionTasks.removeValue(forKey: containerID)?.task.cancel()
         finishExecSessions(using: shim)
         try await shim.terminate()
         if shims[containerID] === shim { shims.removeValue(forKey: containerID) }

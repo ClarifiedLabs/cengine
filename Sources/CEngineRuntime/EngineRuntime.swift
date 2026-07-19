@@ -956,6 +956,10 @@ public actor EngineRuntime {
             throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
         }
         guard (try? containerIndex(identifier)) != nil else { return }
+        // Once `rm -v` is durable, a retry (including prune, which normally
+        // does not remove volumes) must finish that original request.
+        let effectiveRemoveVolumes = removeVolumes
+            || snapshot.removalVolumesPendingContainerIDs?.contains(identifier) == true
         await reconcileExecs(for: identifier)
         guard lifecycleIntents[identifier] == intent,
               let fencedIndex = try? containerIndex(identifier) else {
@@ -966,7 +970,7 @@ public actor EngineRuntime {
         let removed = snapshot.containers[fencedIndex]
         snapshot.containers[fencedIndex].phase = .dead
         markCleanupPending(identifier)
-        markRemovalPending(identifier, removeVolumes: removeVolumes)
+        markRemovalPending(identifier, removeVolumes: effectiveRemoveVolumes)
         do {
             try await persist()
         } catch {
@@ -979,16 +983,18 @@ public actor EngineRuntime {
         resumeExitWaiters(identifier, code: removed.exitCode ?? 137)
         healthTasks.removeValue(forKey: identifier)?.cancel()
         cancelCompletionMonitor(identifier)
-        let removedVolumeMetadata = removeVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+        let removedVolumeMetadata = effectiveRemoveVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
         let publicationReservation = reserveRemovalPublication(
             removed, removedVolumes: removedVolumeMetadata.map(\.element)
         )
         do {
             try await cleanupBackendExecution(removed)
             try await backend.deleteLogs(for: removed)
-            if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
+            if effectiveRemoveVolumes { try await removeAnonymousVolumes(usedBy: removed) }
         } catch {
-            quarantineRemovalPendingContainer(identifier, record: removed, removeVolumes: removeVolumes)
+            quarantineRemovalPendingContainer(
+                identifier, record: removed, removeVolumes: effectiveRemoveVolumes
+            )
             releaseRemovalPublication(publicationReservation)
             try? await persist()
             throw error
@@ -997,7 +1003,7 @@ public actor EngineRuntime {
         guard lifecycleIntents[identifier] == intent,
               let current = try? containerIndex(identifier) else {
             restoreRemovalQuarantine(
-                removed, at: fencedIndex, removeVolumes: removeVolumes,
+                removed, at: fencedIndex, removeVolumes: effectiveRemoveVolumes,
                 removedVolumes: removedVolumeMetadata
             )
             releaseRemovalPublication(publicationReservation)
@@ -1011,7 +1017,7 @@ public actor EngineRuntime {
             releaseRemovalPublication(publicationReservation)
         } catch {
             restoreRemovalQuarantine(
-                durableRemovalRecord, at: current, removeVolumes: removeVolumes,
+                durableRemovalRecord, at: current, removeVolumes: effectiveRemoveVolumes,
                 removedVolumes: removedVolumeMetadata
             )
             releaseRemovalPublication(publicationReservation)
