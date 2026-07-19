@@ -1091,6 +1091,85 @@ private actor PartialStartFailureBackend: ContainerBackend {
     }
 }
 
+/// Leaves an execution live when start/restart fails, then rejects compensation
+/// attempts. This models a daemon crash boundary where the durable
+/// record must drive cleanup after reload instead of hiding the execution as a
+/// safe created/exited container.
+private actor QuarantinedExecutionBackend: ContainerBackend {
+    enum Failure: Error { case partialStart, partialRestart, cleanupStop, cleanupDelete }
+
+    private var preparedContainers = Set<String>()
+    private var runningContainers = Set<String>()
+    private var failNextStart = false
+    private var failNextRestart = false
+    private var rejectCleanup = false
+    private var rejectNextStopOnly = false
+    private var starts = 0
+    private var restarts = 0
+    private var stops = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        preparedContainers.insert(container.id)
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        runningContainers.insert(container.id)
+        if failNextStart {
+            failNextStart = false
+            throw Failure.partialStart
+        }
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        stops += 1
+        if rejectNextStopOnly {
+            rejectNextStopOnly = false
+            throw Failure.cleanupStop
+        }
+        if rejectCleanup { throw Failure.cleanupStop }
+        runningContainers.remove(container.id)
+        return 127
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        if rejectCleanup { throw Failure.cleanupDelete }
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+    }
+    func restart(_ container: ContainerRecord, timeoutSeconds _: Int) async throws {
+        restarts += 1
+        // The replacement crossed its launch boundary before the backend
+        // reports failure, so cleanup must account for a live generation.
+        runningContainers.insert(container.id)
+        if failNextRestart {
+            failNextRestart = false
+            throw Failure.partialRestart
+        }
+    }
+    func completion(_: ContainerRecord) async -> Int32? { nil }
+
+    func failStartAndCleanup() {
+        failNextStart = true
+        rejectCleanup = true
+    }
+    func failRestartAndCleanup() {
+        failNextRestart = true
+        rejectCleanup = true
+    }
+    func failStartAndStopOnly() {
+        failNextStart = true
+        rejectNextStopOnly = true
+    }
+    func allowCleanup() { rejectCleanup = false }
+    func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
+    func counts() -> (starts: Int, restarts: Int, stops: Int, deletes: Int) {
+        (starts, restarts, stops, deletes)
+    }
+}
+
 private actor CompletionMonitorEntryGate {
     private var entries = 0
     private var firstEntryContinuation: CheckedContinuation<Void, Never>?
@@ -4100,6 +4179,124 @@ private actor AuthImageBackend: ContainerBackend {
         try await reloaded.startContainer(record.id)
         #expect(try await reloaded.container(record.id).phase == .running)
         #expect(await backend.isRunning(record.id))
+        #expect(await backend.counts().starts == 2)
+        await reloaded.shutdown()
+    }
+
+    @Test func failedStartCleanupStaysQuarantinedUntilReloadVerifiesTeardown() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = QuarantinedExecutionBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "start-cleanup-quarantine", image: "debian")
+        )
+        // The first quarantine save fails, then the retry after cleanup failure
+        // must make `.dead` durable rather than leaving `.created` on disk.
+        await saveFailure.arm()
+        await backend.failStartAndCleanup()
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.startContainer(record.id)
+        }
+
+        #expect(try await runtime.container(record.id).phase == .dead)
+        #expect(await backend.isRunning(record.id))
+        let durableFailure = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durableFailure.containers.first(where: { $0.id == record.id })?.phase == .dead)
+        let failedCounts = await backend.counts()
+        #expect(failedCounts.starts == 1)
+        #expect(failedCounts.stops == 1)
+        #expect(failedCounts.deletes == 1)
+
+        // A same-daemon retry cannot cross the quarantine while definitive
+        // backend deletion is still failing.
+        await #expect(throws: QuarantinedExecutionBackend.Failure.self) {
+            try await runtime.startContainer(record.id)
+        }
+        #expect(try await runtime.container(record.id).phase == .dead)
+        #expect(await backend.isRunning(record.id))
+
+        await runtime.shutdown()
+        await #expect(throws: EngineError.self) {
+            _ = try await EngineRuntime(root: root, backend: backend)
+        }
+        #expect(await backend.isRunning(record.id))
+        let beforeRecovery = await backend.counts()
+        await backend.allowCleanup()
+        let reloaded = try await EngineRuntime(root: root, backend: backend)
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(try await reloaded.container(record.id).phase == .created)
+        let recoveredCounts = await backend.counts()
+        #expect(recoveredCounts.stops == beforeRecovery.stops + 1)
+        #expect(recoveredCounts.deletes == beforeRecovery.deletes + 1)
+
+        try await reloaded.startContainer(record.id)
+        #expect(await backend.isRunning(record.id))
+        #expect(try await reloaded.container(record.id).phase == .running)
+        await reloaded.shutdown()
+    }
+
+    @Test func successfulDeleteVerifiesFailedStartCleanupAfterStopFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = QuarantinedExecutionBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "delete-verifies-cleanup", image: "debian")
+        )
+        await backend.failStartAndStopOnly()
+
+        await #expect(throws: QuarantinedExecutionBackend.Failure.self) {
+            try await runtime.startContainer(record.id)
+        }
+
+        #expect(try await runtime.container(record.id).phase == .created)
+        #expect(!(await backend.isRunning(record.id)))
+        let counts = await backend.counts()
+        #expect(counts.stops == 1)
+        #expect(counts.deletes == 1)
+        await runtime.shutdown()
+    }
+
+    @Test func failedRestartCleanupStaysQuarantinedUntilReloadVerifiesTeardown() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = QuarantinedExecutionBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "restart-cleanup-quarantine", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        await backend.failRestartAndCleanup()
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.restartContainer(record.id, timeoutSeconds: 0)
+        }
+
+        #expect(try await runtime.container(record.id).phase == .dead)
+        #expect(await backend.isRunning(record.id))
+        let durableFailure = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: EngineSnapshot())
+        #expect(durableFailure.containers.first(where: { $0.id == record.id })?.phase == .dead)
+
+        await runtime.shutdown()
+        await backend.allowCleanup()
+        let reloaded = try await EngineRuntime(root: root, backend: backend)
+        #expect(!(await backend.isRunning(record.id)))
+        let recovered = try await reloaded.container(record.id)
+        #expect(recovered.phase == .exited)
+        #expect(recovered.exitCode == 127)
+
+        try await reloaded.startContainer(record.id)
+        #expect(await backend.isRunning(record.id))
+        #expect(try await reloaded.container(record.id).phase == .running)
         #expect(await backend.counts().starts == 2)
         await reloaded.shutdown()
     }
