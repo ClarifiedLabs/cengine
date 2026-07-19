@@ -138,7 +138,7 @@ public struct DockerRouter: Sendable {
             })
         case (.POST, "/containers/create"):
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
-            let parsedMounts = try validateRuntimeInput(input)
+            let validated = try validateRuntimeInput(input)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
             var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
             let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
@@ -165,6 +165,7 @@ public struct DockerRouter: Sendable {
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.useInit = input.HostConfig?.Init ?? false
             record.pidsLimit = try validatedPidsLimit(input.HostConfig?.PidsLimit) ?? 0
+            record.ulimits = validated.ulimits
             if let memory = input.HostConfig?.Memory, memory > 0 { record.memoryBytes = UInt64(memory) }
             if let nano = input.HostConfig?.NanoCpus, nano > 0 {
                 record.cpus = max(1, Int((nano + 999_999_999) / 1_000_000_000))
@@ -185,7 +186,7 @@ public struct DockerRouter: Sendable {
                 )
                 record.healthStatus = "starting"; record.healthFailingStreak = 0
             }
-            record.mounts = parsedMounts
+            record.mounts = validated.mounts
             for destination in (input.Volumes ?? [:]).keys.sorted()
                 where !record.mounts.contains(where: { $0.destination == destination }) {
                 record.mounts.append(.init(kind: .volume, source: "", destination: destination))
@@ -1017,7 +1018,7 @@ public struct DockerRouter: Sendable {
         try await runtime.subscribeContainerWait(identifier, condition: condition)
     }
 
-    private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> [MountRecord] {
+    private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (mounts: [MountRecord], ulimits: [UlimitRecord]) {
         try rejectActiveRuntimeFields([
             (!(input.Domainname ?? "").isEmpty, "Domainname"),
             (input.ArgsEscaped == true, "ArgsEscaped"),
@@ -1031,7 +1032,7 @@ public struct DockerRouter: Sendable {
         try validateHealthcheck(input.Healthcheck)
         try validateHostRuntimeInput(input.HostConfig)
         try validateVolumeDrivers(in: input)
-        return try mounts(from: input)
+        return (try mounts(from: input), try normalizedUlimits(input.HostConfig?.Ulimits, field: "HostConfig.Ulimits"))
     }
 
     private func validateRuntimeInput(_ input: ContainerUpdateRequest) throws {
@@ -1056,6 +1057,7 @@ public struct DockerRouter: Sendable {
            swappiness != -1, !(0...100).contains(swappiness) {
             throw EngineError(.badRequest, "MemorySwappiness must be -1 or between 0 and 100")
         }
+        _ = try normalizedUlimits(input.Ulimits, field: "ContainerUpdate.Ulimits")
         try rejectActiveRuntimeFields([
             (input.CpuShares != nil && input.CpuShares != 0, "CpuShares"),
             (!(input.CgroupParent ?? "").isEmpty, "CgroupParent"),
@@ -1143,7 +1145,6 @@ public struct DockerRouter: Sendable {
             (host?.CpuPercent != nil && host?.CpuPercent != 0, "CpuPercent"),
             (host?.IOMaximumIOps != nil && host?.IOMaximumIOps != 0, "IOMaximumIOps"),
             (host?.IOMaximumBandwidth != nil && host?.IOMaximumBandwidth != 0, "IOMaximumBandwidth"),
-            (!(host?.Ulimits ?? []).isEmpty, "Ulimits"),
             (!(host?.Devices ?? []).isEmpty, "Devices"),
             (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
             (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
@@ -1167,6 +1168,35 @@ public struct DockerRouter: Sendable {
         let restartName = host?.RestartPolicy?.Name ?? "no"
         if host?.AutoRemove == true && restartName != "" && restartName != "no" {
             throw EngineError(.badRequest, "AutoRemove cannot be combined with a restart policy")
+        }
+    }
+
+    private func normalizedUlimits(
+        _ values: [ContainerCreateRequest.HostConfig.UlimitRequest]?, field: String
+    ) throws -> [UlimitRecord] {
+        let supported: Set<String> = [
+            "core", "cpu", "data", "fsize", "locks", "memlock", "msgqueue", "nice",
+            "nofile", "nproc", "rss", "rtprio", "rttime", "sigpending", "stack",
+        ]
+        var seen = Set<String>()
+        return try (values ?? []).map { value in
+            let name = value.Name.lowercased()
+            guard supported.contains(name) else {
+                throw EngineError(.badRequest, "\(field) contains unsupported limit name \(value.Name)")
+            }
+            guard seen.insert(name).inserted else {
+                throw EngineError(.badRequest, "\(field) contains duplicate limit \(name)")
+            }
+            guard value.Soft >= -1, value.Hard >= -1 else {
+                throw EngineError(.badRequest, "\(field).\(name) values must be -1 or nonnegative")
+            }
+            if value.Soft == -1, value.Hard != -1 {
+                throw EngineError(.badRequest, "\(field).\(name) soft limit cannot exceed its hard limit")
+            }
+            if value.Soft != -1, value.Hard != -1, value.Soft > value.Hard {
+                throw EngineError(.badRequest, "\(field).\(name) soft limit cannot exceed its hard limit")
+            }
+            return UlimitRecord(name: name, soft: value.Soft, hard: value.Hard)
         }
     }
 
@@ -1780,6 +1810,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     }
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let PidsLimit: Int64
+        let Ulimits: [UlimitResponse]
         let AutoRemove: Bool; let Privileged: Bool
         let CapAdd: [String]; let CapDrop: [String]
         let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
@@ -1789,6 +1820,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let NetworkMode: String; let LogConfig: LogConfigResponse
         struct RestartPolicy: Codable, Sendable { let Name: String; let MaximumRetryCount: Int }
         struct LogConfigResponse: Codable, Sendable { let `Type`: String; let Config: [String: String] }
+        struct UlimitResponse: Codable, Sendable { let Name: String; let Soft: Int64; let Hard: Int64 }
     }
     public struct MountResponse: Codable, Sendable {
         let `Type`: String; let Name: String?; let Source: String; let Destination: String
@@ -1841,6 +1873,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             PidsLimit: record.pidsLimit,
+            Ulimits: record.ulimits.map { .init(Name: $0.name, Soft: $0.soft, Hard: $0.hard) },
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,
             ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,

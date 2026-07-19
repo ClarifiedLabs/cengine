@@ -24,6 +24,7 @@ import (
 
 const execStage1Argument = "cengine-exec-stage1"
 const execStage2Argument = "cengine-exec-stage2"
+const execStage3Argument = "cengine-exec-stage3"
 const execStage1CgroupFD = 5
 const execStage1TargetPIDFD = 6
 const execStage2MountNamespaceFD = 5
@@ -36,6 +37,9 @@ func IsExecStage1(arguments []string) bool {
 }
 func IsExecStage2(arguments []string) bool {
 	return len(arguments) == 2 && arguments[1] == execStage2Argument
+}
+func IsExecStage3(arguments []string) bool {
+	return len(arguments) == 2 && arguments[1] == execStage3Argument
 }
 
 func RunExecStage1(pid int) error {
@@ -186,6 +190,44 @@ func RunExecStage2() error {
 		return errors.New("exec specification is unavailable")
 	}
 	defer file.Close()
+	root := os.NewFile(4, "workload-root")
+	if root == nil {
+		return errors.New("workload root is unavailable")
+	}
+	defer root.Close()
+	command := execStage3Command(file, root, cgroup)
+	if err := runExecCommand(command, func(pid int) error {
+		_, err := fmt.Fprintf(targetPID, "%d\n", pid)
+		return err
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func execStage3Command(spec, root, cgroup *os.File) *exec.Cmd {
+	command := exec.Command("/proc/self/exe", execStage3Argument)
+	command.ExtraFiles = []*os.File{spec, root}
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{
+		UseCgroupFD: true,
+		CgroupFD:    int(cgroup.Fd()),
+	}
+	return command
+}
+
+func RunExecStage3() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	unix.CloseOnExec(3)
+	unix.CloseOnExec(4)
+	file := os.NewFile(3, "exec-spec")
+	if file == nil {
+		return errors.New("exec specification is unavailable")
+	}
+	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, protocol.MaxControlFrame))
 	if err != nil {
 		return err
@@ -217,6 +259,9 @@ func RunExecStage2() error {
 	if err != nil {
 		return err
 	}
+	if err := applyRlimits(spec.Rlimits, unix.Setrlimit); err != nil {
+		return err
+	}
 	if err := applyCapabilityBoundingSet(capabilities, unix.Prctl); err != nil {
 		return err
 	}
@@ -225,22 +270,14 @@ func RunExecStage2() error {
 		groups = append(groups, int(group))
 	}
 	groups = append(groups, namedGroups...)
-	var credential *syscall.Credential
-	if uid == 0 {
-		if err := unix.Setgroups(groups); err != nil {
-			return err
-		}
-		if err := unix.Setgid(gid); err != nil {
-			return err
-		}
-	} else {
-		credentialGroups := make([]uint32, len(groups))
-		for index, group := range groups {
-			credentialGroups[index] = uint32(group)
-		}
-		credential = &syscall.Credential{
-			Uid: uint32(uid), Gid: uint32(gid), Groups: credentialGroups,
-		}
+	if err := unix.Setgroups(groups); err != nil {
+		return err
+	}
+	if err := unix.Setgid(gid); err != nil {
+		return err
+	}
+	if err := unix.Setuid(uid); err != nil {
+		return err
 	}
 	if err := applyProcessCapabilities(capabilities, uid, unix.Capset); err != nil {
 		return err
@@ -263,24 +300,7 @@ func RunExecStage2() error {
 	if err != nil {
 		return fmt.Errorf("look up exec command %s: %w", spec.Arguments[0], err)
 	}
-	command := exec.Command(path, spec.Arguments[1:]...)
-	command.Args = spec.Arguments
-	command.Env = environment
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	command.SysProcAttr = &syscall.SysProcAttr{
-		UseCgroupFD: true,
-		CgroupFD:    int(cgroup.Fd()),
-		Credential:  credential,
-	}
-	if err := runExecCommand(command, func(pid int) error {
-		_, err := fmt.Fprintf(targetPID, "%d\n", pid)
-		return err
-	}); err != nil {
-		return err
-	}
-	return nil
+	return unix.Exec(path, spec.Arguments, environment)
 }
 
 // runExecCommand keeps each staging process alive as a transparent signal and

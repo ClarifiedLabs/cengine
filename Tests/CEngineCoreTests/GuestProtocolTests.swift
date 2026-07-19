@@ -3,15 +3,16 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct GuestProtocolTests {
-    @Test func execPayloadUsesVersionSixIdentityAndSecurityContext() throws {
-        #expect(GuestProtocol.version == 6)
+    @Test func execPayloadUsesVersionSevenIdentitySecurityContextAndRlimits() throws {
+        #expect(GuestProtocol.version == 7)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
             workingDirectory: "/work",
             user: .init(uid: 1_000, gid: 2_000, additionalGroups: [3_000]),
             terminal: false, attachStdin: false, attachStdout: true, attachStderr: true,
-            noNewPrivileges: true
+            noNewPrivileges: true,
+            rlimits: [.init(type: "nofile", soft: 1_024, hard: UInt64.max)]
         )
 
         let data = try JSONEncoder().encode(value)
@@ -20,10 +21,13 @@ import Testing
         let user = try #require(object["user"] as? [String: Any])
         #expect(user["uid"] as? Int == 1_000)
         #expect(object["noNewPrivileges"] as? Bool == true)
+        let limits = try #require(object["rlimits"] as? [[String: Any]])
+        #expect(limits.first?["type"] as? String == "nofile")
+        #expect(limits.first?["soft"] as? UInt64 == 1_024)
     }
 
-    @Test func endpointSysctlsUseGuestProtocolVersionSix() throws {
-        #expect(GuestProtocol.version == 6)
+    @Test func endpointSysctlsRemainAvailableInGuestProtocolVersionSeven() throws {
+        #expect(GuestProtocol.version == 7)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -49,7 +53,8 @@ import Testing
             terminal: false, readOnlyRoot: false, stopSignal: "SIGTERM", mounts: [], networks: [],
             resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
             annotations: ["io.example.owner": "runtime"],
-            capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"]
+            capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"],
+            rlimits: [.init(type: "core", soft: 0, hard: UInt64.max)]
         )
 
         let data = try JSONEncoder().encode(value)
@@ -58,6 +63,7 @@ import Testing
         #expect(object["annotations"] as? [String: String] == ["io.example.owner": "runtime"])
         #expect(object["capabilityAdd"] as? [String] == ["CAP_NET_ADMIN"])
         #expect(object["capabilityDrop"] as? [String] == ["CAP_CHOWN"])
+        #expect((object["rlimits"] as? [[String: Any]])?.first?["type"] as? String == "core")
     }
 
     @Test func controlEnvelopeRoundTripsWithLengthPrefix() throws {

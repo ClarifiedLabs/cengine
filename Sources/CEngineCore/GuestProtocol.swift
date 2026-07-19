@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 6
+    public static let version: UInt32 = 7
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -62,12 +62,14 @@ public enum GuestProtocol {
         public var annotations: [String: String]
         public var capabilityAdd: [String]
         public var capabilityDrop: [String]
+        public var rlimits: [Rlimit]
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = []) {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = []) {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
             self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
             self.annotations = annotations; self.capabilityAdd = capabilityAdd; self.capabilityDrop = capabilityDrop
+            self.rlimits = rlimits
         }
     }
 
@@ -93,12 +95,13 @@ public enum GuestProtocol {
         public var privileged: Bool
         public var capabilityAdd: [String]
         public var capabilityDrop: [String]
+        public var rlimits: [Rlimit]
 
         public init(
             id: String, arguments: [String], environment: [String], workingDirectory: String,
             user: User, terminal: Bool, attachStdin: Bool, attachStdout: Bool,
             attachStderr: Bool, noNewPrivileges: Bool, privileged: Bool = false,
-            capabilityAdd: [String] = [], capabilityDrop: [String] = []
+            capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = []
         ) {
             self.id = id
             self.arguments = arguments
@@ -113,6 +116,19 @@ public enum GuestProtocol {
             self.privileged = privileged
             self.capabilityAdd = capabilityAdd
             self.capabilityDrop = capabilityDrop
+            self.rlimits = rlimits
+        }
+    }
+
+    public struct Rlimit: Codable, Sendable, Equatable {
+        public var type: String
+        public var soft: UInt64
+        public var hard: UInt64
+
+        public init(type: String, soft: UInt64, hard: UInt64) {
+            self.type = type
+            self.soft = soft
+            self.hard = hard
         }
     }
 

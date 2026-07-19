@@ -181,6 +181,27 @@ private func descriptorIsReadable(_ descriptor: CInt, timeoutMilliseconds: CInt)
         #expect(workload.annotations == container.annotations)
     }
 
+    @Test func containerUlimitsReachGuestWorkloadSpecification() throws {
+        var container = ContainerRecord(
+            id: "limited-container", name: "limited", image: "alpine:latest",
+            processArguments: ["true"]
+        )
+        container.ulimits = [
+            .init(name: "nofile", soft: 1_024, hard: 2_048),
+            .init(name: "core", soft: -1, hard: -1),
+        ]
+
+        let workload = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+
+        #expect(workload.rlimits == [
+            .init(type: "nofile", soft: 1_024, hard: 2_048),
+            .init(type: "core", soft: UInt64.max, hard: UInt64.max),
+        ])
+    }
+
     @Test func multiContainerVolumesUseSharedStorageBeforeVMsStart() throws {
         let modes = try RawVirtualizationBackend.resolveVolumeStorageModes(
             names: ["compose-data", "buildkit-state"],

@@ -110,6 +110,18 @@ public struct HealthcheckRecord: Codable, Hashable, Sendable {
     }
 }
 
+public struct UlimitRecord: Codable, Hashable, Sendable {
+    public var name: String
+    public var soft: Int64
+    public var hard: Int64
+
+    public init(name: String, soft: Int64, hard: Int64) {
+        self.name = name
+        self.soft = soft
+        self.hard = hard
+    }
+}
+
 public struct ContainerRecord: Codable, Sendable {
     public var id: String
     public var name: String
@@ -144,6 +156,7 @@ public struct ContainerRecord: Codable, Sendable {
     public var cpus: Int
     /// Docker's configured process limit. `0` and `-1` both mean unlimited.
     public var pidsLimit: Int64
+    public var ulimits: [UlimitRecord]
     public var stopSignal: String
     public var stopTimeoutSeconds: Int
     public var restartPolicy: RestartPolicyRecord
@@ -189,6 +202,7 @@ public struct ContainerRecord: Codable, Sendable {
         self.memoryBytes = ContainerSettings.default.memoryBytes
         self.cpus = ContainerSettings.default.cpus
         self.pidsLimit = 0
+        self.ulimits = []
         self.stopSignal = "SIGTERM"
         self.stopTimeoutSeconds = 10
         self.restartPolicy = .init()

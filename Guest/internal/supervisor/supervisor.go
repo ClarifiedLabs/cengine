@@ -848,6 +848,9 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := applyRlimits(spec.Rlimits, unix.Setrlimit); err != nil {
+		return err
+	}
 	if err := applyCapabilityBoundingSet(capabilities, unix.Prctl); err != nil {
 		return err
 	}

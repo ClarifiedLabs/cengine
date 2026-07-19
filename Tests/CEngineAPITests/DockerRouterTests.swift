@@ -1963,7 +1963,6 @@ private actor AuthImageBackend: ContainerBackend {
 
         let unsupportedFields = [
             #""SecurityOpt":["no-new-privileges"]"#,
-            #""Ulimits":[{"Name":"nofile","Soft":1024,"Hard":1024}]"#,
             #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
             #""DeviceCgroupRules":["c 1:3 rwm"]"#,
             #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
@@ -1978,6 +1977,111 @@ private actor AuthImageBackend: ContainerBackend {
             ))
             #expect(rejected.status == .notImplemented)
         }
+    }
+
+    @Test func ulimitsNormalizePersistAndInspectInRequestOrder() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let names = [
+            "CORE", "cpu", "data", "fsize", "locks", "memlock", "msgqueue", "nice",
+            "NOFILE", "nproc", "rss", "rtprio", "rttime", "sigpending", "stack",
+        ]
+        let limits = names.enumerated().map { index, name in
+            ["Name": name, "Soft": index, "Hard": index == names.count - 1 ? -1 : index + 1] as [String: Any]
+        }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "Image": "alpine",
+            "HostConfig": ["Ulimits": limits],
+        ])
+        let create = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=limited", body: body
+        ))
+        #expect(create.status == .created)
+
+        func inspectedLimits(_ router: DockerRouter) async throws -> [[String: Any]] {
+            let response = await router.route(.init(method: .GET, uri: "/v1.55/containers/limited/json"))
+            let object = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+            let host = try #require(object["HostConfig"] as? [String: Any])
+            return try #require(host["Ulimits"] as? [[String: Any]])
+        }
+        var inspected = try await inspectedLimits(try #require(router))
+        #expect(inspected.map { $0["Name"] as? String } == names.map { $0.lowercased() })
+        #expect(inspected[0]["Soft"] as? Int == 0)
+        #expect(inspected.last?["Hard"] as? Int == -1)
+
+        router = nil
+        runtime = nil
+        let restoredRuntime = try await EngineRuntime(root: root)
+        let restoredRouter = DockerRouter(runtime: restoredRuntime, root: root)
+        inspected = try await inspectedLimits(restoredRouter)
+        #expect(inspected.map { $0["Name"] as? String } == names.map { $0.lowercased() })
+
+        let unlimited = try await restoredRuntime.container("limited")
+        #expect(unlimited.ulimits.last == .init(name: "stack", soft: 14, hard: -1))
+    }
+
+    @Test func invalidUlimitsFailBeforeContainerOrAnonymousVolumeMutation() async throws {
+        let cases: [[[String: Any]]] = [
+            [["Name": "as", "Soft": 1, "Hard": 1]],
+            [["Name": "unknown", "Soft": 1, "Hard": 1]],
+            [["Name": "nofile", "Soft": -2, "Hard": 1]],
+            [["Name": "nofile", "Soft": 2, "Hard": 1]],
+            [["Name": "nofile", "Soft": -1, "Hard": 1]],
+            [["Name": "NOFILE", "Soft": 1, "Hard": 1], ["Name": "nofile", "Soft": 1, "Hard": 1]],
+        ]
+        for (index, limits) in cases.enumerated() {
+            let (router, root) = try await fixture()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "Image": "alpine",
+                "Volumes": ["/data": [:]],
+                "HostConfig": ["Ulimits": limits],
+            ])
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=bad-ulimit-\(index)", body: body
+            ))
+            #expect(response.status == .badRequest)
+            let containers = await router.route(.init(method: .GET, uri: "/v1.55/containers/json?all=true"))
+            #expect((try #require(JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]])).isEmpty)
+            let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
+            let envelope = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
+            #expect((envelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+        }
+    }
+
+    @Test func updateUlimitsValidateThenRemainAnIntentionalGap() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=update-ulimit",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Ulimits":[{"Name":"nofile","Soft":100,"Hard":200}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        let invalid = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/update-ulimit/update",
+            body: Data(#"{"Ulimits":[{"Name":"nofile","Soft":300,"Hard":200}]}"#.utf8)
+        ))
+        #expect(invalid.status == .badRequest)
+        let unsupported = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/update-ulimit/update",
+            body: Data(#"{"Ulimits":[{"Name":"nofile","Soft":150,"Hard":200}]}"#.utf8)
+        ))
+        #expect(unsupported.status == .notImplemented)
+        let inert = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/update-ulimit/update",
+            body: Data(#"{"Ulimits":[]}"#.utf8)
+        ))
+        #expect(inert.status == .ok)
+
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/update-ulimit/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        let limits = try #require(host["Ulimits"] as? [[String: Any]])
+        #expect(limits.count == 1)
+        #expect(limits[0]["Soft"] as? Int == 100)
     }
 
     @Test func activeUnsupportedRuntimeCreateInputsFailClosedBeforeSideEffects() async throws {

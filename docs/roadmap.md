@@ -39,10 +39,17 @@ master mount. Unprivileged containers use Docker's default Linux capability set 
 fails closed on unknown inputs instead of widening deletion scope. Focused
 `RTM-004`–`RTM-008` contracts cover enforcement and recovery, explicit
 propagation gaps, capability masks, prune selection, and exec stage signal and
-status behavior. Security options, rlimits, configurable devices, container
+status behavior. Security options, configurable devices, container
 sysctls, masked paths, non-recursive bind variants, health start intervals, and
 custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
+
+Docker create-time ulimits now persist and apply to container init, exec, and
+healthcheck processes through guest protocol v7. The final exec command receives
+limits after namespace and root setup without constraining the guest supervisor
+or its signal/status proxies. `RTM-014` covers inspect, validation without
+side effects, daemon recovery, and container stop/start. Live ulimit updates
+remain an explicit gap.
 
 The API v1.55 runtime-input baseline audit is complete (`RTM-013`). Container
 create and update resources, namespace and process configuration, structured and
@@ -95,7 +102,7 @@ Work in this order:
 1. Maintain the completed API v1.55 runtime-input baseline audit as Docker's
    request schema evolves. Apply newly supported fields, reject active gaps
    explicitly, or classify them in the ledger (`RTM-013`).
-2. Close namespace, cgroup-v2 IO/device, device, rlimit,
+2. Close namespace, cgroup-v2 IO/device, device,
    seccomp/security-option, masked-path, and remaining mount-matrix gaps for
    functionality cengine already exposes. PID limits, private bind isolation,
    and capability add/drop are complete; shared/slave bind propagation is an
@@ -139,7 +146,7 @@ configure, and inspect endpoints is complete:
   `IFNAME` grammar, and apply through the guest network namespace. Create and
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
-  responses. Settings survive recovery over guest protocol v6 (`NET-019`).
+  responses. Settings survive recovery over guest protocol v7 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived

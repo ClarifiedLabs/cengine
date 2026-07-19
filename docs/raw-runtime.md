@@ -25,16 +25,19 @@ expect it to be the namespace root. A read-only root remount therefore applies t
 both the init process and later exec processes, while mounts such as tmpfs retain
 their own write policy.
 
-Exec uses two guest stages. The first joins the workload UTS, IPC, network, and
+Exec uses three guest stages. The first joins the workload UTS, IPC, network, and
 cgroup namespaces while retaining access to supervisor resources. It captures
 the workload root plus mount and PID namespaces through close-on-exec descriptors
 and starts a second stage. The second stage joins the mount namespace, selects
-the workload PID namespace for its child, enters the captured root, applies the
-resolved cwd, user, supplementary groups, capabilities, and `no_new_privs`
-policy, then starts the requested command in a dedicated leaf beneath the
-workload cgroup. This preserves workload-level resource accounting while
-allowing nested runtimes to create their own child cgroups. Both
-stage boundaries proxy catchable signals and preserve child exit status;
+the workload PID namespace, and starts a third stage in a dedicated leaf beneath
+the workload cgroup. The third stage enters the captured root, applies the
+resolved cwd and configured process rlimits, drops to the requested user and
+supplementary groups, applies capabilities and `no_new_privs`, then replaces
+itself with the requested command. Keeping rlimits in the final stage prevents
+application limits from constraining the guest supervisor or signal/status
+proxies. This preserves workload-level resource accounting while allowing
+nested runtimes to create their own child cgroups. The first two stage
+boundaries proxy catchable signals and preserve child exit status;
 uncatchable signals resolve and target the final staged child directly so the
 wrappers can reap it and healthcheck targets cannot survive a timeout.
 Healthchecks use the same path and resolver.

@@ -542,7 +542,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 terminal: configuration.tty, attachStdin: configuration.attachStdin,
                 attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
                 noNewPrivileges: context.noNewPrivileges, privileged: context.privileged,
-                capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
+                capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
+                rlimits: try Self.rlimits(container.ulimits)
             ),
             response: Status.self
         )
@@ -1128,8 +1129,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
             mounts: mounts, networks: networks, hosts: hosts,
             resources: .init(memoryBytes: container.memoryBytes, cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: container.pidsLimit),
             privileged: container.privileged, annotations: container.annotations,
-            capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop
+            capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
+            rlimits: try Self.rlimits(container.ulimits)
         )
+    }
+
+    private static func rlimits(_ values: [UlimitRecord]) throws -> [GuestProtocol.Rlimit] {
+        try values.map {
+            guard $0.soft >= -1, $0.hard >= -1 else {
+                throw EngineError(.internalError, "container has an invalid persisted ulimit value")
+            }
+            return .init(
+                type: $0.name,
+                soft: $0.soft == -1 ? UInt64.max : UInt64($0.soft),
+                hard: $0.hard == -1 ? UInt64.max : UInt64($0.hard)
+            )
+        }
     }
 
     private func ensureVolumeDisks(names: [String]) throws -> [VMShimProtocol.VolumeDisk] {

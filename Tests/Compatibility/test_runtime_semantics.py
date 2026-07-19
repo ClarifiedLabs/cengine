@@ -307,6 +307,119 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
         container.remove(force=True)
 
 
+@pytest.mark.compat("RTM-014")
+def test_ulimits_apply_to_init_exec_healthchecks_and_survive_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    invalid_name = f"invalid-ulimit-{suffix}"
+    with pytest.raises(docker.errors.APIError) as error:
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            params={"name": invalid_name},
+            data={
+                "Image": ALPINE_IMAGE,
+                "Volumes": {"/data": {}},
+                "HostConfig": {
+                    "Ulimits": [{"Name": "nofile", "Soft": 129, "Hard": 128}],
+                },
+            },
+        )
+        client.api._raise_for_status(response)
+    assert error.value.status_code == 400
+    with pytest.raises(docker.errors.NotFound):
+        client.containers.get(invalid_name)
+    assert {volume.name for volume in client.volumes.list()} == initial_volumes
+
+    name = f"ulimits-{suffix}"
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": name},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": [
+                "sh", "-ec",
+                "{ ulimit -Sn; ulimit -Hn; } >/tmp/init-ulimits; "
+                "while :; do sleep 1; done",
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "test \"$(ulimit -Sn)\" = 64 && test \"$(ulimit -Hn)\" = 128",
+                ],
+                "Interval": 1_000_000_000,
+                "Timeout": 2_000_000_000,
+                "Retries": 3,
+            },
+            "HostConfig": {
+                "Ulimits": [
+                    {"Name": "NOFILE", "Soft": 64, "Hard": 128},
+                    {"Name": "core", "Soft": -1, "Hard": -1},
+                ],
+            },
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+
+    def assert_limits(value: docker.models.containers.Container) -> None:
+        result = value.exec_run(["sh", "-ec", "cat /tmp/init-ulimits; ulimit -Sn; ulimit -Hn"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output.splitlines() == [b"64", b"128", b"64", b"128"]
+        value.reload()
+        assert value.attrs["HostConfig"]["Ulimits"] == [
+            {"Name": "nofile", "Soft": 64, "Hard": 128},
+            {"Name": "core", "Soft": -1, "Hard": -1},
+        ]
+
+    def wait_until_healthy(value: docker.models.containers.Container) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            value.reload()
+            status = value.attrs["State"].get("Health", {}).get("Status")
+            if status == "healthy":
+                return
+            if status == "unhealthy":
+                pytest.fail("ulimit healthcheck became unhealthy")
+            time.sleep(0.1)
+        pytest.fail("ulimit healthcheck did not become healthy")
+
+    try:
+        container.start()
+        assert_limits(container)
+        wait_until_healthy(container)
+
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/{0}/update", container.id),
+                data={"Ulimits": [{"Name": "nofile", "Soft": 96, "Hard": 128}]},
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+        assert_limits(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        value = recovered.containers.get(container.id)
+        assert_limits(value)
+        value.stop()
+        value.start()
+        assert_limits(value)
+        wait_until_healthy(value)
+    finally:
+        cleanup_client = recovered or client
+        try:
+            cleanup_client.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,

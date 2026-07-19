@@ -371,6 +371,36 @@ func TestExecStage2InheritsRootAndMountNamespaceDescriptors(t *testing.T) {
 	}
 }
 
+func TestExecStage3ReceivesOnlySpecAndRootAndJoinsTheExecCgroup(t *testing.T) {
+	spec, err := os.CreateTemp(t.TempDir(), "exec-spec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spec.Close()
+	root, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	cgroup, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cgroup.Close()
+
+	command := execStage3Command(spec, root, cgroup)
+	if !reflect.DeepEqual(command.Args, []string{"/proc/self/exe", execStage3Argument}) {
+		t.Fatalf("unexpected exec stage 3 arguments %#v", command.Args)
+	}
+	if !reflect.DeepEqual(command.ExtraFiles, []*os.File{spec, root}) {
+		t.Fatalf("unexpected exec stage 3 descriptors %#v", command.ExtraFiles)
+	}
+	if command.SysProcAttr == nil || !command.SysProcAttr.UseCgroupFD ||
+		command.SysProcAttr.CgroupFD != int(cgroup.Fd()) {
+		t.Fatalf("exec stage 3 did not target cgroup fd %d: %#v", cgroup.Fd(), command.SysProcAttr)
+	}
+}
+
 func TestExecUsesWorkloadUserAndSupplementaryGroupResolution(t *testing.T) {
 	passwd := []byte("root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:app:/home/app:/bin/sh\n")
 	groups := []byte("app:x:1000:\nlogs:x:2000:app\nstaff:x:3000:\n")

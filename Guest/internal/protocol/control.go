@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version             = 6
+	Version             = 7
 	ControlPort         = 4100
 	FileSystemPort      = 4101
 	RootFSContentPort   = 4102
@@ -53,6 +53,7 @@ type WorkloadSpec struct {
 	Annotations      map[string]string `json:"annotations,omitempty"`
 	CapabilityAdd    []string          `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string          `json:"capabilityDrop,omitempty"`
+	Rlimits          []Rlimit          `json:"rlimits,omitempty"`
 }
 
 type User struct {
@@ -60,6 +61,12 @@ type User struct {
 	GID              uint32   `json:"gid"`
 	AdditionalGroups []uint32 `json:"additionalGroups,omitempty"`
 	Username         string   `json:"username,omitempty"`
+}
+
+type Rlimit struct {
+	Type string `json:"type"`
+	Soft uint64 `json:"soft"`
+	Hard uint64 `json:"hard"`
 }
 
 type Mount struct {
@@ -126,6 +133,7 @@ type ExecSpec struct {
 	Privileged       bool     `json:"privileged"`
 	CapabilityAdd    []string `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string `json:"capabilityDrop,omitempty"`
+	Rlimits          []Rlimit `json:"rlimits,omitempty"`
 }
 
 type RootFSLayer struct {
