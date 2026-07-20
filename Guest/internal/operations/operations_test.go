@@ -906,7 +906,15 @@ func TestDescriptorTransferPreservesDirectoryAndFileModes(t *testing.T) {
 	sourcePath := t.TempDir()
 	destinationPath := t.TempDir()
 	nested := filepath.Join(sourcePath, "nested")
-	if err := os.Mkdir(nested, 0o510); err != nil {
+	destinationNested := filepath.Join(destinationPath, "nested")
+	defer func() {
+		for _, path := range []string{nested, destinationNested} {
+			if err := os.Chmod(path, 0o700); err != nil && !os.IsNotExist(err) {
+				t.Errorf("restore directory mode for cleanup: %v", err)
+			}
+		}
+	}()
+	if err := os.Mkdir(nested, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	payload := filepath.Join(nested, "payload")
@@ -934,8 +942,8 @@ func TestDescriptorTransferPreservesDirectoryAndFileModes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, want := range map[string]os.FileMode{
-		filepath.Join(destinationPath, "nested"):            0o510,
-		filepath.Join(destinationPath, "nested", "payload"): 0o400,
+		destinationNested: 0o510,
+		filepath.Join(destinationNested, "payload"): 0o400,
 	} {
 		info, err := os.Lstat(path)
 		if err != nil {

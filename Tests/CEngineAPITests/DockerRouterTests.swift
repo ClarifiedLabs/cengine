@@ -40,7 +40,7 @@ private func upgradedDockerRequest(
     path: String,
     body: String,
     maximumTimeSeconds: Int = 5
-) throws -> String {
+) async throws -> String {
     let process = Process()
     let output = Pipe()
     let errors = Pipe()
@@ -57,14 +57,21 @@ private func upgradedDockerRequest(
     ]
     process.standardOutput = output
     process.standardError = errors
-    try process.run()
-    process.waitUntilExit()
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        process.terminationHandler = { _ in continuation.resume() }
+        do {
+            try process.run()
+        } catch {
+            process.terminationHandler = nil
+            continuation.resume(throwing: error)
+        }
+    }
     return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         + String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
 }
 
-private func upgradedExecStart(socketPath: String, execID: String, body: String) throws -> String {
-    try upgradedDockerRequest(
+private func upgradedExecStart(socketPath: String, execID: String, body: String) async throws -> String {
+    try await upgradedDockerRequest(
         socketPath: socketPath,
         path: "/v1.44/exec/\(execID)/start",
         body: body
@@ -6560,7 +6567,7 @@ private actor AuthImageBackend: ContainerBackend {
         try await server.start()
         defer { Task { try? await server.shutdown() } }
 
-        let attach = try upgradedDockerRequest(
+        let attach = try await upgradedDockerRequest(
             socketPath: socket,
             path: "/v1.44/containers/\(container.id)/attach?stream=1&stdout=1&stderr=1",
             body: "",
@@ -6568,7 +6575,7 @@ private actor AuthImageBackend: ContainerBackend {
         )
         #expect(attach.contains("101 Switching Protocols"), "curl output: \(attach)")
 
-        let execStart = try upgradedExecStart(
+        let execStart = try await upgradedExecStart(
             socketPath: socket,
             execID: exec.id,
             body: #"{"Detach":false,"Tty":false}"#
@@ -6593,11 +6600,11 @@ private actor AuthImageBackend: ContainerBackend {
         try await server.start()
         defer { Task { try? await server.shutdown() } }
 
-        let detached = try upgradedExecStart(
+        let detached = try await upgradedExecStart(
             socketPath: socket, execID: exec.id, body: #"{"Detach":true,"Tty":false}"#
         )
         #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
-        let mismatchedTTY = try upgradedExecStart(
+        let mismatchedTTY = try await upgradedExecStart(
             socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
         )
         #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
@@ -6635,11 +6642,11 @@ private actor AuthImageBackend: ContainerBackend {
             )
             let socket = String(scope.dockerHost.dropFirst("unix://".count))
 
-            let detached = try upgradedExecStart(
+            let detached = try await upgradedExecStart(
                 socketPath: socket, execID: exec.id, body: #"{"Detach":true,"Tty":false}"#
             )
             #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
-            let mismatchedTTY = try upgradedExecStart(
+            let mismatchedTTY = try await upgradedExecStart(
                 socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
             )
             #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
