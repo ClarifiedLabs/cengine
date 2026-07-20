@@ -54,7 +54,7 @@ reference beneath the Docker API.
 | Container lifecycle and inspect | `CTR-001`–`CTR-048`, `EVT-001`–`EVT-005`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; lifecycle event filters include the creating image and accept both Docker filter encodings; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-047`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-022`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | Address-family control, endpoint sysctls, IPAM validation/status and filtered pruning, MAC application, and gateway priority are covered. SCTP publishing is an intentional gap (`NET-017`). |
-| Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003`, `EVT-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, authenticated registry round trips, and pull/load events are covered. |
+| Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003`, `EVT-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, Docker Hub search, authenticated registry round trips, and pull/load events are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
 | Differential behavior | `ORC-001`–`ORC-002` | Optional lifecycle and multi-platform image response-shape comparisons require an explicit reference Docker Engine. |
@@ -112,6 +112,7 @@ an assessment backlog rather than part of the pytest compatibility-ID inventory.
 | API | Change affecting cengine's surface | Status | Notes |
 |---|---|---|---|
 | 1.42 | Volume prune defaults to anonymous volumes | Supported | All accepted cengine API versions inherit the safe anonymous-only default; `all=true` explicitly widens pruning to every unused local volume. |
+| 1.44 | Registry image search automation deprecation | Supported | `GET /images/search` follows Docker's legacy registry-v1 search contract across API v1.44–v1.55, including Docker Hub short-name normalization, HTTPS-first loopback custom registries, padded base64url registry credentials, scoped identity-token exchange, metadata headers, the default/validated result limit, and `is-official`/`stars` filtering. Responses are streamed through an 8 MiB bound, disconnected clients cancel the upstream request, and bypass-read pipelined input is capped at 1 MiB while a response is outstanding. The deprecated `is_automated` response is always false and `is-automated=true` returns no results. |
 | 1.45 | Container network alias response semantics | Supported | v1.44 retains the short ID in `Aliases`; v1.45+ returns submitted aliases and uses `DNSNames` for runtime names. |
 | 1.45 | Named-volume mount `VolumeOptions.Subpath` | Supported | Existing subdirectories are safely resolved beneath the named-volume root. |
 | 1.45 | Image-inspect removal of `Container` and `ContainerConfig` | Supported | Cengine does not emit the removed legacy fields. |
@@ -249,8 +250,8 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `IMG-001` | `test_tag_valid_image` | ✅ Pass | Support | Image tagging persists through the backend store. |
 | `IMG-002` | `test_retag_valid_image` | ✅ Pass | Support | Additional tags resolve to the same image. |
 | `IMG-003` | `test_list_images` | ✅ Pass | Support | Reference filtering excludes nonmatching images. |
-| `IMG-004` | `test_search_image` | ❌ Known fail | Undecided | Registry search is not implemented; upstream currently skips this case. |
-| `IMG-005` | `test_search_bogus_image` | ✅ Pass | Support | Unsupported search is surfaced as an API error. |
+| `IMG-004` | `test_search_image` | ✅ Pass | Support | Docker Hub search applies limits and official/star filters, strips the familiar `library/` prefix, bounds upstream responses, and returns the Docker result shape with deprecated automation state forced false. |
+| `IMG-005` | `test_search_bogus_image` | ✅ Pass | Support | Search terms containing a URL scheme are rejected deterministically as invalid repository names. |
 | `IMG-006` | `test_remove_image` | ✅ Pass | Support | Missing-image and successful removal behavior. |
 | `IMG-007` | `test_image_history` | ✅ Pass | Support | History includes the image identifier. |
 | `IMG-008` | `test_get_image_exists_not` | ✅ Pass | Support | Missing images return NotFound. |

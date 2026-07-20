@@ -57,16 +57,29 @@ def test_list_images(client: docker.DockerClient):
     assert len(client.images.list(filters={"reference": "alpine"})) == 1
 
 
-@KNOWN_GAP(reason="IMG-004: registry search is not implemented")
 @pytest.mark.compat("IMG-004")
 def test_search_image(client: docker.DockerClient):
-    assert any("alpine" in item["name"].lower() for item in client.images.search("alpine"))
+    results = image_request(
+        client,
+        "/images/search",
+        params={
+            "term": "library/alpine",
+            "limit": 5,
+            "filters": json.dumps({"is-official": ["true"], "stars": ["1"]}),
+        },
+    )
+    assert 1 <= len(results) <= 5
+    assert any("alpine" in item["name"].lower() for item in results)
+    assert all(item["is_official"] is True for item in results)
+    assert all(item["is_automated"] is False for item in results)
+    assert all(item["star_count"] >= 1 for item in results)
 
 
 @pytest.mark.compat("IMG-005")
 def test_search_bogus_image(client: docker.DockerClient):
-    with pytest.raises(errors.APIError):
-        client.images.search("bogus/bogus")
+    with pytest.raises(errors.APIError) as caught:
+        client.images.search("https://docker.io/library/alpine")
+    assert caught.value.status_code == 400
 
 
 @pytest.mark.compat("IMG-006")

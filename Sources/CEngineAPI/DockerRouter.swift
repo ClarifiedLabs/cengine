@@ -22,6 +22,13 @@ enum DockerFilterValues: Decodable {
         case .map(let values): values.compactMap { $0.value ? $0.key : nil }.sorted()
         }
     }
+
+    var all: [String] {
+        switch self {
+        case .list(let values): Array(Set(values)).sorted()
+        case .map(let values): values.keys.sorted()
+        }
+    }
 }
 
 public struct APIRequest: Sendable {
@@ -50,6 +57,7 @@ public struct DockerRouter: Sendable {
     private let root: URL
     private let containerResourceOverride: ContainerResourceOverride?
     private let resourceScopeManager: ContainerResourceScopeManager?
+    private let registrySearcher: any RegistrySearching
     private let decoder = JSONDecoder()
 
     private func nonEmpty(_ value: String?) -> String? {
@@ -67,12 +75,14 @@ public struct DockerRouter: Sendable {
         runtime: EngineRuntime,
         root: URL,
         containerResourceOverride: ContainerResourceOverride? = nil,
-        resourceScopeManager: ContainerResourceScopeManager? = nil
+        resourceScopeManager: ContainerResourceScopeManager? = nil,
+        registrySearcher: any RegistrySearching = RegistrySearchClient()
     ) {
         self.runtime = runtime
         self.root = root
         self.containerResourceOverride = containerResourceOverride
         self.resourceScopeManager = resourceScopeManager
+        self.registrySearcher = registrySearcher
     }
 
     public func route(_ request: APIRequest) async -> APIResponse {
@@ -506,6 +516,29 @@ public struct DockerRouter: Sendable {
                     includeIdentity: includeIdentity
                 )
             })
+        case (.GET, "/images/search"):
+            guard let term = query["term"], !term.isEmpty else {
+                throw EngineError(.badRequest, "term is required")
+            }
+            let limit: Int
+            if let encodedLimit = query["limit"], !encodedLimit.isEmpty {
+                guard let parsed = Int(encodedLimit), parsed >= 0 else {
+                    throw EngineError(.badRequest, "invalid limit specified")
+                }
+                limit = parsed
+            } else {
+                limit = 0
+            }
+            guard limit <= 100 else {
+                throw EngineError(.badRequest, "limit \(limit) is outside the range of [1, 100]")
+            }
+            return json(status: .ok, try await registrySearcher.search(
+                term: term,
+                limit: limit,
+                filters: try registrySearchFilters(query["filters"]),
+                credentials: registryCredentials(request.headers),
+                headers: registrySearchHeaders(request.headers)
+            ))
         case (.POST, "/images/create"):
             let collector = PullProgressCollector()
             let image = try await pullImage(request, progress: { await collector.append($0) })
@@ -644,7 +677,10 @@ public struct DockerRouter: Sendable {
         return value
     }
     private func multiQueryItems(_ components: URLComponents) -> [String: [String]] {
-        Dictionary(grouping: components.queryItems ?? [], by: \.name)
+        var formComponents = components
+        formComponents.percentEncodedQuery = components.percentEncodedQuery?
+            .replacingOccurrences(of: "+", with: "%20")
+        return Dictionary(grouping: formComponents.queryItems ?? [], by: \.name)
             .mapValues { $0.map { $0.value ?? "" } }
     }
     private func queryItems(_ components: URLComponents) -> [String: String] {
@@ -684,10 +720,69 @@ public struct DockerRouter: Sendable {
     private func parseBool(_ value: String?) -> Bool? { value.map { $0 == "1" || $0.lowercased() == "true" } }
 
     private func registryCredentials(_ headers: HTTPHeaders) -> RegistryCredentials? {
-        guard let encoded = headers.first(name: "X-Registry-Auth"),
-              let data = Data(base64Encoded: encoded),
+        guard let encoded = headers.first(name: "X-Registry-Auth"), encoded.count.isMultiple(of: 4) else {
+            return nil
+        }
+        let base64 = encoded.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        guard let data = Data(base64Encoded: base64),
               let auth = try? decoder.decode(RegistryAuthRequest.self, from: data) else { return nil }
         return .init(username: auth.username ?? "", password: auth.password ?? "", identityToken: auth.identitytoken ?? "")
+    }
+
+    private func registrySearchHeaders(_ headers: HTTPHeaders) -> [String: [String]] {
+        var result = ["User-Agent": ["cengine/\(CEngineVersion.shortVersion())"]]
+        for (name, value) in headers where name.lowercased().hasPrefix("x-meta-") {
+            result[name, default: []].append(value)
+        }
+        return result
+    }
+
+    private func registrySearchFilters(_ encoded: String?) throws -> RegistrySearchFilters {
+        guard let encoded, !encoded.isEmpty else { return .init() }
+        guard let data = encoded.data(using: .utf8) else {
+            throw EngineError(.badRequest, "invalid filters")
+        }
+        let values: [String: DockerFilterValues]
+        do {
+            values = try decoder.decode([String: DockerFilterValues].self, from: data)
+        } catch {
+            throw EngineError(.badRequest, "invalid filters")
+        }
+        let supported = Set(["is-automated", "is-official", "stars"])
+        if let unknown = values.keys.sorted().first(where: { !supported.contains($0) }) {
+            throw EngineError(.badRequest, "invalid filter '\(unknown)'")
+        }
+
+        func boolean(_ key: String) throws -> Bool? {
+            guard let field = values[key] else { return nil }
+            let entries = Set(field.active)
+            let isFalse = entries.contains("0") || entries.contains("false")
+            let isTrue = entries.contains("1") || entries.contains("true")
+            guard isFalse != isTrue else {
+                throw EngineError(.badRequest, "invalid filter '\(key)'")
+            }
+            return isTrue
+        }
+
+        let isAutomated = try boolean("is-automated")
+        if isAutomated == true { return .init(isAutomated: true) }
+        let isOfficial = try boolean("is-official")
+        var minimumStars: Int?
+        if let field = values["stars"] {
+            var threshold = 0
+            for value in field.all {
+                guard let stars = Int(value) else {
+                    throw EngineError(.badRequest, "invalid filter 'stars=\(value)'")
+                }
+                threshold = max(threshold, stars)
+            }
+            minimumStars = threshold
+        }
+        return .init(
+            isAutomated: isAutomated,
+            isOfficial: isOfficial,
+            minimumStars: minimumStars
+        )
     }
 
     private func filteredContainers(_ containers: [ContainerRecord], filters encoded: String?) -> [ContainerRecord] {

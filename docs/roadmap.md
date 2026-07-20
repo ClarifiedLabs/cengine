@@ -201,10 +201,11 @@ Completion criteria:
 
 ### 3. Close remaining client-visible API gaps
 
-Use the API v1.46-v1.55 assessment table in
+Use the API v1.44-v1.55 assessment table in
 [Docker compatibility](docker-compatibility.md#api-version-envelope) as the
-endpoint-level backlog. After image and networking behavior, address the
-remaining registry search (`IMG-004`). Per-device block-I/O updates are complete
+endpoint-level backlog. Registry search (`IMG-004`) is complete for Docker Hub
+and legacy-v1 custom registries, including authentication, filters, limits, and
+the versioned Docker response shape. Per-device block-I/O updates are complete
 for the VM root disk under API v1.55, with the additional-device limitation
 recorded as an intentional gap.
 Container annotations, pull/load image events, accurate image counts, and

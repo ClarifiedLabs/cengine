@@ -35,20 +35,25 @@ private func versionMetadataBundle() throws -> (Bundle, URL) {
     return (try #require(Bundle(url: bundleURL)), root)
 }
 
-private func upgradedExecStart(socketPath: String, execID: String, body: String) throws -> String {
+private func upgradedDockerRequest(
+    socketPath: String,
+    path: String,
+    body: String,
+    maximumTimeSeconds: Int = 5
+) throws -> String {
     let process = Process()
     let output = Pipe()
     let errors = Pipe()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
     process.arguments = [
-        "--silent", "--show-error", "--include", "--max-time", "5",
+        "--silent", "--show-error", "--include", "--max-time", String(maximumTimeSeconds),
         "--unix-socket", socketPath,
         "--request", "POST",
         "--header", "Connection: Upgrade",
         "--header", "Upgrade: tcp",
         "--header", "Content-Type: application/json",
         "--data-binary", body,
-        "http://localhost/v1.44/exec/\(execID)/start",
+        "http://localhost\(path)",
     ]
     process.standardOutput = output
     process.standardError = errors
@@ -56,6 +61,14 @@ private func upgradedExecStart(socketPath: String, execID: String, body: String)
     process.waitUntilExit()
     return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         + String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+}
+
+private func upgradedExecStart(socketPath: String, execID: String, body: String) throws -> String {
+    try upgradedDockerRequest(
+        socketPath: socketPath,
+        path: "/v1.44/exec/\(execID)/start",
+        body: body
+    )
 }
 
 private actor CompletionBackend: ContainerBackend {
@@ -90,6 +103,9 @@ private actor CompletionBackend: ContainerBackend {
         return await withCheckedContinuation { continuations[container.id] = $0 }
     }
     func logs(for _: ContainerRecord) async throws -> Data { log }
+    func io(for container: ContainerRecord) async throws -> ContainerIOBridge {
+        ContainerIOBridge(tty: container.tty)
+    }
     func finish(_ id: String, code: Int32) { continuations.removeValue(forKey: id)?.resume(returning: code) }
     func isWaitingForCompletion(_ id: String) -> Bool { continuations[id] != nil }
     func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
@@ -6522,6 +6538,44 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(await backend.startCount() == 2)
     }
 
+    @Test func successfulAttachAndExecUpgradesSurviveDisconnectMonitoringRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let socket = root.appending(path: "engine.sock").path
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: CompletionBackend(completionEnabled: false)
+        )
+        let router = DockerRouter(runtime: runtime, root: root)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "upgrade-monitor-removal", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        let exec = try await runtime.createExec(
+            container: container.id,
+            configuration: .init(arguments: ["true"], tty: false)
+        )
+        let server = DockerServer(socketPath: socket, router: router)
+        try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let attach = try upgradedDockerRequest(
+            socketPath: socket,
+            path: "/v1.44/containers/\(container.id)/attach?stream=1&stdout=1&stderr=1",
+            body: "",
+            maximumTimeSeconds: 1
+        )
+        #expect(attach.contains("101 Switching Protocols"), "curl output: \(attach)")
+
+        let execStart = try upgradedExecStart(
+            socketPath: socket,
+            execID: exec.id,
+            body: #"{"Detach":false,"Tty":false}"#
+        )
+        #expect(execStart.contains("101 Switching Protocols"), "curl output: \(execStart)")
+    }
+
     @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
@@ -9259,13 +9313,15 @@ private actor AuthImageBackend: ContainerBackend {
         let backend = AuthImageBackend()
         let runtime = try await EngineRuntime(root: root, backend: backend)
         let router = DockerRouter(runtime: runtime, root: root)
-        let auth = Data(#"{"username":"alice","password":"secret"}"#.utf8).base64EncodedString()
+        // Docker encodes X-Registry-Auth with padded RFC4648 base64url. This fixture contains
+        // both URL-alphabet characters ("_" and "-") so pull exercises the shared decoder.
+        let auth = "eyJ1c2VybmFtZSI6IsK_eMK-IiwicGFzc3dvcmQiOiJwIn0="
         let pull = await router.route(.init(
             method: .POST, uri: "/v1.44/images/create?fromImage=registry.example%2Fteam%2Fapp&tag=latest",
             headers: ["X-Registry-Auth": auth]
         ))
         #expect(pull.status == .ok)
-        #expect(await backend.username() == "alice")
+        #expect(await backend.username() == "¿x¾")
         let output = String(decoding: pull.body, as: UTF8.self)
         #expect(output.contains(#""current":50"#))
         #expect(output.contains(#""total":100"#))

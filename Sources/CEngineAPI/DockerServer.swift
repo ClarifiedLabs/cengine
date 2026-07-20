@@ -18,6 +18,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var statsTask: Task<Void, Never>?
     private var pullTask: Task<Void, Never>?
     private var waitTask: Task<Void, Never>?
+    private var requestTasks: [UUID: Task<Void, Never>] = [:]
+    private var inputCloseHandler: DockerHTTPInputCloseHandler?
     private let maximumBodyBytes: Int
 
     public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
@@ -68,20 +70,53 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             let request = APIRequest(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView))
             let keepAlive = head.isKeepAlive
             let channel = context.channel
-            Task { [router] in
+            let requestID = UUID()
+            let task = Task { [router] in
                 let response = await router.route(request)
-                channel.eventLoop.execute { Self.write(channel: channel, response: response, keepAlive: keepAlive) }
+                channel.eventLoop.execute {
+                    guard self.requestTasks.removeValue(forKey: requestID) != nil else { return }
+                    guard channel.isActive else { return }
+                    Self.write(channel: channel, response: response, keepAlive: keepAlive)
+                    if self.requestTasks.isEmpty { self.inputCloseHandler?.stopWatchingWhenDrained() }
+                }
             }
+            requestTasks[requestID] = task
+            inputCloseHandler?.watchForDisconnect()
         }
     }
 
+    fileprivate func monitorDisconnects(with handler: DockerHTTPInputCloseHandler) {
+        inputCloseHandler = handler
+    }
+
     public func channelInactive(context: ChannelHandlerContext) {
+        cancelActiveOperations()
+        context.fireChannelInactive()
+    }
+
+    public func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let channelEvent = event as? ChannelEvent, channelEvent == .inputClosed {
+            cancelActiveOperations()
+            context.close(promise: nil)
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    fileprivate func cancelActiveOperations() {
+        inputCloseHandler?.stopWatching()
         if let followSubscription { followIO?.detach(followSubscription) }
+        followSubscription = nil
+        followIO = nil
         eventTask?.cancel()
         statsTask?.cancel()
         pullTask?.cancel()
         waitTask?.cancel()
-        context.fireChannelInactive()
+        eventTask = nil
+        statsTask = nil
+        pullTask = nil
+        waitTask = nil
+        requestTasks.values.forEach { $0.cancel() }
+        requestTasks.removeAll()
     }
 
     private func startContainerWait(identifier: String, condition: String?, channel: Channel, keepAlive: Bool) {
@@ -369,14 +404,175 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 }
 
+fileprivate final class DockerHTTPInputCloseHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+
+    private weak var httpHandler: DockerHTTPHandler?
+    private let maximumPendingRequestBytes: Int
+    private let maximumPendingRequestParts: Int
+    private var context: ChannelHandlerContext?
+    private var watching = false
+    private var pendingBytes = 0
+    private var pendingParts = 0
+    private var readScheduled = false
+
+    init(
+        httpHandler: DockerHTTPHandler,
+        maximumPendingRequestBytes: Int,
+        maximumPendingRequestParts: Int
+    ) {
+        precondition(maximumPendingRequestBytes > 0)
+        precondition(maximumPendingRequestParts > 0)
+        self.httpHandler = httpHandler
+        self.maximumPendingRequestBytes = maximumPendingRequestBytes
+        self.maximumPendingRequestParts = maximumPendingRequestParts
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        self.context = context
+    }
+
+    func handlerRemoved(context _: ChannelHandlerContext) {
+        stopWatching()
+        context = nil
+    }
+
+    func watchForDisconnect() {
+        guard context != nil else { return }
+        watching = true
+        scheduleRead()
+    }
+
+    func stopWatchingWhenDrained() {
+        guard pendingParts == 0, pendingBytes == 0 else { return }
+        watching = false
+    }
+
+    func stopWatching() {
+        watching = false
+        pendingBytes = 0
+        pendingParts = 0
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        if watching {
+            let requestPart = unwrapInboundIn(data)
+            let requestBytes = Self.wireBytes(for: requestPart)
+            guard pendingParts < maximumPendingRequestParts,
+                  requestBytes <= maximumPendingRequestBytes - pendingBytes else {
+                stopWatching()
+                httpHandler?.cancelActiveOperations()
+                context.close(promise: nil)
+                return
+            }
+            pendingBytes += requestBytes
+            pendingParts += 1
+        }
+        context.fireChannelRead(data)
+        if watching { scheduleRead() }
+    }
+
+    func requestPartConsumed(_ part: HTTPServerRequestPart) {
+        guard pendingParts > 0 else { return }
+        let requestBytes = Self.wireBytes(for: part)
+        precondition(requestBytes <= pendingBytes)
+        pendingBytes -= requestBytes
+        pendingParts -= 1
+    }
+
+    func channelReadComplete(context: ChannelHandlerContext) {
+        context.fireChannelReadComplete()
+        if watching { scheduleRead() }
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let channelEvent = event as? ChannelEvent, channelEvent == .inputClosed {
+            stopWatching()
+            httpHandler?.cancelActiveOperations()
+            context.close(promise: nil)
+            return
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        stopWatching()
+        context.fireChannelInactive()
+    }
+
+    private func scheduleRead() {
+        guard watching, !readScheduled, let context else { return }
+        readScheduled = true
+        context.eventLoop.execute { [weak self] in
+            guard let self else { return }
+            self.readScheduled = false
+            guard self.watching, self.context === context, context.channel.isActive else { return }
+            // Bypass HTTPServerPipelineHandler's response-time read suppression so EOF remains observable.
+            context.read()
+        }
+    }
+
+    private static func wireBytes(for part: HTTPServerRequestPart) -> Int {
+        switch part {
+        case .head(let head):
+            let requestLineBytes = head.method.rawValue.utf8.count
+                + 1 + head.uri.utf8.count
+                + 1 + "HTTP/".utf8.count
+                + String(head.version.major).utf8.count
+                + 1 + String(head.version.minor).utf8.count
+                + 2
+            return requestLineBytes + headerWireBytes(head.headers) + 2
+        case .body(let buffer):
+            return buffer.readableBytes
+        case .end(let trailers):
+            guard let trailers else { return 0 }
+            return headerWireBytes(trailers) + 2
+        }
+    }
+
+    private static func headerWireBytes(_ headers: HTTPHeaders) -> Int {
+        headers.reduce(into: 0) { count, header in
+            // Include the field separator, ordinary wire whitespace, and CRLF in addition to decoded content.
+            count += header.name.utf8.count + 2 + header.value.utf8.count + 2
+        }
+    }
+}
+
+fileprivate final class DockerHTTPPendingRequestConsumptionHandler: ChannelInboundHandler, RemovableChannelHandler {
+    typealias InboundIn = HTTPServerRequestPart
+
+    private weak var inputCloseHandler: DockerHTTPInputCloseHandler?
+
+    init(inputCloseHandler: DockerHTTPInputCloseHandler) {
+        self.inputCloseHandler = inputCloseHandler
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        inputCloseHandler?.requestPartConsumed(unwrapInboundIn(data))
+        context.fireChannelRead(data)
+    }
+}
+
 public final class DockerServer: @unchecked Sendable {
     private let group: MultiThreadedEventLoopGroup
     private let socketPath: String
     private let router: DockerRouter
+    private let maximumPendingRequestBytes: Int
+    private let maximumPendingRequestParts: Int
     private var channel: Channel?
 
-    public init(socketPath: String, router: DockerRouter) {
-        self.socketPath = socketPath; self.router = router
+    public init(
+        socketPath: String,
+        router: DockerRouter,
+        maximumPendingRequestBytes: Int = 1 * 1024 * 1024,
+        maximumPendingRequestParts: Int = 1024
+    ) {
+        precondition(maximumPendingRequestBytes > 0)
+        precondition(maximumPendingRequestParts > 0)
+        self.socketPath = socketPath
+        self.router = router
+        self.maximumPendingRequestBytes = maximumPendingRequestBytes
+        self.maximumPendingRequestParts = maximumPendingRequestParts
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: max(2, System.coreCount / 2))
     }
 
@@ -385,8 +581,13 @@ public final class DockerServer: @unchecked Sendable {
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
-            .childChannelInitializer { [router] channel in
-                configureDockerHTTPPipeline(channel: channel, router: router)
+            .childChannelInitializer { [router, maximumPendingRequestBytes, maximumPendingRequestParts] channel in
+                configureDockerHTTPPipeline(
+                    channel: channel,
+                    router: router,
+                    maximumPendingRequestBytes: maximumPendingRequestBytes,
+                    maximumPendingRequestParts: maximumPendingRequestParts
+                )
             }
         channel = try await bootstrap.bind(unixDomainSocketPath: socketPath).get()
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
@@ -403,9 +604,34 @@ public final class DockerServer: @unchecked Sendable {
     }
 }
 
-func configureDockerHTTPPipeline(channel: Channel, router: DockerRouter) -> EventLoopFuture<Void> {
+func configureDockerHTTPPipeline(
+    channel: Channel,
+    router: DockerRouter,
+    maximumPendingRequestBytes: Int = 1 * 1024 * 1024,
+    maximumPendingRequestParts: Int = 1024
+) -> EventLoopFuture<Void> {
     let responseEncoder = HTTPResponseEncoder()
-    let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes))
+    let httpHandler = DockerHTTPHandler(router: router)
+    let inputCloseHandler = DockerHTTPInputCloseHandler(
+        httpHandler: httpHandler,
+        maximumPendingRequestBytes: maximumPendingRequestBytes,
+        // HTTPServerPipelineHandler buffers one event per decoded part. Keep that queue bounded even when
+        // chunk framing produces many tiny body parts that barely advance the independent byte budget.
+        maximumPendingRequestParts: maximumPendingRequestParts
+    )
+    let pendingRequestConsumptionHandler = DockerHTTPPendingRequestConsumptionHandler(
+        inputCloseHandler: inputCloseHandler
+    )
+    httpHandler.monitorDisconnects(with: inputCloseHandler)
+    var decoderLimits = NIOHTTPDecoderLimitConfiguration()
+    // SwiftNIO 2.101.2 retains the current partial URL/header field until it can emit a request head.
+    // Pin both that field and the complete header list below the 1 MiB production pending-request budget.
+    decoderLimits.maxHeaderFieldSize = 80 * 1024
+    decoderLimits.maxHeaderListSize = 512 * 1024
+    let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder(
+        leftOverBytesStrategy: .forwardBytes,
+        limitConfiguration: decoderLimits
+    ))
     let pipelineHandler = HTTPServerPipelineHandler()
     let headerValidator = NIOHTTPResponseHeadersValidator()
     let protocolErrorHandler = HTTPServerProtocolErrorHandler()
@@ -416,16 +642,18 @@ func configureDockerHTTPPipeline(channel: Channel, router: DockerRouter) -> Even
         upgraders: [tcpUpgrader],
         httpEncoder: responseEncoder,
         extraHTTPHandlers: [
-            requestDecoder, pipelineHandler, headerValidator, protocolErrorHandler, bodyCollector,
+            // Remove the decoded-part monitor before the decoder forwards raw attach/exec bytes.
+            inputCloseHandler, requestDecoder, pipelineHandler, pendingRequestConsumptionHandler,
+            headerValidator, protocolErrorHandler, bodyCollector,
         ],
         upgradeCompletionHandler: { _ in }
     )
     do {
         try channel.pipeline.syncOperations.addHandlers([
-            responseEncoder, requestDecoder, pipelineHandler, headerValidator, protocolErrorHandler,
-            bodyCollector, upgradeHandler,
+            responseEncoder, requestDecoder, inputCloseHandler, pipelineHandler, pendingRequestConsumptionHandler,
+            headerValidator, protocolErrorHandler, bodyCollector, upgradeHandler,
         ])
-        try channel.pipeline.syncOperations.addHandler(DockerHTTPHandler(router: router), name: "docker-http")
+        try channel.pipeline.syncOperations.addHandler(httpHandler, name: "docker-http")
         return channel.eventLoop.makeSucceededFuture(())
     } catch {
         return channel.eventLoop.makeFailedFuture(error)
