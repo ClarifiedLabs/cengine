@@ -3,8 +3,8 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct GuestProtocolTests {
-    @Test func execPayloadUsesVersionSevenIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 7)
+    @Test func execPayloadUsesVersionNineIdentitySecurityContextAndRlimits() throws {
+        #expect(GuestProtocol.version == 9)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -12,7 +12,8 @@ import Testing
             user: .init(uid: 1_000, gid: 2_000, additionalGroups: [3_000]),
             terminal: false, attachStdin: false, attachStdout: true, attachStderr: true,
             noNewPrivileges: true,
-            rlimits: [.init(type: "nofile", soft: 1_024, hard: UInt64.max)]
+            rlimits: [.init(type: "nofile", soft: 1_024, hard: UInt64.max)],
+            ioClaim: "exec-claim"
         )
 
         let data = try JSONEncoder().encode(value)
@@ -21,13 +22,14 @@ import Testing
         let user = try #require(object["user"] as? [String: Any])
         #expect(user["uid"] as? Int == 1_000)
         #expect(object["noNewPrivileges"] as? Bool == true)
+        #expect(object["ioClaim"] as? String == "exec-claim")
         let limits = try #require(object["rlimits"] as? [[String: Any]])
         #expect(limits.first?["type"] as? String == "nofile")
         #expect(limits.first?["soft"] as? UInt64 == 1_024)
     }
 
-    @Test func endpointSysctlsRemainAvailableInGuestProtocolVersionSeven() throws {
-        #expect(GuestProtocol.version == 7)
+    @Test func endpointSysctlsRemainAvailableInGuestProtocolVersionNine() throws {
+        #expect(GuestProtocol.version == 9)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -46,6 +48,30 @@ import Testing
         #expect(endpointObject["sysctls"] as? [String] == ["net.ipv4.conf.IFNAME.forwarding=1"])
     }
 
+    @Test func blockIOThrottleResourcesRoundTripInProtocolVersionNine() throws {
+        let resources = GuestProtocol.Resources(
+            memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 32,
+            blockIOReadBps: [.init(path: "/dev/vda", rate: UInt64(Int64.max) + 1)],
+            blockIOWriteBps: [.init(path: "/dev/vda", rate: UInt64.max)],
+            blockIOReadIOps: [.init(path: "/dev/vda", rate: 100)],
+            blockIOWriteIOps: [.init(path: "/dev/vda", rate: 200)]
+        )
+        let data = try JSONEncoder().encode(resources)
+        #expect(try JSONDecoder().decode(GuestProtocol.Resources.self, from: data) == resources)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let readBps = try #require(object["blockIOReadBps"] as? [[String: Any]])
+        #expect(readBps.first?["path"] as? String == "/dev/vda")
+        #expect((readBps.first?["rate"] as? NSNumber)?.uint64Value == UInt64(Int64.max) + 1)
+        let writeBps = try #require(object["blockIOWriteBps"] as? [[String: Any]])
+        #expect((writeBps.first?["rate"] as? NSNumber)?.uint64Value == UInt64.max)
+
+        let update = GuestProtocol.ResourceUpdate(
+            resources: resources, compatibilityFailureAfterWrites: 4
+        )
+        let updateData = try JSONEncoder().encode(update)
+        #expect(try JSONDecoder().decode(GuestProtocol.ResourceUpdate.self, from: updateData) == update)
+    }
+
     @Test func workloadPayloadCarriesRuntimeAnnotations() throws {
         let value = GuestProtocol.Workload(
             id: "container-1", rootDevice: "/dev/vda", arguments: ["true"],
@@ -54,7 +80,8 @@ import Testing
             resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
             annotations: ["io.example.owner": "runtime"],
             capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"],
-            rlimits: [.init(type: "core", soft: 0, hard: UInt64.max)]
+            rlimits: [.init(type: "core", soft: 0, hard: UInt64.max)],
+            ioClaim: "container-claim"
         )
 
         let data = try JSONEncoder().encode(value)
@@ -64,6 +91,7 @@ import Testing
         #expect(object["capabilityAdd"] as? [String] == ["CAP_NET_ADMIN"])
         #expect(object["capabilityDrop"] as? [String] == ["CAP_CHOWN"])
         #expect((object["rlimits"] as? [[String: Any]])?.first?["type"] as? String == "core")
+        #expect(object["ioClaim"] as? String == "container-claim")
     }
 
     @Test func controlEnvelopeRoundTripsWithLengthPrefix() throws {

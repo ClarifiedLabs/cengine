@@ -11,6 +11,7 @@ import Foundation
     public private(set) var stopError: Error?
 
     private let machine: VZVirtualMachine
+    private let retainedAttachmentHandles: [FileHandle]
     private let maximumMemoryBytes: UInt64
     private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
     private var memoryPressureState = MemoryBalloonPressureState()
@@ -30,10 +31,12 @@ import Foundation
             networkFileHandle: trunk.virtualMachineFileHandle,
             macAddress: configuration.macAddress,
             bindShares: configuration.bindShares,
+            retainedAttachmentHandles: configuration.retainedAttachmentHandles,
             kernelArguments: configuration.kernelArguments
         )
         let virtualizationConfiguration = try value.makeVirtualizationConfiguration()
         maximumMemoryBytes = virtualizationConfiguration.memorySize
+        retainedAttachmentHandles = configuration.retainedAttachmentHandles
         machine = VZVirtualMachine(configuration: virtualizationConfiguration)
         super.init()
         machine.delegate = self
@@ -92,15 +95,34 @@ import Foundation
         timeout: Duration,
         start: (@escaping @MainActor (VZVirtioSocketConnection?, Error?) -> Void) -> Void
     ) async throws -> SendableVirtioSocketConnection {
-        try await withCheckedThrowingContinuation { continuation in
-            let attempt = VirtioSocketConnectionAttempt(continuation: continuation)
-            start { connection, error in
-                if let connection {
-                    attempt.resolve(.success(SendableVirtioSocketConnection(connection)))
-                } else {
-                    attempt.resolve(.failure(error ?? EngineError(.internalError, "virtio socket connection failed")))
+        try await awaitBoundedResult(
+            timeout: timeout,
+            start: { completion in
+                start { connection, error in
+                    if let connection {
+                        completion(.success(SendableVirtioSocketConnection(connection)))
+                    } else {
+                        completion(.failure(error ?? EngineError(
+                            .internalError, "virtio socket connection failed"
+                        )))
+                    }
                 }
-            }
+            },
+            disposeLateSuccess: { $0.connection.close() }
+        )
+    }
+
+    static func awaitBoundedResult<Value: Sendable>(
+        timeout: Duration,
+        start: (@escaping @MainActor (Result<Value, Error>) -> Void) -> Void,
+        disposeLateSuccess: @escaping @MainActor (Value) -> Void = { _ in }
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            let attempt = BoundedAsyncAttempt(
+                continuation: continuation,
+                disposeLateSuccess: disposeLateSuccess
+            )
+            start { attempt.resolve($0) }
             Task { @MainActor in
                 try? await Task.sleep(for: timeout)
                 attempt.resolve(.failure(EngineError(.internalError, "virtio socket connection timed out")))
@@ -218,17 +240,26 @@ import Foundation
     }
 }
 
-@MainActor private final class VirtioSocketConnectionAttempt {
-    private var continuation: CheckedContinuation<SendableVirtioSocketConnection, Error>?
+@MainActor private final class BoundedAsyncAttempt<Value: Sendable> {
+    private var continuation: CheckedContinuation<Value, Error>?
+    private let disposeLateSuccess: @MainActor (Value) -> Void
 
-    init(continuation: CheckedContinuation<SendableVirtioSocketConnection, Error>) {
+    init(
+        continuation: CheckedContinuation<Value, Error>,
+        disposeLateSuccess: @escaping @MainActor (Value) -> Void
+    ) {
         self.continuation = continuation
+        self.disposeLateSuccess = disposeLateSuccess
     }
 
-    func resolve(_ result: Result<SendableVirtioSocketConnection, Error>) {
+    func resolve(_ result: Result<Value, Error>) {
         let pending = continuation
         continuation = nil
-        pending?.resume(with: result)
+        if let pending {
+            pending.resume(with: result)
+        } else if case let .success(value) = result {
+            disposeLateSuccess(value)
+        }
     }
 }
 #endif

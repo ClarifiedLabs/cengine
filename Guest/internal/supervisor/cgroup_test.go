@@ -5,10 +5,12 @@ package supervisor
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"dev.cengine/guest/internal/protocol"
@@ -53,15 +55,245 @@ func TestEnableCgroupControllersDelegatesDockerResourceControllers(t *testing.T)
 	if err := os.WriteFile(filepath.Join(root, "cgroup.subtree_control"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := enableCgroupControllers(root); err != nil {
+	if err := enableCgroupControllers(root, false); err != nil {
 		t.Fatal(err)
 	}
 	value, err := os.ReadFile(filepath.Join(root, "cgroup.subtree_control"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(value) != "+cpu +memory +pids" {
+	if string(value) != "+cpu +io +memory +pids" {
 		t.Fatalf("unexpected controller delegation %q", value)
+	}
+}
+
+func TestEnableCgroupControllersRequiresIOOnlyForConfiguredThrottles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cgroup.subtree_control"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enableCgroupControllers(root, false); err != nil {
+		t.Fatalf("controller delegation without I/O limits failed: %v", err)
+	}
+	if err := enableCgroupControllers(root, true); err == nil || !strings.Contains(err.Error(), "required io controller") {
+		t.Fatalf("enableCgroupControllers(requireIO=true) error = %v", err)
+	}
+}
+
+func TestResolveBlockDeviceUsesHostVDADeviceNumber(t *testing.T) {
+	device, err := resolveBlockDeviceWithStat("/dev/vda", func(path string, status *unix.Stat_t) error {
+		if path != "/dev/vda" {
+			t.Fatalf("stat path = %q", path)
+		}
+		status.Mode = unix.S_IFBLK
+		status.Rdev = uint64(unix.Mkdev(8, 17))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if device != "8:17" {
+		t.Fatalf("device = %q, want 8:17", device)
+	}
+	if _, err := resolveBlockDeviceWithStat("/dev/vdb", func(string, *unix.Stat_t) error { return nil }); err == nil {
+		t.Fatal("non-root device was accepted")
+	}
+	if _, err := resolveBlockDeviceWithStat("/dev/vda", func(_ string, status *unix.Stat_t) error {
+		status.Mode = unix.S_IFREG
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "not a block device") {
+		t.Fatalf("regular-file stat error = %v", err)
+	}
+}
+
+func TestDesiredIOMaxMapsDockerThrottleListsAndRejectsDuplicates(t *testing.T) {
+	resolutions := 0
+	resources := protocol.Resources{
+		BlockIOReadBps:   []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: uint64(1) << 63}},
+		BlockIOWriteBps:  []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: ^uint64(0)}},
+		BlockIOReadIOps:  []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: 3}},
+		BlockIOWriteIOps: []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: 4}},
+	}
+	desired, err := desiredIOMax(resources, func(path string) (string, error) {
+		resolutions++
+		if path != "/dev/vda" {
+			t.Fatalf("resolved path = %q", path)
+		}
+		return "254:0", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolutions != 1 {
+		t.Fatalf("device resolutions = %d, want 1", resolutions)
+	}
+	want := map[string]string{
+		"rbps": "9223372036854775808", "wbps": "18446744073709551615", "riops": "3", "wiops": "4",
+	}
+	if !reflect.DeepEqual(desired["254:0"], want) {
+		t.Fatalf("desired io.max = %#v, want %#v", desired, want)
+	}
+	resources.BlockIOReadBps = append(resources.BlockIOReadBps, protocol.BlockIOThrottle{Path: "/dev/vda", Rate: 5})
+	if _, err := desiredIOMax(resources, func(string) (string, error) { return "254:0", nil }); err == nil ||
+		!strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate throttle error = %v", err)
+	}
+}
+
+func TestParseAndDiffIOMaxClearsAbsentKeysOnce(t *testing.T) {
+	current, err := parseIOMax([]byte(
+		"8:0 rbps=9223372036854775808 wbps=18446744073709551615\n8:1 riops=30\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := map[string]map[string]string{
+		"8:0": {"rbps": "150", "riops": "40"},
+	}
+	changes := ioMaxChanges(current, desired)
+	want := []cgroupIOValue{
+		{device: "8:0", key: "rbps", value: "150"},
+		{device: "8:0", key: "wbps", value: "max"},
+		{device: "8:0", key: "riops", value: "40"},
+		{device: "8:1", key: "riops", value: "max"},
+	}
+	if !reflect.DeepEqual(changes, want) {
+		t.Fatalf("io.max changes = %#v, want %#v", changes, want)
+	}
+	seen := map[string]bool{}
+	for _, change := range changes {
+		key := change.device + "/" + change.key
+		if seen[key] {
+			t.Fatalf("duplicate io.max write for %s", key)
+		}
+		seen[key] = true
+	}
+	if _, err := parseIOMax([]byte("8:0 rbps=0")); err == nil {
+		t.Fatal("invalid zero io.max value was accepted")
+	}
+	if _, err := parseIOMax([]byte("8:0 rbps=18446744073709551616")); err == nil {
+		t.Fatal("overflowing io.max value was accepted")
+	}
+}
+
+func TestCgroupResourceAndIOMaxUpdateRollBackTogether(t *testing.T) {
+	path := "/cgroup/workload"
+	values := map[string][]byte{
+		filepath.Join(path, "memory.max"): []byte("1073741824"),
+		filepath.Join(path, "cpu.max"):    []byte("400000 100000"),
+		filepath.Join(path, "pids.max"):   []byte("max"),
+		filepath.Join(path, "io.max"):     []byte("8:0 rbps=100 wbps=200\n"),
+	}
+	ioValues := map[string]string{"rbps": "100", "wbps": "200"}
+	readFile := func(name string) ([]byte, error) {
+		value, ok := values[name]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return append([]byte(nil), value...), nil
+	}
+	writes := []string{}
+	writeFile := func(name string, value []byte, _ os.FileMode) error {
+		if filepath.Base(name) != "io.max" {
+			values[name] = append([]byte(nil), value...)
+			return nil
+		}
+		directive := string(value)
+		writes = append(writes, directive)
+		fields := strings.Fields(directive)
+		parts := strings.SplitN(fields[1], "=", 2)
+		if parts[0] == "wbps" && parts[1] == "400" {
+			return errors.New("injected io.max write failure")
+		}
+		ioValues[parts[0]] = parts[1]
+		return nil
+	}
+	err := replaceCgroupResourceLimitsWithResolver(path, protocol.Resources{
+		MemoryBytes:     64 * 1024 * 1024,
+		CPUQuota:        200000,
+		CPUPeriod:       100000,
+		BlockIOReadBps:  []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: 300}},
+		BlockIOWriteBps: []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: 400}},
+	}, false, readFile, writeFile, func(string) (string, error) { return "8:0", nil })
+	if err == nil || !strings.Contains(err.Error(), "update io.max") {
+		t.Fatalf("resource update error = %v", err)
+	}
+	if got := string(values[filepath.Join(path, "memory.max")]); got != "1073741824" {
+		t.Fatalf("memory.max after rollback = %q", got)
+	}
+	if got := string(values[filepath.Join(path, "cpu.max")]); got != "400000 100000" {
+		t.Fatalf("cpu.max after rollback = %q", got)
+	}
+	if !reflect.DeepEqual(ioValues, map[string]string{"rbps": "100", "wbps": "200"}) {
+		t.Fatalf("io.max after rollback = %#v", ioValues)
+	}
+	if !reflect.DeepEqual(writes, []string{"8:0 rbps=300", "8:0 wbps=400", "8:0 rbps=100"}) {
+		t.Fatalf("io.max writes = %#v", writes)
+	}
+}
+
+func TestCompatibilityFailureAfterSuccessfulScalarAndIOWritesRollsBack(t *testing.T) {
+	path := "/cgroup/workload"
+	original := map[string][]byte{
+		filepath.Join(path, "memory.max"): []byte("1073741824"),
+		filepath.Join(path, "cpu.max"):    []byte("400000 100000"),
+		filepath.Join(path, "pids.max"):   []byte("max"),
+		filepath.Join(path, "io.max"):     []byte("8:0 rbps=100 riops=30\n"),
+	}
+	values := map[string][]byte{}
+	for name, value := range original {
+		values[name] = append([]byte(nil), value...)
+	}
+	ioValues := map[string]string{"rbps": "100", "riops": "30"}
+	readFile := func(name string) ([]byte, error) {
+		value, ok := values[name]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return append([]byte(nil), value...), nil
+	}
+	writes := 0
+	writeFile := func(name string, value []byte, _ os.FileMode) error {
+		writes++
+		if filepath.Base(name) != "io.max" {
+			values[name] = append([]byte(nil), value...)
+			return nil
+		}
+		fields := strings.Fields(string(value))
+		parts := strings.SplitN(fields[1], "=", 2)
+		ioValues[parts[0]] = parts[1]
+		return nil
+	}
+	err := replaceCgroupResourceLimitsWithResolverAndFailure(
+		path,
+		protocol.Resources{
+			MemoryBytes:     512 * 1024 * 1024,
+			CPUQuota:        200000,
+			CPUPeriod:       100000,
+			BlockIOReadBps:  []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: 300}},
+			BlockIOReadIOps: []protocol.BlockIOThrottle{{Path: "/dev/vda", Rate: 50}},
+		},
+		false, readFile, writeFile, func(string) (string, error) { return "8:0", nil }, 4,
+	)
+	if err == nil || !strings.Contains(err.Error(), "failure after 4 successful writes") {
+		t.Fatalf("compatibility resource failure = %v", err)
+	}
+	for name, expected := range original {
+		if filepath.Base(name) == "io.max" {
+			continue
+		}
+		if !bytes.Equal(values[name], expected) {
+			t.Fatalf("%s after rollback = %q, want %q", name, values[name], expected)
+		}
+	}
+	if !reflect.DeepEqual(ioValues, map[string]string{"rbps": "100", "riops": "30"}) {
+		t.Fatalf("io.max after compatibility rollback = %#v", ioValues)
+	}
+	if writes != 8 {
+		t.Fatalf("underlying writes = %d, want 4 transaction writes plus 4 rollbacks", writes)
 	}
 }
 
@@ -131,6 +363,108 @@ func TestCgroupResourceUpdateRollsBackEarlierLimitsOnFailure(t *testing.T) {
 	}
 	if got := string(values[filepath.Join(path, "cpu.max")]); got != "400000 100000" {
 		t.Fatalf("cpu.max after rollback = %q", got)
+	}
+}
+
+func TestCgroupResourceUpdateReportsSingleRollbackFailure(t *testing.T) {
+	path := "/cgroup/workload"
+	original := map[string][]byte{
+		filepath.Join(path, "memory.max"): []byte("1073741824"),
+		filepath.Join(path, "cpu.max"):    []byte("400000 100000"),
+		filepath.Join(path, "pids.max"):   []byte("max"),
+	}
+	values := map[string][]byte{}
+	for name, value := range original {
+		values[name] = append([]byte(nil), value...)
+	}
+	readFile := func(name string) ([]byte, error) {
+		value, ok := values[name]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return append([]byte(nil), value...), nil
+	}
+	writeFile := func(name string, value []byte, _ os.FileMode) error {
+		base := filepath.Base(name)
+		if base == "pids.max" && string(value) == "128" {
+			return errors.New("forward pids failure")
+		}
+		if base == "cpu.max" && string(value) == "400000 100000" {
+			return errors.New("rollback cpu failure")
+		}
+		values[name] = append([]byte(nil), value...)
+		return nil
+	}
+	err := replaceCgroupResourceLimitsWithResolver(
+		path,
+		protocol.Resources{
+			MemoryBytes: 64 * 1024 * 1024, CPUQuota: 200000, CPUPeriod: 100000, PIDs: 128,
+		},
+		false, readFile, writeFile, func(string) (string, error) { return "8:0", nil },
+	)
+	var rollbackIncomplete *ResourceRollbackIncompleteError
+	if !errors.As(err, &rollbackIncomplete) {
+		t.Fatalf("resource update error = %T %v, want ResourceRollbackIncompleteError", err, err)
+	}
+	if !strings.Contains(rollbackIncomplete.UpdateError.Error(), "forward pids failure") {
+		t.Fatalf("forward error = %v", rollbackIncomplete.UpdateError)
+	}
+	if len(rollbackIncomplete.RollbackErrors) != 1 ||
+		!strings.Contains(rollbackIncomplete.RollbackErrors[0].Error(), "rollback cpu failure") {
+		t.Fatalf("rollback errors = %#v", rollbackIncomplete.RollbackErrors)
+	}
+	if got := string(values[filepath.Join(path, "memory.max")]); got != "1073741824" {
+		t.Fatalf("memory.max after rollback = %q", got)
+	}
+}
+
+func TestCgroupResourceUpdateAttemptsEveryRollbackAfterMultipleFailures(t *testing.T) {
+	path := "/cgroup/workload"
+	original := map[string][]byte{
+		filepath.Join(path, "memory.max"): []byte("1073741824"),
+		filepath.Join(path, "cpu.max"):    []byte("400000 100000"),
+		filepath.Join(path, "pids.max"):   []byte("max"),
+	}
+	values := map[string][]byte{}
+	for name, value := range original {
+		values[name] = append([]byte(nil), value...)
+	}
+	readFile := func(name string) ([]byte, error) {
+		value, ok := values[name]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return append([]byte(nil), value...), nil
+	}
+	rollbackAttempts := []string{}
+	writeFile := func(name string, value []byte, _ os.FileMode) error {
+		base := filepath.Base(name)
+		if base == "pids.max" && string(value) == "128" {
+			return errors.New("forward pids failure")
+		}
+		if bytes.Equal(value, original[name]) {
+			rollbackAttempts = append(rollbackAttempts, base)
+			return fmt.Errorf("rollback %s failure", base)
+		}
+		values[name] = append([]byte(nil), value...)
+		return nil
+	}
+	err := replaceCgroupResourceLimitsWithResolver(
+		path,
+		protocol.Resources{
+			MemoryBytes: 64 * 1024 * 1024, CPUQuota: 200000, CPUPeriod: 100000, PIDs: 128,
+		},
+		false, readFile, writeFile, func(string) (string, error) { return "8:0", nil },
+	)
+	var rollbackIncomplete *ResourceRollbackIncompleteError
+	if !errors.As(err, &rollbackIncomplete) {
+		t.Fatalf("resource update error = %T %v, want ResourceRollbackIncompleteError", err, err)
+	}
+	if len(rollbackIncomplete.RollbackErrors) != 2 {
+		t.Fatalf("rollback errors = %#v", rollbackIncomplete.RollbackErrors)
+	}
+	if !reflect.DeepEqual(rollbackAttempts, []string{"cpu.max", "memory.max"}) {
+		t.Fatalf("rollback attempts = %#v", rollbackAttempts)
 	}
 }
 

@@ -38,6 +38,9 @@ type Supervisor struct {
 	execTargets map[string]int
 	execCgroups map[string]string
 	execStatus  map[string]protocol.ProcessStatus
+	processIO   *pinnedProcessIO
+	execIO      map[string]*pinnedProcessIO
+	execSpecs   map[string]protocol.ExecSpec
 }
 
 func New() *Supervisor {
@@ -47,6 +50,8 @@ func New() *Supervisor {
 		execTargets: map[string]int{},
 		execCgroups: map[string]string{},
 		execStatus:  map[string]protocol.ProcessStatus{},
+		execIO:      map[string]*pinnedProcessIO{},
+		execSpecs:   map[string]protocol.ExecSpec{},
 	}
 }
 
@@ -140,12 +145,21 @@ func (s *Supervisor) Prepare(spec protocol.WorkloadSpec) error {
 	if err := unix.Mount("cengine-io", "/run/cengine/io", "virtiofs", 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
 		return fmt.Errorf("mount cengine I/O share: %w", err)
 	}
+	processIO, err := openPinnedProcessIO(ioDirectoryPath, "", spec.IOClaim)
+	if err != nil {
+		return fmt.Errorf("pin workload I/O: %w", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.command != nil {
+		processIO.close()
 		return errors.New("cannot replace a running workload")
 	}
+	if s.processIO != nil {
+		s.processIO.close()
+	}
 	s.spec = &spec
+	s.processIO = processIO
 	s.status = protocol.ProcessStatus{Status: "prepared"}
 	return nil
 }
@@ -179,6 +193,10 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	if s.command != nil {
 		return s.status, errors.New("workload is already running")
 	}
+	if s.processIO == nil {
+		return s.status, errors.New("workload I/O is not prepared")
+	}
+	processIO := s.processIO
 	data, err := json.Marshal(s.spec)
 	if err != nil {
 		return s.status, err
@@ -203,7 +221,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	}
 	command := exec.Command("/proc/self/exe", stage2Argument)
 	command.ExtraFiles = []*os.File{reader, gateReader, readyWriter}
-	stdout, err := os.OpenFile("/run/cengine/io/stdout", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	stdout, err := duplicateFile(processIO.stdout, "stdout")
 	if err != nil {
 		readyReader.Close()
 		readyWriter.Close()
@@ -234,7 +252,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		command.Stdout = terminalSlave
 		command.Stderr = terminalSlave
 	} else {
-		stderr, err = os.OpenFile("/run/cengine/io/stderr", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		stderr, err = duplicateFile(processIO.stderr, "stderr")
 		if err != nil {
 			readyReader.Close()
 			readyWriter.Close()
@@ -338,9 +356,9 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	s.status = protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
 	go s.reap(command)
 	if terminalMaster != nil {
-		go pumpTerminalInput("/run/cengine/io/stdin", terminalMaster, command)
+		go pumpTerminalInput(processIO.stdin, processIO.stdinClosed, terminalMaster, command)
 	} else {
-		go pumpInput("/run/cengine/io/stdin", stdinWriter, command)
+		go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
 	}
 	return s.status, nil
 }
@@ -391,17 +409,10 @@ func pumpTerminalOutput(master, destination *os.File, command *exec.Cmd) {
 	}
 }
 
-func pumpTerminalInput(path string, destination io.Writer, command *exec.Cmd) {
-	var offset int64
+func pumpTerminalInput(source, closed *os.File, destination io.Writer, command *exec.Cmd) {
 	for {
-		file, err := os.Open(path)
-		if err == nil {
-			_, _ = file.Seek(offset, io.SeekStart)
-			written, _ := io.Copy(destination, file)
-			offset += written
-			file.Close()
-		}
-		if _, err := os.Stat(path + ".closed"); err == nil {
+		inputClosed, err := pumpInputStep(source, closed, destination)
+		if err != nil || inputClosed {
 			return
 		}
 		if command.ProcessState != nil {
@@ -419,14 +430,15 @@ func applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
 	if err := unix.Mount("none", root, "cgroup2", 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
 		return fmt.Errorf("mount cgroup2: %w", err)
 	}
-	if err := enableCgroupControllers(root); err != nil {
+	requireIO := hasBlockIOLimits(spec.Resources)
+	if err := enableCgroupControllers(root, requireIO); err != nil {
 		return err
 	}
 	parent := filepath.Join(root, "cengine")
 	if err := os.MkdirAll(parent, 0755); err != nil {
 		return err
 	}
-	if err := enableCgroupControllers(parent); err != nil {
+	if err := enableCgroupControllers(parent, requireIO); err != nil {
 		return err
 	}
 	path := filepath.Join(parent, spec.ID)
@@ -468,6 +480,177 @@ func writeCgroupResourceLimits(path string, resources protocol.Resources, ignore
 	return replaceCgroupResourceLimits(path, resources, ignoreMissing, os.ReadFile, os.WriteFile)
 }
 
+type cgroupIOValue struct {
+	device string
+	key    string
+	value  string
+}
+
+// ResourceRollbackIncompleteError means a resource update failed and at least
+// one best-effort restoration write failed too. Callers must treat the
+// workload's live cgroup state as unknown and stop or recreate it from durable
+// resources before reporting it as running again.
+type ResourceRollbackIncompleteError struct {
+	UpdateError    error
+	RollbackErrors []error
+}
+
+func (e *ResourceRollbackIncompleteError) Error() string {
+	details := make([]string, 0, len(e.RollbackErrors))
+	for _, err := range e.RollbackErrors {
+		details = append(details, err.Error())
+	}
+	return fmt.Sprintf(
+		"resource update failed (%v); rollback incomplete (%s)",
+		e.UpdateError, strings.Join(details, "; "),
+	)
+}
+
+func (e *ResourceRollbackIncompleteError) Unwrap() error { return e.UpdateError }
+
+func hasBlockIOLimits(resources protocol.Resources) bool {
+	return len(resources.BlockIOReadBps) > 0 || len(resources.BlockIOWriteBps) > 0 ||
+		len(resources.BlockIOReadIOps) > 0 || len(resources.BlockIOWriteIOps) > 0
+}
+
+func resolveBlockDevice(path string) (string, error) {
+	return resolveBlockDeviceWithStat(path, unix.Stat)
+}
+
+func resolveBlockDeviceWithStat(path string, stat func(string, *unix.Stat_t) error) (string, error) {
+	if path != "/dev/vda" {
+		return "", fmt.Errorf("block I/O throttle path %q is not the VM root device /dev/vda", path)
+	}
+	var status unix.Stat_t
+	if err := stat(path, &status); err != nil {
+		return "", fmt.Errorf("stat block I/O throttle device %s: %w", path, err)
+	}
+	if status.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return "", fmt.Errorf("block I/O throttle device %s is not a block device", path)
+	}
+	return fmt.Sprintf("%d:%d", unix.Major(uint64(status.Rdev)), unix.Minor(uint64(status.Rdev))), nil
+}
+
+func desiredIOMax(
+	resources protocol.Resources, resolveDevice func(string) (string, error),
+) (map[string]map[string]string, error) {
+	desired := map[string]map[string]string{}
+	types := []struct {
+		key    string
+		limits []protocol.BlockIOThrottle
+	}{
+		{key: "rbps", limits: resources.BlockIOReadBps},
+		{key: "wbps", limits: resources.BlockIOWriteBps},
+		{key: "riops", limits: resources.BlockIOReadIOps},
+		{key: "wiops", limits: resources.BlockIOWriteIOps},
+	}
+	resolved := map[string]string{}
+	for _, throttleType := range types {
+		seen := map[string]bool{}
+		for _, limit := range throttleType.limits {
+			if limit.Rate == 0 {
+				return nil, fmt.Errorf("block I/O throttle %s for %q must be positive", throttleType.key, limit.Path)
+			}
+			if seen[limit.Path] {
+				return nil, fmt.Errorf("duplicate block I/O throttle %s path %q", throttleType.key, limit.Path)
+			}
+			seen[limit.Path] = true
+			device, ok := resolved[limit.Path]
+			if !ok {
+				var err error
+				device, err = resolveDevice(limit.Path)
+				if err != nil {
+					return nil, err
+				}
+				resolved[limit.Path] = device
+			}
+			if desired[device] == nil {
+				desired[device] = map[string]string{}
+			}
+			if _, duplicate := desired[device][throttleType.key]; duplicate {
+				return nil, fmt.Errorf("duplicate block I/O throttle %s device %s", throttleType.key, device)
+			}
+			desired[device][throttleType.key] = strconv.FormatUint(limit.Rate, 10)
+		}
+	}
+	return desired, nil
+}
+
+func parseIOMax(data []byte) (map[string]map[string]string, error) {
+	result := map[string]map[string]string{}
+	for lineNumber, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		deviceParts := strings.Split(fields[0], ":")
+		if len(deviceParts) != 2 {
+			return nil, fmt.Errorf("parse io.max line %d: invalid device %q", lineNumber+1, fields[0])
+		}
+		if _, err := strconv.ParseUint(deviceParts[0], 10, 32); err != nil {
+			return nil, fmt.Errorf("parse io.max line %d: invalid major number", lineNumber+1)
+		}
+		if _, err := strconv.ParseUint(deviceParts[1], 10, 32); err != nil {
+			return nil, fmt.Errorf("parse io.max line %d: invalid minor number", lineNumber+1)
+		}
+		if result[fields[0]] == nil {
+			result[fields[0]] = map[string]string{}
+		}
+		for _, field := range fields[1:] {
+			parts := strings.SplitN(field, "=", 2)
+			if len(parts) != 2 || !isIOMaxKey(parts[0]) || (parts[1] != "max" && !isPositiveDecimal(parts[1])) {
+				return nil, fmt.Errorf("parse io.max line %d: invalid limit %q", lineNumber+1, field)
+			}
+			if _, duplicate := result[fields[0]][parts[0]]; duplicate {
+				return nil, fmt.Errorf("parse io.max line %d: duplicate key %s", lineNumber+1, parts[0])
+			}
+			result[fields[0]][parts[0]] = parts[1]
+		}
+	}
+	return result, nil
+}
+
+func isIOMaxKey(value string) bool {
+	return value == "rbps" || value == "wbps" || value == "riops" || value == "wiops"
+}
+
+func isPositiveDecimal(value string) bool {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && parsed > 0
+}
+
+func ioMaxChanges(current, desired map[string]map[string]string) []cgroupIOValue {
+	devices := map[string]bool{}
+	for device := range current {
+		devices[device] = true
+	}
+	for device := range desired {
+		devices[device] = true
+	}
+	deviceNames := make([]string, 0, len(devices))
+	for device := range devices {
+		deviceNames = append(deviceNames, device)
+	}
+	sort.Strings(deviceNames)
+	changes := []cgroupIOValue{}
+	for _, device := range deviceNames {
+		for _, key := range []string{"rbps", "wbps", "riops", "wiops"} {
+			oldValue := "max"
+			if value := current[device][key]; value != "" {
+				oldValue = value
+			}
+			newValue := "max"
+			if value := desired[device][key]; value != "" {
+				newValue = value
+			}
+			if oldValue != newValue {
+				changes = append(changes, cgroupIOValue{device: device, key: key, value: newValue})
+			}
+		}
+	}
+	return changes
+}
+
 func replaceCgroupResourceLimits(
 	path string,
 	resources protocol.Resources,
@@ -475,11 +658,44 @@ func replaceCgroupResourceLimits(
 	readFile func(string) ([]byte, error),
 	writeFile func(string, []byte, os.FileMode) error,
 ) error {
+	return replaceCgroupResourceLimitsWithResolver(
+		path, resources, ignoreMissing, readFile, writeFile, resolveBlockDevice,
+	)
+}
+
+func replaceCgroupResourceLimitsWithResolver(
+	path string,
+	resources protocol.Resources,
+	ignoreMissing bool,
+	readFile func(string) ([]byte, error),
+	writeFile func(string, []byte, os.FileMode) error,
+	resolveDevice func(string) (string, error),
+) error {
+	return replaceCgroupResourceLimitsWithResolverAndFailure(
+		path, resources, ignoreMissing, readFile, writeFile, resolveDevice, 0,
+	)
+}
+
+func replaceCgroupResourceLimitsWithResolverAndFailure(
+	path string,
+	resources protocol.Resources,
+	ignoreMissing bool,
+	readFile func(string) ([]byte, error),
+	writeFile func(string, []byte, os.FileMode) error,
+	resolveDevice func(string) (string, error),
+	compatibilityFailureAfterWrites uint32,
+) error {
 	type previousValue struct {
 		path  string
 		value []byte
 	}
-	previous := []previousValue{}
+	type resourceWrite struct {
+		path     string
+		name     string
+		value    []byte
+		previous []byte
+	}
+	writes := []resourceWrite{}
 	for _, limit := range cgroupResourceLimits(resources) {
 		file := filepath.Join(path, limit.name)
 		old, err := readFile(file)
@@ -489,32 +705,121 @@ func replaceCgroupResourceLimits(
 		if err != nil {
 			return fmt.Errorf("read %s: %w", limit.name, err)
 		}
-		if err := writeFile(file, []byte(limit.value), 0644); err != nil {
-			for index := len(previous) - 1; index >= 0; index-- {
-				_ = writeFile(previous[index].path, previous[index].value, 0644)
-			}
-			return fmt.Errorf("update %s: %w", limit.name, err)
+		writes = append(writes, resourceWrite{
+			path: file, name: limit.name, value: []byte(limit.value), previous: old,
+		})
+	}
+
+	desiredIO, err := desiredIOMax(resources, resolveDevice)
+	if err != nil {
+		return err
+	}
+	ioFile := filepath.Join(path, "io.max")
+	currentIO := map[string]map[string]string{}
+	ioData, err := readFile(ioFile)
+	if errors.Is(err, os.ErrNotExist) && !hasBlockIOLimits(resources) {
+		ioData = nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("io controller is unavailable for configured block I/O throttles")
+	} else if err != nil {
+		return fmt.Errorf("read io.max: %w", err)
+	} else {
+		currentIO, err = parseIOMax(ioData)
+		if err != nil {
+			return err
 		}
-		previous = append(previous, previousValue{path: file, value: old})
+	}
+	ioChanges := ioMaxChanges(currentIO, desiredIO)
+	previous := []previousValue{}
+	previousIO := []cgroupIOValue{}
+	successfulWrites := uint32(0)
+	transactionWrite := func(path string, value []byte, mode os.FileMode) error {
+		if compatibilityFailureAfterWrites > 0 && successfulWrites == compatibilityFailureAfterWrites {
+			return fmt.Errorf(
+				"compatibility injected resource write failure after %d successful writes",
+				successfulWrites,
+			)
+		}
+		if err := writeFile(path, value, mode); err != nil {
+			return err
+		}
+		successfulWrites++
+		return nil
+	}
+	rollback := func(updateError error) error {
+		rollbackErrors := []error{}
+		for index := len(previousIO) - 1; index >= 0; index-- {
+			value := previousIO[index]
+			directive := fmt.Sprintf("%s %s=%s", value.device, value.key, value.value)
+			if err := writeFile(ioFile, []byte(directive), 0644); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf(
+					"restore io.max %s %s: %w", value.device, value.key, err,
+				))
+			}
+		}
+		for index := len(previous) - 1; index >= 0; index-- {
+			if err := writeFile(previous[index].path, previous[index].value, 0644); err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf(
+					"restore %s: %w", filepath.Base(previous[index].path), err,
+				))
+			}
+		}
+		if len(rollbackErrors) != 0 {
+			return &ResourceRollbackIncompleteError{
+				UpdateError: updateError, RollbackErrors: rollbackErrors,
+			}
+		}
+		return updateError
+	}
+	for _, write := range writes {
+		if err := transactionWrite(write.path, write.value, 0644); err != nil {
+			return rollback(fmt.Errorf("update %s: %w", write.name, err))
+		}
+		previous = append(previous, previousValue{path: write.path, value: write.previous})
+	}
+	for _, change := range ioChanges {
+		directive := fmt.Sprintf("%s %s=%s", change.device, change.key, change.value)
+		if err := transactionWrite(ioFile, []byte(directive), 0644); err != nil {
+			return rollback(fmt.Errorf("update io.max %s %s: %w", change.device, change.key, err))
+		}
+		oldValue := "max"
+		if value := currentIO[change.device][change.key]; value != "" {
+			oldValue = value
+		}
+		previousIO = append(previousIO, cgroupIOValue{
+			device: change.device, key: change.key, value: oldValue,
+		})
 	}
 	return nil
 }
 
 func (s *Supervisor) UpdateResources(resources protocol.Resources) error {
+	return s.updateResources(resources, 0)
+}
+
+func (s *Supervisor) UpdateResourcesWithCompatibilityFailure(
+	resources protocol.Resources, failureAfterWrites uint32,
+) error {
+	return s.updateResources(resources, failureAfterWrites)
+}
+
+func (s *Supervisor) updateResources(resources protocol.Resources, failureAfterWrites uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.command == nil || s.command.Process == nil || s.spec == nil || s.status.Status != "running" {
 		return errors.New("workload is not running")
 	}
 	path := filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID)
-	if err := writeCgroupResourceLimits(path, resources, false); err != nil {
+	if err := replaceCgroupResourceLimitsWithResolverAndFailure(
+		path, resources, false, os.ReadFile, os.WriteFile, resolveBlockDevice, failureAfterWrites,
+	); err != nil {
 		return err
 	}
 	s.spec.Resources = resources
 	return nil
 }
 
-func enableCgroupControllers(path string) error {
+func enableCgroupControllers(path string, requireIO bool) error {
 	data, err := os.ReadFile(filepath.Join(path, "cgroup.controllers"))
 	if err != nil {
 		return fmt.Errorf("read cgroup controllers at %s: %w", path, err)
@@ -524,7 +829,10 @@ func enableCgroupControllers(path string) error {
 		available[name] = true
 	}
 	directives := []string{}
-	for _, name := range []string{"cpu", "memory", "pids"} {
+	if requireIO && !available["io"] {
+		return fmt.Errorf("cgroup at %s does not expose the required io controller", path)
+	}
+	for _, name := range []string{"cpu", "io", "memory", "pids"} {
 		if available[name] {
 			directives = append(directives, "+"+name)
 		}
@@ -538,18 +846,11 @@ func enableCgroupControllers(path string) error {
 	return nil
 }
 
-func pumpInput(path string, destination *io.PipeWriter, command *exec.Cmd) {
+func pumpInput(source, closed *os.File, destination *io.PipeWriter, command *exec.Cmd) {
 	defer destination.Close()
-	var offset int64
 	for {
-		file, err := os.Open(path)
-		if err == nil {
-			_, _ = file.Seek(offset, io.SeekStart)
-			written, _ := io.Copy(destination, file)
-			offset += written
-			file.Close()
-		}
-		if _, err := os.Stat(path + ".closed"); err == nil {
+		inputClosed, err := pumpInputStep(source, closed, destination)
+		if err != nil || inputClosed {
 			return
 		}
 		if command.ProcessState != nil {

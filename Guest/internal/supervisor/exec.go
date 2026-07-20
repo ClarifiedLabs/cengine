@@ -416,24 +416,25 @@ func applyNoNewPrivileges(
 }
 
 func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
-	if spec.ID == "" || len(spec.Arguments) == 0 {
+	if spec.ID == "" || spec.ID == "." || spec.ID == ".." || filepath.Base(spec.ID) != spec.ID || len(spec.Arguments) == 0 {
 		return errors.New("exec requires id and arguments")
 	}
-	data, err := json.Marshal(spec)
+	processIO, err := openPinnedProcessIO(ioDirectoryPath, "exec-"+spec.ID+"-", spec.IOClaim)
 	if err != nil {
-		return err
+		return fmt.Errorf("pin exec I/O: %w", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.command == nil {
+		processIO.close()
 		return errors.New("workload is not running")
 	}
 	if _, exists := s.execStatus[spec.ID]; exists {
+		processIO.close()
 		return errors.New("exec already exists")
 	}
-	if err := os.WriteFile("/run/cengine/io/exec-"+spec.ID+".json", data, 0600); err != nil {
-		return err
-	}
+	s.execSpecs[spec.ID] = spec
+	s.execIO[spec.ID] = processIO
 	s.execStatus[spec.ID] = protocol.ProcessStatus{Status: "created"}
 	return nil
 }
@@ -443,14 +444,17 @@ func (s *Supervisor) DiscardExec(id string) error {
 		return errors.New("exec requires id")
 	}
 	s.mu.Lock()
-	if status, exists := s.execStatus[id]; exists && status.Status != "created" {
+	if status, exists := s.execStatus[id]; exists && status.Status != "created" && status.Status != "exited" {
 		s.mu.Unlock()
-		return errors.New("exec has already started")
+		return errors.New("exec is still running")
 	}
+	processIO := s.execIO[id]
+	delete(s.execIO, id)
+	delete(s.execSpecs, id)
 	delete(s.execStatus, id)
 	s.mu.Unlock()
-	if err := os.Remove("/run/cengine/io/exec-" + id + ".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	if processIO != nil {
+		processIO.close()
 	}
 	return nil
 }
@@ -467,14 +471,20 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 	}
 	pid := s.command.Process.Pid
 	workloadID := s.spec.ID
+	spec, specExists := s.execSpecs[id]
+	processIO := s.execIO[id]
 	s.mu.Unlock()
+	if !specExists || processIO == nil {
+		s.rollbackExecStart(id)
+		return protocol.ProcessStatus{}, errors.New("exec I/O is not prepared")
+	}
 	committed := false
 	defer func() {
 		if !committed {
 			s.rollbackExecStart(id)
 		}
 	}()
-	data, err := os.ReadFile("/run/cengine/io/exec-" + id + ".json")
+	data, err := json.Marshal(spec)
 	if err != nil {
 		return protocol.ProcessStatus{}, err
 	}
@@ -496,7 +506,7 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		gateWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
-	stdout, err := os.OpenFile("/run/cengine/io/exec-"+id+"-stdout", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	stdout, err := duplicateFile(processIO.stdout, "exec-"+id+"-stdout")
 	if err != nil {
 		reader.Close()
 		writer.Close()
@@ -506,7 +516,7 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		targetPIDWriter.Close()
 		return protocol.ProcessStatus{}, err
 	}
-	stderr, err := os.OpenFile("/run/cengine/io/exec-"+id+"-stderr", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	stderr, err := duplicateFile(processIO.stderr, "exec-"+id+"-stderr")
 	if err != nil {
 		reader.Close()
 		writer.Close()
@@ -599,7 +609,7 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 	s.mu.Unlock()
 	committed = true
 	go s.reapExec(id, command)
-	go pumpInput("/run/cengine/io/exec-"+id+"-stdin", stdinWriter, command)
+	go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
 	return status, nil
 }
 
@@ -615,7 +625,12 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	}
 	pid := s.command.Process.Pid
 	workloadID := s.spec.ID
+	spec, specExists := s.execSpecs[id]
 	s.mu.Unlock()
+	if !specExists {
+		s.failAttachedExecStart(id, errors.New("exec specification is not prepared"))
+		return protocol.ProcessStatus{}, errors.New("exec specification is not prepared")
+	}
 	committed := false
 	defer func() {
 		if !committed {
@@ -623,12 +638,8 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		}
 	}()
 
-	data, err := os.ReadFile("/run/cengine/io/exec-" + id + ".json")
+	data, err := json.Marshal(spec)
 	if err != nil {
-		return protocol.ProcessStatus{}, err
-	}
-	var spec protocol.ExecSpec
-	if err := json.Unmarshal(data, &spec); err != nil {
 		return protocol.ProcessStatus{}, err
 	}
 	reader, writer, err := os.Pipe()
@@ -993,6 +1004,7 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	}
 	s.mu.Lock()
 	cgroup := s.execCgroups[id]
+	processIO := s.execIO[id]
 	inspectPID := s.execStatus[id].PID
 	if inspectPID == 0 {
 		inspectPID = execInspectPID(s.execTargets[id])
@@ -1000,8 +1012,13 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	delete(s.execs, id)
 	delete(s.execTargets, id)
 	delete(s.execCgroups, id)
+	delete(s.execIO, id)
+	delete(s.execSpecs, id)
 	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", PID: inspectPID, ExitCode: &code}
 	s.mu.Unlock()
+	if processIO != nil {
+		processIO.close()
+	}
 	if cgroup != "" {
 		_ = os.Remove(cgroup)
 	}

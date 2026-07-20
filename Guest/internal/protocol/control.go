@@ -9,15 +9,16 @@ import (
 )
 
 const (
-	Version             = 7
-	ControlPort         = 4100
-	FileSystemPort      = 4101
-	RootFSContentPort   = 4102
-	ExecIOPort          = 4103
-	PortProxyPort       = 4104
-	SocketProxyPortBase = 4200
-	MaxControlFrame     = 16 << 20
-	MaxFileSystemIO     = 4 << 20
+	Version                         = 9
+	ControlPort                     = 4100
+	FileSystemPort                  = 4101
+	RootFSContentPort               = 4102
+	ExecIOPort                      = 4103
+	PortProxyPort                   = 4104
+	SocketProxyPortBase             = 4200
+	MaxControlFrame                 = 16 << 20
+	MaxFileSystemIO                 = 4 << 20
+	ErrorResourceRollbackIncomplete = "resource_rollback_incomplete"
 )
 
 type Envelope struct {
@@ -54,6 +55,7 @@ type WorkloadSpec struct {
 	CapabilityAdd    []string          `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string          `json:"capabilityDrop,omitempty"`
 	Rlimits          []Rlimit          `json:"rlimits,omitempty"`
+	IOClaim          string            `json:"ioClaim"`
 }
 
 type User struct {
@@ -98,10 +100,24 @@ type NetworkEndpoint struct {
 }
 
 type Resources struct {
-	MemoryBytes uint64 `json:"memoryBytes"`
-	CPUQuota    int64  `json:"cpuQuota"`
-	CPUPeriod   uint64 `json:"cpuPeriod"`
-	PIDs        int64  `json:"pids"`
+	MemoryBytes      uint64            `json:"memoryBytes"`
+	CPUQuota         int64             `json:"cpuQuota"`
+	CPUPeriod        uint64            `json:"cpuPeriod"`
+	PIDs             int64             `json:"pids"`
+	BlockIOReadBps   []BlockIOThrottle `json:"blockIOReadBps"`
+	BlockIOWriteBps  []BlockIOThrottle `json:"blockIOWriteBps"`
+	BlockIOReadIOps  []BlockIOThrottle `json:"blockIOReadIOps"`
+	BlockIOWriteIOps []BlockIOThrottle `json:"blockIOWriteIOps"`
+}
+
+type BlockIOThrottle struct {
+	Path string `json:"path"`
+	Rate uint64 `json:"rate"`
+}
+
+type ResourceUpdate struct {
+	Resources                       Resources `json:"resources"`
+	CompatibilityFailureAfterWrites uint32    `json:"compatibilityFailureAfterWrites,omitempty"`
 }
 
 type ProcessStatus struct {
@@ -134,6 +150,7 @@ type ExecSpec struct {
 	CapabilityAdd    []string `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string `json:"capabilityDrop,omitempty"`
 	Rlimits          []Rlimit `json:"rlimits,omitempty"`
+	IOClaim          string   `json:"ioClaim"`
 }
 
 type RootFSLayer struct {

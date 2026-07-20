@@ -3,6 +3,7 @@ import Foundation
 
 extension EngineRuntime {
     public func copyArchiveIntoContainer(_ identifier: String, path: String, archive: Data) async throws {
+        try requireCanonicalSnapshotWritable()
         let container = try container(identifier)
         try requireBackendExecutionAvailable(container)
         guard container.phase == .created || container.phase == .running else { throw EngineError(.conflict, "archive copy requires a created or running container") }

@@ -62,11 +62,22 @@ private actor CompletionBackend: ContainerBackend {
     private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private let log: Data
     private let completionEnabled: Bool
+    private let containedStartExitCode: Int32?
+    private let quarantinedStartExitCode: Int32?
     private var execBridges: [String: ContainerIOBridge] = [:]
+    private var retiredExecIDs = Set<String>()
+    private var execRetirementCalls = 0
 
-    init(log: Data = Data(), completionEnabled: Bool = true) {
+    init(
+        log: Data = Data(),
+        completionEnabled: Bool = true,
+        containedStartExitCode: Int32? = nil,
+        quarantinedStartExitCode: Int32? = nil
+    ) {
         self.log = log
         self.completionEnabled = completionEnabled
+        self.containedStartExitCode = containedStartExitCode
+        self.quarantinedStartExitCode = quarantinedStartExitCode
     }
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
@@ -87,13 +98,30 @@ private actor CompletionBackend: ContainerBackend {
         return bridge
     }
     func startExec(_ exec: ExecRecord) async throws {
+        if let containedStartExitCode {
+            throw BackendExecStartContainedError(
+                exitCode: containedStartExitCode, message: "lost start response"
+            )
+        }
+        if let quarantinedStartExitCode {
+            throw BackendExecStartQuarantinedError(
+                exitCode: quarantinedStartExitCode, message: "containment unavailable"
+            )
+        }
         try execBridges[exec.id]?.writer(.stdout).write(Data("exec-ok\n".utf8))
         execBridges[exec.id]?.finishOutput()
     }
     func execCompletion(_: ExecRecord) async -> Int32? { 0 }
+    func retireExec(_ exec: ExecRecord) async {
+        execRetirementCalls += 1
+        retiredExecIDs.insert(exec.id)
+    }
     func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge { try #require(execBridges[exec.id]) }
     func execPID(_: ExecRecord) async -> Int32 { 42 }
     func execStatus(_: ExecRecord) async -> Int32? { 0 }
+    func retiredExecCount() -> Int { retiredExecIDs.count }
+    func retirementCallCount() -> Int { execRetirementCalls }
+    func hasRetiredExec(_ execID: String) -> Bool { retiredExecIDs.contains(execID) }
     func pause(_: ContainerRecord) async throws {}
     func resume(_: ContainerRecord) async throws {}
     func statistics(_: ContainerRecord) async throws -> BackendStatistics {
@@ -455,6 +483,29 @@ private actor BlockingPrepareBackend: ContainerBackend {
     }
 }
 
+private actor IncarnationOwnershipBackend: ContainerBackend {
+    private var owners: [String: ContainerRecord] = [:]
+    private var networkUpdateCount = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        owners[container.id] = container
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_ container: ContainerRecord) async throws {
+        guard owners[container.id]?.instanceID == container.instanceID else { return }
+        owners.removeValue(forKey: container.id)
+    }
+    func updateNetworkRecords(_: [ContainerRecord]) async throws {
+        networkUpdateCount += 1
+    }
+
+    func owner(for identifier: String) -> ContainerRecord? { owners[identifier] }
+    func updates() -> Int { networkUpdateCount }
+}
+
 private actor ConcurrentDeleteBackend: ContainerBackend {
     private var arrivals = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -535,6 +586,212 @@ private actor BlockingResourceUpdateBackend: ContainerBackend {
     }
     func hasEnteredUpdate() -> Bool { updateEntered }
     func releaseUpdate() { continuation?.resume(); continuation = nil }
+}
+
+private actor FailingResourceUpdateBackend: ContainerBackend {
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func updateResources(_: ContainerRecord) async throws {
+        throw EngineError(.internalError, "injected resource update failure")
+    }
+}
+
+private actor TransactionalResourceUpdateBackend: ContainerBackend {
+    enum Mode: Equatable {
+        case normal
+        case failCompensation
+        case blockCompensation
+        case rollbackIncomplete
+        case rollbackIncompleteDeleteFailure
+        case rollbackIncompleteRecoveryAndDeleteFailure
+    }
+    enum Failure: Error { case compensation, recovery, deletion }
+
+    private let mode: Mode
+    private var prepared = Set<String>()
+    private var running = Set<String>()
+    private var resources: [String: ContainerRecord] = [:]
+    private var updates: [ContainerRecord] = []
+    private var starts = 0
+    private var deletes = 0
+    private var compensationBlocked = false
+    private var compensationContinuation: CheckedContinuation<Void, Never>?
+
+    init(mode: Mode = .normal) { self.mode = mode }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        prepared.insert(container.id)
+        resources[container.id] = container
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        starts += 1
+        prepared.insert(container.id)
+        running.insert(container.id)
+        resources[container.id] = container
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        running.remove(container.id)
+        return 137
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        if mode == .rollbackIncompleteDeleteFailure
+            || mode == .rollbackIncompleteRecoveryAndDeleteFailure {
+            throw Failure.deletion
+        }
+        prepared.remove(container.id)
+        running.remove(container.id)
+        resources.removeValue(forKey: container.id)
+    }
+    func updateResources(_ container: ContainerRecord) async throws {
+        updates.append(container)
+        if mode == .rollbackIncomplete, updates.count == 1 {
+            throw BackendResourceRollbackIncompleteError("injected guest rollback failure")
+        }
+        if (mode == .rollbackIncompleteDeleteFailure
+            || mode == .rollbackIncompleteRecoveryAndDeleteFailure), updates.count == 1 {
+            throw BackendResourceRollbackIncompleteError("injected guest rollback failure")
+        }
+        if mode == .rollbackIncompleteRecoveryAndDeleteFailure, updates.count > 1 {
+            throw Failure.recovery
+        }
+        if mode == .failCompensation, updates.count == 2 {
+            throw Failure.compensation
+        }
+        if mode == .blockCompensation, updates.count == 2 {
+            compensationBlocked = true
+            await withCheckedContinuation { compensationContinuation = $0 }
+            compensationBlocked = false
+        }
+        resources[container.id] = container
+    }
+    func completion(_: ContainerRecord) async -> Int32? { nil }
+    func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery {
+        running.contains(container.id) ? .running : .unavailable
+    }
+
+    func currentResources(_ identifier: String) -> ContainerRecord? { resources[identifier] }
+    func resourceUpdates() -> [ContainerRecord] { updates }
+    func isRunning(_ identifier: String) -> Bool { running.contains(identifier) }
+    func isCompensationBlocked() -> Bool { compensationBlocked }
+    func releaseCompensation() {
+        compensationContinuation?.resume()
+        compensationContinuation = nil
+    }
+    func lifecycleCounts() -> (starts: Int, deletes: Int) { (starts, deletes) }
+}
+
+private actor ResourceFenceCompletionBackend: ContainerBackend {
+    private var prepared = Set<String>()
+    private var running = Set<String>()
+    private var completionContinuations: [String: CheckedContinuation<Int32?, Never>] = [:]
+    private var prepares = 0
+    private var starts = 0
+    private var deletes = 0
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        prepared.insert(container.id)
+        prepares += 1
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        prepared.insert(container.id)
+        running.insert(container.id)
+        starts += 1
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        running.remove(container.id)
+        return 137
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_ container: ContainerRecord) async throws {
+        running.remove(container.id)
+        prepared.remove(container.id)
+        deletes += 1
+    }
+    func updateResources(_: ContainerRecord) async throws {}
+    func completion(_ container: ContainerRecord) async -> Int32? {
+        await withCheckedContinuation { completionContinuations[container.id] = $0 }
+    }
+    func isWaitingForCompletion(_ identifier: String) -> Bool {
+        completionContinuations[identifier] != nil
+    }
+    func finish(_ identifier: String, code: Int32) {
+        completionContinuations.removeValue(forKey: identifier)?.resume(returning: code)
+    }
+    func lifecycleCounts() -> (prepares: Int, starts: Int, deletes: Int) {
+        (prepares, starts, deletes)
+    }
+}
+
+private actor ResourceRecoveryBackend: ContainerBackend {
+    enum Failure: Error { case update, deletion }
+
+    private var resources: [String: ContainerRecord]
+    private var running: Set<String>
+    private var prepared: Set<String>
+    private var updates: [ContainerRecord] = []
+    private var stoppedPreparationRelaunches = 0
+    private let failUpdate: Bool
+    private let failDelete: Bool
+
+    init(record: ContainerRecord, backendResources: ContainerRecord, failUpdate: Bool = false,
+         failDelete: Bool = false, preparedAvailable: Bool = true) {
+        resources = [record.id: backendResources]
+        running = record.phase == .running ? [record.id] : []
+        prepared = preparedAvailable ? [record.id] : []
+        self.failUpdate = failUpdate
+        self.failDelete = failDelete
+    }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_ container: ContainerRecord) async throws {
+        prepared.insert(container.id)
+        resources[container.id] = container
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        prepared.insert(container.id)
+        running.insert(container.id)
+        resources[container.id] = container
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        running.remove(container.id)
+        return 137
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_ container: ContainerRecord) async throws {
+        if failDelete { throw Failure.deletion }
+        running.remove(container.id)
+        prepared.remove(container.id)
+        resources.removeValue(forKey: container.id)
+    }
+    func updateResources(_ container: ContainerRecord) async throws {
+        updates.append(container)
+        if failUpdate { throw Failure.update }
+        if container.phase != .running, !prepared.contains(container.id) {
+            // Mirrors RawVirtualizationBackend reconstructing a stopped shim
+            // from its persisted specification and writable root.
+            prepared.insert(container.id)
+            stoppedPreparationRelaunches += 1
+        }
+        resources[container.id] = container
+    }
+    func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery {
+        running.contains(container.id) ? .running : .unavailable
+    }
+
+    func currentResources(_ identifier: String) -> ContainerRecord? { resources[identifier] }
+    func resourceUpdates() -> [ContainerRecord] { updates }
+    func preparationRelaunchCount() -> Int { stoppedPreparationRelaunches }
 }
 
 private actor UpdateExitRaceBackend: ContainerBackend {
@@ -618,6 +875,7 @@ private actor BlockingReconciliationBackend: ContainerBackend {
 private actor AttachedExecLifecycleBackend: ContainerBackend {
     private var execCompletionContinuation: CheckedContinuation<Int32?, Never>?
     private var terminal = false
+    private var retiredExecIDs = Set<String>()
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
@@ -632,8 +890,10 @@ private actor AttachedExecLifecycleBackend: ContainerBackend {
     func execCompletion(_: ExecRecord) async -> Int32? {
         await withCheckedContinuation { execCompletionContinuation = $0 }
     }
+    func retireExec(_ exec: ExecRecord) async { retiredExecIDs.insert(exec.id) }
     func execPID(_: ExecRecord) async -> Int32 { terminal ? 0 : 73 }
     func isWaitingForExecCompletion() -> Bool { execCompletionContinuation != nil }
+    func hasRetiredExec(_ execID: String) -> Bool { retiredExecIDs.contains(execID) }
     func finishExec(code: Int32) {
         terminal = true
         execCompletionContinuation?.resume(returning: code)
@@ -912,6 +1172,249 @@ private actor ArmedStateSaveFailure {
     }
 
     func failureCount() -> Int { injectedFailures }
+}
+
+private final class ArmedAtomicStoreBoundaryFailure: @unchecked Sendable {
+    enum Failure: Error { case injected }
+
+    private let lock = NSLock()
+    private var armed = false
+    private var successfulSavesBeforeFailure = 0
+    private var failuresRemaining = 0
+    private let target: AtomicStoreSaveBoundary
+
+    init(target: AtomicStoreSaveBoundary = .replacementCompleted) {
+        self.target = target
+    }
+
+    func arm(afterSuccessfulSaves: Int = 0, failures: Int = 1) {
+        lock.withLock {
+            armed = true
+            successfulSavesBeforeFailure = afterSuccessfulSaves
+            failuresRemaining = failures
+        }
+    }
+
+    func failWhenArmed(_ boundary: AtomicStoreSaveBoundary) throws {
+        let shouldFail = lock.withLock {
+            guard armed, boundary == target else { return false }
+            guard successfulSavesBeforeFailure == 0 else {
+                successfulSavesBeforeFailure -= 1
+                return false
+            }
+            failuresRemaining -= 1
+            armed = failuresRemaining > 0
+            return true
+        }
+        if shouldFail { throw Failure.injected }
+    }
+}
+
+private final class BlockingAtomicStoreBoundaryFailure: @unchecked Sendable {
+    enum Failure: Error { case injected }
+
+    private let condition = NSCondition()
+    private var armed = false
+    private var blocked = false
+    private var released = false
+
+    func arm() {
+        condition.withLock {
+            armed = true
+            blocked = false
+            released = false
+        }
+    }
+
+    func blockAndFail(_ boundary: AtomicStoreSaveBoundary) throws {
+        guard boundary == .replacementCompleted else { return }
+        condition.lock()
+        guard armed else {
+            condition.unlock()
+            return
+        }
+        armed = false
+        blocked = true
+        condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock()
+        throw Failure.injected
+    }
+
+    func isBlocked() -> Bool { condition.withLock { blocked } }
+
+    func release() {
+        condition.withLock {
+            released = true
+            condition.broadcast()
+        }
+    }
+}
+
+private final class ArmedAtomicStoreCanonicalMutator: @unchecked Sendable {
+    enum Mutation { case remove, malformed }
+    enum Failure: Error { case injected }
+
+    private let lock = NSLock()
+    private let stateURL: URL
+    private let mutation: Mutation
+    private var armed = false
+    private var successfulSavesBeforeMutation = 0
+
+    init(stateURL: URL, mutation: Mutation) {
+        self.stateURL = stateURL
+        self.mutation = mutation
+    }
+
+    func arm(afterSuccessfulSaves: Int) {
+        lock.withLock {
+            armed = true
+            successfulSavesBeforeMutation = afterSuccessfulSaves
+        }
+    }
+
+    func mutate(_ boundary: AtomicStoreSaveBoundary) throws {
+        guard boundary == .replacementCompleted else { return }
+        try lock.withLock {
+            guard armed else { return }
+            guard successfulSavesBeforeMutation == 0 else {
+                successfulSavesBeforeMutation -= 1
+                return
+            }
+            armed = false
+            switch mutation {
+            case .remove:
+                try FileManager.default.removeItem(at: stateURL)
+            case .malformed:
+                try Data("{".utf8).write(to: stateURL, options: .atomic)
+            }
+            throw Failure.injected
+        }
+    }
+}
+
+private final class InvalidCanonicalSnapshotMutator: @unchecked Sendable {
+    enum Mutation: String, CaseIterable {
+        case duplicateExactKey
+        case samePublicIDDifferentInstance
+        case duplicateName
+        case fenceMismatch
+    }
+
+    enum Failure: Error { case injected }
+
+    private struct Envelope: Codable {
+        let schemaVersion: Int
+        var value: EngineSnapshot
+    }
+
+    private let condition = NSCondition()
+    private let stateURL: URL
+    private let mutation: Mutation
+    private let blocksBeforeMutation: Bool
+    private var armed = false
+    private var blocked = false
+    private var released = false
+
+    init(stateURL: URL, mutation: Mutation, blocksBeforeMutation: Bool) {
+        self.stateURL = stateURL
+        self.mutation = mutation
+        self.blocksBeforeMutation = blocksBeforeMutation
+    }
+
+    func arm() {
+        condition.withLock {
+            armed = true
+            blocked = false
+            released = false
+        }
+    }
+
+    func mutateAndFail(_ boundary: AtomicStoreSaveBoundary) throws {
+        guard boundary == .replacementCompleted else { return }
+        condition.lock()
+        guard armed else {
+            condition.unlock()
+            return
+        }
+        armed = false
+        if blocksBeforeMutation {
+            blocked = true
+            condition.broadcast()
+            while !released { condition.wait() }
+        }
+        condition.unlock()
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var envelope = try decoder.decode(Envelope.self, from: Data(contentsOf: stateURL))
+        guard let original = envelope.value.containers.first else {
+            throw Failure.injected
+        }
+        switch mutation {
+        case .duplicateExactKey:
+            envelope.value.containers.append(original)
+        case .samePublicIDDifferentInstance:
+            var duplicate = original.withFreshInstanceID()
+            duplicate.name += "-different-instance"
+            envelope.value.containers.append(duplicate)
+        case .duplicateName:
+            envelope.value.containers.append(ContainerRecord(
+                id: "\(original.id)-duplicate-name",
+                name: original.name,
+                image: original.image
+            ))
+        case .fenceMismatch:
+            var cleanup = envelope.value.cleanupPendingContainerIDs ?? []
+            cleanup.insert(original.id)
+            envelope.value.cleanupPendingContainerIDs = cleanup
+            var identities = envelope.value.containerFenceInstanceIDs ?? [:]
+            var mismatched = UUID()
+            while mismatched == original.instanceID { mismatched = UUID() }
+            identities[original.id] = mismatched
+            envelope.value.containerFenceInstanceIDs = identities
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(envelope).write(to: stateURL, options: .atomic)
+        throw Failure.injected
+    }
+
+    func isBlocked() -> Bool { condition.withLock { blocked } }
+
+    func release() {
+        condition.withLock {
+            released = true
+            condition.broadcast()
+        }
+    }
+}
+
+private final class EngineStoreParentRelocator: @unchecked Sendable {
+    private let lock = NSLock()
+    private let root: URL
+    private let detached: URL
+    private var armed = false
+
+    init(root: URL, detached: URL) {
+        self.root = root
+        self.detached = detached
+    }
+
+    func arm() { lock.withLock { armed = true } }
+
+    func relocate(_ boundary: AtomicStoreSaveBoundary) throws {
+        guard boundary == .replacementCompleted else { return }
+        try lock.withLock {
+            guard armed else { return }
+            armed = false
+            try FileManager.default.moveItem(at: root, to: detached)
+            try FileManager.default.createDirectory(
+                at: root, withIntermediateDirectories: false
+            )
+        }
+    }
 }
 
 private actor FinalPersistenceGate {
@@ -1576,6 +2079,10 @@ private actor GenerationCompletionBackend: ContainerBackend {
         completionContinuation?.resume(returning: code)
         completionContinuation = nil
     }
+    func reportRetryableNotComplete() {
+        completionContinuation?.resume(returning: nil)
+        completionContinuation = nil
+    }
 }
 
 private actor RawCompletionPublicationHarness {
@@ -1596,7 +2103,7 @@ private actor RawCompletionPublicationHarness {
         generation: RawBackendExecutionFence.Token,
         fabricBoundary: FinalPersistenceGate
     ) async -> Bool {
-        await RawCompletionPublisher.run(
+        (try? await RawCompletionPublisher.run(
             fence: fence,
             identifier: identifier,
             generation: generation,
@@ -1607,7 +2114,7 @@ private actor RawCompletionPublicationHarness {
                 return RawCompletionPublication(value: true, synchronizeFabric: true)
             },
             synchronizeFabric: { await fabricBoundary.blockWhenArmed() }
-        ) ?? false
+        )) ?? false
     }
 
     func publicationCount() -> Int { destructivePublications }
@@ -2201,6 +2708,155 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
+    @Test func dockerCLIConsoleSizeIsIgnoredForNonTTYCreateAcrossSupportedAPIVersions() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Captured from Docker CLI 29.6.2 running `docker create --pull=never alpine true`
+        // with a 24x80 client terminal. The CLI sends ConsoleSize even though Tty is false.
+        let nonTTYBody = Data(#"""
+        {
+            "Hostname":"",
+            "Domainname":"",
+            "User":"",
+            "AttachStdin":false,
+            "AttachStdout":true,
+            "AttachStderr":true,
+            "Tty":false,
+            "OpenStdin":false,
+            "StdinOnce":false,
+            "Env":null,
+            "Cmd":["true"],
+            "Image":"alpine",
+            "Volumes":{},
+            "WorkingDir":"",
+            "Entrypoint":null,
+            "Labels":{},
+            "HostConfig":{
+                "Binds":null,
+                "ContainerIDFile":"",
+                "LogConfig":{"Type":"","Config":{}},
+                "NetworkMode":"default",
+                "PortBindings":{},
+                "RestartPolicy":{"Name":"no","MaximumRetryCount":0},
+                "AutoRemove":false,
+                "VolumeDriver":"",
+                "VolumesFrom":null,
+                "ConsoleSize":[24,80],
+                "CapAdd":null,
+                "CapDrop":null,
+                "CgroupnsMode":"",
+                "Dns":null,
+                "DnsOptions":[],
+                "DnsSearch":[],
+                "ExtraHosts":null,
+                "GroupAdd":null,
+                "IpcMode":"",
+                "Cgroup":"",
+                "Links":null,
+                "OomScoreAdj":0,
+                "PidMode":"",
+                "Privileged":false,
+                "PublishAllPorts":false,
+                "ReadonlyRootfs":false,
+                "SecurityOpt":null,
+                "UTSMode":"",
+                "UsernsMode":"",
+                "ShmSize":0,
+                "Isolation":"",
+                "CpuShares":0,
+                "Memory":0,
+                "NanoCpus":0,
+                "CgroupParent":"",
+                "BlkioWeight":0,
+                "BlkioWeightDevice":[],
+                "BlkioDeviceReadBps":[],
+                "BlkioDeviceWriteBps":[],
+                "BlkioDeviceReadIOps":[],
+                "BlkioDeviceWriteIOps":[],
+                "CpuPeriod":0,
+                "CpuQuota":0,
+                "CpuRealtimePeriod":0,
+                "CpuRealtimeRuntime":0,
+                "CpusetCpus":"",
+                "CpusetMems":"",
+                "Devices":[],
+                "DeviceCgroupRules":null,
+                "DeviceRequests":null,
+                "MemoryReservation":0,
+                "MemorySwap":0,
+                "MemorySwappiness":-1,
+                "OomKillDisable":false,
+                "PidsLimit":0,
+                "Ulimits":[],
+                "CpuCount":0,
+                "CpuPercent":0,
+                "IOMaximumIOps":0,
+                "IOMaximumBandwidth":0,
+                "MaskedPaths":null,
+                "ReadonlyPaths":null
+            },
+            "NetworkingConfig":{
+                "EndpointsConfig":{
+                    "default":{
+                        "IPAMConfig":null,
+                        "Links":null,
+                        "Aliases":null,
+                        "DriverOpts":null,
+                        "GwPriority":0,
+                        "NetworkID":"",
+                        "EndpointID":"",
+                        "Gateway":"",
+                        "IPAddress":"",
+                        "MacAddress":"",
+                        "IPPrefixLen":0,
+                        "IPv6Gateway":"",
+                        "GlobalIPv6Address":"",
+                        "GlobalIPv6PrefixLen":0,
+                        "DNSNames":null
+                    }
+                }
+            }
+        }
+        """#.utf8)
+        let ttyBody = Data(#"""
+        {
+            "AttachStderr":true,
+            "AttachStdout":true,
+            "Cmd":["true"],
+            "Image":"alpine",
+            "Tty":true,
+            "HostConfig":{"ConsoleSize":[24,80],"NetworkMode":"default"}
+        }
+        """#.utf8)
+
+        for version in ["1.44", "1.55"] {
+            let accepted = await router.route(.init(
+                method: .POST,
+                uri: "/v\(version)/containers/create?name=docker-cli-console-\(version)",
+                body: nonTTYBody
+            ))
+            #expect(accepted.status == .created)
+
+            let inspect = await router.route(.init(
+                method: .GET,
+                uri: "/v\(version)/containers/docker-cli-console-\(version)/json"
+            ))
+            let inspected = try #require(
+                JSONSerialization.jsonObject(with: inspect.body) as? [String: Any]
+            )
+            let config = try #require(inspected["Config"] as? [String: Any])
+            #expect(config["Tty"] as? Bool == false)
+
+            let rejected = await router.route(.init(
+                method: .POST,
+                uri: "/v\(version)/containers/create?name=tty-console-\(version)",
+                body: ttyBody
+            ))
+            #expect(rejected.status == .notImplemented)
+        }
+    }
+
     @Test func privilegedUnconfinedSecurityDefaultsRemainAcceptedForKind() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2334,6 +2990,1410 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(invalid.status == .badRequest)
     }
 
+    @Test func blockIOThrottlesCreateInspectPersistAndUseVersionedUpdateSemantics() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let aboveInt64Max: UInt64 = 9_223_372_036_854_775_808
+
+        let unsetCreate = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=block-io-unset",
+            body: Data(#"{"Image":"alpine"}"#.utf8)
+        ))
+        #expect(unsetCreate.status == .created)
+        let unsetInspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/block-io-unset/json"))
+        let unsetObject = try #require(JSONSerialization.jsonObject(with: unsetInspect.body) as? [String: Any])
+        let unsetHost = try #require(unsetObject["HostConfig"] as? [String: Any])
+        for field in [
+            "BlkioDeviceReadBps", "BlkioDeviceWriteBps",
+            "BlkioDeviceReadIOps", "BlkioDeviceWriteIOps",
+        ] {
+            #expect(unsetHost.keys.contains(field))
+            #expect(unsetHost[field] is NSNull)
+        }
+
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=block-io",
+            body: Data(#"""
+            {"Image":"alpine","HostConfig":{
+              "BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":1048576}],
+              "BlkioDeviceWriteBps":[{"Path":"/dev/vda","Rate":18446744073709551615}],
+              "BlkioDeviceReadIOps":[{"Path":"/dev/vda","Rate":100}],
+              "BlkioDeviceWriteIOps":[{"Path":"/dev/vda","Rate":200}]
+            }}
+            """#.utf8)
+        ))
+        #expect(create.status == .created)
+        let createdInspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/block-io/json"))
+        let createdObject = try #require(JSONSerialization.jsonObject(with: createdInspect.body) as? [String: Any])
+        let createdHost = try #require(createdObject["HostConfig"] as? [String: Any])
+        let createdWriteBps = try #require(createdHost["BlkioDeviceWriteBps"] as? [[String: Any]])
+        #expect((createdWriteBps.first?["Rate"] as? NSNumber)?.uint64Value == UInt64.max)
+
+        let firstUpdate = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/block-io/update",
+            body: Data(#"""
+            {
+              "BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":9223372036854775808}],
+              "BlkioDeviceWriteBps":[],
+              "BlkioDeviceReadIOps":null
+            }
+            """#.utf8)
+        ))
+        #expect(firstUpdate.status == .ok)
+
+        let ignoredLegacyUpdate = await router.route(.init(
+            method: .POST, uri: "/v1.54/containers/block-io/update",
+            body: Data(#"""
+            {
+              "BlkioDeviceReadBps":[{"Path":"relative","Rate":0},{"Path":"relative","Rate":0}],
+              "BlkioDeviceWriteIOps":[{"Path":"/dev/vdb","Rate":999}]
+            }
+            """#.utf8)
+        ))
+        #expect(ignoredLegacyUpdate.status == .ok)
+
+        let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/block-io/json"))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        let readBps = try #require(host["BlkioDeviceReadBps"] as? [[String: Any]])
+        let writeBps = try #require(host["BlkioDeviceWriteBps"] as? [[String: Any]])
+        let readIOps = try #require(host["BlkioDeviceReadIOps"] as? [[String: Any]])
+        let writeIOps = try #require(host["BlkioDeviceWriteIOps"] as? [[String: Any]])
+        #expect(readBps.count == 1)
+        #expect(readBps.first?["Path"] as? String == "/dev/vda")
+        #expect((readBps.first?["Rate"] as? NSNumber)?.uint64Value == aboveInt64Max)
+        #expect(writeBps.isEmpty)
+        #expect(host.keys.contains("BlkioDeviceWriteBps"))
+        #expect(readIOps.count == 1)
+        #expect(readIOps.first?["Rate"] as? Int == 100)
+        #expect(writeIOps.count == 1)
+        #expect(writeIOps.first?["Rate"] as? Int == 200)
+
+        let snapshot = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        let persisted = try #require(snapshot.containers.first { $0.name == "block-io" })
+        #expect(persisted.blockIOReadBps == [.init(path: "/dev/vda", rate: aboveInt64Max)])
+        #expect(persisted.blockIOWriteBps == [])
+        #expect(persisted.blockIOReadIOps == [.init(path: "/dev/vda", rate: 100)])
+        #expect(persisted.blockIOWriteIOps == [.init(path: "/dev/vda", rate: 200)])
+    }
+
+    @Test func blockIOThrottleValidationDistinguishesBadRequestsFromRootDeviceGap() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let malformed = [
+            #"[{"Path":"relative","Rate":1}]"#,
+            #"[{"Path":"/dev/../dev/vda","Rate":1}]"#,
+            #"[{"Path":"/dev/vda","Rate":0}]"#,
+            #"[{"Path":"/dev/vda","Rate":1},{"Path":"/dev/vda","Rate":2}]"#,
+        ]
+        for (index, devices) in malformed.enumerated() {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=bad-block-io-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":{\"BlkioDeviceReadBps\":\(devices)}}".utf8)
+            ))
+            #expect(response.status == .badRequest)
+        }
+        let unsupported = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=unsupported-block-io",
+            body: Data(#"{"Image":"alpine","HostConfig":{"BlkioDeviceReadBps":[{"Path":"/dev/vdb","Rate":1}]}}"#.utf8)
+        ))
+        #expect(unsupported.status == .notImplemented)
+    }
+
+    @Test func legacyBlockIOUpdatesIgnoreMalformedFieldsBeforeTypedDecoding() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=legacy-block-io-decode",
+            body: Data(#"""
+            {"Image":"alpine","HostConfig":{
+              "BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":1048576}],
+              "BlkioDeviceWriteIOps":[{"Path":"/dev/vda","Rate":2000}]
+            }}
+            """#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        let malformed: [(String, HTTPResponseStatus)] = [
+            (#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":-1}]}"#, .badRequest),
+            (#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":18446744073709551616}]}"#, .badRequest),
+            (#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":"fast"}]}"#, .badRequest),
+            (#"{"BlkioDeviceReadBps":{"Path":"/dev/vda","Rate":1}}"#, .badRequest),
+            (#"{"BlkioDeviceReadBps":["not-a-device"]}"#, .badRequest),
+            (#"{"BlkioDeviceReadBps":[{"Path":"relative","Rate":1}]}"#, .badRequest),
+            (#"{"BlkioDeviceReadBps":[{"Path":"/dev/vdb","Rate":1}]}"#, .notImplemented),
+        ]
+        for version in ["1.44", "1.54"] {
+            for (body, _) in malformed {
+                let response = await router.route(.init(
+                    method: .POST, uri: "/v\(version)/containers/legacy-block-io-decode/update",
+                    body: Data(body.utf8)
+                ))
+                #expect(response.status == .ok)
+            }
+        }
+        let unrelatedMalformed = await router.route(.init(
+            method: .POST, uri: "/v1.54/containers/legacy-block-io-decode/update",
+            body: Data(#"{"PidsLimit":"bad","BlkioDeviceReadBps":{"Rate":"ignored"}}"#.utf8)
+        ))
+        #expect(unrelatedMalformed.status == .badRequest)
+        for (body, expectedStatus) in malformed {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/legacy-block-io-decode/update",
+                body: Data(body.utf8)
+            ))
+            #expect(response.status == expectedStatus)
+        }
+
+        let inspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/legacy-block-io-decode/json"
+        ))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        let readBps = try #require(host["BlkioDeviceReadBps"] as? [[String: Any]])
+        let writeIOps = try #require(host["BlkioDeviceWriteIOps"] as? [[String: Any]])
+        #expect(readBps.first?["Rate"] as? Int == 1_048_576)
+        #expect(writeIOps.first?["Rate"] as? Int == 2_000)
+        let snapshot = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        let persisted = try #require(snapshot.containers.first { $0.name == "legacy-block-io-decode" })
+        #expect(persisted.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
+        #expect(persisted.blockIOWriteIOps == [.init(path: "/dev/vda", rate: 2_000)])
+    }
+
+    @Test func failedLiveBlockIOUpdateDoesNotMutateHostStateOrPersistence() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root, backend: FailingResourceUpdateBackend())
+        let router = DockerRouter(runtime: runtime, root: root)
+        var record = ContainerRecord(name: "block-io-rollback", image: "alpine")
+        record.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        record = try await runtime.createContainer(record)
+        try await runtime.startContainer(record.id)
+
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/block-io-rollback/update",
+            body: Data(#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":2097152}]}"#.utf8)
+        ))
+        #expect(response.status == .internalServerError)
+        #expect(try await runtime.container(record.id).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(durable.containers.first).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+    }
+
+    @Test func resourceUpdatePublishesOnlyAfterItsCandidateIsDurable() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let persistenceGate = FinalPersistenceGate()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { await persistenceGate.blockWhenArmed() }
+        )
+        var input = ContainerRecord(name: "resource-durable-commit", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        await persistenceGate.arm(afterSuccessfulSaves: 2)
+
+        let update = Task {
+            try await runtime.updateContainer(
+                record.id, memoryBytes: nil, nanoCPUs: nil, pidsLimit: nil, restartPolicy: nil,
+                blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+            )
+        }
+        while !(await persistenceGate.isBlocked()) { await Task.yield() }
+
+        #expect(try await runtime.container(record.id).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+        let beforeCommit = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(beforeCommit.containers.first).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+
+        await persistenceGate.release()
+        _ = try await update.value
+        #expect(try await runtime.container(record.id).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 2_097_152),
+        ])
+    }
+
+    @Test func resourceUpdatePersistenceFailureCompensatesBackendAndRemainsRecoverable() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let router = DockerRouter(runtime: runtime, root: root)
+        var input = ContainerRecord(name: "resource-save-compensation", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        await saveFailure.arm(afterSuccessfulSaves: 2)
+
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/\(record.id)/update",
+            body: Data(#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":2097152}]}"#.utf8)
+        ))
+        #expect(response.status == .internalServerError)
+        #expect(try await runtime.container(record.id).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+        #expect((await backend.currentResources(record.id))?.blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+        let updates = await backend.resourceUpdates()
+        #expect(updates.map(\.blockIOReadBps) == [
+            [.init(path: "/dev/vda", rate: 2_097_152)],
+            [.init(path: "/dev/vda", rate: 1_048_576)],
+        ])
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(durable.containers.first).blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 1_048_576),
+        ])
+
+        _ = try await runtime.updateContainer(
+            record.id, memoryBytes: nil, nanoCPUs: nil, pidsLimit: nil,
+            restartPolicy: .init(name: "unless-stopped")
+        )
+        await runtime.shutdown()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        let recoveredRecord = try await recovered.container(record.id)
+        #expect(recoveredRecord.phase == .running)
+        #expect(recoveredRecord.restartPolicy.name == "unless-stopped")
+        #expect(recoveredRecord.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
+        #expect((await backend.currentResources(record.id))?.blockIOReadBps == recoveredRecord.blockIOReadBps)
+        await recovered.shutdown()
+    }
+
+    @Test func ambiguousSaveReconcilesAConcurrentContainerCreate() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = IncarnationOwnershipBackend()
+        let boundary = BlockingAtomicStoreBoundaryFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            atomicStoreSaveBoundaryHook: { try boundary.blockAndFail($0) }
+        )
+        boundary.arm()
+
+        let firstCreate = Task {
+            try await runtime.createContainer(.init(name: "ambiguous-first", image: "alpine"))
+        }
+        while !boundary.isBlocked() { await Task.yield() }
+
+        let secondCreate = Task {
+            try await runtime.createContainer(.init(name: "concurrent-second", image: "alpine"))
+        }
+        while await backend.updates() < 2 { await Task.yield() }
+        boundary.release()
+
+        await #expect(throws: AtomicStorePersistenceAmbiguousError.self) {
+            _ = try await firstCreate.value
+        }
+        let second = try await secondCreate.value
+        let visible = await runtime.listContainers(all: true)
+        #expect(visible.contains(where: { $0.name == "ambiguous-first" }))
+        #expect(visible.contains(where: {
+            $0.id == second.id && $0.instanceID == second.instanceID
+        }))
+        let durable = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).loadRequired()
+        #expect(durable.containers.count == 2)
+        #expect(durable.containers.contains(where: {
+            $0.id == second.id && $0.instanceID == second.instanceID
+        }))
+        await runtime.shutdown()
+    }
+
+    @Test func ambiguousCanonicalReloadRejectsInvalidUnchangedSnapshots() async throws {
+        for mutation in InvalidCanonicalSnapshotMutator.Mutation.allCases {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let mutator = InvalidCanonicalSnapshotMutator(
+                stateURL: root.appending(path: "engine.json"),
+                mutation: mutation,
+                blocksBeforeMutation: false
+            )
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: MetadataOnlyBackend(),
+                atomicStoreSaveBoundaryHook: { try mutator.mutateAndFail($0) }
+            )
+            mutator.arm()
+
+            var createFailed = false
+            do {
+                _ = try await runtime.createContainer(.init(
+                    name: "invalid-unchanged-\(mutation.rawValue)", image: "alpine"
+                ))
+            } catch { createFailed = true }
+            #expect(createFailed)
+
+            let visible = await runtime.listContainers(all: true)
+            #expect(visible.count == 1)
+            #expect(Set(visible.map(\.id)).count == visible.count)
+            #expect(Set(visible.map(\.name)).count == visible.count)
+            #expect(Set(visible.map(\.instanceID)).count == visible.count)
+            let live = await runtime.snapshot
+            #expect(live.cleanupPendingContainerIDs == nil)
+            #expect(live.removalPendingContainerIDs == nil)
+            #expect(live.removalVolumesPendingContainerIDs == nil)
+            #expect(live.containerFenceInstanceIDs == nil)
+
+            let refusedName = "poisoned-unchanged-\(mutation.rawValue)"
+            var laterMutationFailed = false
+            do {
+                _ = try await runtime.createVolume(name: refusedName)
+            } catch { laterMutationFailed = true }
+            #expect(laterMutationFailed)
+            #expect(!(await runtime.listVolumes().contains(where: { $0.name == refusedName })))
+            await runtime.shutdown()
+        }
+    }
+
+    @Test func ambiguousCanonicalReloadRejectsInvalidSnapshotsDuringReentrancy() async throws {
+        for mutation in InvalidCanonicalSnapshotMutator.Mutation.allCases {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let backend = IncarnationOwnershipBackend()
+            let mutator = InvalidCanonicalSnapshotMutator(
+                stateURL: root.appending(path: "engine.json"),
+                mutation: mutation,
+                blocksBeforeMutation: true
+            )
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: backend,
+                atomicStoreSaveBoundaryHook: { try mutator.mutateAndFail($0) }
+            )
+            mutator.arm()
+
+            let firstCreate = Task {
+                try await runtime.createContainer(.init(
+                    name: "invalid-reentrant-first-\(mutation.rawValue)", image: "alpine"
+                ))
+            }
+            while !mutator.isBlocked() { await Task.yield() }
+            let secondCreate = Task {
+                try await runtime.createContainer(.init(
+                    name: "invalid-reentrant-second-\(mutation.rawValue)", image: "alpine"
+                ))
+            }
+            while await backend.updates() < 2 { await Task.yield() }
+            mutator.release()
+
+            var firstFailed = false
+            do { _ = try await firstCreate.value } catch { firstFailed = true }
+            var secondFailed = false
+            do { _ = try await secondCreate.value } catch { secondFailed = true }
+            #expect(firstFailed)
+            #expect(secondFailed)
+
+            let visible = await runtime.listContainers(all: true)
+            #expect(visible.count == 2)
+            #expect(Set(visible.map(\.id)).count == visible.count)
+            #expect(Set(visible.map(\.name)).count == visible.count)
+            #expect(Set(visible.map(\.instanceID)).count == visible.count)
+            let live = await runtime.snapshot
+            #expect(live.cleanupPendingContainerIDs == nil)
+            #expect(live.removalPendingContainerIDs == nil)
+            #expect(live.removalVolumesPendingContainerIDs == nil)
+            #expect(live.containerFenceInstanceIDs == nil)
+
+            let refusedName = "poisoned-reentrant-\(mutation.rawValue)"
+            var laterMutationFailed = false
+            do {
+                _ = try await runtime.createVolume(name: refusedName)
+            } catch { laterMutationFailed = true }
+            #expect(laterMutationFailed)
+            #expect(!(await runtime.listVolumes().contains(where: { $0.name == refusedName })))
+            await runtime.shutdown()
+        }
+    }
+
+    @Test func ambiguousRemovalFenceNeverCrossesBackendBoundaryAndRecovers() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let failure = ArmedAtomicStoreBoundaryFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            atomicStoreSaveBoundaryHook: { try failure.failWhenArmed($0) }
+        )
+        let record = try await runtime.createContainer(.init(
+            name: "ambiguous-removal", image: "alpine"
+        ))
+        failure.arm()
+
+        await #expect(throws: AtomicStorePersistenceAmbiguousError.self) {
+            try await runtime.removeContainer(record.id, force: false)
+        }
+        #expect((await backend.lifecycleCounts()).deletes == 0)
+        let fenced = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: .init())
+        #expect(fenced.removalPendingContainerIDs?.contains(record.id) == true)
+        #expect(fenced.cleanupPendingContainerIDs?.contains(record.id) == true)
+
+        await runtime.shutdown()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        #expect((await backend.lifecycleCounts()).deletes == 1)
+        await #expect(throws: EngineError.self) {
+            _ = try await recovered.container(record.id)
+        }
+        await recovered.shutdown()
+    }
+
+    @Test func ambiguousResourceFenceNeverAppliesCandidateAndRecoversOldResources() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let failure = ArmedAtomicStoreBoundaryFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            atomicStoreSaveBoundaryHook: { try failure.failWhenArmed($0) }
+        )
+        var input = ContainerRecord(name: "ambiguous-resource", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        failure.arm()
+
+        await #expect(throws: AtomicStorePersistenceAmbiguousError.self) {
+            _ = try await runtime.updateContainer(
+                record.id,
+                memoryBytes: nil,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil,
+                blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+            )
+        }
+        #expect((await backend.resourceUpdates()).isEmpty)
+        let fenced = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: .init())
+        #expect(fenced.resourceUpdateIntents?.first?.containerID == record.id)
+
+        await runtime.shutdown()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        let restored = try await recovered.container(record.id)
+        #expect(restored.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
+        #expect((await backend.currentResources(record.id))?.blockIOReadBps == restored.blockIOReadBps)
+        let durable = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: .init())
+        #expect(durable.resourceUpdateIntents == nil)
+        await recovered.shutdown()
+    }
+
+    @Test func landedResourceCommitAmbiguityIsReconfirmedWithoutRollback() async throws {
+        for boundary in [
+            AtomicStoreSaveBoundary.replacementCompleted,
+            .directorySynchronized,
+        ] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let backend = TransactionalResourceUpdateBackend()
+            let failure = ArmedAtomicStoreBoundaryFailure(target: boundary)
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: backend,
+                atomicStoreSaveBoundaryHook: { try failure.failWhenArmed($0) }
+            )
+            var input = ContainerRecord(name: "landed-resource-\(boundary)", image: "alpine")
+            input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+            let record = try await runtime.createContainer(input)
+            try await runtime.startContainer(record.id)
+            failure.arm(afterSuccessfulSaves: 2)
+
+            let updated = try await runtime.updateContainer(
+                record.id,
+                memoryBytes: nil,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil,
+                blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+            )
+            #expect(updated.blockIOReadBps == [
+                .init(path: "/dev/vda", rate: 2_097_152),
+            ])
+            #expect((await backend.resourceUpdates()).map(\.blockIOReadBps) == [[
+                .init(path: "/dev/vda", rate: 2_097_152),
+            ]])
+            let durable = try await AtomicStore<EngineSnapshot>(
+                url: root.appending(path: "engine.json")
+            ).load(default: .init())
+            #expect(durable.resourceUpdateIntents == nil)
+            #expect(try #require(durable.containers.first).blockIOReadBps == updated.blockIOReadBps)
+            #expect((await backend.currentResources(record.id))?.blockIOReadBps
+                == updated.blockIOReadBps)
+
+            await runtime.shutdown()
+            let recovered = try await EngineRuntime(root: root, backend: backend)
+            #expect(try await recovered.container(record.id).blockIOReadBps
+                == updated.blockIOReadBps)
+            #expect((await backend.currentResources(record.id))?.blockIOReadBps
+                == updated.blockIOReadBps)
+            await recovered.shutdown()
+        }
+    }
+
+    @Test func landedFinalRemovalAmbiguityDoesNotResurrectOrDuplicateCleanup() async throws {
+        for boundary in [
+            AtomicStoreSaveBoundary.replacementCompleted,
+            .directorySynchronized,
+        ] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let backend = TransactionalResourceUpdateBackend()
+            let failure = ArmedAtomicStoreBoundaryFailure(target: boundary)
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: backend,
+                atomicStoreSaveBoundaryHook: { try failure.failWhenArmed($0) }
+            )
+            let volumeName = "landed-remove-volume-\(UUID().uuidString)"
+            let volume = try await runtime.createVolume(name: volumeName, anonymous: true)
+            var input = ContainerRecord(name: "landed-remove", image: "alpine")
+            input.mounts = [.init(
+                kind: .volume, source: volume.name, destination: "/data"
+            )]
+            let record = try await runtime.createContainer(input)
+            failure.arm(afterSuccessfulSaves: 1)
+
+            try await runtime.removeContainer(
+                record.id, force: false, removeVolumes: true
+            )
+            #expect((await backend.lifecycleCounts()).deletes == 1)
+            await #expect(throws: EngineError.self) {
+                _ = try await runtime.container(record.id)
+            }
+            #expect(!(await runtime.listVolumes().contains(where: {
+                $0.name == volume.name
+            })))
+            let durable = try await AtomicStore<EngineSnapshot>(
+                url: root.appending(path: "engine.json")
+            ).load(default: .init())
+            #expect(!durable.containers.contains(where: { $0.id == record.id }))
+            #expect(durable.cleanupPendingContainerIDs == nil)
+            #expect(durable.removalPendingContainerIDs == nil)
+            #expect(durable.removalVolumesPendingContainerIDs == nil)
+            #expect(durable.resourceUpdateIntents == nil)
+            #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
+
+            await runtime.shutdown()
+            let recovered = try await EngineRuntime(root: root, backend: backend)
+            #expect((await backend.lifecycleCounts()).deletes == 1)
+            _ = try await recovered.createContainer(.init(
+                name: input.name, image: "alpine"
+            ))
+            _ = try await recovered.createVolume(name: volume.name, anonymous: true)
+            await recovered.shutdown()
+        }
+    }
+
+    @Test func repeatedResourceCommitAmbiguityReclassifiesTheReconfirmation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let failure = ArmedAtomicStoreBoundaryFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            atomicStoreSaveBoundaryHook: { try failure.failWhenArmed($0) }
+        )
+        var input = ContainerRecord(name: "repeated-resource-ambiguity", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        failure.arm(afterSuccessfulSaves: 2, failures: 2)
+
+        await #expect(throws: AtomicStorePersistenceAmbiguousError.self) {
+            _ = try await runtime.updateContainer(
+                record.id,
+                memoryBytes: nil,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil,
+                blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+            )
+        }
+        #expect((await backend.resourceUpdates()).map(\.blockIOReadBps) == [[
+            .init(path: "/dev/vda", rate: 2_097_152),
+        ]])
+        #expect((await backend.lifecycleCounts()).deletes == 0)
+        let durable = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).loadRequired()
+        #expect(durable.resourceUpdateIntents == nil)
+        #expect(durable.containers.first?.blockIOReadBps == [
+            .init(path: "/dev/vda", rate: 2_097_152),
+        ])
+        #expect(try await runtime.container(record.id).blockIOReadBps
+            == durable.containers.first?.blockIOReadBps)
+    }
+
+    @Test func repeatedRemovalCommitAmbiguityNeverRepeatsBackendDeletion() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let failure = ArmedAtomicStoreBoundaryFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            atomicStoreSaveBoundaryHook: { try failure.failWhenArmed($0) }
+        )
+        let record = try await runtime.createContainer(.init(
+            name: "repeated-removal-ambiguity", image: "alpine"
+        ))
+        failure.arm(afterSuccessfulSaves: 1, failures: 2)
+
+        await #expect(throws: AtomicStorePersistenceAmbiguousError.self) {
+            try await runtime.removeContainer(record.id, force: false)
+        }
+        #expect((await backend.lifecycleCounts()).deletes == 1)
+        let durable = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).loadRequired()
+        #expect(!durable.containers.contains(where: { $0.id == record.id }))
+        await #expect(throws: EngineError.self) {
+            _ = try await runtime.container(record.id)
+        }
+        await runtime.shutdown()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        #expect((await backend.lifecycleCounts()).deletes == 1)
+        await recovered.shutdown()
+    }
+
+    @Test func unclassifiableFinalResourceCommitNeverRollsBackOrOverwritesCanonicalState() async throws {
+        for item in [
+            ("missing", ArmedAtomicStoreCanonicalMutator.Mutation.remove),
+            ("malformed", ArmedAtomicStoreCanonicalMutator.Mutation.malformed),
+        ] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let stateURL = root.appending(path: "engine.json")
+            let mutator = ArmedAtomicStoreCanonicalMutator(
+                stateURL: stateURL, mutation: item.1
+            )
+            let backend = TransactionalResourceUpdateBackend()
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: backend,
+                atomicStoreSaveBoundaryHook: { try mutator.mutate($0) }
+            )
+            var input = ContainerRecord(
+                name: "unclassified-resource-\(item.0)", image: "alpine"
+            )
+            input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+            let record = try await runtime.createContainer(input)
+            try await runtime.startContainer(record.id)
+            mutator.arm(afterSuccessfulSaves: 2)
+
+            var failed = false
+            do {
+                _ = try await runtime.updateContainer(
+                    record.id,
+                    memoryBytes: nil,
+                    nanoCPUs: nil,
+                    pidsLimit: nil,
+                    restartPolicy: nil,
+                    blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+                )
+            } catch { failed = true }
+            #expect(failed)
+            #expect((await backend.resourceUpdates()).map(\.blockIOReadBps) == [[
+                .init(path: "/dev/vda", rate: 2_097_152),
+            ]])
+            #expect((await backend.lifecycleCounts()).deletes == 1)
+            #expect(try await runtime.container(record.id).phase == .exited)
+            let poisonedVolumeName = "must-not-overwrite-\(item.0)"
+            var laterPersistenceFailed = false
+            do {
+                _ = try await runtime.createVolume(name: poisonedVolumeName)
+            } catch { laterPersistenceFailed = true }
+            #expect(laterPersistenceFailed)
+            #expect(!(await runtime.listVolumes().contains(where: {
+                $0.name == poisonedVolumeName
+            })))
+            var retryFailed = false
+            do {
+                _ = try await runtime.createVolume(name: poisonedVolumeName)
+            } catch { retryFailed = true }
+            #expect(retryFailed)
+            if item.0 == "missing" {
+                #expect(!FileManager.default.fileExists(atPath: stateURL.path))
+                await runtime.shutdown()
+                let recovered = try await EngineRuntime(
+                    root: root, backend: MetadataOnlyBackend()
+                )
+                await #expect(throws: EngineError.self) {
+                    _ = try await recovered.container(record.id)
+                }
+                await recovered.shutdown()
+            } else {
+                #expect(try Data(contentsOf: stateURL) == Data("{".utf8))
+                await runtime.shutdown()
+                await #expect(throws: EngineError.self) {
+                    _ = try await EngineRuntime(
+                        root: root, backend: MetadataOnlyBackend()
+                    )
+                }
+            }
+        }
+    }
+
+    @Test func unclassifiableFinalRemovalNeverRestoresDeletedMetadata() async throws {
+        for item in [
+            ("missing", ArmedAtomicStoreCanonicalMutator.Mutation.remove),
+            ("malformed", ArmedAtomicStoreCanonicalMutator.Mutation.malformed),
+        ] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let stateURL = root.appending(path: "engine.json")
+            let mutator = ArmedAtomicStoreCanonicalMutator(
+                stateURL: stateURL, mutation: item.1
+            )
+            let backend = TransactionalResourceUpdateBackend()
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: backend,
+                atomicStoreSaveBoundaryHook: { try mutator.mutate($0) }
+            )
+            let record = try await runtime.createContainer(.init(
+                name: "unclassified-removal-\(item.0)", image: "alpine"
+            ))
+            mutator.arm(afterSuccessfulSaves: 1)
+
+            var failed = false
+            do {
+                try await runtime.removeContainer(record.id, force: false)
+            } catch { failed = true }
+            #expect(failed)
+            #expect((await backend.lifecycleCounts()).deletes == 1)
+            await #expect(throws: EngineError.self) {
+                _ = try await runtime.container(record.id)
+            }
+            let poisonedVolumeName = "must-not-overwrite-\(item.0)"
+            var laterPersistenceFailed = false
+            do {
+                _ = try await runtime.createVolume(name: poisonedVolumeName)
+            } catch { laterPersistenceFailed = true }
+            #expect(laterPersistenceFailed)
+            #expect(!(await runtime.listVolumes().contains(where: {
+                $0.name == poisonedVolumeName
+            })))
+            var retryFailed = false
+            do {
+                _ = try await runtime.createVolume(name: poisonedVolumeName)
+            } catch { retryFailed = true }
+            #expect(retryFailed)
+            if item.0 == "missing" {
+                #expect(!FileManager.default.fileExists(atPath: stateURL.path))
+                await runtime.shutdown()
+                let recovered = try await EngineRuntime(
+                    root: root, backend: MetadataOnlyBackend()
+                )
+                await #expect(throws: EngineError.self) {
+                    _ = try await recovered.container(record.id)
+                }
+                await recovered.shutdown()
+            } else {
+                #expect(try Data(contentsOf: stateURL) == Data("{".utf8))
+                await runtime.shutdown()
+                await #expect(throws: EngineError.self) {
+                    _ = try await EngineRuntime(
+                        root: root, backend: MetadataOnlyBackend()
+                    )
+                }
+            }
+        }
+    }
+
+    @Test func replacedAtomicStoreParentNeverAllowsRemovalToCrossBackendFence() async throws {
+        let base = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let root = base.appending(path: "engine")
+        let detached = base.appending(path: "detached")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let backend = TransactionalResourceUpdateBackend()
+        let relocator = EngineStoreParentRelocator(root: root, detached: detached)
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            atomicStoreSaveBoundaryHook: { try relocator.relocate($0) }
+        )
+        let record = try await runtime.createContainer(.init(
+            name: "parent-replaced-removal", image: "alpine"
+        ))
+        relocator.arm()
+
+        var removalFailed = false
+        do {
+            try await runtime.removeContainer(record.id, force: false)
+        } catch { removalFailed = true }
+        #expect(removalFailed)
+        #expect((await backend.lifecycleCounts()).deletes == 0)
+        #expect(FileManager.default.fileExists(
+            atPath: detached.appending(path: "engine.json").path
+        ))
+        await runtime.shutdown()
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        // The replacement root is an independent empty store. Recovery must
+        // not reach through it to consume the record in the detached tree.
+        #expect((await backend.lifecycleCounts()).deletes == 0)
+        await #expect(throws: EngineError.self) {
+            _ = try await recovered.container(record.id)
+        }
+        #expect(FileManager.default.fileExists(
+            atPath: detached.appending(path: "engine.json").path
+        ))
+        await recovered.shutdown()
+    }
+
+    @Test func resourceUpdateCompensationFailureStopsAndPublishesSafeState() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend(mode: .failCompensation)
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let router = DockerRouter(runtime: runtime, root: root)
+        var input = ContainerRecord(name: "resource-compensation-failure", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        await saveFailure.arm(afterSuccessfulSaves: 2)
+
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/\(record.id)/update",
+            body: Data(#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":2097152}]}"#.utf8)
+        ))
+        #expect(response.status == .internalServerError)
+        #expect(String(decoding: response.body, as: UTF8.self).contains("backend compensation failed"))
+        let stopped = try await runtime.container(record.id)
+        #expect(stopped.phase == .exited)
+        #expect(stopped.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(await backend.currentResources(record.id) == nil)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(durable.containers.first).phase == .exited)
+        #expect(durable.cleanupPendingContainerIDs == nil)
+
+        await runtime.shutdown()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        #expect(try await recovered.container(record.id).phase == .exited)
+        await recovered.shutdown()
+    }
+
+    @Test func rollbackIncompleteResourceUpdateIsRecognizedAndContained() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend(mode: .rollbackIncomplete)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        var input = ContainerRecord(name: "resource-rollback-incomplete", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+
+        let response = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/\(record.id)/update",
+            body: Data(#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":2097152}]}"#.utf8)
+        ))
+        #expect(response.status == .internalServerError)
+        #expect(String(decoding: response.body, as: UTF8.self).contains("rollback was incomplete"))
+        let stopped = try await runtime.container(record.id)
+        #expect(stopped.phase == .exited)
+        #expect(stopped.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
+        #expect(!(await backend.isRunning(record.id)))
+        #expect(await backend.currentResources(record.id) == nil)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(durable.containers.first).phase == .exited)
+        #expect(durable.cleanupPendingContainerIDs == nil)
+    }
+
+    @Test func incompleteResourceJournalReappliesOldResourcesBeforeLiveOrStoppedRecovery() async throws {
+        for originalPhase in [ContainerPhase.running, .created] {
+            for journalPhase in [
+                ResourceUpdateIntentRecord.TransactionPhase.prepared,
+                .backendApplied,
+            ] {
+                let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: root) }
+                var old = ContainerRecord(
+                    name: "resource-crash-\(originalPhase.rawValue)-\(journalPhase.rawValue)",
+                    image: "alpine"
+                )
+                old.phase = originalPhase
+                old.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+                if originalPhase == .running { old.startedAt = Date() }
+                var desired = old
+                desired.blockIOReadBps = [.init(path: "/dev/vda", rate: 2_097_152)]
+                let intent = ResourceUpdateIntentRecord(
+                    containerID: old.id,
+                    originalPhase: originalPhase,
+                    old: old,
+                    desired: desired,
+                    phase: journalPhase
+                )
+                try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json")).save(
+                    EngineSnapshot(containers: [old], resourceUpdateIntents: [intent])
+                )
+                let backend = ResourceRecoveryBackend(
+                    record: old,
+                    backendResources: journalPhase == .prepared ? old : desired
+                )
+
+                let recovered = try await EngineRuntime(root: root, backend: backend)
+                let record = try await recovered.container(old.id)
+                #expect(record.phase == originalPhase)
+                #expect(record.blockIOReadBps == old.blockIOReadBps)
+                #expect((await backend.currentResources(old.id))?.blockIOReadBps == old.blockIOReadBps)
+                #expect((await backend.resourceUpdates()).first?.blockIOReadBps == old.blockIOReadBps)
+                let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+                    .load(default: .init())
+                #expect(durable.resourceUpdateIntents == nil)
+                #expect(try #require(durable.containers.first).blockIOReadBps == old.blockIOReadBps)
+                await recovered.shutdown()
+            }
+        }
+    }
+
+    @Test func stoppedResourceJournalRecoveryReconstructsMissingPreparationWithoutDeletingWritableRoot() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var old = ContainerRecord(name: "stopped-crash-preparation", image: "alpine")
+        old.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        var desired = old
+        desired.memoryBytes = 768 * 1_024 * 1_024
+        desired.blockIOReadBps = [.init(path: "/dev/vda", rate: 2_097_152)]
+        let intent = ResourceUpdateIntentRecord(
+            containerID: old.id,
+            originalPhase: .created,
+            old: old,
+            desired: desired,
+            phase: .prepared
+        )
+        try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json")).save(
+            EngineSnapshot(containers: [old], resourceUpdateIntents: [intent])
+        )
+        let containerRoot = root.appending(path: "containers/\(old.id)")
+        try FileManager.default.createDirectory(at: containerRoot, withIntermediateDirectories: true)
+        let writableRoot = containerRoot.appending(path: "root.ext4")
+        let retainedState = Data("writable-state-survives-crash".utf8)
+        try retainedState.write(to: writableRoot)
+        let backend = ResourceRecoveryBackend(
+            record: old,
+            backendResources: desired,
+            preparedAvailable: false
+        )
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        #expect(await backend.preparationRelaunchCount() == 1)
+        #expect(try Data(contentsOf: writableRoot) == retainedState)
+        #expect(try await recovered.container(old.id).phase == .created)
+        #expect(try await recovered.container(old.id).blockIOReadBps == old.blockIOReadBps)
+        try await recovered.startContainer(old.id)
+        #expect(try await recovered.container(old.id).phase == .running)
+        #expect(try Data(contentsOf: writableRoot) == retainedState)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(durable.resourceUpdateIntents == nil)
+        await recovered.shutdown()
+    }
+
+    @Test func resourceIntentUsesStableContainerIdentityBeforeRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var original = ContainerRecord(name: "stable-resource-owner", image: "alpine")
+        original.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        var desired = original
+        desired.blockIOReadBps = [.init(path: "/dev/vda", rate: 2_097_152)]
+        let intent = ResourceUpdateIntentRecord(
+            containerID: original.id,
+            originalPhase: .created,
+            old: original,
+            desired: desired,
+            phase: .backendApplied
+        )
+        var reused = ContainerRecord(
+            id: original.id,
+            instanceID: UUID(),
+            name: original.name,
+            image: original.image
+        )
+        reused.createdAt = original.createdAt
+        reused.blockIOReadBps = original.blockIOReadBps
+        #expect(reused.instanceID != original.instanceID)
+        try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json")).save(
+            EngineSnapshot(containers: [reused], resourceUpdateIntents: [intent])
+        )
+        let backend = ResourceRecoveryBackend(record: reused, backendResources: desired)
+
+        await #expect(throws: EngineError.self) {
+            _ = try await EngineRuntime(root: root, backend: backend)
+        }
+        #expect(await backend.resourceUpdates().isEmpty)
+    }
+
+    @Test func containerAdmissionAlwaysCreatesANewBackendIncarnation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = IncarnationOwnershipBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let callerInstanceID = UUID()
+        let input = ContainerRecord(
+            id: "reused-public-container-id",
+            instanceID: callerInstanceID,
+            name: "reused-public-container",
+            image: "alpine"
+        )
+
+        let first = try await runtime.createContainer(input)
+        #expect(first.instanceID != callerInstanceID)
+        try await runtime.removeContainer(first.id, force: false)
+
+        let second = try await runtime.createContainer(input)
+        #expect(second.id == first.id)
+        #expect(second.instanceID != callerInstanceID)
+        #expect(second.instanceID != first.instanceID)
+        #expect(await backend.owner(for: second.id)?.instanceID == second.instanceID)
+
+        // A stale record from the removed incarnation cannot delete or adopt
+        // the replacement's backend preparation.
+        try await backend.delete(first)
+        #expect(await backend.owner(for: second.id)?.instanceID == second.instanceID)
+        await runtime.shutdown()
+    }
+
+    @Test func removalFenceRejectsAReusedContainerIDInstanceBeforeBackendRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let record = ContainerRecord(
+            id: "stable-removal-owner", name: "same-name", image: "alpine"
+        )
+        let snapshot = EngineSnapshot(
+            containers: [record],
+            removalPendingContainerIDs: [record.id],
+            containerFenceInstanceIDs: [record.id: UUID()]
+        )
+        try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).save(snapshot)
+
+        await #expect(throws: EngineError.self) {
+            _ = try await EngineRuntime(root: root, backend: MetadataOnlyBackend())
+        }
+    }
+
+    @Test func unresolvedResourceIntentFencesLifecycleAndDefinitiveRemovalClearsIdentity() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let original = try await runtime.createContainer(
+            ContainerRecord(name: "resource-identity-fence", image: "alpine")
+        )
+        await saveFailure.arm(afterSuccessfulSaves: 2, failures: 2)
+        await #expect(throws: EngineError.self) {
+            try await runtime.updateContainer(
+                original.id,
+                memoryBytes: 512 * 1_024 * 1_024,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil
+            )
+        }
+        let fenced = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(fenced.resourceUpdateIntents?.count == 1)
+
+        await #expect(throws: EngineError.self) { try await runtime.startContainer(original.id) }
+        await #expect(throws: EngineError.self) { try await runtime.restartContainer(original.id) }
+        await #expect(throws: EngineError.self) {
+            try await runtime.renameContainer(original.id, name: "resource-identity-renamed")
+        }
+        #expect((await backend.lifecycleCounts()).starts == 0)
+
+        try await runtime.removeContainer(original.id, force: false)
+        let removed = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(removed.containers.isEmpty)
+        #expect(removed.resourceUpdateIntents == nil)
+        let reused = try await runtime.createContainer(original)
+        #expect(reused.id == original.id)
+        #expect(reused.name == original.name)
+        await runtime.shutdown()
+    }
+
+    @Test func failedDefinitiveRemovalKeepsJournalIdentityReservedUntilRecoveryCommit() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend()
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        let original = try await runtime.createContainer(
+            ContainerRecord(name: "resource-removal-reservation", image: "alpine")
+        )
+        await saveFailure.arm(afterSuccessfulSaves: 2, failures: 2)
+        await #expect(throws: EngineError.self) {
+            try await runtime.updateContainer(
+                original.id,
+                memoryBytes: 512 * 1_024 * 1_024,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil
+            )
+        }
+
+        // The cleanup-fence save succeeds and the atomic record+journal removal
+        // save fails. Its retry persists quarantine, never an intent-less gap.
+        await saveFailure.arm(afterSuccessfulSaves: 1, failures: 1)
+        await #expect(throws: ArmedStateSaveFailure.Failure.self) {
+            try await runtime.removeContainer(original.id, force: false)
+        }
+        let quarantined = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(quarantined.containers.count == 1)
+        #expect(quarantined.resourceUpdateIntents?.count == 1)
+        #expect(quarantined.removalPendingContainerIDs?.contains(original.id) == true)
+        await #expect(throws: EngineError.self) {
+            try await runtime.createContainer(original)
+        }
+        await runtime.shutdown()
+
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        let afterRecovery = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(afterRecovery.containers.isEmpty)
+        #expect(afterRecovery.resourceUpdateIntents == nil)
+        #expect(afterRecovery.removalPendingContainerIDs == nil)
+        let reused = try await recovered.createContainer(original)
+        #expect(reused.id == original.id)
+        #expect(reused.name == original.name)
+        await recovered.shutdown()
+    }
+
+    @Test func unresolvedResourceIntentFencesDeferredRestartAndAutoRemove() async throws {
+        for autoRemove in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let backend = ResourceFenceCompletionBackend()
+            let saveFailure = ArmedStateSaveFailure()
+            let runtime = try await EngineRuntime(
+                root: root,
+                backend: backend,
+                beforePersistence: { try await saveFailure.failWhenArmed() }
+            )
+            var input = ContainerRecord(
+                name: autoRemove ? "resource-auto-remove-fence" : "resource-restart-fence",
+                image: "alpine"
+            )
+            input.autoRemove = autoRemove
+            if !autoRemove { input.restartPolicy = .init(name: "always") }
+            let record = try await runtime.createContainer(input)
+            try await runtime.startContainer(record.id)
+            while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+
+            await saveFailure.arm(afterSuccessfulSaves: 2, failures: 2)
+            await #expect(throws: EngineError.self) {
+                try await runtime.updateContainer(
+                    record.id,
+                    memoryBytes: 512 * 1_024 * 1_024,
+                    nanoCPUs: nil,
+                    pidsLimit: nil,
+                    restartPolicy: nil
+                )
+            }
+            let beforeCompletion = await backend.lifecycleCounts()
+            await backend.finish(record.id, code: 1)
+            for _ in 0..<1_000 {
+                if (try? await runtime.container(record.id))?.phase == .exited { break }
+                await Task.yield()
+            }
+            let terminal = try await runtime.container(record.id)
+            #expect(terminal.phase == .exited)
+            #expect((await backend.lifecycleCounts()).prepares == beforeCompletion.prepares)
+            #expect((await backend.lifecycleCounts()).starts == beforeCompletion.starts)
+            #expect((await backend.lifecycleCounts()).deletes == beforeCompletion.deletes)
+            let store = AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            var durable: EngineSnapshot?
+            for _ in 0..<1_000 {
+                do {
+                    let loaded = try await store.load(default: .init())
+                    durable = loaded
+                    if loaded.containers.first?.phase == .exited { break }
+                } catch is AtomicStoreCanonicalStateUnavailableError {
+                    // A separate store can observe EngineRuntime's atomic rename
+                    // between opening and revalidating the canonical name.
+                }
+                await Task.yield()
+            }
+            let stableDurable = try #require(durable)
+            #expect(stableDurable.resourceUpdateIntents?.count == 1)
+            #expect(stableDurable.containers.first?.phase == .exited)
+            await runtime.shutdown()
+        }
+    }
+
+    @Test func unrelatedSaveCannotCommitCandidateAndFailedJournalClearRecoversOldResources() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend(mode: .blockCompensation)
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        var input = ContainerRecord(name: "resource-save-order", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        // Intent and backend-applied saves succeed; the atomic desired commit fails.
+        await saveFailure.arm(afterSuccessfulSaves: 2)
+        let update = Task {
+            try await runtime.updateContainer(
+                record.id,
+                memoryBytes: nil,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil,
+                blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+            )
+        }
+        while !(await backend.isCompensationBlocked()) { await Task.yield() }
+
+        let volume = try await runtime.createVolume(name: "resource-save-order-volume")
+        let duringCompensation = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: .init())
+        #expect(try #require(duringCompensation.containers.first).blockIOReadBps == input.blockIOReadBps)
+        #expect(duringCompensation.resourceUpdateIntents?.count == 1)
+        #expect(duringCompensation.volumes.contains(where: { $0.name == volume.name }))
+
+        // Model a crash boundary where backend compensation succeeds but the
+        // old+journal clearing save fails. Recovery must consume that journal.
+        await saveFailure.arm(failures: 1)
+        await backend.releaseCompensation()
+        await #expect(throws: EngineError.self) { try await update.value }
+        let beforeRecovery = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(beforeRecovery.containers.first).blockIOReadBps == input.blockIOReadBps)
+        #expect(beforeRecovery.resourceUpdateIntents?.count == 1)
+        #expect(beforeRecovery.volumes.contains(where: { $0.name == volume.name }))
+
+        await runtime.shutdown()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        #expect(try await recovered.container(record.id).blockIOReadBps == input.blockIOReadBps)
+        #expect((await backend.currentResources(record.id))?.blockIOReadBps == input.blockIOReadBps)
+        let recoveredDurable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(recoveredDurable.resourceUpdateIntents == nil)
+        #expect(recoveredDurable.volumes.contains(where: { $0.name == volume.name }))
+        await recovered.shutdown()
+    }
+
+    @Test func failedContainmentPersistenceAndDeleteRemainFencedAcrossRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TransactionalResourceUpdateBackend(
+            mode: .rollbackIncompleteRecoveryAndDeleteFailure
+        )
+        let saveFailure = ArmedStateSaveFailure()
+        let runtime = try await EngineRuntime(
+            root: root,
+            backend: backend,
+            beforePersistence: { try await saveFailure.failWhenArmed() }
+        )
+        var input = ContainerRecord(name: "resource-fatal-fence", image: "alpine")
+        input.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        let record = try await runtime.createContainer(input)
+        try await runtime.startContainer(record.id)
+        // The intent save succeeds; both dead-fence saves fail while delete is
+        // also unverifiable.
+        await saveFailure.arm(afterSuccessfulSaves: 1, failures: 2)
+        await #expect(throws: EngineError.self) {
+            try await runtime.updateContainer(
+                record.id,
+                memoryBytes: nil,
+                nanoCPUs: nil,
+                pidsLimit: nil,
+                restartPolicy: nil,
+                blockIOReadBps: [.init(path: "/dev/vda", rate: 2_097_152)]
+            )
+        }
+        #expect(try await runtime.container(record.id).phase == .dead)
+        await #expect(throws: EngineError.self) { try await runtime.startContainer(record.id) }
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(durable.containers.first).phase == .running)
+        #expect(durable.resourceUpdateIntents?.count == 1)
+
+        await runtime.shutdown()
+        await #expect(throws: EngineError.self) {
+            _ = try await EngineRuntime(root: root, backend: backend)
+        }
+        let quarantined = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        #expect(try #require(quarantined.containers.first).phase == .dead)
+        #expect(quarantined.cleanupPendingContainerIDs?.contains(record.id) == true)
+        #expect(quarantined.resourceUpdateIntents?.count == 1)
+    }
+
+    @Test func blockIOThrottlesMapFromRecoveredRecordIntoGuestWorkload() throws {
+        var record = ContainerRecord(name: "block-io-protocol", image: "alpine", processArguments: ["true"])
+        record.blockIOReadBps = [.init(path: "/dev/vda", rate: UInt64.max)]
+        record.blockIOWriteBps = []
+        record.blockIOReadIOps = [.init(path: "/dev/vda", rate: 3)]
+        record.blockIOWriteIOps = [.init(path: "/dev/vda", rate: 4)]
+        let encoded = try JSONEncoder().encode(record)
+        let recovered = try JSONDecoder().decode(ContainerRecord.self, from: encoded)
+        let workload = try RawVirtualizationBackend.workloadSpecification(
+            container: recovered, imageConfiguration: nil, mounts: [], networks: [], hosts: [:], volumeServer: nil
+        )
+
+        #expect(workload.resources.blockIOReadBps == [.init(path: "/dev/vda", rate: UInt64.max)])
+        #expect(workload.resources.blockIOWriteBps == [])
+        #expect(workload.resources.blockIOReadIOps == [.init(path: "/dev/vda", rate: 3)])
+        #expect(workload.resources.blockIOWriteIOps == [.init(path: "/dev/vda", rate: 4)])
+    }
+
     @Test func createUsesConfiguredContainerDefaultsUnlessResourcesAreExplicit() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2434,11 +4494,15 @@ private actor AuthImageBackend: ContainerBackend {
             #expect(FileManager.default.fileExists(atPath: path))
 
             owner.terminate()
-            owner.waitUntilExit()
-            for _ in 0..<100 where FileManager.default.fileExists(atPath: path) {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(5))
+            while FileManager.default.fileExists(atPath: path), clock.now < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
-            #expect(!FileManager.default.fileExists(atPath: path))
+            #expect(
+                !FileManager.default.fileExists(atPath: path),
+                "resource scope socket remained after its owner process exited"
+            )
             try await manager.shutdown()
         } catch {
             if owner.isRunning { owner.terminate() }
@@ -4063,6 +6127,79 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(value["Running"] as? Bool == false)
         #expect(value["ExitCode"] as? Int == 0)
         #expect(value["ContainerID"] as? String == container.id)
+        #expect(await backend.hasRetiredExec(execID))
+        #expect(await backend.retirementCallCount() == 1)
+    }
+
+    @Test func completedExecsRetireBeyondBackendArtifactLimitAndRemainInspectable() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = CompletionBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let container = try await runtime.createContainer(
+            ContainerRecord(name: "exec-retirement-cap", image: "debian")
+        )
+        try await runtime.startContainer(container.id)
+        var completedExecs: [ExecRecord] = []
+
+        for index in 0..<70 {
+            let exec = try await runtime.createExec(
+                container: container.id,
+                configuration: .init(
+                    arguments: ["echo", "\(index)"],
+                    attachStdout: true,
+                    attachStderr: true
+                )
+            )
+            try await runtime.startExec(exec.id)
+            var completed = try await runtime.inspectExec(exec.id)
+            for _ in 0..<100 where completed.exitCode == nil {
+                await Task.yield()
+                completed = try await runtime.inspectExec(exec.id)
+            }
+            #expect(!completed.running)
+            #expect(completed.exitCode == 0)
+            #expect(completed.pid == 42)
+            completedExecs.append(completed)
+        }
+
+        #expect(await backend.retiredExecCount() == 70)
+        #expect(await backend.retirementCallCount() == 70)
+        let first = try await runtime.inspectExec(try #require(completedExecs.first).id)
+        let last = try await runtime.inspectExec(try #require(completedExecs.last).id)
+        #expect(first.exitCode == 0)
+        #expect(last.exitCode == 0)
+        #expect(first.pid == 42)
+        #expect(last.pid == 42)
+
+        let retainedIO = try await runtime.execIO(last.id)
+        let retainedOutput = try retainedIO.logData()
+        #expect(String(decoding: retainedOutput.suffix(8), as: UTF8.self) == "exec-ok\n")
+    }
+
+    @Test func execMetadataPurgeIsBoundToTheRemovedContainerInstance() {
+        let removed = ContainerRecord(
+            id: "reused-exec-owner", name: "old-owner", image: "debian"
+        )
+        let replacement = ContainerRecord(
+            id: removed.id, name: "replacement-owner", image: "debian"
+        )
+        let oldExec = ExecRecord(
+            id: "old-exec", containerID: removed.id,
+            containerInstanceID: removed.instanceID,
+            configuration: .init(arguments: ["true"])
+        )
+        let replacementExec = ExecRecord(
+            id: "replacement-exec", containerID: replacement.id,
+            containerInstanceID: replacement.instanceID,
+            configuration: .init(arguments: ["true"])
+        )
+        let records = [oldExec.id: oldExec, replacementExec.id: replacementExec]
+
+        #expect(Set(EngineRuntime.execIdentifiersOwned(by: removed, in: records)) == [oldExec.id])
+        #expect(Set(EngineRuntime.execIdentifiersOwned(by: replacement, in: records)) == [
+            replacementExec.id,
+        ])
     }
 
     @Test func concurrentDetachedExecStartsLaunchOnlyOnce() async throws {
@@ -4091,6 +6228,35 @@ private actor AuthImageBackend: ContainerBackend {
         let counts = await backend.counts()
         #expect(counts.detached == 1)
         #expect(counts.attached == 0)
+    }
+
+    @Test func uncertainDetachedExecStartPublishesTerminalResultAndCannotRetry() async throws {
+        for (backend, expectedCode) in [
+            (CompletionBackend(containedStartExitCode: 137), Int32(137)),
+            (CompletionBackend(quarantinedStartExitCode: 125), Int32(125)),
+        ] {
+            let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let runtime = try await EngineRuntime(root: root, backend: backend)
+            let container = try await runtime.createContainer(
+                ContainerRecord(name: "uncertain-exec-\(expectedCode)", image: "debian")
+            )
+            try await runtime.startContainer(container.id)
+            let exec = try await runtime.createExec(
+                container: container.id,
+                configuration: .init(arguments: ["sleep", "30"])
+            )
+
+            await #expect(throws: (any Error).self) {
+                try await runtime.startExec(exec.id)
+            }
+            let terminal = try await runtime.inspectExec(exec.id)
+            #expect(!terminal.running)
+            #expect(terminal.exitCode == expectedCode)
+            await #expect(throws: EngineError.self) {
+                try await runtime.startExec(exec.id)
+            }
+        }
     }
 
     @Test func concurrentAttachedExecStartsLaunchOnlyOnce() async throws {
@@ -4150,6 +6316,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(!completed.running)
         #expect(completed.exitCode == 23)
         #expect(completed.pid == 73)
+        #expect(await backend.hasRetiredExec(exec.id))
     }
 
     @Test func attachedExecLaunchFailureReconcilesTheHostRecord() async throws {
@@ -4212,8 +6379,12 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(attachedCompleted.pid == 81)
 
         try await runtime.removeContainer(container.id, force: false)
-        #expect(try await runtime.inspectExec(detached.id).exitCode == 137)
-        #expect(try await runtime.inspectExec(attached.id).exitCode == 137)
+        await #expect(throws: EngineError.self) {
+            _ = try await runtime.inspectExec(detached.id)
+        }
+        await #expect(throws: EngineError.self) {
+            _ = try await runtime.inspectExec(attached.id)
+        }
     }
 
     @Test func parentRestartTerminalizesOldAttachedAndDetachedExecsBeforePublishingNewGeneration() async throws {
@@ -4714,6 +6885,34 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(completed.phase == .exited)
         #expect(completed.exitCode == 23)
         #expect(completed.startedAt == restarted.startedAt)
+    }
+
+    @Test func completionMonitorRetriesBackendFinalDrainWithoutPublishingFallback() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = GenerationCompletionBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "completion-drain-retry", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        while await backend.registrationCount() != 1 { await Task.yield() }
+
+        await backend.reportRetryableNotComplete()
+        while await backend.registrationCount() != 2 { await Task.yield() }
+        let stillRunning = try await runtime.container(record.id)
+        #expect(stillRunning.phase == .running)
+        #expect(stillRunning.exitCode == nil)
+
+        await backend.complete(code: 23)
+        for _ in 0..<1_000 {
+            if try await runtime.container(record.id).phase == .exited { break }
+            await Task.yield()
+        }
+        let completed = try await runtime.container(record.id)
+        #expect(completed.phase == .exited)
+        #expect(completed.exitCode == 23)
+        #expect(await backend.registrationCount() == 2)
     }
 
     @Test func rawCompletionCannotTearDownReplacementAfterFabricSuspension() async throws {
@@ -6219,12 +8418,19 @@ private actor AuthImageBackend: ContainerBackend {
         await #expect(throws: EngineError.self) {
             try await runtime.createVolume(name: volume.name)
         }
-        let unrelated = try await runtime.createContainer(
-            ContainerRecord(name: "unrelated-final-save-create", image: "debian")
-        )
+        let unrelatedCreation = Task {
+            try await runtime.createContainer(
+                ContainerRecord(name: "unrelated-final-save-create", image: "debian")
+            )
+        }
+        // Snapshot persistence now has one total order. The unrelated create
+        // may enter the actor while removal is suspended, but its save waits
+        // behind the already-started final removal publication.
+        for _ in 0..<100 { await Task.yield() }
 
         await persistenceGate.release()
         try await removal.value
+        let unrelated = try await unrelatedCreation.value
         await #expect(throws: EngineError.self) { try await runtime.container(removed.id) }
         #expect(try await runtime.container(renameCandidate.id).name == renameCandidate.name)
         #expect(try await runtime.container(unrelated.id).name == unrelated.name)

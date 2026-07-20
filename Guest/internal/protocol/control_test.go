@@ -6,12 +6,13 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
-	if Version != 7 {
-		t.Fatalf("Version = %d, want 7", Version)
+	if Version != 9 {
+		t.Fatalf("Version = %d, want 9", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
 		"id":"container-1",
+		"ioClaim":"container-claim",
 		"annotations":{"io.example.owner":"runtime"},
 		"rlimits":[{"type":"nofile","soft":1024,"hard":18446744073709551615}]
 	}`), &spec); err != nil {
@@ -20,18 +21,61 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
 	if got := spec.Annotations["io.example.owner"]; got != "runtime" {
 		t.Fatalf("Annotations[io.example.owner] = %q, want runtime", got)
 	}
+	if spec.IOClaim != "container-claim" {
+		t.Fatalf("IOClaim = %q, want container-claim", spec.IOClaim)
+	}
 	if len(spec.Rlimits) != 1 || spec.Rlimits[0].Type != "nofile" ||
 		spec.Rlimits[0].Soft != 1024 || spec.Rlimits[0].Hard != ^uint64(0) {
 		t.Fatalf("Rlimits did not decode: %#v", spec.Rlimits)
 	}
 }
 
-func TestEndpointSysctlsRemainAvailableInProtocolVersionSeven(t *testing.T) {
-	if Version != 7 {
-		t.Fatalf("endpoint sysctls require guest protocol version 7, got %d", Version)
+func TestExecSpecDecodesIOClaim(t *testing.T) {
+	var spec ExecSpec
+	if err := json.Unmarshal([]byte(`{"id":"exec-1","ioClaim":"exec-claim"}`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.IOClaim != "exec-claim" {
+		t.Fatalf("IOClaim = %q, want exec-claim", spec.IOClaim)
+	}
+}
+
+func TestEndpointSysctlsRemainAvailableInProtocolVersionNine(t *testing.T) {
+	if Version != 9 {
+		t.Fatalf("endpoint sysctls require guest protocol version 9, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {
 		t.Fatalf("endpoint sysctls did not round-trip through protocol model: %#v", endpoint.Sysctls)
+	}
+}
+
+func TestBlockIOThrottlesDecodeInProtocolVersionNine(t *testing.T) {
+	var resources Resources
+	if err := json.Unmarshal([]byte(`{
+		"memoryBytes":67108864,"cpuQuota":100000,"cpuPeriod":100000,"pids":32,
+		"blockIOReadBps":[{"path":"/dev/vda","rate":9223372036854775808}],
+		"blockIOWriteBps":[{"path":"/dev/vda","rate":18446744073709551615}],
+		"blockIOReadIOps":[],"blockIOWriteIOps":[]
+	}`), &resources); err != nil {
+		t.Fatal(err)
+	}
+	if len(resources.BlockIOReadBps) != 1 || resources.BlockIOReadBps[0].Path != "/dev/vda" ||
+		resources.BlockIOReadBps[0].Rate != uint64(1)<<63 ||
+		len(resources.BlockIOWriteBps) != 1 || resources.BlockIOWriteBps[0].Rate != ^uint64(0) {
+		t.Fatalf("block I/O throttles did not decode: %#v", resources.BlockIOReadBps)
+	}
+}
+
+func TestResourceUpdateDecodesCompatibilityFailureBoundary(t *testing.T) {
+	var update ResourceUpdate
+	if err := json.Unmarshal([]byte(`{
+		"resources":{"blockIOReadBps":[],"blockIOWriteBps":[],"blockIOReadIOps":[],"blockIOWriteIOps":[]},
+		"compatibilityFailureAfterWrites":4
+	}`), &update); err != nil {
+		t.Fatal(err)
+	}
+	if update.CompatibilityFailureAfterWrites != 4 {
+		t.Fatalf("CompatibilityFailureAfterWrites = %d, want 4", update.CompatibilityFailureAfterWrites)
 	}
 }

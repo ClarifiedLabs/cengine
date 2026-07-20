@@ -5,6 +5,11 @@ import Foundation
 @preconcurrency import XPC
 
 final class VMNetUplink: @unchecked Sendable {
+    private static let timeoutQueue = DispatchQueue(
+        label: "com.cengine.vmnet-uplink-timeout",
+        qos: .userInitiated
+    )
+
     let fabricFileHandle: FileHandle
 
     private let networkID: String
@@ -151,18 +156,32 @@ final class VMNetUplink: @unchecked Sendable {
 
     static func awaitUplinkReply(
         timeout: Duration,
+        completionHook: (@Sendable () -> Void)? = nil,
+        connectionCancellation: @escaping @Sendable (xpc_connection_t) -> Void = {
+            xpc_connection_cancel($0)
+        },
         start: @escaping @Sendable (VMNetUplinkReply) -> Void
     ) async throws -> VMNetUplinkTransport {
-        try await withCheckedThrowingContinuation { continuation in
-            let reply = VMNetUplinkReply(continuation: continuation)
-            Task {
-                try? await Task.sleep(for: timeout)
-                reply.finish(.failure(EngineError(
-                    .unsupported,
-                    "timed out waiting for privileged networking helper; enable Networking in the cengine app"
-                )))
+        let reply = VMNetUplinkReply(
+            completionHook: completionHook,
+            connectionCancellation: connectionCancellation
+        )
+        return try await withTaskCancellationHandler {
+            if Task.isCancelled {
+                reply.finish(.failure(CancellationError()))
             }
-            start(reply)
+            return try await withCheckedThrowingContinuation { continuation in
+                let shouldStart = reply.install(
+                    continuation: continuation,
+                    timeout: timeout,
+                    timeoutQueue: timeoutQueue
+                )
+                if shouldStart {
+                    start(reply)
+                }
+            }
+        } onCancel: {
+            reply.finish(.failure(CancellationError()))
         }
     }
 
@@ -237,18 +256,73 @@ final class VMNetUplinkEvents: @unchecked Sendable {
 
 final class VMNetUplinkReply: @unchecked Sendable {
     private let lock = NSLock()
+    private let connectionCancellation: @Sendable (xpc_connection_t) -> Void
+    private var completionHook: (@Sendable () -> Void)?
     private var continuation: CheckedContinuation<VMNetUplinkTransport, Error>?
+    private var pendingResult: Result<VMNetUplinkTransport, Error>?
     private var connection: xpc_connection_t?
+    private var cancelledConnection: xpc_connection_t?
+    private var timeoutTimer: DispatchSourceTimer?
+    private var isFinished = false
 
-    init(continuation: CheckedContinuation<VMNetUplinkTransport, Error>) {
+    init(
+        completionHook: (@Sendable () -> Void)? = nil,
+        connectionCancellation: @escaping @Sendable (xpc_connection_t) -> Void = {
+            xpc_connection_cancel($0)
+        }
+    ) {
+        self.completionHook = completionHook
+        self.connectionCancellation = connectionCancellation
+    }
+
+    func install(
+        continuation: CheckedContinuation<VMNetUplinkTransport, Error>,
+        timeout: Duration,
+        timeoutQueue: DispatchQueue
+    ) -> Bool {
+        lock.lock()
+        if isFinished {
+            let result = pendingResult
+            pendingResult = nil
+            lock.unlock()
+            guard let result else {
+                preconditionFailure("VMNet uplink reply installed more than once")
+            }
+            continuation.resume(with: result)
+            return false
+        }
+
         self.continuation = continuation
+        let timer = DispatchSource.makeTimerSource(queue: timeoutQueue)
+        let components = timeout.components
+        let delay = max(
+            0,
+            Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
+        )
+        timer.schedule(deadline: .now() + delay)
+        timer.setEventHandler {
+            self.finish(.failure(EngineError(
+                .unsupported,
+                "timed out waiting for privileged networking helper; enable Networking in the cengine app"
+            )))
+        }
+        timeoutTimer = timer
+        timer.activate()
+        lock.unlock()
+        return true
     }
 
     func attach(_ connection: xpc_connection_t) {
         lock.lock()
-        if continuation == nil {
+        if isFinished {
+            let shouldCancel = cancelledConnection !== connection
+            if shouldCancel {
+                cancelledConnection = connection
+            }
             lock.unlock()
-            xpc_connection_cancel(connection)
+            if shouldCancel {
+                connectionCancellation(connection)
+            }
             return
         }
         self.connection = connection
@@ -257,23 +331,48 @@ final class VMNetUplinkReply: @unchecked Sendable {
 
     func finish(_ result: Result<VMNetUplinkTransport, Error>) {
         lock.lock()
-        guard let continuation else {
+        guard !isFinished else {
             lock.unlock()
-            if case let .success(transport) = result {
-                close(transport.descriptor)
-                xpc_connection_cancel(transport.connection)
-            }
+            discard(result)
             return
         }
+        isFinished = true
+        let continuation = self.continuation
         self.continuation = nil
+        if continuation == nil {
+            pendingResult = result
+        }
         let connection = self.connection
         self.connection = nil
+        if case .failure = result {
+            cancelledConnection = connection
+        }
+        let timeoutTimer = self.timeoutTimer
+        self.timeoutTimer = nil
+        let completionHook = self.completionHook
+        self.completionHook = nil
         lock.unlock()
 
+        timeoutTimer?.cancel()
         if case .failure = result, let connection {
-            xpc_connection_cancel(connection)
+            connectionCancellation(connection)
         }
-        continuation.resume(with: result)
+        completionHook?()
+        continuation?.resume(with: result)
+    }
+
+    private func discard(_ result: Result<VMNetUplinkTransport, Error>) {
+        guard case let .success(transport) = result else { return }
+        let shouldCancel = lock.withLock { () -> Bool in
+            guard cancelledConnection === transport.connection else { return true }
+            cancelledConnection = nil
+            return false
+        }
+        transport.events.cancel()
+        close(transport.descriptor)
+        if shouldCancel {
+            connectionCancellation(transport.connection)
+        }
     }
 }
 #endif

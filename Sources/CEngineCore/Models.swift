@@ -122,8 +122,22 @@ public struct UlimitRecord: Codable, Hashable, Sendable {
     }
 }
 
+public struct BlockIOThrottleDeviceRecord: Codable, Hashable, Sendable {
+    public var path: String
+    public var rate: UInt64
+
+    public init(path: String, rate: UInt64) {
+        self.path = path
+        self.rate = rate
+    }
+}
+
 public struct ContainerRecord: Codable, Sendable {
     public var id: String
+    /// Internal immutable identity for one logical container incarnation.
+    /// Docker's public ID may be reused after deletion; ownership journals and
+    /// backend artifacts must never transfer across that reuse boundary.
+    public private(set) var instanceID: UUID
     public var name: String
     public var image: String
     public var imageID: String
@@ -156,6 +170,10 @@ public struct ContainerRecord: Codable, Sendable {
     public var cpus: Int
     /// Docker's configured process limit. `0` and `-1` both mean unlimited.
     public var pidsLimit: Int64
+    public var blockIOReadBps: [BlockIOThrottleDeviceRecord]?
+    public var blockIOWriteBps: [BlockIOThrottleDeviceRecord]?
+    public var blockIOReadIOps: [BlockIOThrottleDeviceRecord]?
+    public var blockIOWriteIOps: [BlockIOThrottleDeviceRecord]?
     public var ulimits: [UlimitRecord]
     public var stopSignal: String
     public var stopTimeoutSeconds: Int
@@ -170,10 +188,12 @@ public struct ContainerRecord: Codable, Sendable {
     public var networkDisabled: Bool?
 
     public init(
-        id: String = Identifier.random(), name: String, image: String,
+        id: String = Identifier.random(), instanceID: UUID = UUID(),
+        name: String, image: String,
         platform: String = "linux/arm64", processArguments: [String] = []
     ) {
         self.id = id
+        self.instanceID = instanceID
         self.name = name
         self.image = image
         self.imageID = ""
@@ -202,6 +222,10 @@ public struct ContainerRecord: Codable, Sendable {
         self.memoryBytes = ContainerSettings.default.memoryBytes
         self.cpus = ContainerSettings.default.cpus
         self.pidsLimit = 0
+        self.blockIOReadBps = nil
+        self.blockIOWriteBps = nil
+        self.blockIOReadIOps = nil
+        self.blockIOWriteIOps = nil
         self.ulimits = []
         self.stopSignal = "SIGTERM"
         self.stopTimeoutSeconds = 10
@@ -213,6 +237,15 @@ public struct ContainerRecord: Codable, Sendable {
         self.networks = []
         self.restartCount = 0
         self.networkDisabled = false
+    }
+
+    /// Returns the same requested container configuration with a new internal
+    /// incarnation identity. Runtime admission uses this copy so caller-owned
+    /// records can never select or reuse backend ownership identity.
+    public func withFreshInstanceID() -> ContainerRecord {
+        var copy = self
+        copy.instanceID = UUID()
+        return copy
     }
 }
 

@@ -34,6 +34,20 @@ def control_plane_status_is_ready(exit_code: int, output: bytes | str) -> bool:
     return bool(statuses) and all(status == "True" for status in statuses)
 
 
+def persisted_container_record(state: Mapping[str, object], container_id: str) -> dict:
+    """Read a container from AtomicStore's `{schemaVersion,value}` envelope."""
+    value = state.get("value")
+    if not isinstance(value, Mapping):
+        raise AssertionError("engine state is missing the AtomicStore value envelope")
+    containers = value.get("containers")
+    if not isinstance(containers, list):
+        raise AssertionError("engine state value has no container list")
+    return next(
+        item for item in containers
+        if isinstance(item, dict) and item.get("id") == container_id
+    )
+
+
 COMPATIBILITY_OWNER_FILE = ".cengine-compat-owner"
 VMNET_TEARDOWN_SETTLE_SECONDS = 2.0
 
@@ -130,12 +144,17 @@ def terminate_compatibility_runtime(
     return processes
 
 
-def docker_environment(
-    host: str | pathlib.Path, *, base: Mapping[str, str] | None = None,
-) -> dict[str, str]:
+def compatibility_environment(*, base: Mapping[str, str] | None = None) -> dict[str, str]:
     environment = dict(os.environ if base is None else base)
     for key in DOCKER_ENDPOINT_VARIABLES:
         environment.pop(key, None)
+    return environment
+
+
+def docker_environment(
+    host: str | pathlib.Path, *, base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    environment = compatibility_environment(base=base)
     value = str(host)
     environment["DOCKER_HOST"] = value if "://" in value else f"unix://{value}"
     return environment

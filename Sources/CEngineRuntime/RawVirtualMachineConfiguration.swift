@@ -39,6 +39,7 @@ public struct RawVirtualMachineConfiguration: Sendable {
     public let networkFileHandle: FileHandle?
     public let macAddress: String
     public let bindShares: [BindShare]
+    public let retainedAttachmentHandles: [FileHandle]
     public let kernelArguments: [String]
 
     public init(
@@ -53,6 +54,7 @@ public struct RawVirtualMachineConfiguration: Sendable {
         networkFileHandle: FileHandle? = nil,
         macAddress: String,
         bindShares: [BindShare] = [],
+        retainedAttachmentHandles: [FileHandle] = [],
         kernelArguments: [String] = []
     ) {
         self.id = id
@@ -66,6 +68,7 @@ public struct RawVirtualMachineConfiguration: Sendable {
         self.networkFileHandle = networkFileHandle
         self.macAddress = macAddress
         self.bindShares = bindShares
+        self.retainedAttachmentHandles = retainedAttachmentHandles
         self.kernelArguments = kernelArguments
     }
 

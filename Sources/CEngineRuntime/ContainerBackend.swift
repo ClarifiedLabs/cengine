@@ -27,6 +27,209 @@ public enum BackendContainerRecovery: Sendable, Equatable {
     case unavailable
 }
 
+/// The guest could not completely restore its prior cgroup state after a
+/// failed live update. The workload must not remain running until the backend
+/// execution has been stopped or recreated from durable resources.
+public struct BackendResourceRollbackIncompleteError: Error, LocalizedError, Sendable, Equatable {
+    public let message: String
+
+    public init(_ message: String) { self.message = message }
+
+    public var errorDescription: String? { message }
+}
+
+/// A detached exec start crossed the guest execution boundary, but the reply
+/// was not authoritative. The backend contained the exact guest exec (or its
+/// owning VM), selected a deterministic terminal result, and retired its
+/// backend resources before surfacing the original start failure.
+public struct BackendExecStartContainedError: Error, LocalizedError, Sendable, Equatable {
+    public let exitCode: Int32
+    public let message: String
+    /// True when containment required terminating the owning VM because the
+    /// guest control channel could not prove exec-local containment.
+    public let containerTerminated: Bool
+
+    public init(exitCode: Int32, message: String, containerTerminated: Bool = false) {
+        self.exitCode = exitCode
+        self.message = message
+        self.containerTerminated = containerTerminated
+    }
+
+    public var errorDescription: String? { message }
+}
+
+/// The backend could not prove containment after an uncertain exec start.
+/// Durable ownership is retained and fenced for retry, while EngineRuntime
+/// must still make the host exec terminal so the start cannot be repeated.
+public struct BackendExecStartQuarantinedError: Error, LocalizedError, Sendable, Equatable {
+    public let exitCode: Int32
+    public let message: String
+
+    public init(exitCode: Int32, message: String) {
+        self.exitCode = exitCode
+        self.message = message
+    }
+
+    public var errorDescription: String? { message }
+}
+
+/// Cleanup boundary after a shim became ready but container preparation did
+/// not complete. The writable root is discarded only after every generation
+/// has been proven dead; a termination failure remains retryable ownership,
+/// rather than an ordinary preparation error that could lose containment.
+enum PreparedShimFailureRecovery {
+    nonisolated(nonsending) static func perform(
+        preparationError: Error,
+        terminateEveryGeneration: () async throws -> Void,
+        discardWritableRoot: () throws -> Void
+    ) async throws -> Never {
+        do {
+            try await terminateEveryGeneration()
+        } catch {
+            throw BackendResourceRollbackIncompleteError(
+                "container VM preparation failed: \(EngineError.message(for: preparationError)); "
+                    + "shim cleanup failed and the writable root was retained: "
+                    + EngineError.message(for: error)
+            )
+        }
+        do {
+            try discardWritableRoot()
+        } catch {
+            throw BackendResourceRollbackIncompleteError(
+                "container VM preparation failed: \(EngineError.message(for: preparationError)); "
+                    + "the contained writable root could not be discarded: "
+                    + EngineError.message(for: error)
+            )
+        }
+        throw preparationError
+    }
+}
+
+/// Runs the destructive portion of a stopped-container resource replacement.
+/// A failed candidate launch must attempt both partial-candidate cleanup and
+/// original-shim restoration; failure of either reverse step is a structured
+/// rollback-incomplete result that the runtime will contain.
+enum StoppedResourceReplacementTransaction {
+    nonisolated(nonsending) static func perform(
+        terminateOriginal: () async throws -> Void,
+        launchCandidate: () async throws -> Void,
+        cleanupCandidate: () async throws -> Void,
+        restoreOriginal: () async throws -> Void
+    ) async throws {
+        do {
+            try await terminateOriginal()
+        } catch {
+            let terminationError = error
+            var cleanupFailure: String?
+            do {
+                try await cleanupCandidate()
+            } catch {
+                cleanupFailure = EngineError.message(for: error)
+            }
+            do {
+                try await restoreOriginal()
+            } catch {
+                throw BackendResourceRollbackIncompleteError(
+                    [
+                        "original shim termination failed: \(EngineError.message(for: terminationError))",
+                        cleanupFailure.map {
+                            "cleanup after original shim termination failed: \($0)"
+                        },
+                        "original shim restoration after termination failure failed: \(EngineError.message(for: error))",
+                    ].compactMap { $0 }.joined(separator: "; ")
+                )
+            }
+            // The destructive step failed, but both deterministic cleanup and
+            // old-shim restoration proved that the original preparation is
+            // again authoritative. The ordinary error lets EngineRuntime clear
+            // the durable journal through its normal rollback path.
+            if terminationError is BackendResourceRollbackIncompleteError || cleanupFailure != nil {
+                throw EngineError(
+                    .internalError,
+                    "original shim termination failed but its preparation was restored: "
+                        + EngineError.message(for: terminationError)
+                )
+            }
+            throw terminationError
+        }
+        do {
+            try await launchCandidate()
+        } catch {
+            let forwardError = error
+            var cleanupFailure: String?
+            do {
+                try await cleanupCandidate()
+            } catch {
+                cleanupFailure = EngineError.message(for: error)
+            }
+            do {
+                try await restoreOriginal()
+            } catch {
+                throw BackendResourceRollbackIncompleteError(
+                    [
+                        "candidate launch failed: \(EngineError.message(for: forwardError))",
+                        cleanupFailure.map { "candidate cleanup failed: \($0)" },
+                        "original shim restoration failed: \(EngineError.message(for: error))",
+                    ].compactMap { $0 }.joined(separator: "; ")
+                )
+            }
+            // `restoreOriginal` is the final proof boundary and includes a
+            // second cleanup attempt in the raw backend. Once it succeeds an
+            // earlier partial-launch cleanup failure is no longer unresolved.
+            if forwardError is BackendResourceRollbackIncompleteError || cleanupFailure != nil {
+                throw EngineError(
+                    .internalError,
+                    "candidate launch failed but the original preparation was restored: "
+                        + EngineError.message(for: forwardError)
+                )
+            }
+            throw forwardError
+        }
+    }
+}
+
+/// Commits a live guest resource change and its durable canonical record as
+/// one recoverable transaction. A canonical write can fail after rename, so
+/// both the guest and the old canonical record are restored on every durable
+/// publication failure.
+enum LiveResourceCanonicalTransaction {
+    nonisolated(nonsending) static func perform(
+        applyDesired: () async throws -> Void,
+        persistDesired: () throws -> Void,
+        applyOriginal: () async throws -> Void,
+        persistOriginal: () throws -> Void
+    ) async throws {
+        try await applyDesired()
+        do {
+            try persistDesired()
+        } catch {
+            let publicationError = error
+            var compensationFailures: [String] = []
+            do { try await applyOriginal() }
+            catch {
+                compensationFailures.append(
+                    "guest restoration failed: \(EngineError.message(for: error))"
+                )
+            }
+            do { try persistOriginal() }
+            catch {
+                compensationFailures.append(
+                    "canonical restoration failed: \(EngineError.message(for: error))"
+                )
+            }
+            if !compensationFailures.isEmpty {
+                throw BackendResourceRollbackIncompleteError(
+                    ([
+                        "canonical live-resource publication failed: "
+                            + EngineError.message(for: publicationError),
+                    ] + compensationFailures).joined(separator: "; ")
+                )
+            }
+            throw publicationError
+        }
+    }
+}
+
 public protocol ContainerBackend: Sendable {
     func shutdown() async
     func pullImage(_ reference: String, platform: String) async throws
@@ -44,6 +247,7 @@ public protocol ContainerBackend: Sendable {
     func kill(_ container: ContainerRecord, signal: String) async throws
     func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge
     func discardExec(_ exec: ExecRecord) async
+    func retireExec(_ exec: ExecRecord) async
     func startExec(_ exec: ExecRecord) async throws
     func startAttachedExec(_ exec: ExecRecord) async throws -> CInt?
     func execCompletion(_ exec: ExecRecord) async -> Int32?
@@ -103,6 +307,7 @@ public extension ContainerBackend {
         throw EngineError(.unsupported, "exec is unavailable for this backend")
     }
     func discardExec(_: ExecRecord) async {}
+    func retireExec(_ exec: ExecRecord) async { await discardExec(exec) }
     func startExec(_: ExecRecord) async throws { throw EngineError(.unsupported, "exec is unavailable for this backend") }
     func startAttachedExec(_: ExecRecord) async throws -> CInt? { nil }
     func execCompletion(_: ExecRecord) async -> Int32? { nil }

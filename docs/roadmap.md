@@ -45,11 +45,39 @@ custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
 
 Docker create-time ulimits now persist and apply to container init, exec, and
-healthcheck processes through guest protocol v7. The final exec command receives
+healthcheck processes through capability introduced in guest protocol v7 and
+carried by the current guest protocol v9. The final exec command receives
 limits after namespace and root setup without constraining the guest supervisor
 or its signal/status proxies. `RTM-014` covers inspect, validation without
 side effects, daemon recovery, and container stop/start. Live ulimit updates
 remain an explicit gap.
+
+The four Docker per-device block-I/O throttle arrays now persist and apply to
+the VM root disk `/dev/vda` through cgroup-v2 `io.max`. API v1.55 live updates
+independently replace or clear each BPS/IOPS limit while older update APIs keep
+their historical ignore behavior. `RTM-015` covers inspect, kernel control-state
+readback, direct-I/O enforcement, rollback after a compatibility-injected guest
+failure following successful scalar and IO writes, daemon recovery, and an
+actual stop/start cycle. Updates durably journal the complete old and desired
+resource selections before backend mutation, serialize journal and metadata
+writes, and atomically publish the desired record only when the journal is
+removed. Recovery reapplies the durable old selection before accepting a live
+or stopped execution. Stopped recovery reconstructs a missing in-memory shim
+from the persisted spec and writable root, while failed replacements restore
+the original shim without deleting that root. Partially launched candidates
+are durably owned by immutable per-generation specs and PID/start identities.
+A pre-spawn intent, child-first identity publication, and argv-based recovery
+close the crash boundary immediately after process creation; every generation
+is independently enumerated until process, socket, spec, and capacity cleanup
+has succeeded. Preparation failures retain the writable root when termination
+cannot be proven, and recovered stopped preparations seed the exact old CPU,
+memory, PID, block-I/O, and VM-capacity selection before replacement. An
+unresolved journal reserves the container's stable
+ID/name/creation identity, fences lifecycle, restart-policy, and auto-remove
+work, and is removed atomically with a definitive container deletion.
+Compatibility fault markers are claimed by rename before validation so a
+replacement path cannot be consumed accidentally. Blkio weights and additional
+devices remain explicit gaps.
 
 The API v1.55 runtime-input baseline audit is complete (`RTM-013`). Container
 create and update resources, namespace and process configuration, structured and
@@ -146,7 +174,8 @@ configure, and inspect endpoints is complete:
   `IFNAME` grammar, and apply through the guest network namespace. Create and
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
-  responses. Settings survive recovery over guest protocol v7 (`NET-019`).
+  responses. Recovery support shipped in guest protocol v7 and is carried by
+  the current guest protocol v9 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived
@@ -175,7 +204,9 @@ Completion criteria:
 Use the API v1.46-v1.55 assessment table in
 [Docker compatibility](docker-compatibility.md#api-version-envelope) as the
 endpoint-level backlog. After image and networking behavior, address the
-remaining registry search (`IMG-004`) and per-device blkio update fields.
+remaining registry search (`IMG-004`). Per-device block-I/O updates are complete
+for the VM root disk under API v1.55, with the additional-device limitation
+recorded as an intentional gap.
 Container annotations, pull/load image events, accurate image counts, and
 versioned native-engine information are complete. Direct-build image `create`
 events remain part of the intentional direct-builder gap. Implement accepted

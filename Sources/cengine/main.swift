@@ -59,7 +59,13 @@ private final class DaemonLock {
         let lockURL = URL(filePath: socket + ".lock")
         let daemonLock = try DaemonLock(url: lockURL)
         _ = daemonLock
-        let root = option("--root", in: arguments).map { URL(filePath: $0, directoryHint: .isDirectory) } ?? paths.data
+        let requestedRoot = option("--root", in: arguments).map {
+            URL(filePath: $0, directoryHint: .isDirectory)
+        } ?? paths.data
+        try FileManager.default.createDirectory(
+            at: requestedRoot, withIntermediateDirectories: true
+        )
+        let root = requestedRoot.resolvingSymlinksInPath().standardizedFileURL
         let backend: any ContainerBackend
         if arguments.contains("--metadata-only") {
             backend = MetadataOnlyBackend()
@@ -127,7 +133,11 @@ private final class DaemonLock {
 
     private static func vmShim(_ arguments: [String]) async throws -> Never {
         guard let path = option("--spec", in: arguments) else { throw EngineError(.badRequest, "vm-shim requires --spec") }
-        return try await VMShimServer.run(specificationURL: URL(filePath: path))
+        let launchIntentURL = option("--launch-intent", in: arguments).map { URL(filePath: $0) }
+        return try await VMShimServer.run(
+            specificationURL: URL(filePath: path),
+            launchIntentURL: launchIntentURL
+        )
     }
 
     private static func service(_ arguments: [String]) async throws {

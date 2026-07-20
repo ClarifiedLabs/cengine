@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import pathlib
 import tarfile
 import threading
@@ -12,6 +13,7 @@ import uuid
 import docker
 import pytest
 from docker.types import Mount
+from harness import persisted_container_record
 
 
 DIND_IMAGE = "docker:29.6.2-dind"
@@ -414,6 +416,212 @@ def test_ulimits_apply_to_init_exec_healthchecks_and_survive_recovery(
         cleanup_client = recovered or client
         try:
             cleanup_client.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-015")
+def test_block_io_throttles_apply_update_enforce_and_survive_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"block-io-{suffix}"
+    initial = {
+        "BlkioDeviceReadBps": [{"Path": "/dev/vda", "Rate": 1024 * 1024}],
+        "BlkioDeviceWriteBps": [{"Path": "/dev/vda", "Rate": 16 * 1024 * 1024}],
+        "BlkioDeviceReadIOps": [{"Path": "/dev/vda", "Rate": 1000}],
+        "BlkioDeviceWriteIOps": [{"Path": "/dev/vda", "Rate": 2000}],
+    }
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": name},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["tail", "-f", "/dev/null"],
+            "HostConfig": {"Privileged": True, **initial},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+
+    def io_max(value: docker.models.containers.Container) -> dict[str, str]:
+        result = value.exec_run(["cat", "/sys/fs/cgroup/io.max"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        limits = {}
+        for line in result.output.decode().splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            for field in fields[1:]:
+                key, setting = field.split("=", 1)
+                limits[key] = setting
+        return limits
+
+    def memory_max(value: docker.models.containers.Container) -> str:
+        result = value.exec_run(["cat", "/sys/fs/cgroup/memory.max"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        return result.output.decode().strip()
+
+    def persisted_record() -> dict:
+        state = json.loads((daemon.root / "engine.json").read_text())
+        return persisted_container_record(state, container.id)
+
+    try:
+        container.start()
+        container.reload()
+        for field, expected in initial.items():
+            assert container.attrs["HostConfig"][field] == expected
+        assert io_max(container) == {
+            "rbps": str(1024 * 1024),
+            "wbps": str(16 * 1024 * 1024),
+            "riops": "1000",
+            "wiops": "2000",
+        }
+
+        # Alpine's guest-native arm64 BusyBox dd opens the root block device with
+        # O_DIRECT, avoiding page-cache hits while exercising kernel enforcement.
+        started = time.monotonic()
+        direct_read = container.exec_run([
+            "dd", "if=/dev/vda", "of=/dev/null", "bs=1M", "count=6", "iflag=direct",
+        ])
+        elapsed = time.monotonic() - started
+        assert direct_read.exit_code == 0, direct_read.output.decode(errors="replace")
+        assert elapsed >= 3.5, f"1 MiB/s direct read completed too quickly: {elapsed:.2f}s"
+
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={
+                "BlkioDeviceReadBps": [{"Path": "/dev/vda", "Rate": 8 * 1024 * 1024}],
+                "BlkioDeviceWriteBps": [],
+                "BlkioDeviceReadIOps": None,
+            },
+        )
+        client.api._raise_for_status(response)
+        container.reload()
+        assert container.attrs["HostConfig"]["BlkioDeviceReadBps"] == [
+            {"Path": "/dev/vda", "Rate": 8 * 1024 * 1024},
+        ]
+        assert container.attrs["HostConfig"]["BlkioDeviceWriteBps"] == []
+        assert container.attrs["HostConfig"]["BlkioDeviceReadIOps"] == initial["BlkioDeviceReadIOps"]
+        assert container.attrs["HostConfig"]["BlkioDeviceWriteIOps"] == initial["BlkioDeviceWriteIOps"]
+        assert io_max(container) == {
+            "rbps": str(8 * 1024 * 1024),
+            "wbps": "max",
+            "riops": "1000",
+            "wiops": "2000",
+        }
+
+        legacy = docker.APIClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="1.54",
+        )
+        try:
+            response = legacy._post_json(
+                legacy._url("/containers/{0}/update", container.id),
+                data={
+                    "BlkioDeviceReadBps": [{"Path": "relative", "Rate": 0}],
+                    "BlkioDeviceWriteIOps": [],
+                },
+            )
+            legacy._raise_for_status(response)
+        finally:
+            legacy.close()
+        container.reload()
+        assert container.attrs["HostConfig"]["BlkioDeviceReadBps"][0]["Rate"] == 8 * 1024 * 1024
+        assert container.attrs["HostConfig"]["BlkioDeviceWriteIOps"] == initial["BlkioDeviceWriteIOps"]
+
+        before_memory = container.attrs["HostConfig"]["Memory"]
+        before_memory_max = memory_max(container)
+        before_io = io_max(container)
+        daemon.publish_resource_update_failure(
+            container_id=container.id, failure_after_writes=4,
+        )
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/{0}/update", container.id),
+                data={
+                    "Memory": 512 * 1024 * 1024,
+                    "BlkioDeviceReadBps": [{"Path": "/dev/vda", "Rate": 4 * 1024 * 1024}],
+                    "BlkioDeviceReadIOps": [{"Path": "/dev/vda", "Rate": 500}],
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 500
+        assert "failure after 4 successful writes" in str(error.value)
+        assert not daemon.resource_update_failure_file.exists()
+        container.reload()
+        assert container.attrs["HostConfig"]["Memory"] == before_memory
+        assert container.attrs["HostConfig"]["BlkioDeviceReadBps"][0]["Rate"] == 8 * 1024 * 1024
+        assert container.attrs["HostConfig"]["BlkioDeviceReadIOps"] == initial["BlkioDeviceReadIOps"]
+        assert memory_max(container) == before_memory_max
+        assert io_max(container) == before_io
+        persisted = persisted_record()
+        assert persisted["memoryBytes"] == before_memory
+        assert persisted["blockIOReadBps"] == [{"path": "/dev/vda", "rate": 8 * 1024 * 1024}]
+        assert persisted["blockIOReadIOps"] == [{"path": "/dev/vda", "rate": 1000}]
+
+        container.stop(timeout=1)
+        stopped_update = {
+            "BlkioDeviceReadBps": [{"Path": "/dev/vda", "Rate": 2 * 1024 * 1024}],
+            "BlkioDeviceWriteBps": [{"Path": "/dev/vda", "Rate": 4 * 1024 * 1024}],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [{"Path": "/dev/vda", "Rate": 3000}],
+        }
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data=stopped_update,
+        )
+        client.api._raise_for_status(response)
+        container.reload()
+        for field, expected in stopped_update.items():
+            assert container.attrs["HostConfig"][field] == expected
+        persisted = persisted_record()
+        assert persisted["blockIOReadBps"] == [
+            {"path": "/dev/vda", "rate": 2 * 1024 * 1024},
+        ]
+        assert persisted["blockIOReadIOps"] == []
+
+        container.start()
+        container.reload()
+        assert container.attrs["HostConfig"]["Memory"] == before_memory
+        assert memory_max(container) == before_memory_max
+        lifecycle_io = {
+            "rbps": str(2 * 1024 * 1024),
+            "wbps": str(4 * 1024 * 1024),
+            "riops": "max",
+            "wiops": "3000",
+        }
+        assert io_max(container) == lifecycle_io
+
+        # Exercise Docker's explicit POST /restart path. The replacement VM
+        # must rebuild both configured values and cleared cgroup-v2 max keys
+        # from the durable container record.
+        container.restart(timeout=1)
+        container.reload()
+        for field, expected in stopped_update.items():
+            assert container.attrs["HostConfig"][field] == expected
+        assert memory_max(container) == before_memory_max
+        assert io_max(container) == lifecycle_io
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        value = recovered.containers.get(container.id)
+        value.reload()
+        assert value.attrs["HostConfig"]["BlkioDeviceReadBps"] == stopped_update["BlkioDeviceReadBps"]
+        assert value.attrs["HostConfig"]["BlkioDeviceWriteBps"] == stopped_update["BlkioDeviceWriteBps"]
+        assert value.attrs["HostConfig"]["BlkioDeviceReadIOps"] == []
+        assert value.attrs["HostConfig"]["BlkioDeviceWriteIOps"] == stopped_update["BlkioDeviceWriteIOps"]
+        assert value.attrs["HostConfig"]["Memory"] == before_memory
+        assert memory_max(value) == before_memory_max
+        assert io_max(value) == lifecycle_io
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
         except docker.errors.NotFound:
             pass
         if recovered is not None:

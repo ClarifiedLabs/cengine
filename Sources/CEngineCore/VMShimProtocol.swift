@@ -92,6 +92,8 @@ public enum VMShimProtocol {
         public var kernelPath: String
         public var initialRamdiskPath: String
         public var rootDiskPath: String
+        public var rootDiskIdentity: FileIdentity?
+        public var rootDiskSize: UInt64?
         public var rootDiskReadOnly: Bool
         public var volumeDisks: [VolumeDisk]
         public var cpus: Int
@@ -114,6 +116,8 @@ public enum VMShimProtocol {
             kernelPath: String,
             initialRamdiskPath: String,
             rootDiskPath: String,
+            rootDiskIdentity: FileIdentity? = nil,
+            rootDiskSize: UInt64? = nil,
             rootDiskReadOnly: Bool = false,
             volumeDisks: [VolumeDisk] = [],
             cpus: Int,
@@ -135,6 +139,8 @@ public enum VMShimProtocol {
             self.kernelPath = kernelPath
             self.initialRamdiskPath = initialRamdiskPath
             self.rootDiskPath = rootDiskPath
+            self.rootDiskIdentity = rootDiskIdentity
+            self.rootDiskSize = rootDiskSize
             self.rootDiskReadOnly = rootDiskReadOnly
             self.volumeDisks = volumeDisks
             self.cpus = cpus
@@ -154,10 +160,29 @@ public enum VMShimProtocol {
     public struct VolumeDisk: Codable, Sendable, Equatable {
         public var name: String
         public var path: String
+        public var identity: FileIdentity?
+        public var size: UInt64?
 
-        public init(name: String, path: String) {
+        public init(
+            name: String,
+            path: String,
+            identity: FileIdentity? = nil,
+            size: UInt64? = nil
+        ) {
             self.name = name
             self.path = path
+            self.identity = identity
+            self.size = size
+        }
+    }
+
+    public struct FileIdentity: Codable, Sendable, Equatable {
+        public var device: UInt64
+        public var inode: UInt64
+
+        public init(device: UInt64, inode: UInt64) {
+            self.device = device
+            self.inode = inode
         }
     }
 
@@ -165,11 +190,18 @@ public enum VMShimProtocol {
         public var tag: String
         public var source: String
         public var readOnly: Bool
+        public var sourceIdentity: FileIdentity?
 
-        public init(tag: String, source: String, readOnly: Bool) {
+        public init(
+            tag: String,
+            source: String,
+            readOnly: Bool,
+            sourceIdentity: FileIdentity? = nil
+        ) {
             self.tag = tag
             self.source = source
             self.readOnly = readOnly
+            self.sourceIdentity = sourceIdentity
         }
     }
 

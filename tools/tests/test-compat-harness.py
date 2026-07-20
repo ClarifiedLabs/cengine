@@ -19,6 +19,7 @@ from harness import (  # noqa: E402
     compatibility_runtime_processes,
     control_plane_status_is_ready,
     docker_environment,
+    persisted_container_record,
 )
 
 
@@ -43,6 +44,18 @@ def main() -> None:
     assert not control_plane_status_is_ready(0, b"True False")
     assert control_plane_status_is_ready(0, b"True")
     assert control_plane_status_is_ready(0, "True True")
+    assert persisted_container_record(
+        {
+            "schemaVersion": 1,
+            "value": {
+                "containers": [
+                    {"id": "other", "name": "unrelated"},
+                    {"id": "target", "name": "persisted-target"},
+                ]
+            },
+        },
+        "target",
+    )["name"] == "persisted-target"
 
     cache_key = compatibility_image_cache_key([("alpine:latest", "mirror/alpine:latest")])
     assert cache_key == compatibility_image_cache_key([("alpine:latest", "mirror/alpine:latest")])

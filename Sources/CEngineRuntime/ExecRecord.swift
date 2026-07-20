@@ -25,14 +25,22 @@ public struct ExecConfiguration: Sendable {
 public struct ExecRecord: Sendable {
     public let id: String
     public let containerID: String
+    public let containerInstanceID: UUID
     public let configuration: ExecConfiguration
     public let createdAt: Date
     public var running: Bool
     public var exitCode: Int32?
     public var pid: Int32
 
-    public init(id: String = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(), containerID: String, configuration: ExecConfiguration) {
-        self.id = id; self.containerID = containerID; self.configuration = configuration; self.createdAt = Date()
+    public init(
+        id: String = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
+        containerID: String,
+        containerInstanceID: UUID,
+        configuration: ExecConfiguration
+    ) {
+        self.id = id; self.containerID = containerID
+        self.containerInstanceID = containerInstanceID
+        self.configuration = configuration; self.createdAt = Date()
         self.running = false; self.pid = 0
     }
 }

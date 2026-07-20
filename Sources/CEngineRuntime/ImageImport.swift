@@ -3,6 +3,7 @@ import Foundation
 
 extension EngineRuntime {
     public func loadImages(archive: Data, platforms: [OCIPlatform] = []) async throws -> [ImageRecord] {
+        try requireCanonicalSnapshotWritable()
         let temporary = FileManager.default.temporaryDirectory.appending(path: "cengine-image-load-\(UUID().uuidString)", directoryHint: .isDirectory)
         let archiveURL = temporary.appending(path: "image.tar")
         let layout = temporary.appending(path: "layout", directoryHint: .isDirectory)

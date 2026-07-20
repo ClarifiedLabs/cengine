@@ -213,6 +213,75 @@ def test_copy_to_container(client: docker.DockerClient, top):
     code, output = top.exec_run(["cat", "/tmp/a.txt"])
     assert (code, output.rstrip()) == (0, content)
 
+    replacement = b"replacement"
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:") as value:
+        info = tarfile.TarInfo("a.txt")
+        info.mode = 0o600; info.size = len(replacement)
+        value.addfile(info, io.BytesIO(replacement))
+    archive.seek(0); assert top.put_archive("/tmp/", archive)
+    code, output = top.exec_run(["cat", "/tmp/a.txt"])
+    assert (code, output.rstrip()) == (0, replacement)
+
+    code, _ = top.exec_run(["sh", "-c", "mkdir -p /tmp/merge && printf retained >/tmp/merge/retained"])
+    assert code == 0
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:") as value:
+        directory = tarfile.TarInfo("merge")
+        directory.type = tarfile.DIRTYPE; directory.mode = 0o750
+        value.addfile(directory)
+        incoming = b"incoming"
+        info = tarfile.TarInfo("merge/incoming")
+        info.mode = 0o640; info.size = len(incoming)
+        value.addfile(info, io.BytesIO(incoming))
+    archive.seek(0); assert top.put_archive("/tmp/", archive)
+    code, output = top.exec_run(["sh", "-c", "cat /tmp/merge/retained; printf ':'; cat /tmp/merge/incoming"])
+    assert (code, output) == (0, b"retained:incoming")
+
+    code, _ = top.exec_run(["sh", "-c", "printf outside >/tmp/outside; ln -s outside /tmp/swap"])
+    assert code == 0
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:") as value:
+        info = tarfile.TarInfo("swap")
+        info.mode = 0o600; info.size = len(replacement)
+        value.addfile(info, io.BytesIO(replacement))
+    archive.seek(0); assert top.put_archive("/tmp/", archive)
+    code, output = top.exec_run(["sh", "-c", "cat /tmp/swap; printf ':'; cat /tmp/outside"])
+    assert (code, output) == (0, b"replacement:outside")
+
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:") as value:
+        info = tarfile.TarInfo("swap")
+        info.type = tarfile.SYMTYPE; info.linkname = "outside"
+        value.addfile(info)
+    archive.seek(0); assert top.put_archive("/tmp/", archive)
+    code, output = top.exec_run(["readlink", "/tmp/swap"])
+    assert (code, output.rstrip()) == (0, b"outside")
+
+    code, _ = top.exec_run(["sh", "-c", "printf old >/tmp/type-change"])
+    assert code == 0
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:") as value:
+        directory = tarfile.TarInfo("type-change")
+        directory.type = tarfile.DIRTYPE; directory.mode = 0o700
+        value.addfile(directory)
+        payload = b"nested"
+        info = tarfile.TarInfo("type-change/payload")
+        info.mode = 0o600; info.size = len(payload)
+        value.addfile(info, io.BytesIO(payload))
+    archive.seek(0); assert top.put_archive("/tmp/", archive)
+    code, output = top.exec_run(["cat", "/tmp/type-change/payload"])
+    assert (code, output) == (0, b"nested")
+
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:") as value:
+        info = tarfile.TarInfo("type-change")
+        info.mode = 0o600; info.size = len(replacement)
+        value.addfile(info, io.BytesIO(replacement))
+    archive.seek(0); assert top.put_archive("/tmp/", archive)
+    code, output = top.exec_run(["cat", "/tmp/type-change"])
+    assert (code, output) == (0, replacement)
+
 
 @KNOWN_GAP(reason="CTR-016: direct docker build is intentionally unsupported; use Buildx")
 @pytest.mark.compat("CTR-016")

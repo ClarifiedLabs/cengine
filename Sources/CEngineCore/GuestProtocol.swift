@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 7
+    public static let version: UInt32 = 9
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -9,6 +9,7 @@ public enum GuestProtocol {
     public static let portProxyPort: UInt32 = 4_104
     public static let socketProxyPortBase: UInt32 = 4_200
     public static let maximumControlFrameSize = 16 * 1_024 * 1_024
+    public static let resourceRollbackIncompleteErrorCode = "resource_rollback_incomplete"
 
     public struct Envelope: Sendable, Equatable {
         public var version: UInt32
@@ -63,13 +64,15 @@ public enum GuestProtocol {
         public var capabilityAdd: [String]
         public var capabilityDrop: [String]
         public var rlimits: [Rlimit]
+        public var ioClaim: String
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = []) {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ioClaim: String = "") {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
             self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
             self.annotations = annotations; self.capabilityAdd = capabilityAdd; self.capabilityDrop = capabilityDrop
             self.rlimits = rlimits
+            self.ioClaim = ioClaim
         }
     }
 
@@ -96,12 +99,14 @@ public enum GuestProtocol {
         public var capabilityAdd: [String]
         public var capabilityDrop: [String]
         public var rlimits: [Rlimit]
+        public var ioClaim: String
 
         public init(
             id: String, arguments: [String], environment: [String], workingDirectory: String,
             user: User, terminal: Bool, attachStdin: Bool, attachStdout: Bool,
             attachStderr: Bool, noNewPrivileges: Bool, privileged: Bool = false,
-            capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = []
+            capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [],
+            ioClaim: String = ""
         ) {
             self.id = id
             self.arguments = arguments
@@ -117,6 +122,7 @@ public enum GuestProtocol {
             self.capabilityAdd = capabilityAdd
             self.capabilityDrop = capabilityDrop
             self.rlimits = rlimits
+            self.ioClaim = ioClaim
         }
     }
 
@@ -173,7 +179,39 @@ public enum GuestProtocol {
         public var cpuQuota: Int64
         public var cpuPeriod: UInt64
         public var pids: Int64
-        public init(memoryBytes: UInt64, cpuQuota: Int64, cpuPeriod: UInt64, pids: Int64) { self.memoryBytes = memoryBytes; self.cpuQuota = cpuQuota; self.cpuPeriod = cpuPeriod; self.pids = pids }
+        public var blockIOReadBps: [BlockIOThrottle]
+        public var blockIOWriteBps: [BlockIOThrottle]
+        public var blockIOReadIOps: [BlockIOThrottle]
+        public var blockIOWriteIOps: [BlockIOThrottle]
+        public init(
+            memoryBytes: UInt64, cpuQuota: Int64, cpuPeriod: UInt64, pids: Int64,
+            blockIOReadBps: [BlockIOThrottle] = [], blockIOWriteBps: [BlockIOThrottle] = [],
+            blockIOReadIOps: [BlockIOThrottle] = [], blockIOWriteIOps: [BlockIOThrottle] = []
+        ) {
+            self.memoryBytes = memoryBytes; self.cpuQuota = cpuQuota; self.cpuPeriod = cpuPeriod; self.pids = pids
+            self.blockIOReadBps = blockIOReadBps; self.blockIOWriteBps = blockIOWriteBps
+            self.blockIOReadIOps = blockIOReadIOps; self.blockIOWriteIOps = blockIOWriteIOps
+        }
+    }
+
+    public struct BlockIOThrottle: Codable, Sendable, Equatable {
+        public var path: String
+        public var rate: UInt64
+
+        public init(path: String, rate: UInt64) {
+            self.path = path
+            self.rate = rate
+        }
+    }
+
+    public struct ResourceUpdate: Codable, Sendable, Equatable {
+        public var resources: Resources
+        public var compatibilityFailureAfterWrites: UInt32?
+
+        public init(resources: Resources, compatibilityFailureAfterWrites: UInt32? = nil) {
+            self.resources = resources
+            self.compatibilityFailureAfterWrites = compatibilityFailureAfterWrites
+        }
     }
 
     public struct MemoryStatus: Codable, Sendable, Equatable {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pathlib
@@ -17,6 +18,7 @@ import pytest
 
 from harness import (
     COMPATIBILITY_OWNER_FILE,
+    compatibility_environment,
     compatibility_image_cache_key,
     docker_environment,
     terminate_compatibility_runtime,
@@ -113,6 +115,7 @@ class Daemon:
     runtime: pathlib.Path = field(init=False)
     socket: pathlib.Path = field(init=False)
     log_path: pathlib.Path = field(init=False)
+    resource_update_failure_file: pathlib.Path = field(init=False)
     process: subprocess.Popen[bytes] | None = field(default=None, init=False)
     _log: object | None = field(default=None, init=False)
 
@@ -121,6 +124,7 @@ class Daemon:
         self.runtime = self.work / "run"
         self.socket = self.runtime / "docker.sock"
         self.log_path = self.work / "daemon.log"
+        self.resource_update_failure_file = self.work / "resource-update-failure"
         (self.work / COMPATIBILITY_OWNER_FILE).write_text(f"{self.binary.resolve()}\n")
         self.root.mkdir()
         self.runtime.mkdir()
@@ -136,11 +140,16 @@ class Daemon:
             raise RuntimeError("cengine daemon is already running")
         self.socket.unlink(missing_ok=True)
         self._log = self.log_path.open("ab")
+        environment = compatibility_environment()
+        environment["CENGINE_COMPAT_RESOURCE_UPDATE_FAILURE_FILE"] = str(
+            self.resource_update_failure_file
+        )
         self.process = subprocess.Popen(
             [str(self.binary), "daemon", "--root", str(self.root), "--socket", str(self.socket),
              "--kernel", str(self.kernel), "--container-initramfs", str(self.container_initramfs),
              "--storage-initramfs", str(self.storage_initramfs)],
             stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
+            env=environment,
         )
         deadline = time.monotonic() + 60
         last_error = "socket not created"
@@ -173,6 +182,30 @@ class Daemon:
     def restart(self, *, kill: bool = False) -> None:
         self.stop(kill=kill)
         self.start()
+
+    def publish_resource_update_failure(
+        self, *, container_id: str, failure_after_writes: int,
+    ) -> None:
+        if not container_id or failure_after_writes <= 0:
+            raise ValueError("container_id and a positive failure_after_writes are required")
+        temporary = self.resource_update_failure_file.with_name(
+            f".{self.resource_update_failure_file.name}.{uuid.uuid4().hex}.tmp"
+        )
+        lock_path = self.resource_update_failure_file.with_suffix(
+            self.resource_update_failure_file.suffix + ".lock"
+        )
+        try:
+            temporary.write_text(json.dumps({
+                "containerID": container_id,
+                "failureAfterWrites": failure_after_writes,
+            }, separators=(",", ":")))
+            temporary.chmod(0o600)
+            with lock_path.open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                os.replace(temporary, self.resource_update_failure_file)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def logs(self) -> str:
         return self.log_path.read_text(errors="replace") if self.log_path.exists() else ""

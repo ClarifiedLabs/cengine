@@ -114,14 +114,23 @@ func TestExecStartReservationExcludesAttachedAndDetachedLaunches(t *testing.T) {
 	}
 }
 
-func TestDiscardExecRemovesOnlyUnstartedPreparation(t *testing.T) {
+func TestDiscardExecRemovesCreatedAndTerminalStatus(t *testing.T) {
 	supervisor := New()
-	supervisor.execStatus["prepared"] = protocol.ProcessStatus{Status: "created"}
-	if err := supervisor.DiscardExec("prepared"); err != nil {
-		t.Fatal(err)
+	code := 0
+	for id, status := range map[string]protocol.ProcessStatus{
+		"prepared": {Status: "created"},
+		"terminal": {Status: "exited", ExitCode: &code},
+	} {
+		supervisor.execStatus[id] = status
+		if err := supervisor.DiscardExec(id); err != nil {
+			t.Fatal(err)
+		}
+		if status := supervisor.ExecStatus(id); status.Status != "" {
+			t.Fatalf("discarded exec %q status is %#v, want empty", id, status)
+		}
 	}
-	if status := supervisor.ExecStatus("prepared"); status.Status != "" {
-		t.Fatalf("discarded exec status is %#v, want empty", status)
+	if err := supervisor.DiscardExec("missing"); err != nil {
+		t.Fatalf("repeated discard is not idempotent: %v", err)
 	}
 
 	supervisor.execStatus["running"] = protocol.ProcessStatus{Status: "running"}
@@ -130,6 +139,21 @@ func TestDiscardExecRemovesOnlyUnstartedPreparation(t *testing.T) {
 	}
 	if status := supervisor.ExecStatus("running"); status.Status != "running" {
 		t.Fatalf("running exec status changed to %#v", status)
+	}
+}
+
+func TestDiscardExecBoundsTerminalStatusRetention(t *testing.T) {
+	supervisor := New()
+	code := 0
+	for index := 0; index < 128; index++ {
+		id := fmt.Sprintf("health-%d", index)
+		supervisor.execStatus[id] = protocol.ProcessStatus{Status: "exited", ExitCode: &code}
+		if err := supervisor.DiscardExec(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(supervisor.execStatus) != 0 {
+		t.Fatalf("retained %d terminal exec statuses, want 0", len(supervisor.execStatus))
 	}
 }
 

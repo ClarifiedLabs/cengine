@@ -732,14 +732,22 @@ private final class ContainerAttachHandler: ChannelInboundHandler, @unchecked Se
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        io.finishInput()
+        do {
+            try io.finishInput()
+        } catch {
+            context.fireErrorCaught(error)
+        }
         if let subscription { io.detach(subscription) }
         context.fireChannelInactive()
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let event = event as? ChannelEvent, event == .inputClosed {
-            io.finishInput()
+            do {
+                try io.finishInput()
+            } catch {
+                context.fireErrorCaught(error)
+            }
             return
         }
         context.fireUserInboundEventTriggered(event)

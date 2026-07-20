@@ -318,7 +318,7 @@ public struct ContainerCreateRequest: Decodable, Sendable {
         }
         public struct ThrottleDeviceRequest: Decodable, Sendable {
             public var Path: String?
-            public var Rate: Int64?
+            public var Rate: UInt64?
         }
         public struct DeviceDriverRequest: Decodable, Sendable {
             public var Driver: String?

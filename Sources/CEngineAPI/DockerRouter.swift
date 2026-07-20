@@ -165,6 +165,10 @@ public struct DockerRouter: Sendable {
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.useInit = input.HostConfig?.Init ?? false
             record.pidsLimit = try validatedPidsLimit(input.HostConfig?.PidsLimit) ?? 0
+            record.blockIOReadBps = validated.blockIO.readBps
+            record.blockIOWriteBps = validated.blockIO.writeBps
+            record.blockIOReadIOps = validated.blockIO.readIOps
+            record.blockIOWriteIOps = validated.blockIO.writeIOps
             record.ulimits = validated.ulimits
             if let memory = input.HostConfig?.Memory, memory > 0 { record.memoryBytes = UInt64(memory) }
             if let nano = input.HostConfig?.NanoCpus, nano > 0 {
@@ -317,8 +321,8 @@ public struct DockerRouter: Sendable {
             return APIResponse(status: .noContent)
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/update"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/update".count))
-            let input = try decoder.decode(ContainerUpdateRequest.self, from: request.body)
-            try validateRuntimeInput(input)
+            let input = try decodeContainerUpdate(request.body, version: version)
+            let blockIO = try validateRuntimeInput(input, version: version)
             let policy = input.RestartPolicy.map {
                 RestartPolicyRecord(name: $0.Name ?? "no", maximumRetryCount: $0.MaximumRetryCount ?? 0)
             }
@@ -332,7 +336,9 @@ public struct DockerRouter: Sendable {
             }()
             _ = try await runtime.updateContainer(
                 id, memoryBytes: input.Memory, nanoCPUs: nanoCPUs,
-                pidsLimit: try validatedPidsLimit(input.PidsLimit), restartPolicy: policy
+                pidsLimit: try validatedPidsLimit(input.PidsLimit), restartPolicy: policy,
+                blockIOReadBps: blockIO.readBps, blockIOWriteBps: blockIO.writeBps,
+                blockIOReadIOps: blockIO.readIOps, blockIOWriteIOps: blockIO.writeIOps
             )
             return json(status: .ok, ContainerUpdateResponse(Warnings: []))
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
@@ -1018,7 +1024,45 @@ public struct DockerRouter: Sendable {
         try await runtime.subscribeContainerWait(identifier, condition: condition)
     }
 
-    private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (mounts: [MountRecord], ulimits: [UlimitRecord]) {
+    private struct BlockIOConfiguration {
+        var readBps: [BlockIOThrottleDeviceRecord]?
+        var writeBps: [BlockIOThrottleDeviceRecord]?
+        var readIOps: [BlockIOThrottleDeviceRecord]?
+        var writeIOps: [BlockIOThrottleDeviceRecord]?
+
+        static let unchanged = BlockIOConfiguration()
+    }
+
+    private func decodeContainerUpdate(
+        _ body: Data, version: DockerAPIVersion
+    ) throws -> ContainerUpdateRequest {
+        guard version < .init(major: 1, minor: 55) else {
+            return try decoder.decode(ContainerUpdateRequest.self, from: body)
+        }
+        do {
+            guard var object = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+                return try decoder.decode(ContainerUpdateRequest.self, from: body)
+            }
+            for field in [
+                "BlkioDeviceReadBps", "BlkioDeviceWriteBps",
+                "BlkioDeviceReadIOps", "BlkioDeviceWriteIOps",
+            ] {
+                object.removeValue(forKey: field)
+            }
+            return try decoder.decode(
+                ContainerUpdateRequest.self,
+                from: JSONSerialization.data(withJSONObject: object)
+            )
+        } catch let error as DecodingError {
+            throw error
+        } catch {
+            throw EngineError(.badRequest, "invalid request body: \(error.localizedDescription)")
+        }
+    }
+
+    private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (
+        mounts: [MountRecord], ulimits: [UlimitRecord], blockIO: BlockIOConfiguration
+    ) {
         try rejectActiveRuntimeFields([
             (!(input.Domainname ?? "").isEmpty, "Domainname"),
             (input.ArgsEscaped == true, "ArgsEscaped"),
@@ -1030,12 +1074,24 @@ public struct DockerRouter: Sendable {
         }
         try validateStopSignal(input.StopSignal)
         try validateHealthcheck(input.Healthcheck)
-        try validateHostRuntimeInput(input.HostConfig)
+        try validateHostRuntimeInput(input.HostConfig, tty: input.Tty == true)
         try validateVolumeDrivers(in: input)
-        return (try mounts(from: input), try normalizedUlimits(input.HostConfig?.Ulimits, field: "HostConfig.Ulimits"))
+        return (
+            try mounts(from: input),
+            try normalizedUlimits(input.HostConfig?.Ulimits, field: "HostConfig.Ulimits"),
+            try normalizedBlockIO(
+                readBps: input.HostConfig?.BlkioDeviceReadBps,
+                writeBps: input.HostConfig?.BlkioDeviceWriteBps,
+                readIOps: input.HostConfig?.BlkioDeviceReadIOps,
+                writeIOps: input.HostConfig?.BlkioDeviceWriteIOps,
+                prefix: "HostConfig"
+            )
+        )
     }
 
-    private func validateRuntimeInput(_ input: ContainerUpdateRequest) throws {
+    private func validateRuntimeInput(
+        _ input: ContainerUpdateRequest, version: DockerAPIVersion
+    ) throws -> BlockIOConfiguration {
         try validateResourceValues(
             memory: input.Memory, nanoCPUs: input.NanoCpus,
             cpuPeriod: input.CpuPeriod, cpuQuota: input.CpuQuota,
@@ -1044,10 +1100,6 @@ public struct DockerRouter: Sendable {
         try validateUnsupportedResourceValues(
             memory: input.Memory, cpuShares: input.CpuShares, blkioWeight: input.BlkioWeight,
             weightDevices: input.BlkioWeightDevice,
-            throttleDevices: [
-                input.BlkioDeviceReadBps, input.BlkioDeviceWriteBps,
-                input.BlkioDeviceReadIOps, input.BlkioDeviceWriteIOps,
-            ],
             cpuRealtimePeriod: input.CpuRealtimePeriod,
             cpuRealtimeRuntime: input.CpuRealtimeRuntime,
             memoryReservation: input.MemoryReservation, memorySwap: input.MemorySwap,
@@ -1063,10 +1115,6 @@ public struct DockerRouter: Sendable {
             (!(input.CgroupParent ?? "").isEmpty, "CgroupParent"),
             (input.BlkioWeight != nil && input.BlkioWeight != 0, "BlkioWeight"),
             (!(input.BlkioWeightDevice ?? []).isEmpty, "BlkioWeightDevice"),
-            (!(input.BlkioDeviceReadBps ?? []).isEmpty, "BlkioDeviceReadBps"),
-            (!(input.BlkioDeviceWriteBps ?? []).isEmpty, "BlkioDeviceWriteBps"),
-            (!(input.BlkioDeviceReadIOps ?? []).isEmpty, "BlkioDeviceReadIOps"),
-            (!(input.BlkioDeviceWriteIOps ?? []).isEmpty, "BlkioDeviceWriteIOps"),
             (input.CpuRealtimePeriod != nil && input.CpuRealtimePeriod != 0, "CpuRealtimePeriod"),
             (input.CpuRealtimeRuntime != nil && input.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
             (!(input.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
@@ -1088,6 +1136,12 @@ public struct DockerRouter: Sendable {
             name: input.RestartPolicy?.Name,
             maximumRetryCount: input.RestartPolicy?.MaximumRetryCount
         )
+        guard version >= .init(major: 1, minor: 55) else { return .unchanged }
+        return try normalizedBlockIO(
+            readBps: input.BlkioDeviceReadBps, writeBps: input.BlkioDeviceWriteBps,
+            readIOps: input.BlkioDeviceReadIOps, writeIOps: input.BlkioDeviceWriteIOps,
+            prefix: "ContainerUpdate"
+        )
     }
 
     private func validateRuntimeInput(_ input: ExecCreateRequest) throws {
@@ -1101,7 +1155,10 @@ public struct DockerRouter: Sendable {
         try validateConsoleSize(input.ConsoleSize, field: "ExecStartConfig.ConsoleSize")
     }
 
-    private func validateHostRuntimeInput(_ host: ContainerCreateRequest.HostConfig?) throws {
+    private func validateHostRuntimeInput(
+        _ host: ContainerCreateRequest.HostConfig?,
+        tty: Bool
+    ) throws {
         try validateResourceValues(
             memory: host?.Memory, nanoCPUs: host?.NanoCpus,
             cpuPeriod: host?.CpuPeriod, cpuQuota: host?.CpuQuota,
@@ -1110,10 +1167,6 @@ public struct DockerRouter: Sendable {
         try validateUnsupportedResourceValues(
             memory: host?.Memory, cpuShares: host?.CpuShares, blkioWeight: host?.BlkioWeight,
             weightDevices: host?.BlkioWeightDevice,
-            throttleDevices: [
-                host?.BlkioDeviceReadBps, host?.BlkioDeviceWriteBps,
-                host?.BlkioDeviceReadIOps, host?.BlkioDeviceWriteIOps,
-            ],
             cpuRealtimePeriod: host?.CpuRealtimePeriod,
             cpuRealtimeRuntime: host?.CpuRealtimeRuntime,
             memoryReservation: host?.MemoryReservation, memorySwap: host?.MemorySwap,
@@ -1128,10 +1181,6 @@ public struct DockerRouter: Sendable {
             (!(host?.CgroupParent ?? "").isEmpty && host?.CgroupParent != "/docker/buildx", "CgroupParent"),
             (host?.BlkioWeight != nil && host?.BlkioWeight != 0, "BlkioWeight"),
             (!(host?.BlkioWeightDevice ?? []).isEmpty, "BlkioWeightDevice"),
-            (!(host?.BlkioDeviceReadBps ?? []).isEmpty, "BlkioDeviceReadBps"),
-            (!(host?.BlkioDeviceWriteBps ?? []).isEmpty, "BlkioDeviceWriteBps"),
-            (!(host?.BlkioDeviceReadIOps ?? []).isEmpty, "BlkioDeviceReadIOps"),
-            (!(host?.BlkioDeviceWriteIOps ?? []).isEmpty, "BlkioDeviceWriteIOps"),
             (host?.CpuRealtimePeriod != nil && host?.CpuRealtimePeriod != 0, "CpuRealtimePeriod"),
             (host?.CpuRealtimeRuntime != nil && host?.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
             (!(host?.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
@@ -1156,7 +1205,11 @@ public struct DockerRouter: Sendable {
             (!(host?.Runtime ?? "").isEmpty, "Runtime"),
         ])
         try validateSecurityOptions(host?.SecurityOpt, privileged: host?.Privileged == true)
-        try validateConsoleSize(host?.ConsoleSize, field: "HostConfig.ConsoleSize")
+        try validateConsoleSize(
+            host?.ConsoleSize,
+            field: "HostConfig.ConsoleSize",
+            isApplicable: tty
+        )
         try validateNamespaceModes(host)
         try validateOOMScore(host?.OomScoreAdj)
         try validateSharedMemorySize(host?.ShmSize)
@@ -1239,7 +1292,6 @@ public struct DockerRouter: Sendable {
     private func validateUnsupportedResourceValues(
         memory: Int64?, cpuShares: Int64?, blkioWeight: UInt16?,
         weightDevices: [ContainerCreateRequest.HostConfig.WeightDeviceRequest]?,
-        throttleDevices: [[ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?],
         cpuRealtimePeriod: Int64?, cpuRealtimeRuntime: Int64?,
         memoryReservation: Int64?, memorySwap: Int64?, update: Bool
     ) throws {
@@ -1280,11 +1332,43 @@ public struct DockerRouter: Sendable {
                 throw EngineError(.badRequest, "BlkioWeightDevice requires an absolute Path and Weight from 10 to 1000")
             }
         }
-        for device in throttleDevices.compactMap({ $0 }).flatMap({ $0 }) {
-            guard let path = device.Path, path.hasPrefix("/"),
-                  let rate = device.Rate, rate > 0 else {
-                throw EngineError(.badRequest, "blkio throttle devices require an absolute Path and positive Rate")
+    }
+
+    private func normalizedBlockIO(
+        readBps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?,
+        writeBps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?,
+        readIOps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?,
+        writeIOps: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?,
+        prefix: String
+    ) throws -> BlockIOConfiguration {
+        BlockIOConfiguration(
+            readBps: try normalizedThrottleDevices(readBps, field: "\(prefix).BlkioDeviceReadBps"),
+            writeBps: try normalizedThrottleDevices(writeBps, field: "\(prefix).BlkioDeviceWriteBps"),
+            readIOps: try normalizedThrottleDevices(readIOps, field: "\(prefix).BlkioDeviceReadIOps"),
+            writeIOps: try normalizedThrottleDevices(writeIOps, field: "\(prefix).BlkioDeviceWriteIOps")
+        )
+    }
+
+    private func normalizedThrottleDevices(
+        _ devices: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?, field: String
+    ) throws -> [BlockIOThrottleDeviceRecord]? {
+        guard let devices else { return nil }
+        var paths = Set<String>()
+        return try devices.map { device in
+            guard let path = device.Path, !path.isEmpty, path.first == "/",
+                  !path.contains("\0"), path != "/", (path as NSString).standardizingPath == path else {
+                throw EngineError(.badRequest, "\(field) requires a normalized absolute device Path")
             }
+            guard let rate = device.Rate, rate > 0 else {
+                throw EngineError(.badRequest, "\(field) requires a positive Rate")
+            }
+            guard paths.insert(path).inserted else {
+                throw EngineError(.badRequest, "\(field) contains duplicate Path \(path)")
+            }
+            guard path == "/dev/vda" else {
+                throw EngineError(.unsupported, "\(field) currently supports only the root device /dev/vda")
+            }
+            return .init(path: path, rate: rate)
         }
     }
 
@@ -1373,12 +1457,16 @@ public struct DockerRouter: Sendable {
         throw EngineError(.badRequest, "invalid HostConfig.Isolation value: \(value)")
     }
 
-    private func validateConsoleSize(_ value: [Int]?, field: String) throws {
+    private func validateConsoleSize(
+        _ value: [Int]?,
+        field: String,
+        isApplicable: Bool = true
+    ) throws {
         guard let value else { return }
         guard value.count == 2, value.allSatisfy({ $0 >= 0 }) else {
             throw EngineError(.badRequest, "\(field) must be [height, width] with non-negative values")
         }
-        if value.contains(where: { $0 != 0 }) {
+        if isApplicable, value.contains(where: { $0 != 0 }) {
             throw EngineError(.unsupported, "\(field) is not supported")
         }
     }
@@ -1810,6 +1898,10 @@ public struct ContainerInspectResponse: Codable, Sendable {
     }
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let PidsLimit: Int64
+        let BlkioDeviceReadBps: [ThrottleDeviceResponse]?
+        let BlkioDeviceWriteBps: [ThrottleDeviceResponse]?
+        let BlkioDeviceReadIOps: [ThrottleDeviceResponse]?
+        let BlkioDeviceWriteIOps: [ThrottleDeviceResponse]?
         let Ulimits: [UlimitResponse]
         let AutoRemove: Bool; let Privileged: Bool
         let CapAdd: [String]; let CapDrop: [String]
@@ -1821,6 +1913,39 @@ public struct ContainerInspectResponse: Codable, Sendable {
         struct RestartPolicy: Codable, Sendable { let Name: String; let MaximumRetryCount: Int }
         struct LogConfigResponse: Codable, Sendable { let `Type`: String; let Config: [String: String] }
         struct UlimitResponse: Codable, Sendable { let Name: String; let Soft: Int64; let Hard: Int64 }
+        struct ThrottleDeviceResponse: Codable, Sendable { let Path: String; let Rate: UInt64 }
+
+        enum CodingKeys: String, CodingKey {
+            case Memory, NanoCpus, PidsLimit
+            case BlkioDeviceReadBps, BlkioDeviceWriteBps, BlkioDeviceReadIOps, BlkioDeviceWriteIOps
+            case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, ReadonlyRootfs, Init, RestartPolicy
+            case Annotations, Binds, Mounts, PortBindings, NetworkMode, LogConfig
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(Memory, forKey: .Memory)
+            try container.encode(NanoCpus, forKey: .NanoCpus)
+            try container.encode(PidsLimit, forKey: .PidsLimit)
+            try container.encode(BlkioDeviceReadBps, forKey: .BlkioDeviceReadBps)
+            try container.encode(BlkioDeviceWriteBps, forKey: .BlkioDeviceWriteBps)
+            try container.encode(BlkioDeviceReadIOps, forKey: .BlkioDeviceReadIOps)
+            try container.encode(BlkioDeviceWriteIOps, forKey: .BlkioDeviceWriteIOps)
+            try container.encode(Ulimits, forKey: .Ulimits)
+            try container.encode(AutoRemove, forKey: .AutoRemove)
+            try container.encode(Privileged, forKey: .Privileged)
+            try container.encode(CapAdd, forKey: .CapAdd)
+            try container.encode(CapDrop, forKey: .CapDrop)
+            try container.encode(ReadonlyRootfs, forKey: .ReadonlyRootfs)
+            try container.encode(Init, forKey: .Init)
+            try container.encode(self.RestartPolicy, forKey: .RestartPolicy)
+            try container.encodeIfPresent(Annotations, forKey: .Annotations)
+            try container.encode(Binds, forKey: .Binds)
+            try container.encode(Mounts, forKey: .Mounts)
+            try container.encode(PortBindings, forKey: .PortBindings)
+            try container.encode(NetworkMode, forKey: .NetworkMode)
+            try container.encode(LogConfig, forKey: .LogConfig)
+        }
     }
     public struct MountResponse: Codable, Sendable {
         let `Type`: String; let Name: String?; let Source: String; let Destination: String
@@ -1873,6 +1998,10 @@ public struct ContainerInspectResponse: Codable, Sendable {
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             PidsLimit: record.pidsLimit,
+            BlkioDeviceReadBps: record.blockIOReadBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
+            BlkioDeviceWriteBps: record.blockIOWriteBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
+            BlkioDeviceReadIOps: record.blockIOReadIOps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
+            BlkioDeviceWriteIOps: record.blockIOWriteIOps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
             Ulimits: record.ulimits.map { .init(Name: $0.name, Soft: $0.soft, Hard: $0.hard) },
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,

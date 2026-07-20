@@ -2,6 +2,33 @@ import CEngineCore
 import Darwin
 import Foundation
 
+public struct ResourceUpdateIntentRecord: Codable, Sendable {
+    public enum TransactionPhase: String, Codable, Sendable {
+        case prepared
+        case backendApplied
+    }
+
+    public let containerID: String
+    public let originalPhase: ContainerPhase
+    public let old: ContainerRecord
+    public let desired: ContainerRecord
+    public var phase: TransactionPhase
+
+    public init(
+        containerID: String,
+        originalPhase: ContainerPhase,
+        old: ContainerRecord,
+        desired: ContainerRecord,
+        phase: TransactionPhase
+    ) {
+        self.containerID = containerID
+        self.originalPhase = originalPhase
+        self.old = old
+        self.desired = desired
+        self.phase = phase
+    }
+}
+
 public struct EngineSnapshot: Codable, Sendable {
     public var containers: [ContainerRecord]
     public var networks: [NetworkRecord]
@@ -18,12 +45,20 @@ public struct EngineSnapshot: Codable, Sendable {
     /// Kept separate from the required removal fence so Docker's `v=0`
     /// semantics remain recoverable across a daemon restart.
     public var removalVolumesPendingContainerIDs: Set<String>?
+    /// Immutable container incarnation owned by cleanup/removal fences.
+    public var containerFenceInstanceIDs: [String: UUID]?
+    /// Resource mutations are journaled before the backend is touched. An
+    /// unresolved entry is a durable recovery fence: startup must reapply the
+    /// old resources or contain the execution before accepting it.
+    public var resourceUpdateIntents: [ResourceUpdateIntentRecord]?
 
     public init(
         containers: [ContainerRecord] = [], networks: [NetworkRecord] = [], volumes: [VolumeRecord] = [],
         images: [ImageRecord] = [], cleanupPendingContainerIDs: Set<String>? = nil,
         removalPendingContainerIDs: Set<String>? = nil,
-        removalVolumesPendingContainerIDs: Set<String>? = nil
+        removalVolumesPendingContainerIDs: Set<String>? = nil,
+        containerFenceInstanceIDs: [String: UUID]? = nil,
+        resourceUpdateIntents: [ResourceUpdateIntentRecord]? = nil
     ) {
         self.containers = containers
         self.networks = networks
@@ -32,6 +67,14 @@ public struct EngineSnapshot: Codable, Sendable {
         self.cleanupPendingContainerIDs = cleanupPendingContainerIDs
         self.removalPendingContainerIDs = removalPendingContainerIDs
         self.removalVolumesPendingContainerIDs = removalVolumesPendingContainerIDs
+        let fenced = (cleanupPendingContainerIDs ?? [])
+            .union(removalPendingContainerIDs ?? [])
+            .union(removalVolumesPendingContainerIDs ?? [])
+        let derived = Dictionary(uniqueKeysWithValues: containers.compactMap { record in
+            fenced.contains(record.id) ? (record.id, record.instanceID) : nil
+        })
+        self.containerFenceInstanceIDs = containerFenceInstanceIDs ?? (derived.isEmpty ? nil : derived)
+        self.resourceUpdateIntents = resourceUpdateIntents
     }
 }
 
@@ -52,6 +95,57 @@ public enum VolumePruneScope: Equatable, Sendable {
 }
 
 public actor EngineRuntime {
+    private struct LandedResourceCommitCouldNotBeReconfirmed: Error {
+        let underlying: Error
+    }
+
+    private struct ResourceCommitStateCouldNotBeClassified: Error {
+        let underlying: Error
+    }
+
+    private struct LandedRemovalCommitCouldNotBeReconfirmed: Error {
+        let underlying: Error
+    }
+
+    private struct RemovalCommitStateCouldNotBeClassified: Error {
+        let underlying: Error
+    }
+
+    private enum AmbiguousSnapshotReload: Error {
+        case unavailable(
+            ambiguity: AtomicStorePersistenceAmbiguousError,
+            reloadFailure: Error
+        )
+    }
+
+    private struct CanonicalSnapshotPersistenceUnavailable: Error, LocalizedError, Sendable {
+        let detail: String
+
+        var errorDescription: String? {
+            "canonical engine state is unavailable; refusing to overwrite it: \(detail)"
+        }
+    }
+
+    private struct ConcurrentSnapshotReconciliationFailed: Error, LocalizedError, Sendable {
+        let detail: String
+
+        var errorDescription: String? {
+            "concurrent engine state could not be reconciled after an ambiguous save: \(detail)"
+        }
+    }
+
+    private enum ResourceCommitReconciliation {
+        case desired
+        case old
+        case unknown
+    }
+
+    private enum RemovalCommitReconciliation {
+        case absent
+        case fencedOld
+        case unknown
+    }
+
     private struct LifecycleIntent: Equatable {
         enum Operation: Equatable { case start, stop, restart, remove, update, pause, resume, rename, network }
 
@@ -61,11 +155,15 @@ public actor EngineRuntime {
 
     private struct RemovalPublicationReservation {
         let containerID: String
+        let containerInstanceID: UUID
         let containerName: String
         let volumeNames: Set<String>
     }
 
-    var snapshot: EngineSnapshot
+    var snapshot: EngineSnapshot {
+        didSet { snapshotRevision &+= 1 }
+    }
+    private var snapshotRevision: UInt64 = 0
     private let store: AtomicStore<EngineSnapshot>
     private let endpointAllocationStore: AtomicStore<[String: Int]>
     private let beforePersistence: (@Sendable () async throws -> Void)?
@@ -83,11 +181,21 @@ public actor EngineRuntime {
     private var lifecycleIntents: [String: LifecycleIntent] = [:]
     private var pendingContainerNames: [String: String] = [:]
     private var pendingContainerIDs = Set<String>()
+    private var pendingContainerInstances: [String: UUID] = [:]
     private var pendingVolumeNames: [String: Int] = [:]
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
     private var startingExecIDs = Set<String>()
     private var activeExecOperations: [String: Int] = [:]
+    /// `EngineRuntime` is reentrant across the persistence hook and atomic-store
+    /// await. Serialize every snapshot write so resource journal phases and
+    /// unrelated saves have one total order.
+    private var persistenceActive = false
+    private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Once an ambiguity reload cannot classify the canonical state, this
+    /// actor may continue containing already-started backend work but must
+    /// never publish another snapshot from its stale in-memory selection.
+    private var canonicalSnapshotUnavailableDetail: String?
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         try await self.init(
@@ -95,7 +203,8 @@ public actor EngineRuntime {
             backend: backend,
             beforePersistence: nil,
             beforeEndpointAllocationPersistence: nil,
-            beforeCompletionMonitoring: nil
+            beforeCompletionMonitoring: nil,
+            atomicStoreSaveBoundaryHook: nil
         )
     }
 
@@ -104,9 +213,14 @@ public actor EngineRuntime {
         backend: any ContainerBackend,
         beforePersistence: (@Sendable () async throws -> Void)? = nil,
         beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)? = nil,
-        beforeCompletionMonitoring: (@Sendable () async -> Void)? = nil
+        beforeCompletionMonitoring: (@Sendable () async -> Void)? = nil,
+        atomicStoreSaveBoundaryHook: (@Sendable (AtomicStoreSaveBoundary) throws -> Void)? = nil
     ) async throws {
-        self.store = AtomicStore(url: root.appending(path: "engine.json"))
+        let root = try Self.canonicalDataRoot(root)
+        self.store = AtomicStore(
+            url: root.appending(path: "engine.json"),
+            saveBoundaryHook: atomicStoreSaveBoundaryHook
+        )
         self.endpointAllocationStore = AtomicStore(url: root.appending(path: "endpoint-allocation.json"))
         self.beforePersistence = beforePersistence
         self.beforeEndpointAllocationPersistence = beforeEndpointAllocationPersistence
@@ -114,10 +228,15 @@ public actor EngineRuntime {
         self.backend = backend
         self.endpointAllocationCursors = [:]
         self.snapshot = try await store.load(default: EngineSnapshot())
+        try Self.validateEngineSnapshotInvariants(snapshot)
         // Explicit remove/prune publishes this intent before crossing backend
         // teardown. Resolve it before generic cleanup or restart policy so a
         // container whose backend was already deleted can never be resurrected.
         try await resolvePendingContainerRemovals()
+        // Resolve resource journals before generic execution recovery. A
+        // recovered running shim is not trusted until the old durable resource
+        // selection has been reapplied successfully.
+        try await resolvePendingResourceUpdates()
         // A cleanup-pending marker is written before every backend launch
         // boundary. It is the first recovered state: no other backend await may
         // trust or mutate the persisted execution until teardown is verified.
@@ -329,6 +448,14 @@ public actor EngineRuntime {
         }
     }
 
+    private static func canonicalDataRoot(_ requested: URL) throws -> URL {
+        let standardized = requested.standardizedFileURL
+        try FileManager.default.createDirectory(
+            at: standardized, withIntermediateDirectories: true
+        )
+        return standardized.resolvingSymlinksInPath().standardizedFileURL
+    }
+
     public func shutdown() async {
         healthTasks.values.forEach { $0.cancel() }
         healthTasks.removeAll()
@@ -356,10 +483,12 @@ public actor EngineRuntime {
 
     @discardableResult
     public func createContainer(_ input: ContainerRecord) async throws -> ContainerRecord {
-        var record = input
+        try requireCanonicalSnapshotWritable()
+        var record = input.withFreshInstanceID()
         guard Identifier.validateName(record.name) else { throw EngineError(.badRequest, "invalid container name: \(record.name)") }
         if let conflictingID = pendingContainerNames[record.name]
             ?? snapshot.containers.first(where: { $0.name == record.name || $0.id == record.id })?.id
+            ?? resourceUpdateReservation(for: record)
             ?? (pendingContainerIDs.contains(record.id) ? record.id : nil) {
             throw Self.containerNameConflict(name: record.name, conflictingID: conflictingID)
         }
@@ -409,8 +538,10 @@ public actor EngineRuntime {
     }
 
     public func startContainer(_ identifier: String) async throws {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard lifecycleIntents[record.id] == nil else {
             throw EngineError(.conflict, "container \(identifier) has a lifecycle operation in progress")
         }
@@ -514,6 +645,7 @@ public actor EngineRuntime {
     }
 
     public func resizeContainer(_ identifier: String, width: UInt16, height: UInt16) async throws {
+        try requireCanonicalSnapshotWritable()
         let record = try container(identifier)
         try requireBackendExecutionAvailable(record)
         try await backend.resize(record, width: width, height: height)
@@ -538,7 +670,12 @@ public actor EngineRuntime {
     }
 
     public func updateContainer(_ identifier: String, memoryBytes: Int64?, nanoCPUs: Int64?,
-                                pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?) async throws -> ContainerRecord {
+                                pidsLimit: Int64?, restartPolicy: RestartPolicyRecord?,
+                                blockIOReadBps: [BlockIOThrottleDeviceRecord]? = nil,
+                                blockIOWriteBps: [BlockIOThrottleDeviceRecord]? = nil,
+                                blockIOReadIOps: [BlockIOThrottleDeviceRecord]? = nil,
+                                blockIOWriteIOps: [BlockIOThrottleDeviceRecord]? = nil) async throws -> ContainerRecord {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
         try requireBackendExecutionAvailable(old)
@@ -552,9 +689,59 @@ public actor EngineRuntime {
             if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
             if let pidsLimit { updated.pidsLimit = pidsLimit }
             if let restartPolicy { updated.restartPolicy = restartPolicy }
+            if let blockIOReadBps { updated.blockIOReadBps = blockIOReadBps }
+            if let blockIOWriteBps { updated.blockIOWriteBps = blockIOWriteBps }
+            if let blockIOReadIOps { updated.blockIOReadIOps = blockIOReadIOps }
+            if let blockIOWriteIOps { updated.blockIOWriteIOps = blockIOWriteIOps }
             let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
                 || old.pidsLimit != updated.pidsLimit
-            if resourcesChanged { try await backend.updateResources(updated) }
+                || old.blockIOReadBps != updated.blockIOReadBps
+                || old.blockIOWriteBps != updated.blockIOWriteBps
+                || old.blockIOReadIOps != updated.blockIOReadIOps
+                || old.blockIOWriteIOps != updated.blockIOWriteIOps
+            if resourcesChanged {
+                let resourceIntent = ResourceUpdateIntentRecord(
+                    containerID: old.id,
+                    originalPhase: old.phase,
+                    old: old,
+                    desired: updated,
+                    phase: .prepared
+                )
+                // The old public record and the full reconciliation intent are
+                // durable before the backend can observe the desired resources.
+                try await persistInstallingResourceIntent(resourceIntent)
+                do {
+                    try await backend.updateResources(updated)
+                } catch let error as BackendResourceRollbackIncompleteError {
+                    let containmentFailure = await containTaintedResourceUpdate(old)
+                    throw Self.taintedResourceUpdateError(
+                        cause: error, containmentFailure: containmentFailure
+                    )
+                } catch {
+                    let updateError = error
+                    do {
+                        // A non-structured backend failure promises its own
+                        // rollback completed. Clear the journal only through a
+                        // durable old-state transition.
+                        try await persistResourceRollback(containerID: old.id, old: old)
+                    } catch {
+                        throw EngineError(
+                            .internalError,
+                            "resource update failed: \(EngineError.message(for: updateError)); "
+                                + "old resource journal could not be cleared: \(EngineError.message(for: error))"
+                        )
+                    }
+                    throw updateError
+                }
+                do {
+                    try await persistResourceIntentPhase(.backendApplied, containerID: old.id)
+                } catch {
+                    try await rollbackResourceUpdateAfterPersistenceFailure(
+                        old: old,
+                        persistenceError: error
+                    )
+                }
+            }
             guard let current = try? containerIndex(old.id) else {
                 throw EngineError(.conflict, "container \(identifier) was removed while it was being updated")
             }
@@ -565,12 +752,49 @@ public actor EngineRuntime {
             }
             if let pidsLimit { merged.pidsLimit = pidsLimit }
             if let restartPolicy { merged.restartPolicy = restartPolicy }
-            snapshot.containers[current] = merged
-            try await persist()
-            emit(containerEvent("update", merged))
-            endLifecycleIntent(intent, for: old.id)
-            await reconcileDeferredCompletion(old.id)
-            return merged
+            if let blockIOReadBps { merged.blockIOReadBps = blockIOReadBps }
+            if let blockIOWriteBps { merged.blockIOWriteBps = blockIOWriteBps }
+            if let blockIOReadIOps { merged.blockIOReadIOps = blockIOReadIOps }
+            if let blockIOWriteIOps { merged.blockIOWriteIOps = blockIOWriteIOps }
+            do {
+                let publishedRecord: ContainerRecord
+                if resourcesChanged {
+                    publishedRecord = try await persistResourceCommit(
+                        containerID: old.id,
+                        desired: merged
+                    )
+                } else {
+                    publishedRecord = try await persistContainerUpdate(
+                        containerID: old.id,
+                        desired: merged
+                    )
+                }
+                emit(containerEvent("update", publishedRecord))
+                endLifecycleIntent(intent, for: old.id)
+                await reconcileDeferredCompletion(old.id)
+                return publishedRecord
+            } catch {
+                if resourcesChanged {
+                    if let uncertain = error as? LandedResourceCommitCouldNotBeReconfirmed {
+                        throw uncertain.underlying
+                    }
+                    if let unclassified = error as? ResourceCommitStateCouldNotBeClassified {
+                        let containmentFailure = await containUnclassifiedResourceUpdate(old)
+                        let outcome = containmentFailure.map {
+                            "containment failed: \($0)"
+                        } ?? "workload was contained"
+                        throw EngineError(
+                            .internalError,
+                            "resource update durable state could not be classified: "
+                                + "\(EngineError.message(for: unclassified.underlying)); \(outcome)"
+                        )
+                    }
+                    try await rollbackResourceUpdateAfterPersistenceFailure(
+                        old: old, persistenceError: error
+                    )
+                }
+                throw error
+            }
         } catch {
             endLifecycleIntent(intent, for: old.id)
             await reconcileDeferredCompletion(old.id)
@@ -579,6 +803,7 @@ public actor EngineRuntime {
     }
 
     public func killContainer(_ identifier: String, signal: String) async throws {
+        try requireCanonicalSnapshotWritable()
         let record = try container(identifier)
         try requireBackendExecutionAvailable(record)
         guard !startingContainerIDs.contains(record.id) else {
@@ -595,6 +820,7 @@ public actor EngineRuntime {
     }
 
     public func pauseContainer(_ identifier: String) async throws {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
         try requireBackendExecutionAvailable(record)
@@ -625,6 +851,7 @@ public actor EngineRuntime {
     }
 
     public func resumeContainer(_ identifier: String) async throws {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
         try requireBackendExecutionAvailable(record)
@@ -655,8 +882,10 @@ public actor EngineRuntime {
     }
 
     public func restartContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         guard activeExecOperations[record.id, default: 0] == 0 else {
             throw EngineError(.conflict, "container \(identifier) has an exec operation in progress")
         }
@@ -774,13 +1003,18 @@ public actor EngineRuntime {
     }
 
     public func createExec(container identifier: String, configuration: ExecConfiguration) async throws -> ExecRecord {
+        try requireCanonicalSnapshotWritable()
         let container = try container(identifier)
         try requireBackendExecutionAvailable(container)
         guard container.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         guard !configuration.arguments.isEmpty else { throw EngineError(.badRequest, "exec command cannot be empty") }
         try beginExecOperation(for: container.id)
         defer { endExecOperation(for: container.id) }
-        let exec = ExecRecord(containerID: container.id, configuration: configuration)
+        let exec = ExecRecord(
+            containerID: container.id,
+            containerInstanceID: container.instanceID,
+            configuration: configuration
+        )
         do {
             _ = try await backend.prepareExec(exec, container: container)
             guard let current = try? self.container(container.id),
@@ -809,11 +1043,15 @@ public actor EngineRuntime {
         if value.running {
             try requireBackendExecutionAvailable(container(value.containerID))
             if let code = await backend.execStatus(value) {
-                value.running = false
-                value.exitCode = code
                 let refreshedPID = await backend.execPID(value)
-                if refreshedPID > 0 { value.pid = refreshedPID }
-                execs[identifier] = value
+                if var current = execs[identifier], current.exitCode == nil {
+                    current.running = false
+                    current.exitCode = code
+                    if refreshedPID > 0 { current.pid = refreshedPID }
+                    execs[identifier] = current
+                    await backend.retireExec(current)
+                }
+                value = try exec(identifier)
             }
         }
         return value
@@ -826,6 +1064,7 @@ public actor EngineRuntime {
     }
 
     public func startExec(_ identifier: String) async throws {
+        try requireCanonicalSnapshotWritable()
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
         try beginExecOperation(for: exec.containerID)
@@ -834,7 +1073,33 @@ public actor EngineRuntime {
             throw EngineError(.conflict, "exec instance is already starting")
         }
         defer { startingExecIDs.remove(identifier) }
-        try await backend.startExec(exec)
+        do {
+            try await backend.startExec(exec)
+        } catch let contained as BackendExecStartContainedError {
+            // A crossed start boundary is never retryable. The backend has
+            // selected a terminal result and retired (or durably quarantined)
+            // the exact guest resources, so publish that result before
+            // returning the original start failure to Docker.
+            if var current = execs[identifier], current.exitCode == nil {
+                current.running = false
+                current.exitCode = contained.exitCode
+                execs[identifier] = current
+            }
+            if contained.containerTerminated,
+               let owner = try? container(exec.containerID) {
+                await recordCompletion(
+                    owner.id, startedAt: owner.startedAt, code: 137
+                )
+            }
+            throw contained
+        } catch let quarantined as BackendExecStartQuarantinedError {
+            if var current = execs[identifier], current.exitCode == nil {
+                current.running = false
+                current.exitCode = quarantined.exitCode
+                execs[identifier] = current
+            }
+            throw quarantined
+        }
         guard execs[identifier]?.exitCode == nil,
               let container = try? container(exec.containerID), container.phase == .running else {
             throw EngineError(.conflict, "container stopped while exec instance was starting")
@@ -847,6 +1112,7 @@ public actor EngineRuntime {
     }
 
     public func startAttachedExec(_ identifier: String) async throws -> CInt? {
+        try requireCanonicalSnapshotWritable()
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else {
             throw EngineError(.conflict, "exec instance has already run")
@@ -872,12 +1138,14 @@ public actor EngineRuntime {
     }
 
     public func resizeExec(_ identifier: String, width: UInt16, height: UInt16) async throws {
+        try requireCanonicalSnapshotWritable()
         let value = try exec(identifier)
         try requireBackendExecutionAvailable(container(value.containerID))
         try await backend.resizeExec(value, width: width, height: height)
     }
 
     public func stopContainer(_ identifier: String, timeoutSeconds: Int? = nil) async throws {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
         try requireBackendExecutionAvailable(record)
@@ -925,6 +1193,7 @@ public actor EngineRuntime {
     }
 
     public func removeContainer(_ identifier: String, force: Bool, removeVolumes: Bool = false) async throws {
+        try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let removed = snapshot.containers[index]
         let intent = try beginLifecycleIntent(.remove, for: removed.id)
@@ -1031,30 +1300,49 @@ public actor EngineRuntime {
             releaseRemovalPublication(publicationReservation)
             throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
         }
-        let durableRemovalRecord = snapshot.containers.remove(at: current)
-        clearCleanupPending(identifier)
-        clearRemovalPending(identifier)
         do {
-            try await persist()
+            let durableRemovalRecord = try await persistContainerRemovalCommit(
+                expected: snapshot.containers[current]
+            )
             releaseRemovalPublication(publicationReservation)
+            resumeRemovalWaiters(identifier, code: durableRemovalRecord.exitCode ?? 0)
+            emit(containerEvent("destroy", durableRemovalRecord))
+        } catch let uncertain as LandedRemovalCommitCouldNotBeReconfirmed {
+            // Backend teardown and the selected snapshot both say removed.
+            // Do not resurrect stale metadata merely because the independent
+            // durability reconfirmation also failed.
+            releaseRemovalPublication(publicationReservation)
+            throw uncertain.underlying
+        } catch let unclassified as RemovalCommitStateCouldNotBeClassified {
+            // Canonical state is unknown. Backend deletion is already final;
+            // hide the stale record and retain the in-memory publication
+            // reservation for this actor's lifetime. The poisoned persistence
+            // gate prevents any stale snapshot from overwriting the unknown
+            // canonical path, while the reservation prevents ID/name reuse.
+            if let stale = snapshot.containers.firstIndex(where: {
+                Self.resourceUpdateIdentityMatches($0, removed)
+            }) {
+                snapshot.containers.remove(at: stale)
+            }
+            throw unclassified.underlying
         } catch {
-            restoreRemovalQuarantine(
-                durableRemovalRecord, at: current, removeVolumes: effectiveRemoveVolumes,
-                removedVolumes: removedVolumeMetadata
+            restoreRemovedVolumeMetadata(removedVolumeMetadata)
+            quarantineRemovalPendingContainer(
+                identifier, record: removed, removeVolumes: effectiveRemoveVolumes
             )
             releaseRemovalPublication(publicationReservation)
             try? await persist()
             throw error
         }
-        resumeRemovalWaiters(identifier, code: durableRemovalRecord.exitCode ?? 0)
-        emit(containerEvent("destroy", durableRemovalRecord))
     }
 
     public func renameContainer(_ identifier: String, name: String) async throws {
+        try requireCanonicalSnapshotWritable()
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid container name: \(name)") }
         let normalized = name.normalizedContainerName
         let index = try containerIndex(identifier)
         let record = snapshot.containers[index]
+        try requireBackendExecutionAvailable(record)
         let intent = try beginLifecycleIntent(.rename, for: record.id)
         do {
             if let conflictingID = pendingContainerNames[normalized], conflictingID != record.id {
@@ -1102,6 +1390,7 @@ public actor EngineRuntime {
     public func pullImage(_ reference: String, platform: String = "linux/arm64",
                           credentials: RegistryCredentials? = nil,
                           progress: @escaping ImagePullProgressHandler = { _ in }) async throws -> ImageRecord {
+        try requireCanonicalSnapshotWritable()
         try await backend.pullImage(reference, platform: platform, credentials: credentials, progress: progress)
         let image: ImageRecord
         if let backendImages = try await backend.listImages() {
@@ -1149,6 +1438,7 @@ public actor EngineRuntime {
 
     @discardableResult
     public func removeImage(_ identifier: String, force: Bool, platforms: [OCIPlatform] = []) async throws -> [String] {
+        try requireCanonicalSnapshotWritable()
         let image = try image(identifier)
         guard force || !snapshot.containers.contains(where: {
             $0.imageID == image.id || image.references.contains($0.image) || image.references.contains(ImageReference.normalized($0.image))
@@ -1182,6 +1472,7 @@ public actor EngineRuntime {
     }
 
     public func tagImage(_ identifier: String, reference: String) async throws {
+        try requireCanonicalSnapshotWritable()
         let image = try image(identifier)
         let normalized = ImageReference.normalized(reference)
         guard let existing = image.references.first else { throw EngineError(.notFound, "No such image: \(identifier)") }
@@ -1196,6 +1487,7 @@ public actor EngineRuntime {
     }
 
     public func pushImage(_ identifier: String, platform: OCIPlatform? = nil, credentials: RegistryCredentials?) async throws {
+        try requireCanonicalSnapshotWritable()
         let image = try image(identifier)
         let normalized = ImageReference.normalized(identifier)
         let reference = image.references.first(where: { $0 == identifier || $0 == normalized }) ?? normalized
@@ -1230,6 +1522,7 @@ public actor EngineRuntime {
                               enableIPv4: Bool = true, enableIPv6: Bool = true,
                               driver: String? = nil, internalNetwork: Bool = false,
                               labels: [String: String] = [:], options: [String: String] = [:]) async throws -> NetworkRecord {
+        try requireCanonicalSnapshotWritable()
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid network name: \(name)") }
         guard enableIPv4 || enableIPv6 else {
             throw EngineError(.badRequest, "network must enable IPv4, IPv6, or both")
@@ -1303,6 +1596,7 @@ public actor EngineRuntime {
     }
 
     public func removeNetwork(_ identifier: String) async throws {
+        try requireCanonicalSnapshotWritable()
         guard let index = snapshot.networks.firstIndex(where: { $0.id == identifier || $0.id.hasPrefix(identifier) || $0.name == identifier }) else {
             throw EngineError(.notFound, "network \(identifier) not found")
         }
@@ -1325,6 +1619,7 @@ public actor EngineRuntime {
                                ipv6Address: String? = nil, macAddress: String? = nil,
                                gatewayPriority: Int? = nil,
                                driverOptions: [String: String]? = nil) async throws {
+        try requireCanonicalSnapshotWritable()
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         let record = snapshot.containers[index]
@@ -1386,6 +1681,7 @@ public actor EngineRuntime {
     }
 
     public func disconnectNetwork(_ networkIdentifier: String, container containerIdentifier: String, force: Bool) async throws {
+        try requireCanonicalSnapshotWritable()
         let network = try network(networkIdentifier)
         let index = try containerIndex(containerIdentifier)
         let record = snapshot.containers[index]
@@ -1430,6 +1726,7 @@ public actor EngineRuntime {
     }
 
     public func pruneNetworks(identifiers: Set<String>? = nil) async throws -> [String] {
+        try requireCanonicalSnapshotWritable()
         let used = Set(
             (snapshot.containers + Array(pendingContainers.values)).flatMap(\.networks).map(\.networkID)
         )
@@ -1444,6 +1741,7 @@ public actor EngineRuntime {
     }
 
     public func pruneContainers(ids: Set<String>? = nil) async throws -> [String] {
+        try requireCanonicalSnapshotWritable()
         let candidates = snapshot.containers.filter {
             $0.phase != .running && $0.phase != .paused
                 && !startingContainerIDs.contains($0.id)
@@ -1471,6 +1769,7 @@ public actor EngineRuntime {
     }
 
     public func pruneImages(scope: ImagePruneScope = .dangling) async throws -> [ImageRecord] {
+        try requireCanonicalSnapshotWritable()
         let removed = snapshot.images.filter { image in
             let used = snapshot.containers.contains { container in
                 container.image == image.id
@@ -1488,6 +1787,7 @@ public actor EngineRuntime {
     }
 
     public func pruneVolumes(scope: VolumePruneScope = .anonymous) async throws -> [String] {
+        try requireCanonicalSnapshotWritable()
         let used = Set(snapshot.containers.flatMap(\.mounts).filter { $0.kind == .volume }.map(\.source))
         let removed = snapshot.volumes.filter {
             !used.contains($0.name) && (scope == .allUnused || $0.anonymous == true)
@@ -1499,6 +1799,7 @@ public actor EngineRuntime {
     }
 
     public func createVolume(name: String, sizeBytes: UInt64 = VolumeRecord.defaultSizeBytes, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
+        try requireCanonicalSnapshotWritable()
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
         guard pendingVolumeNames[name, default: 0] == 0 else {
             throw EngineError(.conflict, "volume \(name) is being removed")
@@ -1511,6 +1812,7 @@ public actor EngineRuntime {
     }
 
     public func removeVolume(_ name: String, force: Bool) async throws {
+        try requireCanonicalSnapshotWritable()
         guard let index = snapshot.volumes.firstIndex(where: { $0.name == name }) else {
             throw EngineError(.notFound, "get \(name): no such volume")
         }
@@ -1953,26 +2255,797 @@ public actor EngineRuntime {
     }
 
     func persist() async throws {
+        try await acquirePersistence()
+        defer { releasePersistence() }
         try await beforePersistence?()
-        try await store.save(snapshot)
+        try await saveEngineSnapshot(snapshot)
+    }
+
+    func requireCanonicalSnapshotWritable() throws {
+        if let detail = canonicalSnapshotUnavailableDetail {
+            throw CanonicalSnapshotPersistenceUnavailable(detail: detail)
+        }
+    }
+
+    /// A failed parent-directory sync is reported as ambiguous after rename.
+    /// Re-read the selected old/new state before returning the error so later
+    /// operations cannot overwrite a newly durable teardown/resource fence with
+    /// the actor's pre-save snapshot.
+    private func saveEngineSnapshot(_ value: EngineSnapshot) async throws {
+        try requireCanonicalSnapshotWritable()
+        let base = snapshot
+        let revision = snapshotRevision
+        do {
+            try await store.save(value)
+        } catch let ambiguity as AtomicStorePersistenceAmbiguousError {
+            do {
+                let saved = try await store.loadRequired()
+                try Self.validateEngineSnapshotInvariants(saved)
+                let reconciled = if snapshotRevision == revision {
+                    saved
+                } else {
+                    try Self.reconcilingConcurrentSnapshotChanges(
+                        base: base,
+                        saved: saved,
+                        current: snapshot
+                    )
+                }
+                try Self.validateEngineSnapshotInvariants(reconciled)
+                snapshot = reconciled
+            } catch let reloadFailure {
+                canonicalSnapshotUnavailableDetail = reloadFailure.localizedDescription
+                throw AmbiguousSnapshotReload.unavailable(
+                    ambiguity: ambiguity, reloadFailure: reloadFailure
+                )
+            }
+            throw ambiguity
+        }
+    }
+
+    private static func reconcilingConcurrentSnapshotChanges(
+        base: EngineSnapshot,
+        saved: EngineSnapshot,
+        current: EngineSnapshot
+    ) throws -> EngineSnapshot {
+        var merged = saved
+        merged.containers = try reconcileRecords(
+            base: base.containers,
+            saved: saved.containers,
+            current: current.containers,
+            collection: "containers",
+            key: { "\($0.id):\($0.instanceID.uuidString)" }
+        )
+        merged.networks = try reconcileRecords(
+            base: base.networks,
+            saved: saved.networks,
+            current: current.networks,
+            collection: "networks",
+            key: { $0.id }
+        )
+        merged.volumes = try reconcileRecords(
+            base: base.volumes,
+            saved: saved.volumes,
+            current: current.volumes,
+            collection: "volumes",
+            key: { $0.name }
+        )
+        merged.images = try reconcileRecords(
+            base: base.images,
+            saved: saved.images,
+            current: current.images,
+            collection: "images",
+            key: { $0.id }
+        )
+        merged.cleanupPendingContainerIDs = reconcileSet(
+            base: base.cleanupPendingContainerIDs,
+            saved: saved.cleanupPendingContainerIDs,
+            current: current.cleanupPendingContainerIDs
+        )
+        merged.removalPendingContainerIDs = reconcileSet(
+            base: base.removalPendingContainerIDs,
+            saved: saved.removalPendingContainerIDs,
+            current: current.removalPendingContainerIDs
+        )
+        merged.removalVolumesPendingContainerIDs = reconcileSet(
+            base: base.removalVolumesPendingContainerIDs,
+            saved: saved.removalVolumesPendingContainerIDs,
+            current: current.removalVolumesPendingContainerIDs
+        )
+        merged.containerFenceInstanceIDs = try reconcileDictionary(
+            base: base.containerFenceInstanceIDs,
+            saved: saved.containerFenceInstanceIDs,
+            current: current.containerFenceInstanceIDs,
+            collection: "container fence identities"
+        )
+        merged.resourceUpdateIntents = try reconcileRecords(
+            base: base.resourceUpdateIntents ?? [],
+            saved: saved.resourceUpdateIntents ?? [],
+            current: current.resourceUpdateIntents ?? [],
+            collection: "resource update intents",
+            key: { $0.containerID }
+        )
+        if merged.resourceUpdateIntents?.isEmpty == true {
+            merged.resourceUpdateIntents = nil
+        }
+        return merged
+    }
+
+    private static func reconcileRecords<Record: Encodable>(
+        base: [Record],
+        saved: [Record],
+        current: [Record],
+        collection: String,
+        key: (Record) -> String
+    ) throws -> [Record] {
+        let baseByKey = try uniquelyKeyedRecords(base, collection: collection, key: key)
+        let savedByKey = try uniquelyKeyedRecords(saved, collection: collection, key: key)
+        let currentByKey = try uniquelyKeyedRecords(current, collection: collection, key: key)
+        var result = saved
+        for identifier in Set(baseByKey.keys).union(currentByKey.keys) {
+            let baseValue = baseByKey[identifier]
+            let savedValue = savedByKey[identifier]
+            let currentValue = currentByKey[identifier]
+            guard try !persistenceValuesEqual(currentValue, baseValue) else { continue }
+            if try !persistenceValuesEqual(savedValue, baseValue),
+               try !persistenceValuesEqual(savedValue, currentValue) {
+                throw ConcurrentSnapshotReconciliationFailed(
+                    detail: "conflicting concurrent mutation of \(collection) entry \(identifier)"
+                )
+            }
+            result.removeAll { key($0) == identifier }
+            if let currentValue { result.append(currentValue) }
+        }
+        return result
+    }
+
+    private static func uniquelyKeyedRecords<Record>(
+        _ records: [Record],
+        collection: String,
+        key: (Record) -> String
+    ) throws -> [String: Record] {
+        var keyed: [String: Record] = [:]
+        for record in records {
+            let identifier = key(record)
+            guard keyed.updateValue(record, forKey: identifier) == nil else {
+                throw ConcurrentSnapshotReconciliationFailed(
+                    detail: "duplicate \(collection) entry \(identifier)"
+                )
+            }
+        }
+        return keyed
+    }
+
+    private static func persistenceValuesEqual<Value: Encodable>(
+        _ lhs: Value?,
+        _ rhs: Value?
+    ) throws -> Bool {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(lhs) == encoder.encode(rhs)
+    }
+
+    private static func reconcileSet<Element: Hashable>(
+        base: Set<Element>?,
+        saved: Set<Element>?,
+        current: Set<Element>?
+    ) -> Set<Element>? {
+        let base = base ?? []
+        let current = current ?? []
+        var merged = saved ?? []
+        merged.formUnion(current.subtracting(base))
+        merged.subtract(base.subtracting(current))
+        return merged.isEmpty ? nil : merged
+    }
+
+    private static func reconcileDictionary<Key: Hashable, Value: Equatable>(
+        base: [Key: Value]?,
+        saved: [Key: Value]?,
+        current: [Key: Value]?,
+        collection: String
+    ) throws -> [Key: Value]? {
+        let base = base ?? [:]
+        let current = current ?? [:]
+        var merged = saved ?? [:]
+        for key in Set(base.keys).union(current.keys) where current[key] != base[key] {
+            if merged[key] != base[key], merged[key] != current[key] {
+                throw ConcurrentSnapshotReconciliationFailed(
+                    detail: "conflicting concurrent mutation of \(collection)"
+                )
+            }
+            merged[key] = current[key]
+        }
+        return merged.isEmpty ? nil : merged
+    }
+
+    private func acquirePersistence() async throws {
+        if !persistenceActive {
+            persistenceActive = true
+            do {
+                try Task.checkCancellation()
+            } catch {
+                releasePersistence()
+                throw error
+            }
+            return
+        }
+        await withCheckedContinuation { persistenceWaiters.append($0) }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            releasePersistence()
+            throw error
+        }
+    }
+
+    private func releasePersistence() {
+        guard !persistenceWaiters.isEmpty else {
+            persistenceActive = false
+            return
+        }
+        persistenceWaiters.removeFirst().resume()
+    }
+
+    private func persistInstallingResourceIntent(_ intent: ResourceUpdateIntentRecord) async throws {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+        var value = snapshot
+        var intents = value.resourceUpdateIntents ?? []
+        guard !intents.contains(where: { $0.containerID == intent.containerID }) else {
+            throw EngineError(.conflict, "container \(intent.containerID) already has a resource update pending")
+        }
+        guard let current = value.containers.first(where: { $0.id == intent.containerID }),
+              Self.resourceUpdateIdentityMatches(intent.old, intent.desired),
+              Self.resourceUpdateIdentityMatches(current, intent.old) else {
+            throw EngineError(.conflict, "container identity changed before its resource update was journaled")
+        }
+        intents.append(intent)
+        value.resourceUpdateIntents = intents
+        try await saveEngineSnapshot(value)
+        snapshot.resourceUpdateIntents = intents
+    }
+
+    private func persistResourceIntentPhase(
+        _ phase: ResourceUpdateIntentRecord.TransactionPhase,
+        containerID: String
+    ) async throws {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+        var value = snapshot
+        guard var intents = value.resourceUpdateIntents,
+              let index = intents.firstIndex(where: { $0.containerID == containerID }),
+              let current = value.containers.first(where: { $0.id == containerID }),
+              Self.resourceUpdateIntentIsValid(intents[index], current: current) else {
+            throw EngineError(.internalError, "resource update intent disappeared for container \(containerID)")
+        }
+        intents[index].phase = phase
+        value.resourceUpdateIntents = intents
+        try await saveEngineSnapshot(value)
+        snapshot.resourceUpdateIntents = intents
+    }
+
+    /// Atomically commits the desired resource fields and removes the journal.
+    /// The public snapshot remains old+journal until the atomic-store save has
+    /// succeeded, so an unrelated save cannot publish the candidate first.
+    private func persistResourceCommit(
+        containerID: String,
+        desired: ContainerRecord
+    ) async throws -> ContainerRecord {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+        var value = snapshot
+        guard let index = value.containers.firstIndex(where: { $0.id == containerID }),
+              let intent = value.resourceUpdateIntents?.first(where: { $0.containerID == containerID }),
+              Self.resourceUpdateIntentIsValid(intent, current: value.containers[index]),
+              Self.resourceUpdateIdentityMatches(intent.desired, desired) else {
+            throw EngineError(.conflict, "container \(containerID) disappeared during its resource update")
+        }
+        let committed = Self.mergingResourceFields(from: desired, into: value.containers[index])
+        value.containers[index] = committed
+        Self.removeResourceIntent(containerID, from: &value)
+        do {
+            try await saveEngineSnapshot(value)
+        } catch let ambiguity as AtomicStorePersistenceAmbiguousError {
+            switch classifyResourceCommit(
+                containerID: containerID, desired: desired
+            ) {
+            case .desired:
+                // The rename appears to have landed, but canonical directory
+                // durability was ambiguous. Re-save the exact selected state
+                // through an independently successful parent fsync before the
+                // API reports success.
+                do {
+                    try await saveEngineSnapshot(snapshot)
+                } catch let repeated as AtomicStorePersistenceAmbiguousError {
+                    switch classifyResourceCommit(
+                        containerID: containerID, desired: desired
+                    ) {
+                    case .desired:
+                        throw LandedResourceCommitCouldNotBeReconfirmed(
+                            underlying: repeated
+                        )
+                    case .old:
+                        throw repeated
+                    case .unknown:
+                        throw ResourceCommitStateCouldNotBeClassified(
+                            underlying: repeated
+                        )
+                    }
+                } catch let reload as AmbiguousSnapshotReload {
+                    throw ResourceCommitStateCouldNotBeClassified(
+                        underlying: reload
+                    )
+                } catch {
+                    throw LandedResourceCommitCouldNotBeReconfirmed(
+                        underlying: error
+                    )
+                }
+            case .old:
+                // The old+journal side of the transaction is still selected.
+                // Let the caller compensate the backend and durably clear it.
+                throw ambiguity
+            case .unknown:
+                throw ResourceCommitStateCouldNotBeClassified(
+                    underlying: EngineError(
+                        .internalError,
+                        "resource commit for container \(containerID) has an unclassifiable durable state after: "
+                            + ambiguity.localizedDescription
+                    )
+                )
+            }
+        } catch let reload as AmbiguousSnapshotReload {
+            throw ResourceCommitStateCouldNotBeClassified(underlying: reload)
+        }
+        guard let current = snapshot.containers.firstIndex(where: { $0.id == containerID }) else {
+            throw EngineError(.conflict, "container \(containerID) disappeared during its resource update")
+        }
+        let published = Self.mergingResourceFields(from: desired, into: snapshot.containers[current])
+        snapshot.containers[current] = published
+        Self.removeResourceIntent(containerID, from: &snapshot)
+        return published
+    }
+
+    private func classifyResourceCommit(
+        containerID: String,
+        desired: ContainerRecord
+    ) -> ResourceCommitReconciliation {
+        if let landed = snapshot.containers.first(where: { $0.id == containerID }),
+           Self.resourceUpdateIdentityMatches(landed, desired),
+           Self.resourceFieldsMatch(landed, desired),
+           snapshot.resourceUpdateIntents?.contains(where: {
+               $0.containerID == containerID
+           }) != true {
+            return .desired
+        }
+        if let landed = snapshot.containers.first(where: { $0.id == containerID }),
+           let intent = snapshot.resourceUpdateIntents?.first(where: {
+               $0.containerID == containerID
+           }), Self.resourceUpdateIntentIsValid(intent, current: landed),
+           Self.resourceFieldsMatch(landed, intent.old),
+           Self.resourceUpdateIdentityMatches(intent.desired, desired) {
+            return .old
+        }
+        return .unknown
+    }
+
+    /// Persists update fields that did not require a backend resource
+    /// transaction, preserving any runtime state published while waiting for
+    /// the serialized store write.
+    private func persistContainerUpdate(
+        containerID: String,
+        desired: ContainerRecord
+    ) async throws -> ContainerRecord {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+        var value = snapshot
+        guard let index = value.containers.firstIndex(where: { $0.id == containerID }),
+              Self.resourceUpdateIdentityMatches(value.containers[index], desired),
+              !resourceUpdateIsPending(containerID) else {
+            throw EngineError(.conflict, "container \(containerID) changed during its update")
+        }
+        let committed = Self.mergingResourceFields(from: desired, into: value.containers[index])
+        value.containers[index] = committed
+        try await saveEngineSnapshot(value)
+        guard let current = snapshot.containers.firstIndex(where: { $0.id == containerID }),
+              Self.resourceUpdateIdentityMatches(snapshot.containers[current], desired) else {
+            throw EngineError(.conflict, "container \(containerID) changed during its update")
+        }
+        let published = Self.mergingResourceFields(from: desired, into: snapshot.containers[current])
+        snapshot.containers[current] = published
+        return published
+    }
+
+    /// Atomically chooses the old resource fields and clears an incomplete
+    /// journal after the backend has been successfully restored.
+    private func persistResourceRollback(
+        containerID: String,
+        old: ContainerRecord
+    ) async throws {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+        var value = snapshot
+        guard let index = value.containers.firstIndex(where: { $0.id == containerID }),
+              let intent = value.resourceUpdateIntents?.first(where: { $0.containerID == containerID }),
+              Self.resourceUpdateIntentIsValid(intent, current: value.containers[index]),
+              Self.resourceUpdateIdentityMatches(intent.old, old) else {
+            throw EngineError(.conflict, "container \(containerID) disappeared during resource rollback")
+        }
+        value.containers[index] = Self.mergingResourceFields(from: old, into: value.containers[index])
+        Self.removeResourceIntent(containerID, from: &value)
+        try await saveEngineSnapshot(value)
+        guard let current = snapshot.containers.firstIndex(where: { $0.id == containerID }) else { return }
+        snapshot.containers[current] = Self.mergingResourceFields(from: old, into: snapshot.containers[current])
+        Self.removeResourceIntent(containerID, from: &snapshot)
+    }
+
+    private func persistResourceContainmentCompletion(_ stopped: ContainerRecord) async throws {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+        var value = snapshot
+        guard let index = value.containers.firstIndex(where: { $0.id == stopped.id }),
+              let intent = value.resourceUpdateIntents?.first(where: {
+                $0.containerID == stopped.id
+              }),
+              Self.resourceUpdateIntentIsValid(intent, current: value.containers[index]) else {
+            throw EngineError(.conflict, "container \(stopped.id) disappeared during resource containment")
+        }
+        value.containers[index] = stopped
+        if var cleanup = value.cleanupPendingContainerIDs {
+            cleanup.remove(stopped.id)
+            value.cleanupPendingContainerIDs = cleanup.isEmpty ? nil : cleanup
+        }
+        if value.removalPendingContainerIDs?.contains(stopped.id) != true,
+           var identities = value.containerFenceInstanceIDs {
+            identities.removeValue(forKey: stopped.id)
+            value.containerFenceInstanceIDs = identities.isEmpty ? nil : identities
+        }
+        Self.removeResourceIntent(stopped.id, from: &value)
+        try await saveEngineSnapshot(value)
+        guard let current = snapshot.containers.firstIndex(where: { $0.id == stopped.id }) else { return }
+        snapshot.containers[current] = stopped
+        clearCleanupPending(stopped.id)
+        Self.removeResourceIntent(stopped.id, from: &snapshot)
+    }
+
+    private static func removeResourceIntent(_ containerID: String, from snapshot: inout EngineSnapshot) {
+        guard var intents = snapshot.resourceUpdateIntents else { return }
+        intents.removeAll { $0.containerID == containerID }
+        snapshot.resourceUpdateIntents = intents.isEmpty ? nil : intents
+    }
+
+    private static func resourceUpdateIdentityMatches(
+        _ lhs: ContainerRecord,
+        _ rhs: ContainerRecord
+    ) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.instanceID == rhs.instanceID
+    }
+
+    private static func validateEngineSnapshotInvariants(
+        _ snapshot: EngineSnapshot
+    ) throws {
+        try validateUnique(snapshot.containers.map(\.id), collection: "container public IDs")
+        try validateUnique(snapshot.containers.map(\.name), collection: "container names")
+        try validateUnique(snapshot.containers.map(\.instanceID), collection: "container instance IDs")
+        try validateUnique(
+            snapshot.containers.map { "\($0.id):\($0.instanceID.uuidString)" },
+            collection: "container exact keys"
+        )
+        try validateUnique(snapshot.networks.map(\.id), collection: "network IDs")
+        try validateUnique(snapshot.networks.map(\.name), collection: "network names")
+        try validateUnique(snapshot.volumes.map(\.name), collection: "volume names")
+        try validateUnique(snapshot.images.map(\.id), collection: "image IDs")
+
+        let identifiers = (snapshot.cleanupPendingContainerIDs ?? [])
+            .union(snapshot.removalPendingContainerIDs ?? [])
+            .union(snapshot.removalVolumesPendingContainerIDs ?? [])
+        let identities = snapshot.containerFenceInstanceIDs ?? [:]
+        guard Set(identities.keys) == identifiers else {
+            throw EngineError(
+                .internalError,
+                "container fence identities do not exactly match pending cleanup/removal intents"
+            )
+        }
+        for identifier in identifiers {
+            guard let record = snapshot.containers.first(where: { $0.id == identifier }),
+                  identities[identifier] == record.instanceID else {
+                throw EngineError(
+                    .internalError,
+                    "container fence \(identifier) has missing or mismatched instance ownership"
+                )
+            }
+        }
+
+        let intents = snapshot.resourceUpdateIntents ?? []
+        try validateUnique(intents.map(\.containerID), collection: "resource update intent container IDs")
+        for intent in intents {
+            guard let record = snapshot.containers.first(where: { $0.id == intent.containerID }),
+                  resourceUpdateIntentIsValid(intent, current: record) else {
+                throw EngineError(
+                    .internalError,
+                    "resource update intent \(intent.containerID) has missing or mismatched instance ownership"
+                )
+            }
+        }
+    }
+
+    private static func validateUnique<Value: Hashable>(
+        _ values: [Value],
+        collection: String
+    ) throws {
+        var seen = Set<Value>()
+        for value in values where !seen.insert(value).inserted {
+            throw EngineError(.internalError, "duplicate \(collection) entry \(value)")
+        }
+    }
+
+    private static func resourceUpdateIntentIsValid(
+        _ intent: ResourceUpdateIntentRecord,
+        current: ContainerRecord
+    ) -> Bool {
+        intent.containerID == intent.old.id
+            && intent.containerID == intent.desired.id
+            && resourceUpdateIdentityMatches(intent.old, intent.desired)
+            && resourceUpdateIdentityMatches(current, intent.old)
+            && intent.old.phase == intent.originalPhase
+            && intent.desired.phase == intent.originalPhase
+    }
+
+    private static func mergingResourceFields(
+        from candidate: ContainerRecord,
+        into current: ContainerRecord
+    ) -> ContainerRecord {
+        var merged = current
+        merged.memoryBytes = candidate.memoryBytes
+        merged.cpus = candidate.cpus
+        merged.pidsLimit = candidate.pidsLimit
+        merged.restartPolicy = candidate.restartPolicy
+        merged.blockIOReadBps = candidate.blockIOReadBps
+        merged.blockIOWriteBps = candidate.blockIOWriteBps
+        merged.blockIOReadIOps = candidate.blockIOReadIOps
+        merged.blockIOWriteIOps = candidate.blockIOWriteIOps
+        return merged
+    }
+
+    private static func resourceFieldsMatch(
+        _ lhs: ContainerRecord,
+        _ rhs: ContainerRecord
+    ) -> Bool {
+        lhs.memoryBytes == rhs.memoryBytes
+            && lhs.cpus == rhs.cpus
+            && lhs.pidsLimit == rhs.pidsLimit
+            && lhs.restartPolicy.name == rhs.restartPolicy.name
+            && lhs.restartPolicy.maximumRetryCount == rhs.restartPolicy.maximumRetryCount
+            && lhs.blockIOReadBps == rhs.blockIOReadBps
+            && lhs.blockIOWriteBps == rhs.blockIOWriteBps
+            && lhs.blockIOReadIOps == rhs.blockIOReadIOps
+            && lhs.blockIOWriteIOps == rhs.blockIOWriteIOps
+    }
+
+    private func rollbackResourceUpdateAfterPersistenceFailure(
+        old: ContainerRecord,
+        persistenceError: Error
+    ) async throws -> Never {
+        do {
+            try await backend.updateResources(old)
+        } catch {
+            let compensationError = error
+            let containmentFailure = await containTaintedResourceUpdate(old)
+            let details = [
+                "resource update persistence failed: \(EngineError.message(for: persistenceError))",
+                "backend compensation failed: \(EngineError.message(for: compensationError))",
+                containmentFailure.map { "containment failed: \($0)" },
+            ].compactMap { $0 }.joined(separator: "; ")
+            throw EngineError(.internalError, details)
+        }
+        do {
+            try await persistResourceRollback(containerID: old.id, old: old)
+        } catch {
+            throw EngineError(
+                .internalError,
+                "resource update persistence failed: \(EngineError.message(for: persistenceError)); "
+                    + "backend was restored but the durable old-state journal could not be cleared: "
+                    + EngineError.message(for: error)
+            )
+        }
+        throw persistenceError
+    }
+
+    /// Resolve every incomplete resource transaction before normal backend
+    /// recovery. Old resources are the rollback choice until the desired record
+    /// and journal removal have committed in one durable snapshot.
+    private func resolvePendingResourceUpdates() async throws {
+        let intents = snapshot.resourceUpdateIntents ?? []
+        guard !intents.isEmpty else { return }
+        var seen = Set<String>()
+        for intent in intents {
+            guard seen.insert(intent.containerID).inserted,
+                  let index = snapshot.containers.firstIndex(where: { $0.id == intent.containerID }),
+                  Self.resourceUpdateIntentIsValid(
+                    intent, current: snapshot.containers[index]
+                  ) else {
+                throw EngineError(.internalError, "invalid durable resource update intent")
+            }
+            let current = snapshot.containers[index]
+            let chosen = Self.mergingResourceFields(from: intent.old, into: current)
+            if current.phase == .dead || cleanupIsPending(current.id) {
+                if let failure = await containTaintedResourceUpdate(chosen) {
+                    throw EngineError(
+                        .internalError,
+                        "could not contain unresolved resource update for container \(current.id): \(failure)"
+                    )
+                }
+                continue
+            }
+            do {
+                try await backend.updateResources(chosen)
+            } catch {
+                let applyError = error
+                if let failure = await containTaintedResourceUpdate(chosen) {
+                    throw EngineError(
+                        .internalError,
+                        "could not reapply durable resources for container \(current.id): "
+                            + "\(EngineError.message(for: applyError)); containment failed: \(failure)"
+                    )
+                }
+                continue
+            }
+            do {
+                try await persistResourceRollback(containerID: current.id, old: chosen)
+            } catch {
+                throw EngineError(
+                    .internalError,
+                    "durable resources were reapplied for container \(current.id), but its recovery journal "
+                        + "could not be cleared: \(EngineError.message(for: error))"
+                )
+            }
+        }
+    }
+
+    private static func taintedResourceUpdateError(
+        cause: Error,
+        containmentFailure: String?
+    ) -> EngineError {
+        let outcome = containmentFailure.map { "workload remains quarantined: \($0)" }
+            ?? "workload was stopped and removed from the backend execution"
+        return EngineError(
+            .internalError,
+            "resource update rollback was incomplete: \(EngineError.message(for: cause)); \(outcome)"
+        )
+    }
+
+    /// Canonical state could not be classified after publication. Contain the
+    /// backend execution and retain only an in-memory fence; writing any
+    /// snapshot here could overwrite an unknown canonical selection.
+    private func containUnclassifiedResourceUpdate(
+        _ record: ContainerRecord
+    ) async -> String? {
+        healthTasks.removeValue(forKey: record.id)?.cancel()
+        cancelCompletionMonitor(record.id)
+        if let index = try? containerIndex(record.id),
+           Self.resourceUpdateIdentityMatches(snapshot.containers[index], record) {
+            snapshot.containers[index].phase = .dead
+            markCleanupPending(record.id)
+        }
+        do {
+            _ = try await cleanupBackendExecution(record)
+            if let index = try? containerIndex(record.id),
+               Self.resourceUpdateIdentityMatches(snapshot.containers[index], record) {
+                snapshot.containers[index].phase = .exited
+                snapshot.containers[index].finishedAt = Date()
+                snapshot.containers[index].exitCode =
+                    snapshot.containers[index].exitCode ?? 137
+            }
+            return nil
+        } catch {
+            return EngineError.message(for: error)
+        }
+    }
+
+    /// Fail closed when live cgroup state can no longer be proven to match the
+    /// old durable record. The public record is quarantined before teardown;
+    /// only verified backend deletion permits an exited publication.
+    private func containTaintedResourceUpdate(_ record: ContainerRecord) async -> String? {
+        healthTasks.removeValue(forKey: record.id)?.cancel()
+        cancelCompletionMonitor(record.id)
+        guard let index = try? containerIndex(record.id) else {
+            do {
+                try await cleanupBackendExecution(record)
+                return nil
+            } catch {
+                return EngineError.message(for: error)
+            }
+        }
+
+        snapshot.containers[index].phase = .dead
+        markCleanupPending(record.id)
+        // The pre-mutation resource journal is already a durable fence. Still
+        // try to publish the stronger dead+cleanup fence and retain its failure
+        // for diagnostics if physical teardown cannot be verified either.
+        let fenceFailure: Error?
+        do {
+            try await persist()
+            fenceFailure = nil
+        } catch {
+            fenceFailure = error
+        }
+
+        let stopCode: Int32?
+        do {
+            stopCode = try await cleanupBackendExecution(record)
+        } catch {
+            let cleanupFailure = error
+            quarantineCleanupPendingContainer(record.id)
+            markCleanupPending(record.id)
+            let retryFailure: Error?
+            do {
+                try await persist()
+                retryFailure = nil
+            } catch {
+                retryFailure = error
+            }
+            return [
+                fenceFailure.map { "durable quarantine fence failed: \(EngineError.message(for: $0))" },
+                "backend cleanup failed: \(EngineError.message(for: cleanupFailure))",
+                retryFailure.map { "durable quarantine retry failed: \(EngineError.message(for: $0))" },
+            ].compactMap { $0 }.joined(separator: "; ")
+        }
+
+        await reconcileExecs(for: record.id)
+        guard let current = try? containerIndex(record.id) else {
+            clearCleanupPending(record.id)
+            do {
+                try await persist()
+                return nil
+            } catch {
+                return EngineError.message(for: error)
+            }
+        }
+        var stopped = snapshot.containers[current]
+        stopped.phase = .exited
+        stopped.finishedAt = Date()
+        stopped.exitCode = stopCode ?? 137
+        do {
+            try await persistResourceContainmentCompletion(stopped)
+        } catch {
+            guard let quarantined = try? containerIndex(record.id) else {
+                return "backend teardown succeeded but the safe terminal state could not be persisted: \(EngineError.message(for: error))"
+            }
+            snapshot.containers[quarantined].phase = .dead
+            markCleanupPending(record.id)
+            return "backend teardown succeeded but the safe terminal state could not be persisted: \(EngineError.message(for: error))"
+        }
+        resumeExitWaiters(record.id, code: stopped.exitCode ?? 137)
+        emit(containerEvent("die", stopped, extra: ["exitCode": String(stopped.exitCode ?? 137)]))
+        return nil
     }
 
     private func markCleanupPending(_ identifier: String) {
         var pending = snapshot.cleanupPendingContainerIDs ?? []
         pending.insert(identifier)
         snapshot.cleanupPendingContainerIDs = pending
+        markContainerFenceIdentity(identifier)
     }
 
     private func clearCleanupPending(_ identifier: String) {
         guard var pending = snapshot.cleanupPendingContainerIDs else { return }
         pending.remove(identifier)
         snapshot.cleanupPendingContainerIDs = pending.isEmpty ? nil : pending
+        clearContainerFenceIdentityIfUnused(identifier)
     }
 
     private func markRemovalPending(_ identifier: String, removeVolumes: Bool) {
         var pending = snapshot.removalPendingContainerIDs ?? []
         pending.insert(identifier)
         snapshot.removalPendingContainerIDs = pending
+        markContainerFenceIdentity(identifier)
         guard removeVolumes else { return }
         var volumePending = snapshot.removalVolumesPendingContainerIDs ?? []
         volumePending.insert(identifier)
@@ -1988,6 +3061,179 @@ public actor EngineRuntime {
             volumePending.remove(identifier)
             snapshot.removalVolumesPendingContainerIDs = volumePending.isEmpty ? nil : volumePending
         }
+        clearContainerFenceIdentityIfUnused(identifier)
+    }
+
+    private func markContainerFenceIdentity(_ identifier: String) {
+        guard let record = snapshot.containers.first(where: { $0.id == identifier }) else {
+            return
+        }
+        var identities = snapshot.containerFenceInstanceIDs ?? [:]
+        if let existing = identities[identifier], existing != record.instanceID {
+            return
+        }
+        identities[identifier] = record.instanceID
+        snapshot.containerFenceInstanceIDs = identities
+    }
+
+    private func clearContainerFenceIdentityIfUnused(_ identifier: String) {
+        guard snapshot.cleanupPendingContainerIDs?.contains(identifier) != true,
+              snapshot.removalPendingContainerIDs?.contains(identifier) != true,
+              snapshot.removalVolumesPendingContainerIDs?.contains(identifier) != true,
+              var identities = snapshot.containerFenceInstanceIDs else { return }
+        identities.removeValue(forKey: identifier)
+        snapshot.containerFenceInstanceIDs = identities.isEmpty ? nil : identities
+    }
+
+    /// Publish definitive removal as one durable transition. The container
+    /// record, every cleanup/removal fence, and any resource-update journal are
+    /// removed together. Until the save succeeds the live snapshot continues
+    /// to reserve the original ID/name and retains the recovery journal.
+    private func persistContainerRemovalCommit(
+        expected: ContainerRecord
+    ) async throws -> ContainerRecord {
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try await beforePersistence?()
+
+        var value = snapshot
+        guard let valueIndex = value.containers.firstIndex(where: {
+            Self.resourceUpdateIdentityMatches($0, expected)
+        }) else {
+            throw EngineError(.conflict, "container \(expected.id) changed during removal")
+        }
+        if let intent = value.resourceUpdateIntents?.first(where: {
+            $0.containerID == expected.id
+        }), !Self.resourceUpdateIntentIsValid(intent, current: value.containers[valueIndex]) {
+            throw EngineError(.internalError, "resource update intent does not belong to removed container \(expected.id)")
+        }
+        value.containers.remove(at: valueIndex)
+        Self.clearContainerFences(expected.id, from: &value)
+        Self.removeResourceIntent(expected.id, from: &value)
+        do {
+            try await saveEngineSnapshot(value)
+        } catch let ambiguity as AtomicStorePersistenceAmbiguousError {
+            switch classifyRemovalCommit(expected: expected) {
+            case .absent:
+                do {
+                    try await saveEngineSnapshot(snapshot)
+                } catch let repeated as AtomicStorePersistenceAmbiguousError {
+                    switch classifyRemovalCommit(expected: expected) {
+                    case .absent:
+                        purgeExecRecords(ownedBy: expected)
+                        throw LandedRemovalCommitCouldNotBeReconfirmed(
+                            underlying: repeated
+                        )
+                    case .fencedOld:
+                        throw repeated
+                    case .unknown:
+                        throw RemovalCommitStateCouldNotBeClassified(
+                            underlying: repeated
+                        )
+                    }
+                } catch let reload as AmbiguousSnapshotReload {
+                    throw RemovalCommitStateCouldNotBeClassified(
+                        underlying: reload
+                    )
+                } catch {
+                    purgeExecRecords(ownedBy: expected)
+                    throw LandedRemovalCommitCouldNotBeReconfirmed(
+                        underlying: error
+                    )
+                }
+            case .fencedOld:
+                throw ambiguity
+            case .unknown:
+                throw RemovalCommitStateCouldNotBeClassified(
+                    underlying: EngineError(
+                        .internalError,
+                        "container removal commit for \(expected.id) has an unclassifiable durable state after: "
+                            + ambiguity.localizedDescription
+                    )
+                )
+            }
+        } catch let reload as AmbiguousSnapshotReload {
+            throw RemovalCommitStateCouldNotBeClassified(underlying: reload)
+        }
+
+        guard let current = snapshot.containers.firstIndex(where: {
+            Self.resourceUpdateIdentityMatches($0, expected)
+        }) else {
+            purgeExecRecords(ownedBy: expected)
+            return expected
+        }
+        let removed = snapshot.containers.remove(at: current)
+        Self.clearContainerFences(expected.id, from: &snapshot)
+        Self.removeResourceIntent(expected.id, from: &snapshot)
+        purgeExecRecords(ownedBy: removed)
+        return removed
+    }
+
+    private func purgeExecRecords(ownedBy container: ContainerRecord) {
+        let identifiers = Self.execIdentifiersOwned(by: container, in: execs)
+        for identifier in identifiers {
+            execs.removeValue(forKey: identifier)
+            startingExecIDs.remove(identifier)
+        }
+    }
+
+    static func execIdentifiersOwned(
+        by container: ContainerRecord,
+        in records: [String: ExecRecord]
+    ) -> [String] {
+        records.compactMap { identifier, exec in
+            exec.containerID == container.id
+                && exec.containerInstanceID == container.instanceID ? identifier : nil
+        }
+    }
+
+    private func classifyRemovalCommit(
+        expected: ContainerRecord
+    ) -> RemovalCommitReconciliation {
+        let sameInstance = snapshot.containers.contains(where: {
+            Self.resourceUpdateIdentityMatches($0, expected)
+        })
+        let conflictingIdentity = snapshot.containers.contains(where: {
+            $0.id == expected.id || $0.name == expected.name
+        }) && !sameInstance
+        let hasFence = snapshot.cleanupPendingContainerIDs?.contains(expected.id) == true
+            || snapshot.removalPendingContainerIDs?.contains(expected.id) == true
+            || snapshot.removalVolumesPendingContainerIDs?.contains(expected.id) == true
+            || snapshot.resourceUpdateIntents?.contains(where: {
+                $0.containerID == expected.id
+            }) == true
+        let fenceMatches = snapshot.containerFenceInstanceIDs?[expected.id]
+            == expected.instanceID
+        if !sameInstance, !conflictingIdentity, !hasFence { return .absent }
+        if sameInstance,
+           fenceMatches,
+           snapshot.removalPendingContainerIDs?.contains(expected.id) == true,
+           snapshot.cleanupPendingContainerIDs?.contains(expected.id) == true {
+            return .fencedOld
+        }
+        return .unknown
+    }
+
+    private static func clearContainerFences(
+        _ identifier: String,
+        from snapshot: inout EngineSnapshot
+    ) {
+        if var cleanup = snapshot.cleanupPendingContainerIDs {
+            cleanup.remove(identifier)
+            snapshot.cleanupPendingContainerIDs = cleanup.isEmpty ? nil : cleanup
+        }
+        if var removal = snapshot.removalPendingContainerIDs {
+            removal.remove(identifier)
+            snapshot.removalPendingContainerIDs = removal.isEmpty ? nil : removal
+        }
+        if var volumes = snapshot.removalVolumesPendingContainerIDs {
+            volumes.remove(identifier)
+            snapshot.removalVolumesPendingContainerIDs = volumes.isEmpty ? nil : volumes
+        }
+        if var identities = snapshot.containerFenceInstanceIDs {
+            identities.removeValue(forKey: identifier)
+            snapshot.containerFenceInstanceIDs = identities.isEmpty ? nil : identities
+        }
     }
 
     private func reserveRemovalPublication(
@@ -1997,11 +3243,13 @@ public actor EngineRuntime {
         let volumeNames = Set(removedVolumes.map(\.name))
         pendingContainerNames[record.name] = record.id
         pendingContainerIDs.insert(record.id)
+        pendingContainerInstances[record.id] = record.instanceID
         for name in volumeNames {
             pendingVolumeNames[name, default: 0] += 1
         }
         return RemovalPublicationReservation(
             containerID: record.id,
+            containerInstanceID: record.instanceID,
             containerName: record.name,
             volumeNames: volumeNames
         )
@@ -2011,7 +3259,11 @@ public actor EngineRuntime {
         if pendingContainerNames[reservation.containerName] == reservation.containerID {
             pendingContainerNames.removeValue(forKey: reservation.containerName)
         }
-        pendingContainerIDs.remove(reservation.containerID)
+        if pendingContainerInstances[reservation.containerID]
+            == reservation.containerInstanceID {
+            pendingContainerInstances.removeValue(forKey: reservation.containerID)
+            pendingContainerIDs.remove(reservation.containerID)
+        }
         for name in reservation.volumeNames {
             guard let count = pendingVolumeNames[name] else { continue }
             if count == 1 { pendingVolumeNames.removeValue(forKey: name) }
@@ -2023,12 +3275,26 @@ public actor EngineRuntime {
         snapshot.cleanupPendingContainerIDs?.contains(identifier) == true
     }
 
+    private func resourceUpdateIsPending(_ identifier: String) -> Bool {
+        snapshot.resourceUpdateIntents?.contains(where: { $0.containerID == identifier }) == true
+    }
+
+    private func resourceUpdateReservation(for candidate: ContainerRecord) -> String? {
+        snapshot.resourceUpdateIntents?.first(where: {
+            $0.containerID == candidate.id
+                || $0.old.id == candidate.id
+                || $0.desired.id == candidate.id
+                || $0.old.name == candidate.name
+                || $0.desired.name == candidate.name
+        })?.containerID
+    }
+
     /// Reject every backend operation that could attach to or mutate an
     /// execution while its identity is unverifiable. The durable marker is the
     /// primary fence during actor reentrancy; `.dead` keeps the public record in
     /// quarantine after cleanup returns an error.
     func requireBackendExecutionAvailable(_ record: ContainerRecord) throws {
-        guard !cleanupIsPending(record.id), record.phase != .dead else {
+        guard !cleanupIsPending(record.id), !resourceUpdateIsPending(record.id), record.phase != .dead else {
             throw EngineError(.conflict, "container \(record.id) has backend cleanup pending")
         }
     }
@@ -2266,15 +3532,18 @@ public actor EngineRuntime {
             guard let current = try? containerIndex(identifier) else {
                 throw EngineError(.internalError, "container \(identifier) disappeared during removal recovery")
             }
-            let durableRemovalRecord = snapshot.containers.remove(at: current)
-            clearCleanupPending(identifier)
-            clearRemovalPending(identifier)
             do {
-                try await persist()
+                _ = try await persistContainerRemovalCommit(
+                    expected: snapshot.containers[current]
+                )
+            } catch let uncertain as LandedRemovalCommitCouldNotBeReconfirmed {
+                throw uncertain.underlying
+            } catch let unclassified as RemovalCommitStateCouldNotBeClassified {
+                throw unclassified.underlying
             } catch {
-                restoreRemovalQuarantine(
-                    durableRemovalRecord, at: current, removeVolumes: removeVolumes,
-                    removedVolumes: removedVolumeMetadata
+                restoreRemovedVolumeMetadata(removedVolumeMetadata)
+                quarantineRemovalPendingContainer(
+                    identifier, record: removed, removeVolumes: removeVolumes
                 )
                 try? await persist()
                 throw error
@@ -2298,7 +3567,7 @@ public actor EngineRuntime {
         removedVolumes: [(offset: Int, element: VolumeRecord)]
     ) {
         if let existing = snapshot.containers.firstIndex(where: {
-            $0.id == record.id && $0.name == record.name && $0.createdAt == record.createdAt
+            Self.resourceUpdateIdentityMatches($0, record)
         }) {
             // Preserve mutations to the original object made by unrelated
             // actor work; removal owns only its quarantine and durable fences.
@@ -2318,6 +3587,17 @@ public actor EngineRuntime {
         markRemovalPending(record.id, removeVolumes: removeVolumes)
     }
 
+    private func restoreRemovedVolumeMetadata(
+        _ removedVolumes: [(offset: Int, element: VolumeRecord)]
+    ) {
+        for volume in removedVolumes.sorted(by: { $0.offset < $1.offset })
+            where !snapshot.volumes.contains(where: { $0.name == volume.element.name }) {
+            snapshot.volumes.insert(
+                volume.element, at: min(volume.offset, snapshot.volumes.endIndex)
+            )
+        }
+    }
+
     /// Finish startup reconciliation for terminal auto-remove records. A fresh
     /// record is fenced before teardown; one already cleaned through a pending
     /// marker reuses that proof so recovery never issues a duplicate delete.
@@ -2331,6 +3611,8 @@ public actor EngineRuntime {
         for identifier in recoveredAutoRemoveIDs {
             guard let index = try? containerIndex(identifier) else { continue }
             let removed = snapshot.containers[index]
+            guard !resourceUpdateIsPending(identifier) else { continue }
+            let removedVolumeMetadata = anonymousVolumeMetadata(usedBy: removed)
             if !verifiedCleanupIDs.contains(identifier) {
                 markCleanupPending(identifier)
                 try await persist()
@@ -2346,9 +3628,21 @@ public actor EngineRuntime {
             try await backend.deleteLogs(for: removed)
             try await removeAnonymousVolumes(usedBy: removed)
             guard let current = try? containerIndex(identifier) else { continue }
-            snapshot.containers.remove(at: current)
-            clearCleanupPending(identifier)
-            try await persist()
+            do {
+                _ = try await persistContainerRemovalCommit(
+                    expected: snapshot.containers[current]
+                )
+            } catch let uncertain as LandedRemovalCommitCouldNotBeReconfirmed {
+                throw uncertain.underlying
+            } catch let unclassified as RemovalCommitStateCouldNotBeClassified {
+                throw unclassified.underlying
+            } catch {
+                restoreRemovedVolumeMetadata(removedVolumeMetadata)
+                quarantineCleanupPendingContainer(identifier)
+                markCleanupPending(identifier)
+                try? await persist()
+                throw error
+            }
         }
         return verifiedCleanupIDs
     }
@@ -2438,6 +3732,14 @@ public actor EngineRuntime {
             guard let index = try? containerIndex(identifier),
                   snapshot.containers[index].phase == .running,
                   snapshot.containers[index].startedAt == startedAt else { return }
+            if resourceUpdateIsPending(identifier) || cleanupIsPending(identifier) {
+                do {
+                    try await Task.sleep(for: .milliseconds(25))
+                } catch {
+                    return
+                }
+                continue
+            }
             let record = snapshot.containers[index]
             let arguments: [String]
             switch health.test.first {
@@ -2505,18 +3807,24 @@ public actor EngineRuntime {
     }
 
     private func monitorContainer(_ identifier: String, startedAt: Date, token: UUID) async {
-        guard !Task.isCancelled else {
-            removeCompletionMonitor(identifier, token: token)
+        defer { removeCompletionMonitor(identifier, token: token) }
+        while !Task.isCancelled {
+            guard let record = try? container(identifier),
+                  record.startedAt == startedAt,
+                  record.phase == .running || record.phase == .paused else { return }
+            guard let code = await backend.completion(record) else {
+                // A backend that has observed process exit may still be
+                // retrying its durable final log drain. Retain this exact
+                // execution monitor and retry without inventing an exit code.
+                try? await Task.sleep(for: .milliseconds(25))
+                continue
+            }
+            guard !Task.isCancelled else { return }
+            await recordCompletion(
+                identifier, startedAt: startedAt, code: code, monitorToken: token
+            )
             return
         }
-        guard let record = try? container(identifier),
-              let code = await backend.completion(record),
-              !Task.isCancelled else {
-            removeCompletionMonitor(identifier, token: token)
-            return
-        }
-        await recordCompletion(identifier, startedAt: startedAt, code: code, monitorToken: token)
-        removeCompletionMonitor(identifier, token: token)
     }
 
     private func cancelCompletionMonitor(_ identifier: String, preserving token: UUID? = nil) {
@@ -2554,6 +3862,7 @@ public actor EngineRuntime {
     private func reconcileDeferredCompletion(_ identifier: String) async {
         guard lifecycleIntents[identifier] == nil,
               !cleanupIsPending(identifier),
+              !resourceUpdateIsPending(identifier),
               let index = try? containerIndex(identifier),
               snapshot.containers[index].phase == .exited,
               let code = snapshot.containers[index].exitCode else { return }
@@ -2565,7 +3874,14 @@ public actor EngineRuntime {
         code: Int32,
         suppressing intent: LifecycleIntent?
     ) async {
-        guard let index = try? containerIndex(identifier), snapshot.containers[index].phase == .exited else { return }
+        guard let index = try? containerIndex(identifier),
+              snapshot.containers[index].phase == .exited else { return }
+        guard !resourceUpdateIsPending(identifier) else {
+            // The resource journal fences backend reconciliation, but the
+            // independently observed process exit is still durable state.
+            try? await persist()
+            return
+        }
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
         if intent == nil, !autoRemove, !cleanupIsPending(identifier), Self.shouldRestart(record, exitCode: code) {
@@ -2666,6 +3982,7 @@ public actor EngineRuntime {
                 if ownsIntent { endLifecycleIntent(removeIntent, for: identifier) }
             }
             guard ownsReconciliation(removeIntent, record: record) else { return }
+            guard !resourceUpdateIsPending(identifier) else { return }
             if !cleanupIsPending(identifier) {
                 // Publish the cleanup fence before crossing the backend
                 // teardown boundary. If the save fails, leave the terminal
@@ -2699,20 +4016,27 @@ public actor EngineRuntime {
             guard ownsReconciliation(removeIntent, record: record) else { return }
             try? await backend.deleteLogs(for: record)
             guard ownsReconciliation(removeIntent, record: record) else { return }
+            let removedVolumeMetadata = anonymousVolumeMetadata(usedBy: record)
             try? await removeAnonymousVolumes(usedBy: record)
             guard ownsReconciliation(removeIntent, record: record),
                   let current = try? containerIndex(identifier) else { return }
-            snapshot.containers.remove(at: current)
-            clearCleanupPending(identifier)
             do {
-                try await persist()
+                _ = try await persistContainerRemovalCommit(
+                    expected: snapshot.containers[current]
+                )
+            } catch is LandedRemovalCommitCouldNotBeReconfirmed {
+                // The container remains absent and the backend has already
+                // been deleted. A later reload will select the canonical side;
+                // never recreate the removed object in this daemon.
+                return
+            } catch is RemovalCommitStateCouldNotBeClassified {
+                return
             } catch {
                 // Backend deletion succeeded, but keep the cleanup fence in
                 // memory when its metadata removal could not be committed.
                 // The durable pending record will finish removal on reload.
-                var quarantined = record
-                quarantined.phase = .dead
-                snapshot.containers.insert(quarantined, at: min(current, snapshot.containers.endIndex))
+                restoreRemovedVolumeMetadata(removedVolumeMetadata)
+                quarantineCleanupPendingContainer(identifier)
                 markCleanupPending(identifier)
                 return
             }
@@ -2727,7 +4051,8 @@ public actor EngineRuntime {
         guard lifecycleIntents[record.id] == intent,
               let index = try? containerIndex(record.id) else { return false }
         let current = snapshot.containers[index]
-        return current.phase == .exited
+        return current.instanceID == record.instanceID
+            && current.phase == .exited
             && current.startedAt == record.startedAt
             && current.exitCode == record.exitCode
     }
@@ -2736,7 +4061,9 @@ public actor EngineRuntime {
         guard lifecycleIntents[record.id] == intent,
               let index = try? containerIndex(record.id) else { return false }
         let current = snapshot.containers[index]
-        return current.phase == record.phase && current.startedAt == record.startedAt
+        return current.instanceID == record.instanceID
+            && current.phase == record.phase
+            && current.startedAt == record.startedAt
     }
 
     private func ownsRestartExecution(_ intent: LifecycleIntent, record: ContainerRecord) -> Bool {
@@ -2746,7 +4073,8 @@ public actor EngineRuntime {
         // The old execution may report its expected terminal transition while
         // backend.restart is replacing it. No other phase or generation change
         // is safe for this restart operation to overwrite.
-        return (current.phase == record.phase || current.phase == .exited)
+        return current.instanceID == record.instanceID
+            && (current.phase == record.phase || current.phase == .exited)
             && current.startedAt == record.startedAt
     }
 
@@ -2847,13 +4175,23 @@ public actor EngineRuntime {
     }
 
     private func monitorExec(_ identifier: String) async {
-        guard let exec = try? exec(identifier), let code = await backend.execCompletion(exec) else { return }
-        let refreshedPID = await backend.execPID(exec)
-        guard var current = execs[identifier] else { return }
-        current.running = false
-        current.exitCode = code
-        if refreshedPID > 0 { current.pid = refreshedPID }
-        execs[identifier] = current
+        while !Task.isCancelled {
+            guard let exec = try? exec(identifier), exec.running, exec.exitCode == nil else {
+                return
+            }
+            guard let code = await backend.execCompletion(exec) else {
+                try? await Task.sleep(for: .milliseconds(25))
+                continue
+            }
+            let refreshedPID = await backend.execPID(exec)
+            guard var current = execs[identifier], current.exitCode == nil else { return }
+            current.running = false
+            current.exitCode = code
+            if refreshedPID > 0 { current.pid = refreshedPID }
+            execs[identifier] = current
+            await backend.retireExec(current)
+            return
+        }
     }
 
     private func reconcileExecs(for containerID: String) async {
@@ -2867,6 +4205,7 @@ public actor EngineRuntime {
             current.running = false
             current.exitCode = code ?? 137
             execs[identifier] = current
+            await backend.retireExec(current)
         }
     }
 }

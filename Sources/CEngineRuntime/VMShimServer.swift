@@ -3,6 +3,170 @@ import CEngineCore
 import Darwin
 import Foundation
 
+enum VMShimAttachmentBoundary: Equatable, Sendable {
+    case rootDiskOpened
+    case volumeDiskOpened(String)
+    case bindShareOpened(String)
+}
+
+typealias VMShimAttachmentHook = (VMShimAttachmentBoundary) throws -> Void
+
+struct VMShimAttachmentResources: Sendable {
+    let rootDisk: URL
+    let additionalDisks: [RawVirtualMachineConfiguration.BlockDisk]
+    let bindShares: [RawVirtualMachineConfiguration.BindShare]
+    let retainedHandles: [FileHandle]
+}
+
+/// Resolves mutable attachment paths once, through no-follow descriptors, and
+/// converts them to `/dev/fd` URLs while retaining every descriptor for the VM
+/// lifetime. Later path replacement therefore cannot change what VZ opens.
+enum VMShimAttachmentResolver {
+    static func resolve(
+        _ specification: VMShimProtocol.Specification,
+        hook: VMShimAttachmentHook? = nil
+    ) throws -> VMShimAttachmentResources {
+        let root = try openRegularFile(
+            path: specification.rootDiskPath,
+            expected: specification.rootDiskIdentity,
+            expectedSize: specification.rootDiskSize,
+            identityRequired: true
+        )
+        try hook?(.rootDiskOpened)
+        try root.validate()
+
+        var handles = [root.handle]
+        var disks: [RawVirtualMachineConfiguration.BlockDisk] = []
+        for (index, disk) in specification.volumeDisks.enumerated() {
+            if specification.kind == .container,
+               disk.identity == nil || disk.size == nil {
+                throw EngineError(.conflict, "container VM volume disk has no durable identity")
+            }
+            let opened = try openRegularFile(
+                path: disk.path,
+                expected: disk.identity,
+                expectedSize: disk.size,
+                identityRequired: specification.kind == .container
+            )
+            try hook?(.volumeDiskOpened(disk.name))
+            try opened.validate()
+            handles.append(opened.handle)
+            disks.append(.init(
+                identifier: "volume\(index)", source: descriptorURL(opened.handle)
+            ))
+        }
+        var shares: [RawVirtualMachineConfiguration.BindShare] = []
+        for share in specification.bindShares {
+            if specification.kind == .container, share.sourceIdentity == nil {
+                throw EngineError(.conflict, "container VM share has no durable identity")
+            }
+            let directory = try PersistentStateDirectory.open(URL(filePath: share.source))
+            if let expected = share.sourceIdentity {
+                guard directory.identity.device == expected.device,
+                      directory.identity.inode == expected.inode else {
+                    throw EngineError(.conflict, "container VM share identity changed")
+                }
+            }
+            let duplicate = Darwin.fcntl(directory.descriptor, F_DUPFD_CLOEXEC, 0)
+            guard duplicate >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            let handle = FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
+            try hook?(.bindShareOpened(share.tag))
+            guard directory.pathStillNamesThisDirectory() else {
+                throw EngineError(.conflict, "container VM share path changed")
+            }
+            let stableURL = volumeURL(directory.identity)
+            let stableDescriptor = Darwin.open(
+                stableURL.path,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+            )
+            guard stableDescriptor >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            var stableInformation = stat()
+            let stableMatches = Darwin.fstat(stableDescriptor, &stableInformation) == 0
+                && stableInformation.st_mode & S_IFMT == S_IFDIR
+                && PersistentFileIdentity(stableInformation) == directory.identity
+            Darwin.close(stableDescriptor)
+            guard stableMatches else {
+                throw EngineError(.conflict, "container VM stable share identity changed")
+            }
+            handles.append(handle)
+            shares.append(.init(
+                tag: share.tag,
+                source: stableURL,
+                readOnly: share.readOnly
+            ))
+        }
+        return .init(
+            rootDisk: descriptorURL(root.handle),
+            additionalDisks: disks,
+            bindShares: shares,
+            retainedHandles: handles
+        )
+    }
+
+    private struct OpenedRegularFile {
+        let parent: PersistentStateDirectory
+        let name: String
+        let handle: FileHandle
+        let identity: PersistentFileIdentity
+        let expectedSize: UInt64?
+
+        func validate() throws {
+            var information = stat()
+            guard parent.pathStillNamesThisDirectory(),
+                  let current = try parent.entryMetadata(named: name),
+                  current.identity == identity,
+                  current.type == S_IFREG,
+                  Darwin.fstat(handle.fileDescriptor, &information) == 0,
+                  information.st_mode & S_IFMT == S_IFREG,
+                  PersistentFileIdentity(information) == identity,
+                  information.st_size >= 0,
+                  expectedSize == nil || UInt64(information.st_size) == expectedSize else {
+                throw EngineError(.conflict, "container VM root disk path changed")
+            }
+        }
+    }
+
+    private static func openRegularFile(
+        path: String,
+        expected: VMShimProtocol.FileIdentity?,
+        expectedSize: UInt64?,
+        identityRequired: Bool
+    ) throws -> OpenedRegularFile {
+        guard !identityRequired || expected != nil && expectedSize != nil else {
+            throw EngineError(.conflict, "VM disk has no durable identity or size")
+        }
+        let url = URL(filePath: path).standardizedFileURL
+        let parent = try PersistentStateDirectory.open(url.deletingLastPathComponent())
+        let expectedIdentity = expected.map {
+            PersistentFileIdentity(device: $0.device, inode: $0.inode)
+        }
+        let opened = try parent.openRegularFile(
+            named: url.lastPathComponent,
+            expectedIdentity: expectedIdentity,
+            access: .readWrite
+        )
+        return .init(
+            parent: parent,
+            name: url.lastPathComponent,
+            handle: opened.handle,
+            identity: opened.identity,
+            expectedSize: expectedSize
+        )
+    }
+
+    private static func descriptorURL(_ handle: FileHandle) -> URL {
+        URL(filePath: "/dev/fd/\(handle.fileDescriptor)")
+    }
+
+    private static func volumeURL(_ identity: PersistentFileIdentity) -> URL {
+        URL(filePath: "/.vol/\(identity.device)/\(identity.inode)")
+    }
+}
+
 @MainActor public final class VMShimServer {
     private struct NetworkBridgeRegistration {
         let generation: UUID
@@ -15,11 +179,14 @@ import Foundation
     }
 
     private let specification: VMShimProtocol.Specification
+    private let launchIntentURL: URL?
+    private var runtimeArtifactPublication: VMShimClient.PersistentRuntimeArtifactPublication?
     private var machine: RawContainerVirtualMachine?
     private var state: VMShimProtocol.State = .created
     private var exitCode: Int32?
     private var failure: String?
     private var listener: Int32 = -1
+    private var statusDescriptor: Int32 = -1
     private var serviceListener: Int32 = -1
     private var serviceRelays: [UUID: BidirectionalDescriptorRelay] = [:]
     private var hostSocketRelays: [UnixVirtioSocketRelay] = []
@@ -32,25 +199,88 @@ import Foundation
     private var uplinkRecoveries: [String: UplinkRecovery] = [:]
     private var fabricNetworks: [String: VMShimClient.FabricNetwork] = [:]
 
-    public init(specification: VMShimProtocol.Specification) {
+    public init(
+        specification: VMShimProtocol.Specification,
+        launchIntentURL: URL? = nil
+    ) {
         self.specification = specification
+        self.launchIntentURL = launchIntentURL
         activeVLANs = specification.vlans
     }
 
-    public static func run(specificationURL: URL) async throws -> Never {
-        let specification = try JSONDecoder().decode(VMShimProtocol.Specification.self, from: Data(contentsOf: specificationURL))
-        let server = VMShimServer(specification: specification)
-        try server.startListener()
-        if specification.kind == .storage {
-            try server.startStorageProxy()
-            try server.startNetworkFabric()
+    public static func run(
+        specificationURL: URL,
+        launchIntentURL: URL? = nil
+    ) async throws -> Never {
+        let specification = try launchSpecification(
+            specificationURL: specificationURL,
+            launchIntentURL: launchIntentURL
+        )
+        let server = VMShimServer(
+            specification: specification, launchIntentURL: launchIntentURL
+        )
+        if let launchIntentURL {
+            server.runtimeArtifactPublication = try VMShimClient.preparePersistentRuntimeArtifacts(
+                intentURL: launchIntentURL,
+                socketPaths: ownedSocketPaths(specification),
+                statusPath: specification.socketPath + ".status"
+            )
         }
+        do {
+            try server.startListener()
+            if specification.kind == .storage {
+                try server.startStorageProxy()
+                try server.startNetworkFabric()
+            }
+            try server.persist()
+            if let publication = server.runtimeArtifactPublication {
+                _ = try VMShimClient.publishPersistentRuntimeArtifacts(publication)
+            }
+        } catch {
+            if let launchIntentURL {
+                try? VMShimClient.cleanupPersistentRuntimeArtifacts(
+                    intentURL: launchIntentURL
+                )
+            }
+            throw error
+        }
+        server.activateListener()
         await withUnsafeContinuation { (_: UnsafeContinuation<Void, Never>) in }
         fatalError("VM shim listener returned")
     }
 
+    static func launchSpecification(
+        specificationURL: URL,
+        launchIntentURL: URL?,
+        publish: (URL) throws -> VMShimClient.PersistentLaunchRecord = {
+            try VMShimClient.publishPersistentLaunchIdentity(intentURL: $0)
+        }
+    ) throws -> VMShimProtocol.Specification {
+        guard let launchIntentURL else {
+            return try JSONDecoder().decode(
+                VMShimProtocol.Specification.self,
+                from: Data(contentsOf: specificationURL)
+            )
+        }
+        // The immutable publication is the single source of launch truth.
+        // Re-reading the lexical spec path here would allow a replacement
+        // between ownership validation and VM construction.
+        let record = try publish(launchIntentURL)
+        guard VMShimClient.launchPathsMatch(
+            record.specificationPath, specificationURL.path
+        ) else {
+            throw EngineError(.conflict, "published VM shim specification path changed")
+        }
+        return record.specification
+    }
+
     private func startListener() throws {
-        listener = try UnixSocket.listen(path: specification.socketPath)
+        listener = try UnixSocket.listen(path: try runtimeArtifactPath(
+            specification.socketPath
+        ))
+    }
+
+    private func activateListener() {
         let descriptor = listener
         Task.detached { [weak self] in
             while let self {
@@ -82,13 +312,23 @@ import Foundation
             let payload = try await perform(decoded)
             try file.write(contentsOf: VMShimProtocol.encode(.init(id: decoded.id, token: specification.token, operation: decoded.operation, payload: payload)))
             if decoded.operation == .shutdown {
-                for path in Self.ownedSocketPaths(specification) {
-                    try? FileManager.default.removeItem(atPath: path)
+                if let launchIntentURL {
+                    try VMShimClient.cleanupPersistentRuntimeArtifacts(
+                        intentURL: launchIntentURL
+                    )
+                } else {
+                    for path in Self.ownedSocketPaths(specification)
+                        + [specification.socketPath + ".status"] {
+                        try? FileManager.default.removeItem(atPath: path)
+                    }
                 }
                 Darwin.exit(0)
             }
         } catch {
-            let failure = GuestProtocol.Failure(code: "shim_error", message: error.localizedDescription)
+            let code = error is BackendResourceRollbackIncompleteError
+                ? GuestProtocol.resourceRollbackIncompleteErrorCode
+                : "shim_error"
+            let failure = GuestProtocol.Failure(code: code, message: error.localizedDescription)
             try? file.write(contentsOf: VMShimProtocol.encode(.init(
                 id: request?.id ?? UUID().uuidString,
                 token: specification.token,
@@ -98,12 +338,27 @@ import Foundation
         }
     }
 
-    static func ownedSocketPaths(_ specification: VMShimProtocol.Specification) -> [String] {
+    nonisolated static func ownedSocketPaths(
+        _ specification: VMShimProtocol.Specification
+    ) -> [String] {
         var paths = [specification.socketPath]
         if specification.kind == .storage {
             paths.append(contentsOf: [specification.fileSystemSocketPath, specification.networkSocketPath].compactMap { $0 })
         }
         return paths
+    }
+
+    nonisolated static func guestConnectTimeout(
+        deadlineNanoseconds: UInt64?,
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) throws -> Duration {
+        guard let deadlineNanoseconds else { return .seconds(5) }
+        guard deadlineNanoseconds > nowNanoseconds else {
+            throw AsyncTimeout.TimeoutError()
+        }
+        return .nanoseconds(Int64(min(
+            deadlineNanoseconds - nowNanoseconds, UInt64(Int64.max)
+        )))
     }
 
     private func perform(_ request: VMShimProtocol.Envelope) async throws -> Data {
@@ -116,10 +371,19 @@ import Foundation
             guard let payload = request.payload else { throw EngineError(.badRequest, "guest request has no payload") }
             let call = try JSONDecoder().decode(VMShimClient.GuestCall.self, from: payload)
             guard let machine else { throw EngineError(.conflict, "VM guest control is unavailable") }
-            let connection = try await machine.connect(toPort: GuestProtocol.controlPort)
+            let connectTimeout = try Self.guestConnectTimeout(
+                deadlineNanoseconds: call.deadlineNanoseconds
+            )
+            let connection = try await machine.connect(
+                toPort: GuestProtocol.controlPort, timeout: connectTimeout
+            )
             defer { connection.close() }
             let control = GuestControlConnection(connection: SendableVirtioSocketConnection(connection))
-            return try await control.requestRaw(operation: call.operation, payload: call.payload)
+            return try await control.requestRaw(
+                operation: call.operation,
+                payload: call.payload,
+                deadlineNanoseconds: call.deadlineNanoseconds
+            )
         case .prepareRootFS:
             guard let payload = request.payload, let machine else { throw EngineError(.conflict, "VM is not booted") }
             let value = try JSONDecoder().decode(VMShimClient.RootFSRequest.self, from: payload)
@@ -170,19 +434,19 @@ import Foundation
         guard machine == nil else { return }
         state = .starting; try persist()
         do {
+            let attachments = try VMShimAttachmentResolver.resolve(specification)
             let config = RawVirtualMachineConfiguration(
                 id: specification.containerID,
                 kernel: URL(filePath: specification.kernelPath),
                 initialRamdisk: URL(filePath: specification.initialRamdiskPath),
-                rootDisk: URL(filePath: specification.rootDiskPath),
+                rootDisk: attachments.rootDisk,
                 rootDiskReadOnly: specification.rootDiskReadOnly,
-                additionalDisks: specification.volumeDisks.enumerated().map { index, disk in
-                    .init(identifier: "volume\(index)", source: URL(filePath: disk.path))
-                },
+                additionalDisks: attachments.additionalDisks,
                 cpus: specification.cpus,
                 memoryBytes: specification.memoryBytes,
                 macAddress: specification.macAddress,
-                bindShares: specification.bindShares.map { .init(tag: $0.tag, source: URL(filePath: $0.source), readOnly: $0.readOnly) },
+                bindShares: attachments.bindShares,
+                retainedAttachmentHandles: attachments.retainedHandles,
                 kernelArguments: specification.kernelArguments
             )
             let value = try RawContainerVirtualMachine(configuration: config)
@@ -222,14 +486,50 @@ import Foundation
     }
 
     private func persist() throws {
-        let url = URL(filePath: specification.socketPath + ".status")
-        try JSONEncoder().encode(status()).write(to: url, options: .atomic)
+        if statusDescriptor < 0 {
+            let creationFlags = launchIntentURL == nil
+                ? O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC
+                : O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
+            statusDescriptor = Darwin.open(
+                try runtimeArtifactPath(specification.socketPath + ".status"),
+                creationFlags,
+                S_IRUSR | S_IWUSR
+            )
+            guard statusDescriptor >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        var information = stat()
+        guard Darwin.fstat(statusDescriptor, &information) == 0,
+              information.st_mode & S_IFMT == S_IFREG,
+              Darwin.ftruncate(statusDescriptor, 0) == 0,
+              Darwin.lseek(statusDescriptor, 0, SEEK_SET) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let data = try JSONEncoder().encode(status())
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(
+                    statusDescriptor,
+                    bytes.baseAddress!.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if count > 0 { offset += count; continue }
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        guard Darwin.fsync(statusDescriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     private func startStorageProxy() throws {
-        guard let path = specification.fileSystemSocketPath else {
+        guard let finalPath = specification.fileSystemSocketPath else {
             throw EngineError(.internalError, "storage shim has no filesystem transport socket")
         }
+        let path = try runtimeArtifactPath(finalPath)
         serviceListener = try UnixSocket.listen(path: path)
         let descriptor = serviceListener
         Task.detached { [weak self] in
@@ -256,9 +556,10 @@ import Foundation
     }
 
     private func startNetworkFabric() throws {
-        guard let path = specification.networkSocketPath else {
+        guard let finalPath = specification.networkSocketPath else {
             throw EngineError(.internalError, "storage shim has no network transport socket")
         }
+        let path = try runtimeArtifactPath(finalPath)
         networkListener = try UnixSocket.listen(path: path)
         let descriptor = networkListener
         Task.detached { [weak self] in
@@ -270,6 +571,11 @@ import Foundation
                 } catch { continue }
             }
         }
+    }
+
+    private func runtimeArtifactPath(_ finalPath: String) throws -> String {
+        guard let runtimeArtifactPublication else { return finalPath }
+        return try runtimeArtifactPublication.stagedPath(for: finalPath)
     }
 
     private func acceptNetworkClient(_ registration: NetworkRegistration, stream: FileHandle) async {

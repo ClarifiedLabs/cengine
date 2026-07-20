@@ -356,7 +356,12 @@ func (state *controlServer) serve(connection net.Conn) {
 		response := protocol.Envelope{ID: request.ID, Operation: request.Operation}
 		payload, operationError := state.handle(request)
 		if operationError != nil {
-			response.Error = &protocol.Error{Code: "internal", Message: operationError.Error()}
+			code := "internal"
+			var rollbackIncomplete *supervisor.ResourceRollbackIncompleteError
+			if errors.As(operationError, &rollbackIncomplete) {
+				code = protocol.ErrorResourceRollbackIncomplete
+			}
+			response.Error = &protocol.Error{Code: code, Message: operationError.Error()}
 		} else {
 			response.Payload = payload
 		}
@@ -392,11 +397,13 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 		}
 		return json.Marshal(status)
 	case "update-resources":
-		var resources protocol.Resources
-		if err := json.Unmarshal(request.Payload, &resources); err != nil {
+		var update protocol.ResourceUpdate
+		if err := json.Unmarshal(request.Payload, &update); err != nil {
 			return nil, fmt.Errorf("decode resources: %w", err)
 		}
-		if err := state.process.UpdateResources(resources); err != nil {
+		if err := state.process.UpdateResourcesWithCompatibilityFailure(
+			update.Resources, update.CompatibilityFailureAfterWrites,
+		); err != nil {
 			return nil, err
 		}
 		return json.Marshal(state.process.Status())
