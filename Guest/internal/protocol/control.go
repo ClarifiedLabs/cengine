@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 9
+	Version                         = 10
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -55,6 +55,7 @@ type WorkloadSpec struct {
 	CapabilityAdd    []string          `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string          `json:"capabilityDrop,omitempty"`
 	Rlimits          []Rlimit          `json:"rlimits,omitempty"`
+	IPCMode          string            `json:"ipcMode"`
 	IOClaim          string            `json:"ioClaim"`
 }
 

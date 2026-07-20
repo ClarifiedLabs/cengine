@@ -6443,6 +6443,21 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         ])
     }
 
+    @Test func containerIPCModeReachesGuestWorkloadSpecification() throws {
+        var container = ContainerRecord(
+            id: "ipc-none-container", name: "ipc-none", image: "alpine:latest",
+            processArguments: ["true"]
+        )
+        container.ipcMode = "none"
+
+        let workload = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+
+        #expect(workload.ipcMode == "none")
+    }
+
     @Test func multiContainerVolumesUseSharedStorageBeforeVMsStart() throws {
         let modes = try RawVirtualizationBackend.resolveVolumeStorageModes(
             names: ["compose-data", "buildkit-state"],

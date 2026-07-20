@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 9
+    public static let version: UInt32 = 10
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -64,14 +64,16 @@ public enum GuestProtocol {
         public var capabilityAdd: [String]
         public var capabilityDrop: [String]
         public var rlimits: [Rlimit]
+        public var ipcMode: String
         public var ioClaim: String
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ioClaim: String = "") {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", ioClaim: String = "") {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
             self.readOnlyRoot = readOnlyRoot; self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
             self.annotations = annotations; self.capabilityAdd = capabilityAdd; self.capabilityDrop = capabilityDrop
             self.rlimits = rlimits
+            self.ipcMode = ipcMode
             self.ioClaim = ioClaim
         }
     }

@@ -3,8 +3,8 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct GuestProtocolTests {
-    @Test func execPayloadUsesVersionNineIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 9)
+    @Test func execPayloadUsesVersionTenIdentitySecurityContextAndRlimits() throws {
+        #expect(GuestProtocol.version == 10)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -28,8 +28,8 @@ import Testing
         #expect(limits.first?["soft"] as? UInt64 == 1_024)
     }
 
-    @Test func endpointSysctlsRemainAvailableInGuestProtocolVersionNine() throws {
-        #expect(GuestProtocol.version == 9)
+    @Test func endpointSysctlsRemainAvailableInGuestProtocolVersionTen() throws {
+        #expect(GuestProtocol.version == 10)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -48,7 +48,7 @@ import Testing
         #expect(endpointObject["sysctls"] as? [String] == ["net.ipv4.conf.IFNAME.forwarding=1"])
     }
 
-    @Test func blockIOThrottleResourcesRoundTripInProtocolVersionNine() throws {
+    @Test func blockIOThrottleResourcesRoundTripInProtocolVersionTen() throws {
         let resources = GuestProtocol.Resources(
             memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 32,
             blockIOReadBps: [.init(path: "/dev/vda", rate: UInt64(Int64.max) + 1)],
@@ -81,6 +81,7 @@ import Testing
             annotations: ["io.example.owner": "runtime"],
             capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"],
             rlimits: [.init(type: "core", soft: 0, hard: UInt64.max)],
+            ipcMode: "none",
             ioClaim: "container-claim"
         )
 
@@ -91,6 +92,7 @@ import Testing
         #expect(object["capabilityAdd"] as? [String] == ["CAP_NET_ADMIN"])
         #expect(object["capabilityDrop"] as? [String] == ["CAP_CHOWN"])
         #expect((object["rlimits"] as? [[String: Any]])?.first?["type"] as? String == "core")
+        #expect(object["ipcMode"] as? String == "none")
         #expect(object["ioClaim"] as? String == "container-claim")
     }
 

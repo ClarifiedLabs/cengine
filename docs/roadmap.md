@@ -46,11 +46,21 @@ silently ignored.
 
 Docker create-time ulimits now persist and apply to container init, exec, and
 healthcheck processes through capability introduced in guest protocol v7 and
-carried by the current guest protocol v9. The final exec command receives
+carried by the current guest protocol v10. The final exec command receives
 limits after namespace and root setup without constraining the guest supervisor
 or its signal/status proxies. `RTM-014` covers inspect, validation without
 side effects, daemon recovery, and container stop/start. Live ulimit updates
 remain an explicit gap.
+
+Supported namespace selections now persist, inspect, and survive daemon
+recovery. Docker IPC `none` uses a private IPC namespace without mounting
+`/dev/shm`; the default/private cgroup and IPC selections plus the host userns
+selection reflect guest behavior through guest protocol v10 (`RTM-016`).
+Docker-host and cross-container cgroup, IPC, PID, UTS, and network sharing are
+explicit architecture gaps: separate per-container VM kernels cannot join one
+Linux namespace. OCI namespace paths are likewise not exposed through the
+Docker API or an OCI runtime CLI. These requests fail before container or volume
+mutation (`RTM-017`).
 
 The four Docker per-device block-I/O throttle arrays now persist and apply to
 the VM root disk `/dev/vda` through cgroup-v2 `io.max`. API v1.55 live updates
@@ -130,10 +140,11 @@ Work in this order:
 1. Maintain the completed API v1.55 runtime-input baseline audit as Docker's
    request schema evolves. Apply newly supported fields, reject active gaps
    explicitly, or classify them in the ledger (`RTM-013`).
-2. Close namespace, cgroup-v2 IO/device, device,
+2. Close cgroup-v2 IO/device, device,
    seccomp/security-option, masked-path, and remaining mount-matrix gaps for
-   functionality cengine already exposes. PID limits, private bind isolation,
-   and capability add/drop are complete; shared/slave bind propagation is an
+   functionality cengine already exposes. Namespace inputs, PID limits, private
+   bind isolation, and capability add/drop have explicit supported or
+   architectural-gap decisions; shared/slave bind propagation is also an
    explicit architecture gap.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
    cengine contracts have stabilized the expected behavior.
@@ -175,7 +186,7 @@ configure, and inspect endpoints is complete:
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
   responses. Recovery support shipped in guest protocol v7 and is carried by
-  the current guest protocol v9 (`NET-019`).
+  the current guest protocol v10 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived

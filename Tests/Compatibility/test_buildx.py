@@ -273,10 +273,21 @@ def test_buildx_relaunches_missing_stopped_container_shim(daemon, client: docker
         marker = buildkit.exec_run(["sh", "-c", "printf retained >/shim-recovery-marker; sync"])
         assert marker.exit_code == 0, marker.output.decode(errors="replace")
 
-        specification_path = daemon.root / "containers" / buildkit.id / "shim.json"
-        specification = json.loads(specification_path.read_text())
-        status = json.loads(pathlib.Path(specification["socketPath"] + ".status").read_text())
-        assert status["state"] == "running"
+        generations = daemon.root / "containers" / buildkit.id / "shim-generations"
+        def running_generation():
+            running = []
+            for specification_path in generations.glob("*/spec.json"):
+                specification = json.loads(specification_path.read_text())
+                status_path = pathlib.Path(specification["socketPath"] + ".status")
+                if not status_path.exists():
+                    continue
+                status = json.loads(status_path.read_text())
+                if status["state"] == "running":
+                    running.append((specification_path, specification, status))
+            assert len(running) == 1, f"running VM shim generations: {running}"
+            return running[0]
+
+        _, specification, status = running_generation()
         shim_pid = status["processIdentifier"]
 
         daemon.stop(kill=True)
@@ -308,7 +319,7 @@ def test_buildx_relaunches_missing_stopped_container_shim(daemon, client: docker
             docker_host=docker_host,
         )
         assert "ERROR" not in result.stdout
-        relaunched = json.loads(specification_path.read_text())
+        _, relaunched, _ = running_generation()
         assert relaunched["generation"] == specification["generation"] + 1
         buildkit = client.containers.get(f"buildx_buildkit_{builder}0")
         marker = buildkit.exec_run(["cat", "/shim-recovery-marker"])

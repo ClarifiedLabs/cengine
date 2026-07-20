@@ -2731,6 +2731,92 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
+    @Test func supportedNamespaceModesPersistAndInspectAcrossRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let create = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=namespace-modes",
+            body: Data(#"{"Image":"alpine","HostConfig":{"CgroupnsMode":"private","IpcMode":"none","PidMode":"","UTSMode":"","UsernsMode":"host"}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        func namespaceHostConfig(_ router: DockerRouter) async throws -> [String: Any] {
+            let inspect = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/namespace-modes/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: inspect.body) as? [String: Any]
+            )
+            return try #require(object["HostConfig"] as? [String: Any])
+        }
+
+        var host = try await namespaceHostConfig(try #require(router))
+        #expect(host["CgroupnsMode"] as? String == "private")
+        #expect(host["IpcMode"] as? String == "none")
+        #expect(host["PidMode"] as? String == "")
+        #expect(host["UTSMode"] as? String == "")
+        #expect(host["UsernsMode"] as? String == "host")
+
+        router = nil
+        runtime = nil
+        let restoredRuntime = try await EngineRuntime(root: root)
+        let restoredRouter = DockerRouter(runtime: restoredRuntime, root: root)
+        host = try await namespaceHostConfig(restoredRouter)
+        #expect(host["CgroupnsMode"] as? String == "private")
+        #expect(host["IpcMode"] as? String == "none")
+        #expect(host["UsernsMode"] as? String == "host")
+
+        let record = try await restoredRuntime.container("namespace-modes")
+        #expect(record.cgroupNamespaceMode == "private")
+        #expect(record.ipcMode == "none")
+        #expect(record.userNamespaceMode == "host")
+    }
+
+    @Test func sameKernelNamespaceSharingFailsBeforeContainerOrVolumeMutation() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hostConfigs = [
+            #"{"CgroupnsMode":"host"}"#,
+            #"{"IpcMode":"host"}"#,
+            #"{"IpcMode":"shareable"}"#,
+            #"{"IpcMode":"container:donor"}"#,
+            #"{"PidMode":"host"}"#,
+            #"{"PidMode":"container:donor"}"#,
+            #"{"UTSMode":"host"}"#,
+            #"{"NetworkMode":"host"}"#,
+            #"{"NetworkMode":"container:donor"}"#,
+            #"{"Cgroup":"container:donor"}"#,
+        ]
+        for (index, hostConfig) in hostConfigs.enumerated() {
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v1.55/containers/create?name=namespace-sharing-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"Volumes\":{\"/data\":{}},\"HostConfig\":\(hostConfig)}".utf8)
+            ))
+            #expect(response.status == .notImplemented)
+        }
+
+        let path = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=namespace-path",
+            body: Data(#"{"Image":"alpine","HostConfig":{"PidMode":"/proc/1/ns/pid"}}"#.utf8)
+        ))
+        #expect(path.status == .badRequest)
+
+        let containers = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/json?all=true"
+        ))
+        #expect((try #require(
+            JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]]
+        )).isEmpty)
+        let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
+        let envelope = try #require(
+            JSONSerialization.jsonObject(with: volumes.body) as? [String: Any]
+        )
+        #expect((envelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+    }
+
     @Test func dockerCLIConsoleSizeIsIgnoredForNonTTYCreateAcrossSupportedAPIVersions() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

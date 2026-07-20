@@ -5987,7 +5987,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             ),
             privileged: container.privileged, annotations: container.annotations,
             capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
-            rlimits: try Self.rlimits(container.ulimits), ioClaim: ioClaim
+            rlimits: try Self.rlimits(container.ulimits), ipcMode: container.ipcMode,
+            ioClaim: ioClaim
         )
     }
 

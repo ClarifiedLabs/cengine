@@ -628,6 +628,113 @@ def test_block_io_throttles_apply_update_enforce_and_survive_recovery(
             recovered.close()
 
 
+@pytest.mark.compat("RTM-016")
+def test_ipc_none_omits_shared_memory_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    recovered = None
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"runtime-ipc-none-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["top"],
+            "HostConfig": {
+                "CgroupnsMode": "private",
+                "IpcMode": "none",
+                "PidMode": "",
+                "UTSMode": "",
+                "UsernsMode": "host",
+            },
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+
+    def assert_namespace_state(value: docker.models.containers.Container) -> None:
+        value.reload()
+        host = value.attrs["HostConfig"]
+        assert host["CgroupnsMode"] == "private"
+        assert host["IpcMode"] == "none"
+        assert host["PidMode"] == ""
+        assert host["UTSMode"] == ""
+        assert host["UsernsMode"] == "host"
+        result = value.exec_run([
+            "sh", "-ec",
+            "awk '$5 == \"/dev/shm\" { found=1 } END { exit found ? 1 : 0 }' "
+            "/proc/self/mountinfo",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+
+    try:
+        container.start()
+        assert_namespace_state(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        container = recovered.containers.get(container.id)
+        assert_namespace_state(container)
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-017")
+def test_same_kernel_namespace_sharing_fails_closed(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    host_configs = [
+        {"CgroupnsMode": "host"},
+        {"IpcMode": "host"},
+        {"IpcMode": "shareable"},
+        {"IpcMode": "container:donor"},
+        {"PidMode": "host"},
+        {"PidMode": "container:donor"},
+        {"UTSMode": "host"},
+        {"NetworkMode": "host"},
+        {"NetworkMode": "container:donor"},
+        {"Cgroup": "container:donor"},
+    ]
+    for index, host_config in enumerate(host_configs):
+        name = f"runtime-namespace-gap-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": name},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/data": {}},
+                    "HostConfig": host_config,
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(name)
+
+    with pytest.raises(docker.errors.APIError) as error:
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            params={"name": f"runtime-namespace-path-{suffix}"},
+            data={
+                "Image": ALPINE_IMAGE,
+                "Volumes": {"/data": {}},
+                "HostConfig": {"PidMode": "/proc/1/ns/pid"},
+            },
+        )
+        client.api._raise_for_status(response)
+    assert error.value.status_code == 400
+    assert {volume.name for volume in client.volumes.list()} == initial_volumes
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,

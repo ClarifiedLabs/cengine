@@ -166,6 +166,14 @@ public struct ContainerRecord: Codable, Sendable {
     public var readOnlyRootfs: Bool
     public var autoRemove: Bool
     public var useInit: Bool
+    /// Docker namespace selections that cengine can faithfully apply inside a
+    /// per-container VM. Cross-container and Docker-host namespace sharing is
+    /// rejected before a record is persisted.
+    public var cgroupNamespaceMode: String
+    public var ipcMode: String
+    public var pidMode: String
+    public var utsMode: String
+    public var userNamespaceMode: String
     public var memoryBytes: UInt64
     public var cpus: Int
     /// Docker's configured process limit. `0` and `-1` both mean unlimited.
@@ -219,6 +227,11 @@ public struct ContainerRecord: Codable, Sendable {
         self.readOnlyRootfs = false
         self.autoRemove = false
         self.useInit = false
+        self.cgroupNamespaceMode = "private"
+        self.ipcMode = "private"
+        self.pidMode = ""
+        self.utsMode = ""
+        self.userNamespaceMode = ""
         self.memoryBytes = ContainerSettings.default.memoryBytes
         self.cpus = ContainerSettings.default.cpus
         self.pidsLimit = 0

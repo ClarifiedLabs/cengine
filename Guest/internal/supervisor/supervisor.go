@@ -1077,10 +1077,7 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err := configureContainerConsole(root, spec.Terminal); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(root, "dev/shm"), 01777); err != nil {
-		return err
-	}
-	if err := unix.Mount("tmpfs", filepath.Join(root, "dev/shm"), "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777,size=67108864"); err != nil {
+	if err := mountWorkloadSharedMemory(root, spec.IPCMode, os.MkdirAll, unix.Mount); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(root, "dev/mqueue"), 0755); err != nil {
@@ -1200,6 +1197,31 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 		return fmt.Errorf("signal workload readiness: %w", err)
 	}
 	return unix.Exec(path, spec.Arguments, environment)
+}
+
+func mountWorkloadSharedMemory(
+	root, mode string,
+	mkdirAll func(string, os.FileMode) error,
+	mount func(string, string, string, uintptr, string) error,
+) error {
+	switch mode {
+	case "none":
+		return nil
+	case "", "private":
+		path := filepath.Join(root, "dev/shm")
+		if err := mkdirAll(path, 01777); err != nil {
+			return err
+		}
+		if err := mount(
+			"tmpfs", path, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV,
+			"mode=1777,size=67108864",
+		); err != nil {
+			return fmt.Errorf("mount private shared memory: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported IPC namespace mode %q", mode)
+	}
 }
 
 func remountCgroupReadOnly(path string, mount func(string, string, string, uintptr, string) error) error {

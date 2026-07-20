@@ -174,6 +174,13 @@ public struct DockerRouter: Sendable {
             record.capabilityDrop = try normalizedCapabilities(input.HostConfig?.CapDrop ?? [])
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.useInit = input.HostConfig?.Init ?? false
+            record.cgroupNamespaceMode = normalizedPrivateNamespaceMode(
+                input.HostConfig?.CgroupnsMode
+            )
+            record.ipcMode = normalizedPrivateNamespaceMode(input.HostConfig?.IpcMode)
+            record.pidMode = input.HostConfig?.PidMode ?? ""
+            record.utsMode = input.HostConfig?.UTSMode ?? ""
+            record.userNamespaceMode = input.HostConfig?.UsernsMode ?? ""
             record.pidsLimit = try validatedPidsLimit(input.HostConfig?.PidsLimit) ?? 0
             record.blockIOReadBps = validated.blockIO.readBps
             record.blockIOWriteBps = validated.blockIO.writeBps
@@ -1474,7 +1481,7 @@ public struct DockerRouter: Sendable {
         )
         try validateMode(
             host?.IpcMode, field: "HostConfig.IpcMode",
-            supported: ["", "private"], unsupported: ["none", "shareable", "host"],
+            supported: ["", "none", "private"], unsupported: ["shareable", "host"],
             unsupportedPrefix: "container:"
         )
         try validateMode(
@@ -1506,6 +1513,11 @@ public struct DockerRouter: Sendable {
                 throw EngineError(.unsupported, "HostConfig.NetworkMode container sharing is not supported")
             }
         }
+    }
+
+    private func normalizedPrivateNamespaceMode(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "private" }
+        return value
     }
 
     private func validateMode(
@@ -2001,6 +2013,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let AutoRemove: Bool; let Privileged: Bool
         let CapAdd: [String]; let CapDrop: [String]
         let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
+        let CgroupnsMode: String; let IpcMode: String; let PidMode: String
+        let UTSMode: String; let UsernsMode: String
         let Annotations: [String: String]?
         let Binds: [String]; let Mounts: [MountResponse]
         let PortBindings: [String: [PortBindingResponse]]
@@ -2014,6 +2028,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             case Memory, NanoCpus, PidsLimit
             case BlkioDeviceReadBps, BlkioDeviceWriteBps, BlkioDeviceReadIOps, BlkioDeviceWriteIOps
             case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, ReadonlyRootfs, Init, RestartPolicy
+            case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode
             case Annotations, Binds, Mounts, PortBindings, NetworkMode, LogConfig
         }
 
@@ -2034,6 +2049,11 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(ReadonlyRootfs, forKey: .ReadonlyRootfs)
             try container.encode(Init, forKey: .Init)
             try container.encode(self.RestartPolicy, forKey: .RestartPolicy)
+            try container.encode(CgroupnsMode, forKey: .CgroupnsMode)
+            try container.encode(IpcMode, forKey: .IpcMode)
+            try container.encode(PidMode, forKey: .PidMode)
+            try container.encode(UTSMode, forKey: .UTSMode)
+            try container.encode(UsernsMode, forKey: .UsernsMode)
             try container.encodeIfPresent(Annotations, forKey: .Annotations)
             try container.encode(Binds, forKey: .Binds)
             try container.encode(Mounts, forKey: .Mounts)
@@ -2102,6 +2122,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
             CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,
             ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,
             RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount),
+            CgroupnsMode: record.cgroupNamespaceMode, IpcMode: record.ipcMode,
+            PidMode: record.pidMode, UTSMode: record.utsMode,
+            UsernsMode: record.userNamespaceMode,
             Annotations: record.annotations.isEmpty ? nil : record.annotations,
             Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
                 var options = $0.readOnly ? ["ro"] : []

@@ -6,14 +6,15 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
-	if Version != 9 {
-		t.Fatalf("Version = %d, want 9", Version)
+	if Version != 10 {
+		t.Fatalf("Version = %d, want 10", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
 		"id":"container-1",
 		"ioClaim":"container-claim",
 		"annotations":{"io.example.owner":"runtime"},
+		"ipcMode":"none",
 		"rlimits":[{"type":"nofile","soft":1024,"hard":18446744073709551615}]
 	}`), &spec); err != nil {
 		t.Fatal(err)
@@ -23,6 +24,9 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
 	}
 	if spec.IOClaim != "container-claim" {
 		t.Fatalf("IOClaim = %q, want container-claim", spec.IOClaim)
+	}
+	if spec.IPCMode != "none" {
+		t.Fatalf("IPCMode = %q, want none", spec.IPCMode)
 	}
 	if len(spec.Rlimits) != 1 || spec.Rlimits[0].Type != "nofile" ||
 		spec.Rlimits[0].Soft != 1024 || spec.Rlimits[0].Hard != ^uint64(0) {
@@ -40,9 +44,9 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 	}
 }
 
-func TestEndpointSysctlsRemainAvailableInProtocolVersionNine(t *testing.T) {
-	if Version != 9 {
-		t.Fatalf("endpoint sysctls require guest protocol version 9, got %d", Version)
+func TestEndpointSysctlsRemainAvailableInProtocolVersionTen(t *testing.T) {
+	if Version != 10 {
+		t.Fatalf("endpoint sysctls require guest protocol version 10, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {
@@ -50,7 +54,7 @@ func TestEndpointSysctlsRemainAvailableInProtocolVersionNine(t *testing.T) {
 	}
 }
 
-func TestBlockIOThrottlesDecodeInProtocolVersionNine(t *testing.T) {
+func TestBlockIOThrottlesDecodeInProtocolVersionTen(t *testing.T) {
 	var resources Resources
 	if err := json.Unmarshal([]byte(`{
 		"memoryBytes":67108864,"cpuQuota":100000,"cpuPeriod":100000,"pids":32,
