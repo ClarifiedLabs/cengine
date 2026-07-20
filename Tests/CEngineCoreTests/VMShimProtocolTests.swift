@@ -359,7 +359,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
 }
 #endif
 
-@Suite struct VMShimProtocolTests {
+@Suite(.serialized) struct VMShimProtocolTests {
     @Test func envelopeRoundTrips() throws {
         let envelope = VMShimProtocol.Envelope(token: "secret", operation: .status)
 
