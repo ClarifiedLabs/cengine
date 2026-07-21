@@ -279,7 +279,7 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
                 client.api._url("/containers/{0}/update", container.id),
                 data={
                     "Memory": 2 * 1024 * 1024 * 1024,
-                    "BlkioWeightDevice": [{"Path": "/dev/vda", "Weight": 500}],
+                    "DeviceCgroupRules": ["c 1:3 r"],
                 },
             )
             client.api._raise_for_status(response)
@@ -808,6 +808,90 @@ def test_masked_and_readonly_paths_apply_restart_and_survive_recovery(
             pass
         if recovered is not None:
             recovered.close()
+
+
+@pytest.mark.compat("RTM-019")
+def test_block_io_weights_are_an_architecture_gap_with_versioned_update_semantics(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    for index, host_config in enumerate([
+        {"BlkioWeight": 500},
+        {"BlkioWeightDevice": [{"Path": "/dev/vda", "Weight": 500}]},
+    ]):
+        name = f"block-io-weight-gap-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": name},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/data": {}},
+                    "HostConfig": host_config,
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+        assert "per-container VMs" in str(error.value)
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(name)
+    assert {volume.name for volume in client.volumes.list()} == initial_volumes
+
+    container = client.containers.create(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        name=f"block-io-weight-update-{suffix}",
+        mem_limit=1024 * 1024 * 1024,
+    )
+    try:
+        container.reload()
+        assert container.attrs["HostConfig"]["BlkioWeight"] == 0
+        assert container.attrs["HostConfig"]["BlkioWeightDevice"] is None
+
+        legacy = docker.APIClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="1.54",
+        )
+        try:
+            response = legacy._post_json(
+                legacy._url("/containers/{0}/update", container.id),
+                data={
+                    "Memory": 2 * 1024 * 1024 * 1024,
+                    "BlkioWeightDevice": {"malformed": True},
+                },
+            )
+            legacy._raise_for_status(response)
+        finally:
+            legacy.close()
+        container.reload()
+        assert container.attrs["HostConfig"]["Memory"] == 2 * 1024 * 1024 * 1024
+
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/{0}/update", container.id),
+                data={
+                    "Memory": 3 * 1024 * 1024 * 1024,
+                    "BlkioWeightDevice": [{"Path": "/dev/vda", "Weight": 500}],
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+        assert "per-container VMs" in str(error.value)
+
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/{0}/update", container.id),
+                data={"Memory": 3 * 1024 * 1024 * 1024, "BlkioWeight": 500},
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 501
+
+        container.reload()
+        assert container.attrs["HostConfig"]["Memory"] == 2 * 1024 * 1024 * 1024
+        assert container.attrs["HostConfig"]["BlkioWeight"] == 0
+        assert container.attrs["HostConfig"]["BlkioWeightDevice"] is None
+    finally:
+        container.remove(force=True)
 
 
 @pytest.mark.compat("RTM-004")

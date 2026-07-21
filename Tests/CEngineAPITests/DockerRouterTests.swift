@@ -2661,7 +2661,6 @@ private actor AuthImageBackend: ContainerBackend {
             #""Domainname":"example.test","Volumes":{"/data":{}}"#,
             #""HostConfig":{"CpuShares":1024}"#,
             #""HostConfig":{"CgroupParent":"/custom"}"#,
-            #""HostConfig":{"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":500}]}"#,
             #""HostConfig":{"MemorySwappiness":0}"#,
             #""HostConfig":{"DeviceRequests":[{"Driver":"cdi","Count":1}]}"#,
             #""HostConfig":{"PidMode":"host"}"#,
@@ -3071,7 +3070,7 @@ private actor AuthImageBackend: ContainerBackend {
 
         let update = await router.route(.init(
             method: .POST, uri: "/v1.55/containers/runtime-update/update",
-            body: Data(#"{"Memory":2147483648,"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":500}]}"#.utf8)
+            body: Data(#"{"Memory":2147483648,"Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/null","CgroupPermissions":"r"}]}"#.utf8)
         ))
         #expect(update.status == .notImplemented)
         let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/runtime-update/json"))
@@ -3225,6 +3224,70 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(persisted.blockIOWriteBps == [])
         #expect(persisted.blockIOReadIOps == [.init(path: "/dev/vda", rate: 100)])
         #expect(persisted.blockIOWriteIOps == [.init(path: "/dev/vda", rate: 200)])
+    }
+
+    @Test func blockIOWeightsAreAnExplicitArchitectureGapWithVersionedUpdateSemantics() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for (index, hostConfig) in [
+            #"{"BlkioWeight":500}"#,
+            #"{"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":500}]}"#,
+        ].enumerated() {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=weight-gap-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
+            ))
+            #expect(response.status == .notImplemented)
+            #expect(String(decoding: response.body, as: UTF8.self).contains("per-container VMs"))
+        }
+
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=weight-update",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Memory":1073741824}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        let legacy = await router.route(.init(
+            method: .POST, uri: "/v1.54/containers/weight-update/update",
+            body: Data(#"{"Memory":2147483648,"BlkioWeightDevice":{"malformed":true}}"#.utf8)
+        ))
+        #expect(legacy.status == .ok)
+
+        let unsupportedDevice = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/weight-update/update",
+            body: Data(#"{"Memory":3221225472,"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":500}]}"#.utf8)
+        ))
+        #expect(unsupportedDevice.status == .notImplemented)
+        #expect(String(decoding: unsupportedDevice.body, as: UTF8.self).contains("per-container VMs"))
+
+        let unsupportedGlobal = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/weight-update/update",
+            body: Data(#"{"Memory":3221225472,"BlkioWeight":500}"#.utf8)
+        ))
+        #expect(unsupportedGlobal.status == .notImplemented)
+
+        let inspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/containers/weight-update/json"
+        ))
+        let object = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let host = try #require(object["HostConfig"] as? [String: Any])
+        #expect(host["Memory"] as? Int == 2_147_483_648)
+        #expect(host["BlkioWeight"] as? Int == 0)
+        #expect(host.keys.contains("BlkioWeightDevice"))
+        #expect(host["BlkioWeightDevice"] is NSNull)
+
+        for hostConfig in [
+            #"{"BlkioWeight":1}"#,
+            #"{"BlkioWeightDevice":[{"Path":"relative","Weight":500}]}"#,
+            #"{"BlkioWeightDevice":[{"Path":"/dev/vda","Weight":1}]}"#,
+        ] {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
+            ))
+            #expect(response.status == .badRequest)
+        }
     }
 
     @Test func blockIOThrottleValidationDistinguishesBadRequestsFromRootDeviceGap() async throws {

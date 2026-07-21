@@ -95,8 +95,18 @@ unresolved journal reserves the container's stable
 ID/name/creation identity, fences lifecycle, restart-policy, and auto-remove
 work, and is removed atomically with a definitive container deletion.
 Compatibility fault markers are claimed by rename before validation so a
-replacement path cannot be consumed accidentally. Blkio weights and additional
-devices remain explicit gaps.
+replacement path cannot be consumed accidentally. Additional devices remain an
+explicit gap.
+
+Docker block-I/O weights now have an explicit architecture decision. Relative
+weights arbitrate sibling container cgroups sharing one kernel block scheduler;
+a weight inside a cengine guest can affect only processes in that VM and cannot
+coordinate separate container VM disks. Virtualization.framework exposes cache
+and synchronization choices for disk attachments but no host-side relative
+weight control. Active global and per-device weight requests therefore fail
+before mutation instead of publishing cosmetic guest-only state. API v1.44–v1.54
+updates retain Docker's historical ignore behavior for `BlkioWeightDevice`, and
+inspect reports the inert defaults (`RTM-019`).
 
 The API v1.55 runtime-input baseline audit is complete (`RTM-013`). Container
 create and update resources, namespace and process configuration, structured and
@@ -154,7 +164,10 @@ Work in this order:
    functionality cengine already exposes. Namespace inputs, PID limits, private
    bind isolation, and capability add/drop have explicit supported or
    architectural-gap decisions; shared/slave bind propagation is also an
-   explicit architecture gap.
+   explicit architecture gap. Docker-relative block-I/O weights are now an
+   explicit architecture gap (`RTM-019`); remaining I/O work concerns
+   non-root devices, device access, and accounting rather than guest-only
+   weight readback.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
    cengine contracts have stabilized the expected behavior.
 4. Implement otherwise unexposed OCI features only when cengine adopts them as

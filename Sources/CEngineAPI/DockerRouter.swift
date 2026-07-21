@@ -1148,7 +1148,7 @@ public struct DockerRouter: Sendable {
                 return try decoder.decode(ContainerUpdateRequest.self, from: body)
             }
             for field in [
-                "BlkioDeviceReadBps", "BlkioDeviceWriteBps",
+                "BlkioWeightDevice", "BlkioDeviceReadBps", "BlkioDeviceWriteBps",
                 "BlkioDeviceReadIOps", "BlkioDeviceWriteIOps",
             ] {
                 object.removeValue(forKey: field)
@@ -1209,6 +1209,11 @@ public struct DockerRouter: Sendable {
             memoryReservation: input.MemoryReservation, memorySwap: input.MemorySwap,
             update: true
         )
+        try rejectUnsupportedBlockIOWeights(
+            weight: input.BlkioWeight,
+            weightDevices: input.BlkioWeightDevice,
+            prefix: "ContainerUpdate"
+        )
         if let swappiness = input.MemorySwappiness,
            swappiness != -1, !(0...100).contains(swappiness) {
             throw EngineError(.badRequest, "MemorySwappiness must be -1 or between 0 and 100")
@@ -1217,8 +1222,6 @@ public struct DockerRouter: Sendable {
         try rejectActiveRuntimeFields([
             (input.CpuShares != nil && input.CpuShares != 0, "CpuShares"),
             (!(input.CgroupParent ?? "").isEmpty, "CgroupParent"),
-            (input.BlkioWeight != nil && input.BlkioWeight != 0, "BlkioWeight"),
-            (!(input.BlkioWeightDevice ?? []).isEmpty, "BlkioWeightDevice"),
             (input.CpuRealtimePeriod != nil && input.CpuRealtimePeriod != 0, "CpuRealtimePeriod"),
             (input.CpuRealtimeRuntime != nil && input.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
             (!(input.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
@@ -1276,6 +1279,11 @@ public struct DockerRouter: Sendable {
             memoryReservation: host?.MemoryReservation, memorySwap: host?.MemorySwap,
             update: false
         )
+        try rejectUnsupportedBlockIOWeights(
+            weight: host?.BlkioWeight,
+            weightDevices: host?.BlkioWeightDevice,
+            prefix: "HostConfig"
+        )
         if let swappiness = host?.MemorySwappiness,
            swappiness != -1, !(0...100).contains(swappiness) {
             throw EngineError(.badRequest, "HostConfig.MemorySwappiness must be -1 or between 0 and 100")
@@ -1283,8 +1291,6 @@ public struct DockerRouter: Sendable {
         try rejectActiveRuntimeFields([
             (host?.CpuShares != nil && host?.CpuShares != 0, "CpuShares"),
             (!(host?.CgroupParent ?? "").isEmpty && host?.CgroupParent != "/docker/buildx", "CgroupParent"),
-            (host?.BlkioWeight != nil && host?.BlkioWeight != 0, "BlkioWeight"),
-            (!(host?.BlkioWeightDevice ?? []).isEmpty, "BlkioWeightDevice"),
             (host?.CpuRealtimePeriod != nil && host?.CpuRealtimePeriod != 0, "CpuRealtimePeriod"),
             (host?.CpuRealtimeRuntime != nil && host?.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
             (!(host?.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
@@ -1443,6 +1449,29 @@ public struct DockerRouter: Sendable {
                   let weight = device.Weight, (10...1_000).contains(weight) else {
                 throw EngineError(.badRequest, "BlkioWeightDevice requires an absolute Path and Weight from 10 to 1000")
             }
+        }
+    }
+
+    private func rejectUnsupportedBlockIOWeights(
+        weight: UInt16?,
+        weightDevices: [ContainerCreateRequest.HostConfig.WeightDeviceRequest]?,
+        prefix: String
+    ) throws {
+        // Docker block-I/O weights distribute one host block device between sibling
+        // container cgroups. A guest io.weight value would only compete with other
+        // processes inside this container's private VM and cannot affect another VM.
+        // Virtualization.framework has no corresponding host disk-weight control.
+        if weight != nil && weight != 0 {
+            throw EngineError(
+                .unsupported,
+                "\(prefix).BlkioWeight cannot provide relative I/O scheduling across cengine's per-container VMs"
+            )
+        }
+        if !(weightDevices ?? []).isEmpty {
+            throw EngineError(
+                .unsupported,
+                "\(prefix).BlkioWeightDevice cannot provide relative I/O scheduling across cengine's per-container VMs"
+            )
         }
     }
 
@@ -2015,6 +2044,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
     }
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let PidsLimit: Int64
+        let BlkioWeight: UInt16
+        let BlkioWeightDevice: [WeightDeviceResponse]?
         let BlkioDeviceReadBps: [ThrottleDeviceResponse]?
         let BlkioDeviceWriteBps: [ThrottleDeviceResponse]?
         let BlkioDeviceReadIOps: [ThrottleDeviceResponse]?
@@ -2033,11 +2064,13 @@ public struct ContainerInspectResponse: Codable, Sendable {
         struct RestartPolicy: Codable, Sendable { let Name: String; let MaximumRetryCount: Int }
         struct LogConfigResponse: Codable, Sendable { let `Type`: String; let Config: [String: String] }
         struct UlimitResponse: Codable, Sendable { let Name: String; let Soft: Int64; let Hard: Int64 }
+        struct WeightDeviceResponse: Codable, Sendable { let Path: String; let Weight: UInt16 }
         struct ThrottleDeviceResponse: Codable, Sendable { let Path: String; let Rate: UInt64 }
 
         enum CodingKeys: String, CodingKey {
             case Memory, NanoCpus, PidsLimit
-            case BlkioDeviceReadBps, BlkioDeviceWriteBps, BlkioDeviceReadIOps, BlkioDeviceWriteIOps
+            case BlkioWeight, BlkioWeightDevice, BlkioDeviceReadBps, BlkioDeviceWriteBps
+            case BlkioDeviceReadIOps, BlkioDeviceWriteIOps
             case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, ReadonlyRootfs
             case MaskedPaths, ReadonlyPaths, Init, RestartPolicy
             case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode
@@ -2049,6 +2082,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(Memory, forKey: .Memory)
             try container.encode(NanoCpus, forKey: .NanoCpus)
             try container.encode(PidsLimit, forKey: .PidsLimit)
+            try container.encode(BlkioWeight, forKey: .BlkioWeight)
+            try container.encode(BlkioWeightDevice, forKey: .BlkioWeightDevice)
             try container.encode(BlkioDeviceReadBps, forKey: .BlkioDeviceReadBps)
             try container.encode(BlkioDeviceWriteBps, forKey: .BlkioDeviceWriteBps)
             try container.encode(BlkioDeviceReadIOps, forKey: .BlkioDeviceReadIOps)
@@ -2127,6 +2162,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             PidsLimit: record.pidsLimit,
+            BlkioWeight: 0, BlkioWeightDevice: nil,
             BlkioDeviceReadBps: record.blockIOReadBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
             BlkioDeviceWriteBps: record.blockIOWriteBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
             BlkioDeviceReadIOps: record.blockIOReadIOps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
