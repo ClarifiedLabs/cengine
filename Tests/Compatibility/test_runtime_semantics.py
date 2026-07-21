@@ -519,6 +519,160 @@ def test_structured_tmpfs_execution_options_apply_restart_and_survive_recovery(
             recovered.close()
 
 
+@pytest.mark.compat("RTM-023")
+def test_volume_readonly_matrix_orders_nested_mounts_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    volume_names = {
+        storage: {
+            role: f"runtime-volume-{storage}-{role}-{suffix}"
+            for role in ("rw-parent", "ro-child", "ro-parent", "rw-child")
+        }
+        for storage in ("block", "shared")
+    }
+    for names in volume_names.values():
+        for name in names.values():
+            client.volumes.create(
+                name, labels={"dev.cengine.compat": "true"},
+            )
+    shared_keeper = client.containers.create(
+        ALPINE_IMAGE,
+        ["true"],
+        name=f"runtime-volume-shared-keeper-{suffix}",
+        mounts=[
+            Mount(
+                target=f"/keep/{role}", source=name, type="volume", no_copy=True,
+            )
+            for role, name in volume_names["shared"].items()
+        ],
+    )
+
+    init_probe = (
+        "if touch /rootfs-must-stay-readonly 2>/dev/null; then exit 40; fi; "
+        "touch /etc/init-parent-rw; "
+        "if touch /etc/ssl/init-child-ro 2>/dev/null; then exit 41; fi; "
+        "if touch /usr/init-parent-ro 2>/dev/null; then exit 42; fi; "
+        "touch /usr/bin/init-child-rw; "
+        "printf 'volume-matrix-init-ok\\n'; "
+        "while :; do /bin/sleep 1; done"
+    )
+
+    def create_target(storage: str) -> docker.models.containers.Container:
+        names = volume_names[storage]
+        # Children deliberately precede their parents. Docker depth-orders these
+        # mounts so a later parent cannot hide an already-mounted child.
+        return client.containers.create(
+            ALPINE_IMAGE,
+            ["/bin/sh", "-ec", init_probe],
+            name=f"runtime-volume-{storage}-{suffix}",
+            read_only=True,
+            mounts=[
+                Mount(
+                    target="/etc/ssl", source=names["ro-child"], type="volume",
+                    read_only=True,
+                ),
+                Mount(
+                    target="/usr/bin", source=names["rw-child"], type="volume",
+                ),
+                Mount(target="/etc", source=names["rw-parent"], type="volume"),
+                Mount(
+                    target="/usr", source=names["ro-parent"], type="volume",
+                    read_only=True,
+                ),
+            ],
+        )
+
+    targets = {
+        storage: create_target(storage) for storage in ("block", "shared")
+    }
+    recovered = None
+
+    def wait_for_init(value: docker.models.containers.Container) -> None:
+        deadline = time.monotonic() + 30
+        output = b""
+        while time.monotonic() < deadline:
+            output = value.logs()
+            if b"volume-matrix-init-ok" in output:
+                return
+            value.reload()
+            if value.status == "exited":
+                break
+            time.sleep(0.1)
+        pytest.fail(
+            f"volume matrix init failed for {value.name}:\n"
+            + output.decode(errors="replace")
+        )
+
+    def assert_matrix(
+        value: docker.models.containers.Container, stage: str,
+    ) -> None:
+        result = value.exec_run([
+            "/bin/sh", "-ec",
+            f"if touch /rootfs-{stage} 2>/dev/null; then exit 40; fi; "
+            f"touch /etc/{stage}-parent-rw; "
+            f"if touch /etc/ssl/{stage}-child-ro 2>/dev/null; then exit 41; fi; "
+            f"if touch /usr/{stage}-parent-ro 2>/dev/null; then exit 42; fi; "
+            f"touch /usr/bin/{stage}-child-rw; "
+            "for entry in /etc:rw /etc/ssl:ro /usr:ro /usr/bin:rw; do "
+            "  path=${entry%:*}; expected=${entry##*:}; "
+            "  options=$(awk -v target=\"$path\" '$2 == target { print $4; exit }' /proc/mounts); "
+            "  test -n \"$options\"; "
+            "  case ,$options, in *,ro,*) actual=ro ;; *) actual=rw ;; esac; "
+            "  test \"$actual\" = \"$expected\"; "
+            "done; printf volume-matrix-ok",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output == b"volume-matrix-ok"
+
+        value.reload()
+        mounts = {
+            mount["Destination"]: mount for mount in value.attrs["Mounts"]
+        }
+        assert mounts["/etc"]["RW"] is True
+        assert mounts["/etc/ssl"]["RW"] is False
+        assert mounts["/usr"]["RW"] is False
+        assert mounts["/usr/bin"]["RW"] is True
+        assert value.attrs["HostConfig"]["ReadonlyRootfs"] is True
+
+    try:
+        for value in targets.values():
+            value.start()
+            wait_for_init(value)
+            assert_matrix(value, "initial")
+
+        storage_modes = json.loads(
+            (daemon.root / "volume-storage.json").read_text()
+        )
+        for name in volume_names["block"].values():
+            assert storage_modes[name] == "block"
+        for name in volume_names["shared"].values():
+            assert storage_modes[name] == "shared"
+
+        for value in targets.values():
+            value.restart(timeout=5)
+            wait_for_init(value)
+            assert_matrix(value, "restart")
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        for original in targets.values():
+            value = recovered.containers.get(original.id)
+            wait_for_init(value)
+            assert_matrix(value, "recovery")
+    finally:
+        cleanup = recovered or client
+        for value in [*targets.values(), shared_keeper]:
+            try:
+                cleanup.containers.get(value.id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-015")
 def test_block_io_throttles_apply_update_enforce_and_survive_recovery(
     daemon, client: docker.DockerClient,

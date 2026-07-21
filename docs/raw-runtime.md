@@ -25,7 +25,11 @@ expect it to be the namespace root. A read-only root remount therefore applies t
 both the init process and later exec processes, while mounts such as tmpfs retain
 their own write policy. Workload tmpfs mounts remain writable but default to
 `noexec,nosuid,nodev`; Docker's structured `exec`/`noexec` selection can change
-only the execution flag.
+only the execution flag. User mounts are depth-ordered before guest application so
+parents cannot hide nested children submitted earlier in the request. Read-only
+named volumes use recursive mount attributes; a writable child mounted afterward
+therefore retains its explicit policy beneath a read-only parent, for both direct
+ext4 and storage-appliance NFS volumes.
 
 Exec uses three guest stages. The first joins the workload UTS, IPC, network, and
 cgroup namespaces while retaining access to supervisor resources. It captures

@@ -5952,7 +5952,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let volumeDevices = try Dictionary(uniqueKeysWithValues: blockVolumes.enumerated().map {
             ($0.element, try Self.volumeDevicePath(index: $0.offset))
         })
-        let mounts = container.mounts.enumerated().map { index, mount -> GuestProtocol.Mount in
+        let mountOrder = Self.mountDestinationOrder(container.mounts.map(\.destination))
+        let mounts = mountOrder.map { index -> GuestProtocol.Mount in
+            let mount = container.mounts[index]
             if let source = bindSources[index], case .socket(let socket) = source {
                 return GuestProtocol.Mount(
                     kind: "socket", source: mount.source, destination: mount.destination,
@@ -6236,6 +6238,25 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return mounts.compactMap { mount in
             guard mount.kind == .volume, seen.insert(mount.source).inserted else { return nil }
             return mount.source
+        }
+    }
+
+    static func mountDestinationOrder(_ destinations: [String]) -> [Int] {
+        func depth(_ destination: String) -> Int {
+            var result = 0
+            for component in destination.split(separator: "/", omittingEmptySubsequences: true) {
+                switch component {
+                case ".": break
+                case "..": result = max(result - 1, 0)
+                default: result += 1
+                }
+            }
+            return result
+        }
+        return destinations.indices.sorted { left, right in
+            let leftDepth = depth(destinations[left])
+            let rightDepth = depth(destinations[right])
+            return leftDepth == rightDepth ? left < right : leftDepth < rightDepth
         }
     }
 

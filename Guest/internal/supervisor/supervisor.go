@@ -1559,10 +1559,7 @@ func applyMount(root string, mount protocol.Mount) error {
 		if err := unix.Mount(source, destination, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 			return err
 		}
-		if mount.ReadOnly {
-			return unix.Mount("", destination, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
-		}
-		return nil
+		return applyVolumeMountAttributes(destination, mount, unix.MountSetattr)
 	default:
 		return fmt.Errorf("unsupported mount kind %q", mount.Kind)
 	}
@@ -1588,6 +1585,21 @@ func tmpfsMountConfiguration(options []string) (uintptr, string, error) {
 
 type mountOperation func(source, target, filesystem string, flags uintptr, data string) error
 type mountSetattrOperation func(dirfd int, path string, flags uint, attr *unix.MountAttr) error
+
+func applyVolumeMountAttributes(
+	destination string,
+	spec protocol.Mount,
+	mountSetattr mountSetattrOperation,
+) error {
+	if !spec.ReadOnly {
+		return nil
+	}
+	attribute := &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
+	if err := mountSetattr(unix.AT_FDCWD, destination, unix.AT_RECURSIVE, attribute); err != nil {
+		return fmt.Errorf("make volume recursively read-only at %s: %w", destination, err)
+	}
+	return nil
+}
 
 func bindMountFlags(spec protocol.Mount) uintptr {
 	if spec.NonRecursive {

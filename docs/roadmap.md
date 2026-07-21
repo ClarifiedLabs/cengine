@@ -96,6 +96,14 @@ in submitted order so the final execution selection wins. Unknown options and
 non-flag-shaped arrays fail before mutation, and `RTM-022` covers application,
 container restart, and daemon recovery.
 
+Named-volume write-policy composition now follows Docker's mount ordering.
+Parents are applied before nested children regardless of request order, and
+read-only volumes use recursive mount attributes. A read-only container root can
+therefore contain writable volumes, read-only children beneath writable volumes,
+and writable children beneath read-only volumes without one policy erasing the
+other. `RTM-023` covers init and exec across direct ext4 and shared NFS storage,
+container restart, and daemon recovery.
+
 The four Docker per-device block-I/O throttle arrays now persist and apply to
 the VM root disk `/dev/vda` through cgroup-v2 `io.max`. API v1.55 live updates
 independently replace or clear each BPS/IOPS limit while older update APIs keep
@@ -192,9 +200,9 @@ Work in this order:
    explicit architecture gap. Docker-relative block-I/O weights are now an
    explicit architecture gap (`RTM-019`); remaining I/O work concerns
    non-root devices, device access, and accounting rather than guest-only
-   weight readback. Structured tmpfs execution policy is complete (`RTM-022`);
-   remaining mount work concerns volume remount matrices and explicitly
-   classified filesystem options.
+   weight readback. Structured tmpfs execution policy and named-volume remount
+   matrices are complete (`RTM-022`, `RTM-023`); remaining mount inputs have
+   explicit support or gap classifications in the compatibility ledger.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
    cengine contracts have stabilized the expected behavior.
 4. Implement otherwise unexposed OCI features only when cengine adopts them as

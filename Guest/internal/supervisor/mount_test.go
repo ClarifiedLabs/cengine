@@ -112,6 +112,39 @@ func TestRecursiveReadOnlyFallbackAndForceBehavior(t *testing.T) {
 	}
 }
 
+func TestVolumeReadOnlyIsRecursive(t *testing.T) {
+	calls := []string{}
+	mountSetattr := func(_ int, path string, flags uint, attr *unix.MountAttr) error {
+		calls = append(calls, fmt.Sprintf("%s:%#x:%#x", path, flags, attr.Attr_set))
+		return nil
+	}
+	if err := applyVolumeMountAttributes("/root/data", protocol.Mount{
+		ReadOnly: true,
+	}, mountSetattr); err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{
+		fmt.Sprintf("/root/data:%#x:%#x", uint(unix.AT_RECURSIVE), uint64(unix.MOUNT_ATTR_RDONLY)),
+	}
+	if !reflect.DeepEqual(calls, expected) {
+		t.Fatalf("mount calls = %#v, want %#v", calls, expected)
+	}
+
+	if err := applyVolumeMountAttributes("/root/writable", protocol.Mount{}, mountSetattr); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, expected) {
+		t.Fatalf("writable volume changed mount attributes: %#v", calls)
+	}
+
+	failure := func(_ int, _ string, _ uint, _ *unix.MountAttr) error { return unix.EPERM }
+	if err := applyVolumeMountAttributes("/root/data", protocol.Mount{
+		ReadOnly: true,
+	}, failure); err == nil {
+		t.Fatal("read-only volume unexpectedly ignored recursive read-only failure")
+	}
+}
+
 func TestTmpfsMountConfigurationDefaultsToNoexecAndAppliesLastOverride(t *testing.T) {
 	tests := []struct {
 		name       string

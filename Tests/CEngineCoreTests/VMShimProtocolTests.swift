@@ -6620,6 +6620,14 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(throws: EngineError.self) { try RawVirtualizationBackend.volumeDevicePath(index: 25) }
     }
 
+    @Test func nestedMountDestinationsSortAfterTheirParents() {
+        let destinations = [
+            "/data/nested", "/other/child", "/data", "/other",
+            "/data//./nested/child/..",
+        ]
+        #expect(RawVirtualizationBackend.mountDestinationOrder(destinations) == [2, 3, 0, 1, 4])
+    }
+
     @MainActor @Test func containerShutdownDoesNotOwnInfrastructureTransportSockets() {
         func specification(kind: VMShimProtocol.Specification.Kind) -> VMShimProtocol.Specification {
             VMShimProtocol.Specification(
