@@ -1181,10 +1181,8 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err := applyProcessCapabilities(capabilities, uid, unix.Capset); err != nil {
 		return err
 	}
-	if !spec.Privileged {
-		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-			return err
-		}
+	if err := applyNoNewPrivileges(spec.NoNewPrivileges, unix.Prctl); err != nil {
+		return err
 	}
 	unix.Umask(0022)
 	environment := processEnvironment(spec.Environment, spec.Hostname, homeDirectory(uid), spec.Terminal)

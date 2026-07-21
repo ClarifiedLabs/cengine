@@ -3845,6 +3845,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             containerWorkingDirectory: container.workingDirectory,
             containerUser: container.user,
             containerPrivileged: container.privileged,
+            containerNoNewPrivileges: container.noNewPrivileges,
             imageEnvironment: image.configuration.config?.environment ?? [],
             imageWorkingDirectory: image.configuration.config?.workingDirectory,
             imageUser: image.configuration.config?.user
@@ -6023,7 +6024,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 blockIOReadIOps: Self.blockIOThrottles(container.blockIOReadIOps),
                 blockIOWriteIOps: Self.blockIOThrottles(container.blockIOWriteIOps)
             ),
-            privileged: container.privileged, annotations: container.annotations,
+            privileged: container.privileged,
+            noNewPrivileges: container.noNewPrivileges ?? !container.privileged,
+            annotations: container.annotations,
             capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
             rlimits: try Self.rlimits(container.ulimits), ipcMode: container.ipcMode,
             ioClaim: ioClaim
@@ -6380,6 +6383,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         containerWorkingDirectory: String,
         containerUser: String,
         containerPrivileged: Bool,
+        containerNoNewPrivileges: Bool?,
         imageEnvironment: [String],
         imageWorkingDirectory: String?,
         imageUser: String?
@@ -6400,7 +6404,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     ?? containerUser.nilIfEmpty
                     ?? imageUser?.nilIfEmpty
             ),
-            noNewPrivileges: !(containerPrivileged || configuration.privileged),
+            noNewPrivileges: containerNoNewPrivileges
+                ?? !(containerPrivileged || configuration.privileged),
             privileged: containerPrivileged || configuration.privileged
         )
     }

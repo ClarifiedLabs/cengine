@@ -44,9 +44,16 @@ sysctls, health start intervals, and
 custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
 
+Docker's `SecurityOpt` no-new-privileges selection now persists, inspects, and
+applies to container init, default and privileged exec, and healthchecks through
+guest protocol v13. Omitted policy retains cengine's existing process-privilege
+defaults, while explicit true or false selections override them and survive
+container restart and daemon recovery (`RTM-021`). Seccomp and AppArmor/SELinux-
+shaped profiles remain explicit gaps.
+
 Docker create-time ulimits now persist and apply to container init, exec, and
 healthcheck processes through capability introduced in guest protocol v7 and
-carried by the current guest protocol v12. The final exec command receives
+carried by the current guest protocol v13. The final exec command receives
 limits after namespace and root setup without constraining the guest supervisor
 or its signal/status proxies. `RTM-014` covers inspect, validation without
 side effects, daemon recovery, and container stop/start. Live ulimit updates
@@ -56,7 +63,7 @@ Supported namespace selections now persist, inspect, and survive daemon
 recovery. Docker IPC `none` uses a private IPC namespace without mounting
 `/dev/shm`; the default/private cgroup and IPC selections plus the host userns
 selection introduced in guest protocol v11 reflect guest behavior through the
-current guest protocol v12 (`RTM-016`).
+current guest protocol v13 (`RTM-016`).
 Docker-host and cross-container cgroup, IPC, PID, UTS, and network sharing are
 explicit architecture gaps: separate per-container VM kernels cannot join one
 Linux namespace. OCI namespace paths are likewise not exposed through the
@@ -64,7 +71,7 @@ Docker API or an OCI runtime CLI. These requests fail before container or volume
 mutation (`RTM-017`).
 
 Docker masked and read-only paths now persist, inspect, and enter the guest
-protocol (introduced in v11 and carried by current v12). Omitted lists select
+protocol (introduced in v11 and carried by current v13). Omitted lists select
 Docker's defaults, explicit empty lists disable them,
 and privileged workloads clear them. The guest applies the policy after its
 filesystems and workload root are in place: missing targets are ignored,
@@ -74,8 +81,9 @@ flags. `RTM-018` covers file and directory masks, read-only enforcement,
 restart, and daemon recovery.
 
 Docker's structured bind recursion and read-only controls now persist and enter
-guest protocol v12. `NonRecursive` selects a single bind instead of a recursive
-bind; read-only binds default to recursive `mount_setattr`,
+guest protocol v12 and are carried by the current v13 protocol. `NonRecursive`
+selects a single bind instead of a recursive bind; read-only binds default to
+recursive `mount_setattr`,
 `ReadOnlyNonRecursive` limits the remount to the bind root, and
 `ReadOnlyForceRecursive` forbids compatibility fallback. Contradictory modes
 fail before mutation, and `RTM-020` covers application, restart, and daemon
@@ -218,7 +226,7 @@ configure, and inspect endpoints is complete:
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
   responses. Recovery support shipped in guest protocol v7 and is carried by
-  the current guest protocol v12 (`NET-019`).
+  the current guest protocol v13 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived

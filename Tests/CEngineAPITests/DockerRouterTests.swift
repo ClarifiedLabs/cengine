@@ -2535,7 +2535,6 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(invalid.status == .badRequest)
 
         let unsupportedFields = [
-            #""SecurityOpt":["no-new-privileges"]"#,
             #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
             #""DeviceCgroupRules":["c 1:3 rwm"]"#,
             #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
@@ -2548,6 +2547,55 @@ private actor AuthImageBackend: ContainerBackend {
             ))
             #expect(rejected.status == .notImplemented)
         }
+    }
+
+    @Test func noNewPrivilegesSecurityOptionPersistsAndInspects() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let options = ["no-new-privileges:false"]
+        let create = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=security-policy",
+            body: try JSONSerialization.data(withJSONObject: [
+                "Image": "alpine", "HostConfig": ["SecurityOpt": options],
+            ])
+        ))
+        #expect(create.status == .created)
+
+        func assertPolicy(_ runtime: EngineRuntime, _ router: DockerRouter) async throws {
+            let record = try await runtime.container("security-policy")
+            #expect(record.securityOptions == options)
+            #expect(record.noNewPrivileges == false)
+            let response = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/security-policy/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            )
+            let host = try #require(object["HostConfig"] as? [String: Any])
+            #expect(host["SecurityOpt"] as? [String] == options)
+        }
+        try await assertPolicy(try #require(runtime), try #require(router))
+
+        let privileged = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=privileged-security-policy",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Privileged":true,"SecurityOpt":["no-new-privileges","seccomp:unconfined","apparmor=unconfined"]}}"#.utf8)
+        ))
+        #expect(privileged.status == .created)
+        #expect(try await #require(runtime).container("privileged-security-policy").noNewPrivileges == true)
+
+        router = nil
+        runtime = nil
+        runtime = try await EngineRuntime(root: root)
+        router = DockerRouter(runtime: try #require(runtime), root: root)
+        try await assertPolicy(try #require(runtime), try #require(router))
+
+        let malformed = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=malformed-security-policy",
+            body: Data(#"{"Image":"alpine","HostConfig":{"SecurityOpt":["no-new-privileges=maybe"]}}"#.utf8)
+        ))
+        #expect(malformed.status == .badRequest)
     }
 
     @Test func maskedAndReadonlyPathsPersistInspectAndRequireAbsolutePaths() async throws {

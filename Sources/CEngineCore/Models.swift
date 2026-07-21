@@ -174,6 +174,12 @@ public struct ContainerRecord: Codable, Sendable {
     public var privileged: Bool
     public var capabilityAdd: [String]
     public var capabilityDrop: [String]
+    /// Docker security options accepted for this workload and returned by inspect.
+    public var securityOptions: [String]
+    /// An explicit Docker no-new-privileges selection. When omitted, cengine's
+    /// default remains enabled for unprivileged processes and disabled for
+    /// privileged processes.
+    public var noNewPrivileges: Bool?
     public var readOnlyRootfs: Bool
     /// OCI Linux paths whose contents are hidden from the workload.
     public var maskedPaths: [String]?
@@ -239,6 +245,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.privileged = false
         self.capabilityAdd = []
         self.capabilityDrop = []
+        self.securityOptions = []
+        self.noNewPrivileges = nil
         self.readOnlyRootfs = false
         self.maskedPaths = nil
         self.readonlyPaths = nil

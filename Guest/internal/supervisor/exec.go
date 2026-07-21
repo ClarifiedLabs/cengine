@@ -410,7 +410,7 @@ func applyNoNewPrivileges(
 		return nil
 	}
 	if err := prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("set no-new-privileges for exec: %w", err)
+		return fmt.Errorf("set no-new-privileges: %w", err)
 	}
 	return nil
 }

@@ -1020,6 +1020,94 @@ def test_bind_recursion_and_readonly_modes_apply_restart_and_survive_recovery(
             recovered.close()
 
 
+@pytest.mark.compat("RTM-021")
+def test_no_new_privileges_security_option_applies_restart_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    options = [
+        "no-new-privileges=true", "seccomp=unconfined", "apparmor=unconfined",
+    ]
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"no-new-privileges-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": [
+                "sh", "-ec",
+                "awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status >/tmp/init-nnp; "
+                "while :; do sleep 1; done",
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "test \"$(awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status)\" = 1",
+                ],
+                "Interval": 1_000_000_000,
+                "Timeout": 2_000_000_000,
+                "Retries": 5,
+            },
+            "HostConfig": {"Privileged": True, "SecurityOpt": options},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+
+    def assert_policy(value: docker.models.containers.Container) -> None:
+        deadline = time.monotonic() + 30
+        result = None
+        while time.monotonic() < deadline:
+            result = value.exec_run([
+                "sh", "-ec",
+                "test \"$(cat /tmp/init-nnp)\" = 1; "
+                "awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status",
+            ])
+            value.reload()
+            if result.exit_code == 0 and value.attrs["State"]["Health"]["Status"] == "healthy":
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "no-new-privileges init/exec/healthcheck policy was not ready: "
+                f"{result.output.decode(errors='replace') if result else 'no exec result'}"
+            )
+        assert result.output.strip() == b"1"
+        privileged_exec = value.exec_run(
+            ["sh", "-ec", "awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status"],
+            privileged=True,
+        )
+        assert privileged_exec.exit_code == 0
+        assert privileged_exec.output.strip() == b"1"
+        value.reload()
+        assert value.attrs["HostConfig"]["SecurityOpt"] == options
+
+    try:
+        container.start()
+        assert_policy(container)
+        state = json.loads((daemon.root / "engine.json").read_text())
+        record = persisted_container_record(state, container.id)
+        assert record["securityOptions"] == options
+        assert record["noNewPrivileges"] is True
+
+        container.restart(timeout=5)
+        assert_policy(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_policy(recovered.containers.get(container.id))
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,

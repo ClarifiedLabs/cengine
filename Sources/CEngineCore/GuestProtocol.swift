@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 12
+    public static let version: UInt32 = 13
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -62,6 +62,7 @@ public enum GuestProtocol {
         public var hosts: [String: String]
         public var resources: Resources
         public var privileged: Bool
+        public var noNewPrivileges: Bool
         public var annotations: [String: String]
         public var capabilityAdd: [String]
         public var capabilityDrop: [String]
@@ -69,11 +70,11 @@ public enum GuestProtocol {
         public var ipcMode: String
         public var ioClaim: String
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, maskedPaths: [String] = [], readonlyPaths: [String] = [], stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", ioClaim: String = "") {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, maskedPaths: [String] = [], readonlyPaths: [String] = [], stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, noNewPrivileges: Bool = true, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", ioClaim: String = "") {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
             self.readOnlyRoot = readOnlyRoot; self.maskedPaths = maskedPaths; self.readonlyPaths = readonlyPaths
-            self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged
+            self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged; self.noNewPrivileges = noNewPrivileges
             self.annotations = annotations; self.capabilityAdd = capabilityAdd; self.capabilityDrop = capabilityDrop
             self.rlimits = rlimits
             self.ipcMode = ipcMode

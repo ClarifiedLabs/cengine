@@ -6,14 +6,15 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 12 {
-		t.Fatalf("Version = %d, want 12", Version)
+	if Version != 13 {
+		t.Fatalf("Version = %d, want 13", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
 		"id":"container-1",
 		"ioClaim":"container-claim",
 		"annotations":{"io.example.owner":"runtime"},
+		"noNewPrivileges":true,
 		"ipcMode":"none",
 		"maskedPaths":["/proc/kcore"],
 		"readonlyPaths":["/proc/sys"],
@@ -27,6 +28,9 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 	}
 	if spec.IOClaim != "container-claim" {
 		t.Fatalf("IOClaim = %q, want container-claim", spec.IOClaim)
+	}
+	if !spec.NoNewPrivileges {
+		t.Fatal("NoNewPrivileges did not decode")
 	}
 	if spec.IPCMode != "none" {
 		t.Fatalf("IPCMode = %q, want none", spec.IPCMode)
@@ -58,8 +62,8 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 12 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 12, got %d", Version)
+	if Version != 13 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 13, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {

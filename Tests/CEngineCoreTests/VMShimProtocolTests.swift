@@ -4888,6 +4888,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             containerWorkingDirectory: "",
             containerUser: "",
             containerPrivileged: false,
+            containerNoNewPrivileges: nil,
             imageEnvironment: ["IMAGE=1", "SHARED=image"],
             imageWorkingDirectory: "/image-work",
             imageUser: "image-user"
@@ -4910,6 +4911,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             containerWorkingDirectory: "/container-work",
             containerUser: "1000:1000",
             containerPrivileged: false,
+            containerNoNewPrivileges: nil,
             imageEnvironment: ["IMAGE=1", "SHARED=image"],
             imageWorkingDirectory: "/image-work",
             imageUser: "image-user"
@@ -4931,6 +4933,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             containerWorkingDirectory: "",
             containerUser: "",
             containerPrivileged: true,
+            containerNoNewPrivileges: nil,
             imageEnvironment: [],
             imageWorkingDirectory: nil,
             imageUser: nil
@@ -4938,6 +4941,36 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
 
         #expect(context.privileged)
         #expect(!context.noNewPrivileges)
+    }
+
+    @Test func explicitNoNewPrivilegesSelectionOverridesInitAndExecPrivilegeDefaults() throws {
+        var container = ContainerRecord(
+            id: "security-policy-container", name: "security-policy", image: "alpine:latest",
+            processArguments: ["true"]
+        )
+        container.privileged = true
+        container.noNewPrivileges = true
+
+        let workload = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+        let exec = RawVirtualizationBackend.resolveExecContext(
+            configuration: .init(arguments: ["id"], privileged: true),
+            containerEnvironment: [], containerWorkingDirectory: "", containerUser: "",
+            containerPrivileged: true, containerNoNewPrivileges: true,
+            imageEnvironment: [], imageWorkingDirectory: nil, imageUser: nil
+        )
+
+        #expect(workload.noNewPrivileges)
+        #expect(exec.noNewPrivileges)
+
+        container.privileged = false
+        container.noNewPrivileges = false
+        #expect(try !RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        ).noNewPrivileges)
     }
 
     @Test func healthcheckExecLifecycleRetiresMoreThanJournalActiveLimit() async throws {

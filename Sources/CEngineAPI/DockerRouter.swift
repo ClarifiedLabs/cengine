@@ -172,6 +172,8 @@ public struct DockerRouter: Sendable {
             record.privileged = input.HostConfig?.Privileged ?? false
             record.capabilityAdd = try normalizedCapabilities(input.HostConfig?.CapAdd ?? [])
             record.capabilityDrop = try normalizedCapabilities(input.HostConfig?.CapDrop ?? [])
+            record.securityOptions = validated.security.options
+            record.noNewPrivileges = validated.security.noNewPrivileges
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.maskedPaths = input.HostConfig?.MaskedPaths
             record.readonlyPaths = input.HostConfig?.ReadonlyPaths
@@ -1137,6 +1139,11 @@ public struct DockerRouter: Sendable {
         static let unchanged = BlockIOConfiguration()
     }
 
+    private struct SecurityConfiguration {
+        var options: [String]
+        var noNewPrivileges: Bool?
+    }
+
     private func decodeContainerUpdate(
         _ body: Data, version: DockerAPIVersion
     ) throws -> ContainerUpdateRequest {
@@ -1165,7 +1172,8 @@ public struct DockerRouter: Sendable {
     }
 
     private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (
-        mounts: [MountRecord], ulimits: [UlimitRecord], blockIO: BlockIOConfiguration
+        mounts: [MountRecord], ulimits: [UlimitRecord], blockIO: BlockIOConfiguration,
+        security: SecurityConfiguration
     ) {
         try rejectActiveRuntimeFields([
             (!(input.Domainname ?? "").isEmpty, "Domainname"),
@@ -1178,7 +1186,7 @@ public struct DockerRouter: Sendable {
         }
         try validateStopSignal(input.StopSignal)
         try validateHealthcheck(input.Healthcheck)
-        try validateHostRuntimeInput(input.HostConfig, tty: input.Tty == true)
+        let security = try validateHostRuntimeInput(input.HostConfig, tty: input.Tty == true)
         try validateVolumeDrivers(in: input)
         return (
             try mounts(from: input),
@@ -1189,7 +1197,8 @@ public struct DockerRouter: Sendable {
                 readIOps: input.HostConfig?.BlkioDeviceReadIOps,
                 writeIOps: input.HostConfig?.BlkioDeviceWriteIOps,
                 prefix: "HostConfig"
-            )
+            ),
+            security
         )
     }
 
@@ -1265,7 +1274,7 @@ public struct DockerRouter: Sendable {
     private func validateHostRuntimeInput(
         _ host: ContainerCreateRequest.HostConfig?,
         tty: Bool
-    ) throws {
+    ) throws -> SecurityConfiguration {
         try validateResourceValues(
             memory: host?.Memory, nanoCPUs: host?.NanoCpus,
             cpuPeriod: host?.CpuPeriod, cpuQuota: host?.CpuQuota,
@@ -1312,7 +1321,9 @@ public struct DockerRouter: Sendable {
             (!(host?.StorageOpt ?? [:]).isEmpty, "StorageOpt"),
             (!(host?.Runtime ?? "").isEmpty, "Runtime"),
         ])
-        try validateSecurityOptions(host?.SecurityOpt, privileged: host?.Privileged == true)
+        let security = try validateSecurityOptions(
+            host?.SecurityOpt, privileged: host?.Privileged == true
+        )
         try validateContainerPaths(host?.MaskedPaths, field: "HostConfig.MaskedPaths")
         try validateContainerPaths(host?.ReadonlyPaths, field: "HostConfig.ReadonlyPaths")
         try validateConsoleSize(
@@ -1332,6 +1343,7 @@ public struct DockerRouter: Sendable {
         if host?.AutoRemove == true && restartName != "" && restartName != "no" {
             throw EngineError(.badRequest, "AutoRemove cannot be combined with a restart policy")
         }
+        return security
     }
 
     private func normalizedUlimits(
@@ -1363,11 +1375,48 @@ public struct DockerRouter: Sendable {
         }
     }
 
-    private func validateSecurityOptions(_ values: [String]?, privileged: Bool) throws {
-        guard let values, !values.isEmpty else { return }
-        let privilegedDefaults: Set<String> = ["seccomp=unconfined", "apparmor=unconfined"]
-        if privileged, values.allSatisfy(privilegedDefaults.contains) { return }
-        throw EngineError(.unsupported, "HostConfig.SecurityOpt is not supported")
+    private func validateSecurityOptions(
+        _ values: [String]?, privileged: Bool
+    ) throws -> SecurityConfiguration {
+        let values = values ?? []
+        var noNewPrivileges: Bool?
+        for value in values {
+            if value == "no-new-privileges" {
+                noNewPrivileges = true
+                continue
+            }
+            let separator = value.firstIndex(of: "=") ?? value.firstIndex(of: ":")
+            guard let separator else {
+                throw EngineError(.unsupported, "HostConfig.SecurityOpt option \(value) is not supported")
+            }
+            let key = String(value[..<separator])
+            let option = String(value[value.index(after: separator)...])
+            switch key {
+            case "no-new-privileges":
+                switch option {
+                case "1", "t", "T", "TRUE", "true", "True":
+                    noNewPrivileges = true
+                case "0", "f", "F", "FALSE", "false", "False":
+                    noNewPrivileges = false
+                default:
+                    throw EngineError(
+                        .badRequest,
+                        "HostConfig.SecurityOpt no-new-privileges requires a boolean value"
+                    )
+                }
+            case "seccomp", "apparmor":
+                guard privileged, option == "unconfined" else {
+                    throw EngineError(
+                        .unsupported, "HostConfig.SecurityOpt option \(value) is not supported"
+                    )
+                }
+            default:
+                throw EngineError(
+                    .unsupported, "HostConfig.SecurityOpt option \(value) is not supported"
+                )
+            }
+        }
+        return SecurityConfiguration(options: values, noNewPrivileges: noNewPrivileges)
     }
 
     private func validateContainerPaths(_ values: [String]?, field: String) throws {
@@ -2061,6 +2110,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Ulimits: [UlimitResponse]
         let AutoRemove: Bool; let Privileged: Bool
         let CapAdd: [String]; let CapDrop: [String]
+        let SecurityOpt: [String]?
         let ReadonlyRootfs: Bool; let MaskedPaths: [String]?; let ReadonlyPaths: [String]?
         let Init: Bool; let RestartPolicy: RestartPolicy
         let CgroupnsMode: String; let IpcMode: String; let PidMode: String
@@ -2079,7 +2129,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             case Memory, NanoCpus, PidsLimit
             case BlkioWeight, BlkioWeightDevice, BlkioDeviceReadBps, BlkioDeviceWriteBps
             case BlkioDeviceReadIOps, BlkioDeviceWriteIOps
-            case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, ReadonlyRootfs
+            case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, SecurityOpt, ReadonlyRootfs
             case MaskedPaths, ReadonlyPaths, Init, RestartPolicy
             case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode
             case Annotations, Binds, Mounts, PortBindings, NetworkMode, LogConfig
@@ -2101,6 +2151,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(Privileged, forKey: .Privileged)
             try container.encode(CapAdd, forKey: .CapAdd)
             try container.encode(CapDrop, forKey: .CapDrop)
+            try container.encode(SecurityOpt, forKey: .SecurityOpt)
             try container.encode(ReadonlyRootfs, forKey: .ReadonlyRootfs)
             try container.encode(MaskedPaths, forKey: .MaskedPaths)
             try container.encode(ReadonlyPaths, forKey: .ReadonlyPaths)
@@ -2178,6 +2229,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             Ulimits: record.ulimits.map { .init(Name: $0.name, Soft: $0.soft, Hard: $0.hard) },
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,
+            SecurityOpt: record.securityOptions.isEmpty ? nil : record.securityOptions,
             ReadonlyRootfs: record.readOnlyRootfs,
             MaskedPaths: record.maskedPaths, ReadonlyPaths: record.readonlyPaths,
             Init: record.useInit,

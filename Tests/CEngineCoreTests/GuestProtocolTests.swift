@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 12)
+        #expect(GuestProtocol.version == 13)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -29,7 +29,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 12)
+        #expect(GuestProtocol.version == 13)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -96,6 +96,7 @@ import Testing
             maskedPaths: ["/proc/kcore"], readonlyPaths: ["/proc/sys"],
             stopSignal: "SIGTERM", mounts: [], networks: [],
             resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
+            noNewPrivileges: false,
             annotations: ["io.example.owner": "runtime"],
             capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"],
             rlimits: [.init(type: "core", soft: 0, hard: UInt64.max)],
@@ -113,6 +114,7 @@ import Testing
         #expect(object["ipcMode"] as? String == "none")
         #expect(object["maskedPaths"] as? [String] == ["/proc/kcore"])
         #expect(object["readonlyPaths"] as? [String] == ["/proc/sys"])
+        #expect(object["noNewPrivileges"] as? Bool == false)
         #expect(object["ioClaim"] as? String == "container-claim")
     }
 
