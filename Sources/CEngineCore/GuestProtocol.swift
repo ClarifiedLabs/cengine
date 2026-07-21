@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 11
+    public static let version: UInt32 = 12
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -153,14 +153,20 @@ public enum GuestProtocol {
         public var subpath: String?
         public var noCopy: Bool
         public var propagation: String
+        public var nonRecursive: Bool
+        public var readOnlyNonRecursive: Bool
+        public var readOnlyForceRecursive: Bool
         public var socketPort: UInt32?
         public var socketMode: UInt32?
         public var socketUID: UInt32?
         public var socketGID: UInt32?
-        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, propagation: String = "rprivate", socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil) {
+        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, propagation: String = "rprivate", nonRecursive: Bool = false, readOnlyNonRecursive: Bool = false, readOnlyForceRecursive: Bool = false, socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil) {
             self.kind = kind; self.source = source; self.device = device; self.destination = destination; self.readOnly = readOnly; self.options = options; self.subpath = subpath; self.noCopy = noCopy
             self.socketPort = socketPort; self.socketMode = socketMode; self.socketUID = socketUID; self.socketGID = socketGID
             self.propagation = propagation
+            self.nonRecursive = nonRecursive
+            self.readOnlyNonRecursive = readOnlyNonRecursive
+            self.readOnlyForceRecursive = readOnlyForceRecursive
         }
     }
 

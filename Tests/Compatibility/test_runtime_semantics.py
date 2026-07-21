@@ -894,6 +894,132 @@ def test_block_io_weights_are_an_architecture_gap_with_versioned_update_semantic
         container.remove(force=True)
 
 
+@pytest.mark.compat("RTM-020")
+def test_bind_recursion_and_readonly_modes_apply_restart_and_survive_recovery(
+    daemon, client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    suffix = uuid.uuid4().hex[:8]
+    sources = {}
+    for mode in ("default", "nonrecursive", "forced", "writable"):
+        source = tmp_path / mode
+        source.mkdir()
+        (source / "source-marker").write_text(mode)
+        sources[mode] = source
+
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"bind-modes-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["tail", "-f", "/dev/null"],
+            "HostConfig": {"Mounts": [
+                {
+                    "Type": "bind", "Source": str(sources["default"]),
+                    "Target": "/default", "ReadOnly": True,
+                },
+                {
+                    "Type": "bind", "Source": str(sources["nonrecursive"]),
+                    "Target": "/nonrecursive", "ReadOnly": True,
+                    "BindOptions": {
+                        "NonRecursive": True, "ReadOnlyNonRecursive": True,
+                    },
+                },
+                {
+                    "Type": "bind", "Source": str(sources["forced"]),
+                    "Target": "/forced", "ReadOnly": True,
+                    "BindOptions": {"ReadOnlyForceRecursive": True},
+                },
+                {
+                    "Type": "bind", "Source": str(sources["writable"]),
+                    "Target": "/writable",
+                    "BindOptions": {"NonRecursive": True},
+                },
+            ]},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+
+    def assert_bind_modes(value: docker.models.containers.Container) -> None:
+        result = value.exec_run([
+            "sh", "-ec",
+            "for path in default nonrecursive forced; do "
+            "  test \"$(cat /$path/source-marker)\" = \"$path\"; "
+            "  options=$(awk -v target=\"/$path\" '$2 == target { print $4; exit }' /proc/mounts); "
+            "  case ,$options, in *,ro,*) ;; *) exit 40 ;; esac; "
+            "  if touch /$path/rejected 2>/dev/null; then exit 41; fi; "
+            "done; "
+            "test \"$(cat /writable/source-marker)\" = writable; "
+            "touch /writable/accepted; printf bind-modes-ok",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output == b"bind-modes-ok"
+
+    def assert_persisted_modes() -> None:
+        state = json.loads((daemon.root / "engine.json").read_text())
+        record = persisted_container_record(state, container.id)
+        mounts = {mount["destination"]: mount for mount in record["mounts"]}
+        assert mounts["/default"]["nonRecursive"] is False
+        assert mounts["/default"]["readOnlyNonRecursive"] is False
+        assert mounts["/default"]["readOnlyForceRecursive"] is False
+        assert mounts["/nonrecursive"]["nonRecursive"] is True
+        assert mounts["/nonrecursive"]["readOnlyNonRecursive"] is True
+        assert mounts["/nonrecursive"]["readOnlyForceRecursive"] is False
+        assert mounts["/forced"]["nonRecursive"] is False
+        assert mounts["/forced"]["readOnlyNonRecursive"] is False
+        assert mounts["/forced"]["readOnlyForceRecursive"] is True
+        assert mounts["/writable"]["nonRecursive"] is True
+
+    try:
+        container.start()
+        assert_bind_modes(container)
+        assert_persisted_modes()
+
+        container.restart(timeout=5)
+        assert_bind_modes(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        value = recovered.containers.get(container.id)
+        assert_bind_modes(value)
+        assert_persisted_modes()
+
+        initial_volumes = {volume.name for volume in recovered.volumes.list()}
+        with pytest.raises(docker.errors.APIError) as error:
+            conflict = recovered.api._post_json(
+                recovered.api._url("/containers/create"),
+                params={"name": f"conflicting-bind-modes-{suffix}"},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/leaked-volume": {}},
+                    "HostConfig": {"Mounts": [{
+                        "Type": "bind", "Source": str(sources["default"]),
+                        "Target": "/data", "ReadOnly": True,
+                        "BindOptions": {
+                            "ReadOnlyNonRecursive": True,
+                            "ReadOnlyForceRecursive": True,
+                        },
+                    }]},
+                },
+            )
+            recovered.api._raise_for_status(conflict)
+        assert error.value.status_code == 400
+        assert {volume.name for volume in recovered.volumes.list()} == initial_volumes
+        with pytest.raises(docker.errors.NotFound):
+            recovered.containers.get(f"conflicting-bind-modes-{suffix}")
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,

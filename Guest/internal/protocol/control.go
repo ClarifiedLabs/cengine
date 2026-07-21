@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 11
+	Version                         = 12
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -75,19 +75,22 @@ type Rlimit struct {
 }
 
 type Mount struct {
-	Kind        string   `json:"kind"`
-	Source      string   `json:"source"`
-	Device      string   `json:"device,omitempty"`
-	Destination string   `json:"destination"`
-	ReadOnly    bool     `json:"readOnly"`
-	Options     []string `json:"options,omitempty"`
-	Subpath     string   `json:"subpath,omitempty"`
-	NoCopy      bool     `json:"noCopy,omitempty"`
-	Propagation string   `json:"propagation,omitempty"`
-	SocketPort  uint32   `json:"socketPort,omitempty"`
-	SocketMode  uint32   `json:"socketMode,omitempty"`
-	SocketUID   uint32   `json:"socketUID,omitempty"`
-	SocketGID   uint32   `json:"socketGID,omitempty"`
+	Kind                   string   `json:"kind"`
+	Source                 string   `json:"source"`
+	Device                 string   `json:"device,omitempty"`
+	Destination            string   `json:"destination"`
+	ReadOnly               bool     `json:"readOnly"`
+	Options                []string `json:"options,omitempty"`
+	Subpath                string   `json:"subpath,omitempty"`
+	NoCopy                 bool     `json:"noCopy,omitempty"`
+	Propagation            string   `json:"propagation,omitempty"`
+	NonRecursive           bool     `json:"nonRecursive,omitempty"`
+	ReadOnlyNonRecursive   bool     `json:"readOnlyNonRecursive,omitempty"`
+	ReadOnlyForceRecursive bool     `json:"readOnlyForceRecursive,omitempty"`
+	SocketPort             uint32   `json:"socketPort,omitempty"`
+	SocketMode             uint32   `json:"socketMode,omitempty"`
+	SocketUID              uint32   `json:"socketUID,omitempty"`
+	SocketGID              uint32   `json:"socketGID,omitempty"`
 }
 
 type NetworkEndpoint struct {

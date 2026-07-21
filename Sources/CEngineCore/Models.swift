@@ -37,14 +37,25 @@ public struct MountRecord: Codable, Hashable, Sendable {
     public var tmpfsMode: UInt32?
     public var createSourceIfMissing: Bool?
     public var propagation: Propagation?
+    /// Whether a bind excludes mounts nested beneath its source.
+    public var nonRecursive: Bool
+    /// Whether a read-only bind applies read-only only to its top-level mount.
+    public var readOnlyNonRecursive: Bool
+    /// Whether recursive read-only application must succeed instead of falling back.
+    public var readOnlyForceRecursive: Bool
 
     public init(kind: Kind, source: String, destination: String, readOnly: Bool = false, noCopy: Bool = false,
                 subpath: String? = nil, tmpfsSizeBytes: Int64? = nil, tmpfsMode: UInt32? = nil,
-                createSourceIfMissing: Bool? = nil, propagation: Propagation? = nil) {
+                createSourceIfMissing: Bool? = nil, propagation: Propagation? = nil,
+                nonRecursive: Bool = false, readOnlyNonRecursive: Bool = false,
+                readOnlyForceRecursive: Bool = false) {
         self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly
         self.noCopy = noCopy; self.subpath = subpath; self.tmpfsSizeBytes = tmpfsSizeBytes; self.tmpfsMode = tmpfsMode
         self.createSourceIfMissing = createSourceIfMissing
         self.propagation = propagation
+        self.nonRecursive = nonRecursive
+        self.readOnlyNonRecursive = readOnlyNonRecursive
+        self.readOnlyForceRecursive = readOnlyForceRecursive
     }
 }
 

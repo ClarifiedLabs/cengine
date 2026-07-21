@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 11)
+        #expect(GuestProtocol.version == 12)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -29,7 +29,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 11)
+        #expect(GuestProtocol.version == 12)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -46,6 +46,22 @@ import Testing
             try JSONSerialization.jsonObject(with: endpointData) as? [String: Any]
         )
         #expect(endpointObject["sysctls"] as? [String] == ["net.ipv4.conf.IFNAME.forwarding=1"])
+    }
+
+    @Test func bindMountPayloadCarriesRecursionAndReadOnlyModes() throws {
+        let value = GuestProtocol.Mount(
+            kind: "bind", source: "bind-0", destination: "/data", readOnly: true,
+            propagation: "private", nonRecursive: true, readOnlyNonRecursive: true
+        )
+        let data = try JSONEncoder().encode(value)
+
+        #expect(try JSONDecoder().decode(GuestProtocol.Mount.self, from: data) == value)
+        let object = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        #expect(object["nonRecursive"] as? Bool == true)
+        #expect(object["readOnlyNonRecursive"] as? Bool == true)
+        #expect(object["readOnlyForceRecursive"] as? Bool == false)
     }
 
     @Test func blockIOThrottleResourcesRoundTripInCurrentProtocol() throws {

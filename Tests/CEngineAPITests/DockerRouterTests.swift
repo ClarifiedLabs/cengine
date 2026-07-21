@@ -2469,6 +2469,49 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(mismatched.status == .badRequest)
     }
 
+    @Test func bindRecursionAndReadOnlyModesPersistAndValidateConflicts() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let response = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=bind-modes",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/nonrecursive","ReadOnly":true,"BindOptions":{"NonRecursive":true,"ReadOnlyNonRecursive":true}},{"Type":"bind","Source":"/tmp","Target":"/forced","ReadOnly":true,"BindOptions":{"ReadOnlyForceRecursive":true}},{"Type":"bind","Source":"/tmp","Target":"/writable","BindOptions":{"NonRecursive":true,"ReadOnlyNonRecursive":true,"ReadOnlyForceRecursive":true}}]}}"#.utf8)
+        ))
+        #expect(response.status == .created)
+
+        func assertModes(_ runtime: EngineRuntime) async throws {
+            let record = try await runtime.container("bind-modes")
+            let nonrecursive = try #require(
+                record.mounts.first { $0.destination == "/nonrecursive" }
+            )
+            #expect(nonrecursive.nonRecursive)
+            #expect(nonrecursive.readOnlyNonRecursive)
+            #expect(!nonrecursive.readOnlyForceRecursive)
+            let forced = try #require(record.mounts.first { $0.destination == "/forced" })
+            #expect(!forced.nonRecursive)
+            #expect(!forced.readOnlyNonRecursive)
+            #expect(forced.readOnlyForceRecursive)
+            let writable = try #require(record.mounts.first { $0.destination == "/writable" })
+            #expect(writable.nonRecursive)
+            #expect(!writable.readOnlyNonRecursive)
+            #expect(!writable.readOnlyForceRecursive)
+        }
+        try await assertModes(try #require(runtime))
+
+        router = nil
+        runtime = nil
+        runtime = try await EngineRuntime(root: root)
+        router = DockerRouter(runtime: try #require(runtime), root: root)
+        try await assertModes(try #require(runtime))
+
+        let conflict = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=conflicting-bind-modes",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"bind","Source":"/tmp","Target":"/data","ReadOnly":true,"BindOptions":{"ReadOnlyNonRecursive":true,"ReadOnlyForceRecursive":true}}]}}"#.utf8)
+        ))
+        #expect(conflict.status == .badRequest)
+    }
+
     @Test func capabilityChangesRoundTripAndUnsupportedSecurityFieldsAreRejected() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }

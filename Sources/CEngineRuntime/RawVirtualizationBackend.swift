@@ -5974,7 +5974,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 options: options,
                 subpath: bindSubpath,
                 noCopy: mount.noCopy,
-                propagation: mount.propagation?.rawValue ?? ""
+                propagation: mount.propagation?.rawValue ?? "",
+                nonRecursive: mount.nonRecursive,
+                readOnlyNonRecursive: mount.readOnlyNonRecursive,
+                readOnlyForceRecursive: mount.readOnlyForceRecursive
             )
         }
         return try Self.workloadSpecification(

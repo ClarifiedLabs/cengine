@@ -1757,9 +1757,12 @@ public struct DockerRouter: Sendable {
                 throw EngineError(.badRequest, "invalid volume name: \(source)")
             }
             let bindOptions = mount.BindOptions
-            if bindOptions?.NonRecursive == true || bindOptions?.ReadOnlyNonRecursive == true
-                || bindOptions?.ReadOnlyForceRecursive == true {
-                throw EngineError(.unsupported, "non-recursive bind mount options are not supported")
+            if mount.ReadOnly == true, bindOptions?.ReadOnlyNonRecursive == true,
+               bindOptions?.ReadOnlyForceRecursive == true {
+                throw EngineError(
+                    .badRequest,
+                    "BindOptions.ReadOnlyNonRecursive conflicts with ReadOnlyForceRecursive"
+                )
             }
             if mount.VolumeOptions?.Labels?.isEmpty == false {
                 throw EngineError(.unsupported, "VolumeOptions.Labels is not supported")
@@ -1788,7 +1791,12 @@ public struct DockerRouter: Sendable {
                 noCopy: mount.VolumeOptions?.NoCopy ?? false, subpath: mount.VolumeOptions?.Subpath,
                 tmpfsSizeBytes: mount.TmpfsOptions?.SizeBytes, tmpfsMode: mount.TmpfsOptions?.Mode,
                 createSourceIfMissing: kind == .bind ? (bindOptions?.CreateMountpoint ?? false) : nil,
-                propagation: kind == .bind ? try validatedMountPropagation(bindOptions?.Propagation) : nil
+                propagation: kind == .bind ? try validatedMountPropagation(bindOptions?.Propagation) : nil,
+                nonRecursive: kind == .bind ? (bindOptions?.NonRecursive ?? false) : false,
+                readOnlyNonRecursive: kind == .bind && mount.ReadOnly == true
+                    ? (bindOptions?.ReadOnlyNonRecursive ?? false) : false,
+                readOnlyForceRecursive: kind == .bind && mount.ReadOnly == true
+                    ? (bindOptions?.ReadOnlyForceRecursive ?? false) : false
             )
         }
         for bind in input.HostConfig?.Binds ?? [] {

@@ -1539,10 +1539,10 @@ func applyMount(root string, mount protocol.Mount) error {
 		if err := prepareMountpoint(source, destination); err != nil {
 			return err
 		}
-		if err := unix.Mount(source, destination, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		if err := unix.Mount(source, destination, "", bindMountFlags(mount), ""); err != nil {
 			return err
 		}
-		return applyBindMountAttributes(destination, mount, unix.Mount)
+		return applyBindMountAttributes(destination, mount, unix.Mount, unix.MountSetattr)
 	case "socket":
 		return nil
 	case "volume":
@@ -1567,8 +1567,21 @@ func applyMount(root string, mount protocol.Mount) error {
 }
 
 type mountOperation func(source, target, filesystem string, flags uintptr, data string) error
+type mountSetattrOperation func(dirfd int, path string, flags uint, attr *unix.MountAttr) error
 
-func applyBindMountAttributes(destination string, spec protocol.Mount, mount mountOperation) error {
+func bindMountFlags(spec protocol.Mount) uintptr {
+	if spec.NonRecursive {
+		return unix.MS_BIND
+	}
+	return unix.MS_BIND | unix.MS_REC
+}
+
+func applyBindMountAttributes(
+	destination string,
+	spec protocol.Mount,
+	mount mountOperation,
+	mountSetattr mountSetattrOperation,
+) error {
 	flags, err := mountPropagationFlags(spec.Propagation)
 	if err != nil {
 		return err
@@ -1576,10 +1589,23 @@ func applyBindMountAttributes(destination string, spec protocol.Mount, mount mou
 	if err := mount("", destination, "", flags, ""); err != nil {
 		return fmt.Errorf("set mount propagation on %s: %w", destination, err)
 	}
-	if spec.ReadOnly {
+	if !spec.ReadOnly {
+		return nil
+	}
+	if spec.ReadOnlyNonRecursive {
+		if spec.ReadOnlyForceRecursive {
+			return errors.New("read-only bind mount cannot be both non-recursive and force-recursive")
+		}
 		return mount("", destination, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
 	}
-	return nil
+	attribute := &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
+	if err := mountSetattr(unix.AT_FDCWD, destination, unix.AT_RECURSIVE, attribute); err == nil {
+		return nil
+	} else if spec.ReadOnlyForceRecursive ||
+		(!errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.EOPNOTSUPP)) {
+		return fmt.Errorf("make bind mount recursively read-only at %s: %w", destination, err)
+	}
+	return mount("", destination, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
 }
 
 func mountPropagationFlags(propagation string) (uintptr, error) {
