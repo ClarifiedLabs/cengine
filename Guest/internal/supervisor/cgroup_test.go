@@ -17,13 +17,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestCgroupNamespaceIsCreatedAfterParentPlacement(t *testing.T) {
+func TestCgroupNamespaceRootIsFixedBeforeInitMovesToDelegatedLeaf(t *testing.T) {
 	calls := []string{}
-	gate := &recordingReader{
-		Reader: bytes.NewReader([]byte{1}),
-		calls:  &calls,
-	}
-	if err := enterPlacedCgroupNamespace(gate, func(flag int) error {
+	gate := &recordingCgroupDelegation{calls: &calls}
+	if err := enterDelegatedCgroupNamespace(gate, func(flag int) error {
 		calls = append(calls, "unshare")
 		if flag != unix.CLONE_NEWCGROUP {
 			t.Fatalf("unshare flag = %d", flag)
@@ -32,19 +29,32 @@ func TestCgroupNamespaceIsCreatedAfterParentPlacement(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(calls, []string{"placement", "unshare"}) {
+	if !reflect.DeepEqual(calls, []string{
+		"placement", "unshare", "namespace-ready", "leaf-ready",
+	}) {
 		t.Fatalf("cgroup namespace sequence = %#v", calls)
 	}
 }
 
-type recordingReader struct {
-	*bytes.Reader
+type recordingCgroupDelegation struct {
 	calls *[]string
+	reads int
 }
 
-func (reader *recordingReader) Read(value []byte) (int, error) {
-	*reader.calls = append(*reader.calls, "placement")
-	return reader.Reader.Read(value)
+func (gate *recordingCgroupDelegation) Read(value []byte) (int, error) {
+	name := "placement"
+	if gate.reads > 0 {
+		name = "leaf-ready"
+	}
+	gate.reads++
+	*gate.calls = append(*gate.calls, name)
+	value[0] = 1
+	return 1, nil
+}
+
+func (gate *recordingCgroupDelegation) Write(value []byte) (int, error) {
+	*gate.calls = append(*gate.calls, "namespace-ready")
+	return len(value), nil
 }
 
 func TestEnableCgroupControllersDelegatesDockerResourceControllers(t *testing.T) {
@@ -83,9 +93,9 @@ func TestEnableCgroupControllersRequiresIOOnlyForConfiguredThrottles(t *testing.
 	}
 }
 
-func TestResolveBlockDeviceUsesHostVDADeviceNumber(t *testing.T) {
-	device, err := resolveBlockDeviceWithStat("/dev/vda", func(path string, status *unix.Stat_t) error {
-		if path != "/dev/vda" {
+func TestResolveBlockDeviceUsesConfiguredHostDeviceNumber(t *testing.T) {
+	device, err := resolveBlockDeviceWithStat("/dev/vdb", func(path string, status *unix.Stat_t) error {
+		if path != "/dev/vdb" {
 			t.Fatalf("stat path = %q", path)
 		}
 		status.Mode = unix.S_IFBLK
@@ -98,8 +108,8 @@ func TestResolveBlockDeviceUsesHostVDADeviceNumber(t *testing.T) {
 	if device != "8:17" {
 		t.Fatalf("device = %q, want 8:17", device)
 	}
-	if _, err := resolveBlockDeviceWithStat("/dev/vdb", func(string, *unix.Stat_t) error { return nil }); err == nil {
-		t.Fatal("non-root device was accepted")
+	if _, err := resolveBlockDeviceWithStat("relative", func(string, *unix.Stat_t) error { return nil }); err == nil {
+		t.Fatal("relative device was accepted")
 	}
 	if _, err := resolveBlockDeviceWithStat("/dev/vda", func(_ string, status *unix.Stat_t) error {
 		status.Mode = unix.S_IFREG

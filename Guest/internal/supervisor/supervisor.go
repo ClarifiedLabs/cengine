@@ -29,30 +29,31 @@ const stage2Argument = "cengine-workload-stage2"
 const workloadReadyFD = 5
 
 type Supervisor struct {
-	mu                    sync.Mutex
-	spec                  *protocol.WorkloadSpec
-	command               *exec.Cmd
-	status                protocol.ProcessStatus
-	waiters               []chan protocol.ProcessStatus
-	execs                 map[string]*exec.Cmd
-	execTargets           map[string]int
-	execCgroups           map[string]string
-	execStatus            map[string]protocol.ProcessStatus
-	processIO             *pinnedProcessIO
-	execIO                map[string]*pinnedProcessIO
-	execSpecs             map[string]protocol.ExecSpec
-	devicePolicyInstalled bool
+	mu             sync.Mutex
+	spec           *protocol.WorkloadSpec
+	command        *exec.Cmd
+	status         protocol.ProcessStatus
+	waiters        []chan protocol.ProcessStatus
+	execs          map[string]*exec.Cmd
+	execTargets    map[string]int
+	execCgroups    map[string]string
+	execStatus     map[string]protocol.ProcessStatus
+	processIO      *pinnedProcessIO
+	execIO         map[string]*pinnedProcessIO
+	execSpecs      map[string]protocol.ExecSpec
+	devicePolicyFD int
 }
 
 func New() *Supervisor {
 	return &Supervisor{
-		status:      protocol.ProcessStatus{Status: "empty"},
-		execs:       map[string]*exec.Cmd{},
-		execTargets: map[string]int{},
-		execCgroups: map[string]string{},
-		execStatus:  map[string]protocol.ProcessStatus{},
-		execIO:      map[string]*pinnedProcessIO{},
-		execSpecs:   map[string]protocol.ExecSpec{},
+		status:         protocol.ProcessStatus{Status: "empty"},
+		execs:          map[string]*exec.Cmd{},
+		execTargets:    map[string]int{},
+		execCgroups:    map[string]string{},
+		execStatus:     map[string]protocol.ProcessStatus{},
+		execIO:         map[string]*pinnedProcessIO{},
+		execSpecs:      map[string]protocol.ExecSpec{},
+		devicePolicyFD: -1,
 	}
 }
 
@@ -79,12 +80,12 @@ func RunStage2() error {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return fmt.Errorf("decode workload specification: %w", err)
 	}
-	gate := os.NewFile(4, "network-ready")
+	gate := os.NewFile(4, "cgroup-delegation")
 	if gate == nil {
-		return errors.New("network readiness file descriptor is unavailable")
+		return errors.New("cgroup delegation file descriptor is unavailable")
 	}
 	defer gate.Close()
-	if err := enterPlacedCgroupNamespace(gate, unix.Unshare); err != nil {
+	if err := enterDelegatedCgroupNamespace(gate, unix.Unshare); err != nil {
 		return err
 	}
 	ready := os.NewFile(workloadReadyFD, "workload-ready")
@@ -96,13 +97,19 @@ func RunStage2() error {
 	return enterWorkload(spec, ready)
 }
 
-func enterPlacedCgroupNamespace(gate io.Reader, unshare func(int) error) error {
+func enterDelegatedCgroupNamespace(gate io.ReadWriter, unshare func(int) error) error {
 	var ready [1]byte
 	if _, err := io.ReadFull(gate, ready[:]); err != nil {
 		return fmt.Errorf("wait for workload placement: %w", err)
 	}
 	if err := unshare(unix.CLONE_NEWCGROUP); err != nil {
 		return fmt.Errorf("create cgroup namespace: %w", err)
+	}
+	if _, err := gate.Write([]byte{1}); err != nil {
+		return fmt.Errorf("publish cgroup namespace: %w", err)
+	}
+	if _, err := io.ReadFull(gate, ready[:]); err != nil {
+		return fmt.Errorf("wait for delegated cgroup leaf: %w", err)
 	}
 	return nil
 }
@@ -112,6 +119,9 @@ func (s *Supervisor) Prepare(spec protocol.WorkloadSpec) error {
 		return errors.New("workload requires id, rootDevice, and arguments")
 	}
 	if err := validateVolumeMounts(spec); err != nil {
+		return err
+	}
+	if _, err := configuredDeviceRulesForHost(spec.Resources); err != nil {
 		return err
 	}
 	for _, mount := range spec.Mounts {
@@ -206,7 +216,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	if err != nil {
 		return s.status, err
 	}
-	gateReader, gateWriter, err := os.Pipe()
+	gateReader, gateWriter, err := cgroupDelegationSocketPair()
 	if err != nil {
 		reader.Close()
 		writer.Close()
@@ -339,6 +349,28 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		_ = command.Process.Kill()
 		return s.status, err
 	}
+	var namespaceReady [1]byte
+	if _, err := io.ReadFull(gateWriter, namespaceReady[:]); err != nil {
+		readyReader.Close()
+		gateWriter.Close()
+		_ = command.Process.Kill()
+		return s.status, fmt.Errorf("wait for workload cgroup namespace: %w", err)
+	}
+	if err := delegateWorkloadCgroup(
+		filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID), command.Process.Pid,
+		hasBlockIOLimits(s.spec.Resources),
+	); err != nil {
+		readyReader.Close()
+		gateWriter.Close()
+		_ = command.Process.Kill()
+		return s.status, err
+	}
+	if _, err := gateWriter.Write([]byte{1}); err != nil {
+		readyReader.Close()
+		gateWriter.Close()
+		_ = command.Process.Kill()
+		return s.status, fmt.Errorf("release delegated workload cgroup: %w", err)
+	}
 	gateWriter.Close()
 	var ready [1]byte
 	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
@@ -362,6 +394,17 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
 	}
 	return s.status, nil
+}
+
+func cgroupDelegationSocketPair() (*os.File, *os.File, error) {
+	descriptors, err := unix.Socketpair(
+		unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(descriptors[0]), "cgroup-delegation-child"),
+		os.NewFile(uintptr(descriptors[1]), "cgroup-delegation-parent"), nil
 }
 
 func openPseudoTerminal() (*os.File, *os.File, error) {
@@ -449,13 +492,34 @@ func (s *Supervisor) applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
 	if err := writeCgroupResourceLimits(path, spec.Resources, true); err != nil {
 		return err
 	}
-	if !spec.Privileged && !s.devicePolicyInstalled {
-		if err := attachDefaultDevicePolicy(path); err != nil {
+	if !spec.Privileged && s.devicePolicyFD < 0 {
+		rules, err := configuredDeviceRulesForHost(spec.Resources)
+		if err != nil {
 			return err
 		}
-		s.devicePolicyInstalled = true
+		fd, err := attachDevicePolicy(path, rules, -1)
+		if err != nil {
+			return err
+		}
+		s.devicePolicyFD = fd
 	}
 	return os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0644)
+}
+
+func delegateWorkloadCgroup(path string, pid int, requireIO bool) error {
+	leaf := filepath.Join(path, ".cengine-init")
+	if err := os.MkdirAll(leaf, 0755); err != nil {
+		return fmt.Errorf("create workload init cgroup: %w", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(leaf, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0644,
+	); err != nil {
+		return fmt.Errorf("move workload init to delegated cgroup leaf: %w", err)
+	}
+	if err := enableCgroupControllers(path, requireIO); err != nil {
+		return fmt.Errorf("delegate workload cgroup controllers: %w", err)
+	}
+	return nil
 }
 
 type cgroupResourceLimit struct {
@@ -525,8 +589,8 @@ func resolveBlockDevice(path string) (string, error) {
 }
 
 func resolveBlockDeviceWithStat(path string, stat func(string, *unix.Stat_t) error) (string, error) {
-	if path != "/dev/vda" {
-		return "", fmt.Errorf("block I/O throttle path %q is not the VM root device /dev/vda", path)
+	if !strings.HasPrefix(path, "/dev/") || filepath.Clean(path) != path {
+		return "", fmt.Errorf("block I/O throttle path %q is not a normalized /dev path", path)
 	}
 	var status unix.Stat_t
 	if err := stat(path, &status); err != nil {
@@ -817,10 +881,62 @@ func (s *Supervisor) updateResources(resources protocol.Resources, failureAfterW
 		return errors.New("workload is not running")
 	}
 	path := filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID)
+	oldResources := s.spec.Resources
+	root := fmt.Sprintf("/proc/%d/root", s.command.Process.Pid)
+	if err := applyConfiguredDevicesForHost(root, oldResources.Devices, resources.Devices); err != nil {
+		return err
+	}
+	newPolicyFD := s.devicePolicyFD
+	if !s.spec.Privileged {
+		rules, err := configuredDeviceRulesForHost(resources)
+		if err != nil {
+			if rollbackErr := applyConfiguredDevicesForHost(
+				root, resources.Devices, oldResources.Devices,
+			); rollbackErr != nil {
+				return &ResourceRollbackIncompleteError{
+					UpdateError: err, RollbackErrors: []error{rollbackErr},
+				}
+			}
+			return err
+		}
+		newPolicyFD, err = attachDevicePolicy(path, rules, s.devicePolicyFD)
+		if err != nil {
+			if rollbackErr := applyConfiguredDevicesForHost(
+				root, resources.Devices, oldResources.Devices,
+			); rollbackErr != nil {
+				return &ResourceRollbackIncompleteError{
+					UpdateError: err, RollbackErrors: []error{rollbackErr},
+				}
+			}
+			return err
+		}
+	}
 	if err := replaceCgroupResourceLimitsWithResolverAndFailure(
 		path, resources, false, os.ReadFile, os.WriteFile, resolveBlockDevice, failureAfterWrites,
 	); err != nil {
+		rollbackErrors := []error{}
+		if !s.spec.Privileged {
+			oldRules, rulesErr := configuredDeviceRulesForHost(oldResources)
+			if rulesErr != nil {
+				rollbackErrors = append(rollbackErrors, rulesErr)
+			} else if rollbackFD, replaceErr := attachDevicePolicy(path, oldRules, newPolicyFD); replaceErr != nil {
+				rollbackErrors = append(rollbackErrors, replaceErr)
+			} else {
+				_ = unix.Close(newPolicyFD)
+				s.devicePolicyFD = rollbackFD
+			}
+		}
+		if deviceErr := applyConfiguredDevicesForHost(root, resources.Devices, oldResources.Devices); deviceErr != nil {
+			rollbackErrors = append(rollbackErrors, deviceErr)
+		}
+		if len(rollbackErrors) != 0 {
+			return &ResourceRollbackIncompleteError{UpdateError: err, RollbackErrors: rollbackErrors}
+		}
 		return err
+	}
+	if !s.spec.Privileged {
+		_ = unix.Close(s.devicePolicyFD)
+		s.devicePolicyFD = newPolicyFD
 	}
 	s.spec.Resources = resources
 	return nil
@@ -892,6 +1008,15 @@ func (s *Supervisor) PID() int {
 		return 0
 	}
 	return s.command.Process.Pid
+}
+
+func (s *Supervisor) CgroupPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.spec == nil {
+		return ""
+	}
+	return filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID)
 }
 
 func (s *Supervisor) ConnectNetwork(endpoint protocol.NetworkEndpoint) error {
@@ -1103,24 +1228,11 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 		_ = remountCgroupReadOnly(filepath.Join(root, "sys/fs/cgroup"), unix.Mount)
 		_ = unix.Mount("", filepath.Join(root, "sys"), "", unix.MS_REMOUNT|unix.MS_RDONLY, "")
 	}
-	for _, device := range []struct {
-		name string
-		mode uint32
-		dev  int
-	}{
-		{"null", unix.S_IFCHR | 0666, int(unix.Mkdev(1, 3))},
-		{"zero", unix.S_IFCHR | 0666, int(unix.Mkdev(1, 5))},
-		{"full", unix.S_IFCHR | 0666, int(unix.Mkdev(1, 7))},
-		{"random", unix.S_IFCHR | 0666, int(unix.Mkdev(1, 8))},
-		{"urandom", unix.S_IFCHR | 0666, int(unix.Mkdev(1, 9))},
-		{"tty", unix.S_IFCHR | 0666, int(unix.Mkdev(5, 0))},
-	} {
-		if err := unix.Mknod(filepath.Join(root, "dev", device.name), device.mode, device.dev); err != nil && !errors.Is(err, unix.EEXIST) {
-			return err
-		}
-		if err := unix.Chmod(filepath.Join(root, "dev", device.name), device.mode&07777); err != nil {
-			return err
-		}
+	if err := createStandardDevices(root); err != nil {
+		return err
+	}
+	if err := applyConfiguredDevicesForHost(root, nil, spec.Resources.Devices); err != nil {
+		return err
 	}
 	if spec.Hostname != "" {
 		if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {

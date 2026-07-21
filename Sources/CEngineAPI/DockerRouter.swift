@@ -190,6 +190,8 @@ public struct DockerRouter: Sendable {
             record.blockIOWriteBps = validated.blockIO.writeBps
             record.blockIOReadIOps = validated.blockIO.readIOps
             record.blockIOWriteIOps = validated.blockIO.writeIOps
+            record.devices = validated.devices
+            record.deviceCgroupRules = validated.deviceCgroupRules
             record.ulimits = validated.ulimits
             if let memory = input.HostConfig?.Memory, memory > 0 { record.memoryBytes = UInt64(memory) }
             if let nano = input.HostConfig?.NanoCpus, nano > 0 {
@@ -343,7 +345,7 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/update"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/update".count))
             let input = try decodeContainerUpdate(request.body, version: version)
-            let blockIO = try validateRuntimeInput(input, version: version)
+            let validated = try validateRuntimeInput(input, version: version)
             let policy = input.RestartPolicy.map {
                 RestartPolicyRecord(name: $0.Name ?? "no", maximumRetryCount: $0.MaximumRetryCount ?? 0)
             }
@@ -358,8 +360,11 @@ public struct DockerRouter: Sendable {
             _ = try await runtime.updateContainer(
                 id, memoryBytes: input.Memory, nanoCPUs: nanoCPUs,
                 pidsLimit: try validatedPidsLimit(input.PidsLimit), restartPolicy: policy,
-                blockIOReadBps: blockIO.readBps, blockIOWriteBps: blockIO.writeBps,
-                blockIOReadIOps: blockIO.readIOps, blockIOWriteIOps: blockIO.writeIOps
+                blockIOReadBps: validated.blockIO.readBps,
+                blockIOWriteBps: validated.blockIO.writeBps,
+                blockIOReadIOps: validated.blockIO.readIOps,
+                blockIOWriteIOps: validated.blockIO.writeIOps,
+                devices: validated.devices, deviceCgroupRules: validated.deviceCgroupRules
             )
             return json(status: .ok, ContainerUpdateResponse(Warnings: []))
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
@@ -1172,7 +1177,8 @@ public struct DockerRouter: Sendable {
     }
 
     private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (
-        mounts: [MountRecord], ulimits: [UlimitRecord], blockIO: BlockIOConfiguration,
+        mounts: [MountRecord], ulimits: [UlimitRecord], devices: [DeviceMappingRecord],
+        deviceCgroupRules: [String], blockIO: BlockIOConfiguration,
         security: SecurityConfiguration
     ) {
         try rejectActiveRuntimeFields([
@@ -1191,6 +1197,10 @@ public struct DockerRouter: Sendable {
         return (
             try mounts(from: input),
             try normalizedUlimits(input.HostConfig?.Ulimits, field: "HostConfig.Ulimits"),
+            try normalizedDevices(input.HostConfig?.Devices, field: "HostConfig.Devices"),
+            try normalizedDeviceCgroupRules(
+                input.HostConfig?.DeviceCgroupRules, field: "HostConfig.DeviceCgroupRules"
+            ),
             try normalizedBlockIO(
                 readBps: input.HostConfig?.BlkioDeviceReadBps,
                 writeBps: input.HostConfig?.BlkioDeviceWriteBps,
@@ -1204,7 +1214,11 @@ public struct DockerRouter: Sendable {
 
     private func validateRuntimeInput(
         _ input: ContainerUpdateRequest, version: DockerAPIVersion
-    ) throws -> BlockIOConfiguration {
+    ) throws -> (
+        blockIO: BlockIOConfiguration,
+        devices: [DeviceMappingRecord]?,
+        deviceCgroupRules: [String]?
+    ) {
         try validateResourceValues(
             memory: input.Memory, nanoCPUs: input.NanoCpus,
             cpuPeriod: input.CpuPeriod, cpuQuota: input.CpuQuota,
@@ -1235,8 +1249,6 @@ public struct DockerRouter: Sendable {
             (input.CpuRealtimeRuntime != nil && input.CpuRealtimeRuntime != 0, "CpuRealtimeRuntime"),
             (!(input.CpusetCpus ?? "").isEmpty, "CpusetCpus"),
             (!(input.CpusetMems ?? "").isEmpty, "CpusetMems"),
-            (!(input.Devices ?? []).isEmpty, "Devices"),
-            (!(input.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
             (!(input.DeviceRequests ?? []).isEmpty, "DeviceRequests"),
             (input.MemoryReservation != nil && input.MemoryReservation != 0, "MemoryReservation"),
             (input.MemorySwap != nil && input.MemorySwap != 0, "MemorySwap"),
@@ -1252,11 +1264,19 @@ public struct DockerRouter: Sendable {
             name: input.RestartPolicy?.Name,
             maximumRetryCount: input.RestartPolicy?.MaximumRetryCount
         )
-        guard version >= .init(major: 1, minor: 55) else { return .unchanged }
-        return try normalizedBlockIO(
-            readBps: input.BlkioDeviceReadBps, writeBps: input.BlkioDeviceWriteBps,
-            readIOps: input.BlkioDeviceReadIOps, writeIOps: input.BlkioDeviceWriteIOps,
-            prefix: "ContainerUpdate"
+        let blockIO = version >= .init(major: 1, minor: 55)
+            ? try normalizedBlockIO(
+                readBps: input.BlkioDeviceReadBps, writeBps: input.BlkioDeviceWriteBps,
+                readIOps: input.BlkioDeviceReadIOps, writeIOps: input.BlkioDeviceWriteIOps,
+                prefix: "ContainerUpdate"
+            )
+            : .unchanged
+        return (
+            blockIO,
+            try input.Devices.map { try normalizedDevices($0, field: "ContainerUpdate.Devices") },
+            try input.DeviceCgroupRules.map {
+                try normalizedDeviceCgroupRules($0, field: "ContainerUpdate.DeviceCgroupRules")
+            }
         )
     }
 
@@ -1313,8 +1333,6 @@ public struct DockerRouter: Sendable {
             (host?.CpuPercent != nil && host?.CpuPercent != 0, "CpuPercent"),
             (host?.IOMaximumIOps != nil && host?.IOMaximumIOps != 0, "IOMaximumIOps"),
             (host?.IOMaximumBandwidth != nil && host?.IOMaximumBandwidth != 0, "IOMaximumBandwidth"),
-            (!(host?.Devices ?? []).isEmpty, "Devices"),
-            (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
             (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
             (!(host?.VolumesFrom ?? []).isEmpty, "VolumesFrom"),
             (!(host?.GroupAdd ?? []).isEmpty, "GroupAdd"),
@@ -1539,6 +1557,66 @@ public struct DockerRouter: Sendable {
         )
     }
 
+    private func normalizedDevices(
+        _ devices: [ContainerCreateRequest.HostConfig.DeviceRequest]?, field: String
+    ) throws -> [DeviceMappingRecord] {
+        var destinations = Set<String>()
+        return try (devices ?? []).map { device in
+            let source = try normalizedDevicePath(device.PathOnHost, field: "\(field).PathOnHost")
+            let destination = try normalizedDevicePath(
+                device.PathInContainer, field: "\(field).PathInContainer"
+            )
+            guard destinations.insert(destination).inserted else {
+                throw EngineError(.badRequest, "\(field) contains duplicate PathInContainer \(destination)")
+            }
+            let permissions = try normalizedDevicePermissions(
+                device.CgroupPermissions, field: "\(field).CgroupPermissions"
+            )
+            return .init(
+                pathOnHost: source, pathInContainer: destination,
+                cgroupPermissions: permissions
+            )
+        }
+    }
+
+    private func normalizedDevicePath(_ value: String, field: String) throws -> String {
+        guard value.hasPrefix("/dev/"), !value.contains("\0"), value != "/dev/",
+              (value as NSString).standardizingPath == value else {
+            throw EngineError(.badRequest, "\(field) must be a normalized absolute /dev path")
+        }
+        return value
+    }
+
+    private func normalizedDevicePermissions(_ value: String, field: String) throws -> String {
+        let submitted = Set(value)
+        guard !submitted.isEmpty, submitted.isSubset(of: Set("rwm")), submitted.count == value.count else {
+            throw EngineError(.badRequest, "\(field) must contain unique r, w, or m permissions")
+        }
+        return "rwm".filter(submitted.contains)
+    }
+
+    private func normalizedDeviceCgroupRules(_ rules: [String]?, field: String) throws -> [String] {
+        try (rules ?? []).map { rule in
+            let fields = rule.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard fields.count == 3, ["a", "b", "c"].contains(fields[0]) else {
+                throw EngineError(.badRequest, "\(field) contains an invalid device type")
+            }
+            let numbers = fields[1].split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            guard numbers.count == 2 else {
+                throw EngineError(.badRequest, "\(field) requires major:minor device numbers")
+            }
+            for number in numbers {
+                guard number == "*" || UInt32(number) != nil else {
+                    throw EngineError(.badRequest, "\(field) contains an invalid device number")
+                }
+            }
+            let permissions = try normalizedDevicePermissions(
+                fields[2], field: "\(field) permissions"
+            )
+            return "\(fields[0]) \(numbers[0]):\(numbers[1]) \(permissions)"
+        }
+    }
+
     private func normalizedThrottleDevices(
         _ devices: [ContainerCreateRequest.HostConfig.ThrottleDeviceRequest]?, field: String
     ) throws -> [BlockIOThrottleDeviceRecord]? {
@@ -1554,9 +1632,6 @@ public struct DockerRouter: Sendable {
             }
             guard paths.insert(path).inserted else {
                 throw EngineError(.badRequest, "\(field) contains duplicate Path \(path)")
-            }
-            guard path == "/dev/vda" else {
-                throw EngineError(.unsupported, "\(field) currently supports only the root device /dev/vda")
             }
             return .init(path: path, rate: rate)
         }
@@ -2120,6 +2195,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let BlkioDeviceWriteBps: [ThrottleDeviceResponse]?
         let BlkioDeviceReadIOps: [ThrottleDeviceResponse]?
         let BlkioDeviceWriteIOps: [ThrottleDeviceResponse]?
+        let Devices: [DeviceResponse]
+        let DeviceCgroupRules: [String]?
+        let DeviceRequests: [String]?
         let Ulimits: [UlimitResponse]
         let AutoRemove: Bool; let Privileged: Bool
         let CapAdd: [String]; let CapDrop: [String]
@@ -2137,11 +2215,15 @@ public struct ContainerInspectResponse: Codable, Sendable {
         struct UlimitResponse: Codable, Sendable { let Name: String; let Soft: Int64; let Hard: Int64 }
         struct WeightDeviceResponse: Codable, Sendable { let Path: String; let Weight: UInt16 }
         struct ThrottleDeviceResponse: Codable, Sendable { let Path: String; let Rate: UInt64 }
+        struct DeviceResponse: Codable, Sendable {
+            let PathOnHost: String; let PathInContainer: String; let CgroupPermissions: String
+        }
 
         enum CodingKeys: String, CodingKey {
             case Memory, NanoCpus, PidsLimit
             case BlkioWeight, BlkioWeightDevice, BlkioDeviceReadBps, BlkioDeviceWriteBps
             case BlkioDeviceReadIOps, BlkioDeviceWriteIOps
+            case Devices, DeviceCgroupRules, DeviceRequests
             case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, SecurityOpt, ReadonlyRootfs
             case MaskedPaths, ReadonlyPaths, Init, RestartPolicy
             case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode
@@ -2159,6 +2241,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(BlkioDeviceWriteBps, forKey: .BlkioDeviceWriteBps)
             try container.encode(BlkioDeviceReadIOps, forKey: .BlkioDeviceReadIOps)
             try container.encode(BlkioDeviceWriteIOps, forKey: .BlkioDeviceWriteIOps)
+            try container.encode(Devices, forKey: .Devices)
+            try container.encode(DeviceCgroupRules, forKey: .DeviceCgroupRules)
+            try container.encode(DeviceRequests, forKey: .DeviceRequests)
             try container.encode(Ulimits, forKey: .Ulimits)
             try container.encode(AutoRemove, forKey: .AutoRemove)
             try container.encode(Privileged, forKey: .Privileged)
@@ -2245,6 +2330,12 @@ public struct ContainerInspectResponse: Codable, Sendable {
             BlkioDeviceWriteBps: record.blockIOWriteBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
             BlkioDeviceReadIOps: record.blockIOReadIOps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
             BlkioDeviceWriteIOps: record.blockIOWriteIOps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
+            Devices: record.devices.map { .init(
+                PathOnHost: $0.pathOnHost, PathInContainer: $0.pathInContainer,
+                CgroupPermissions: $0.cgroupPermissions
+            ) },
+            DeviceCgroupRules: record.deviceCgroupRules.isEmpty ? nil : record.deviceCgroupRules,
+            DeviceRequests: nil,
             Ulimits: record.ulimits.map { .init(Name: $0.name, Soft: $0.soft, Hard: $0.hard) },
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,

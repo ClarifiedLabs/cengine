@@ -150,7 +150,9 @@ private actor CompletionBackend: ContainerBackend {
     func statistics(_: ContainerRecord) async throws -> BackendStatistics {
         .init(cpuTotalNanoseconds: 1_000, cpuUserNanoseconds: 700, cpuSystemNanoseconds: 300,
               memoryUsage: 1_024, memoryLimit: 4_096, memoryCache: 128, pids: 2,
-              blockReadBytes: 10, blockWriteBytes: 20, networks: [])
+              blockReadBytes: 10, blockWriteBytes: 20, networks: [], memoryPeak: 2_048,
+              blockIO: [.init(major: 254, minor: 1, readBytes: 10, writeBytes: 20)],
+              cpuPeriods: 8, cpuThrottledPeriods: 3, cpuThrottledNanoseconds: 400)
     }
     func top(_: ContainerRecord, arguments _: [String]) async throws -> (titles: [String], processes: [[String]]) {
         (["PID", "CMD"], [["1", "sleep 10"]])
@@ -2622,9 +2624,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(invalid.status == .badRequest)
 
         let unsupportedFields = [
-            #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
-            #""DeviceCgroupRules":["c 1:3 rwm"]"#,
             #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
+            #""DeviceRequests":[{"Driver":"cdi","DeviceIDs":["example.com/device=one"]}]"#,
         ]
         for (index, field) in unsupportedFields.enumerated() {
             let body = "{\"Image\":\"alpine\",\"HostConfig\":{\(field)}}"
@@ -2633,6 +2634,92 @@ private actor AuthImageBackend: ContainerBackend {
                 body: Data(body.utf8)
             ))
             #expect(rejected.status == .notImplemented)
+        }
+    }
+
+    @Test func devicesAndCustomCgroupRulesCreateUpdateInspectAndPersist() async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=configured-devices",
+            body: Data(#"""
+            {"Image":"alpine","HostConfig":{
+              "Devices":[{
+                "PathOnHost":"/dev/null","PathInContainer":"/dev/nested/test-null",
+                "CgroupPermissions":"wm"
+              }],
+              "DeviceCgroupRules":["a *:* mw","c 10:* r"]
+            }}
+            """#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        func assertConfiguration(
+            _ expectedSource: String, _ expectedDestination: String,
+            _ expectedPermissions: String, _ expectedRules: [String]
+        ) async throws {
+            let inspect = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/configured-devices/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: inspect.body) as? [String: Any]
+            )
+            let host = try #require(object["HostConfig"] as? [String: Any])
+            let devices = try #require(host["Devices"] as? [[String: Any]])
+            #expect(devices.count == 1)
+            #expect(devices.first?["PathOnHost"] as? String == expectedSource)
+            #expect(devices.first?["PathInContainer"] as? String == expectedDestination)
+            #expect(devices.first?["CgroupPermissions"] as? String == expectedPermissions)
+            if expectedRules.isEmpty {
+                #expect(host["DeviceCgroupRules"] is NSNull)
+            } else {
+                #expect(host["DeviceCgroupRules"] as? [String] == expectedRules)
+            }
+            #expect(host.keys.contains("DeviceRequests"))
+            #expect(host["DeviceRequests"] is NSNull)
+        }
+        try await assertConfiguration(
+            "/dev/null", "/dev/nested/test-null", "wm", ["a *:* wm", "c 10:* r"]
+        )
+
+        let update = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/configured-devices/update",
+            body: Data(#"""
+            {"Devices":[{
+              "PathOnHost":"/dev/zero","PathInContainer":"/dev/test-zero",
+              "CgroupPermissions":"wr"
+            }],"DeviceCgroupRules":[]}
+            """#.utf8)
+        ))
+        #expect(update.status == .ok)
+        try await assertConfiguration("/dev/zero", "/dev/test-zero", "rw", [])
+
+        let snapshot = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+            .load(default: .init())
+        let persisted = try #require(snapshot.containers.first { $0.name == "configured-devices" })
+        #expect(persisted.devices == [
+            .init(
+                pathOnHost: "/dev/zero", pathInContainer: "/dev/test-zero",
+                cgroupPermissions: "rw"
+            ),
+        ])
+        #expect(persisted.deviceCgroupRules == [])
+
+        let malformed = [
+            #""Devices":[{"PathOnHost":"relative","PathInContainer":"/dev/test","CgroupPermissions":"r"}]"#,
+            #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/../tmp/test","CgroupPermissions":"r"}]"#,
+            #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rr"}]"#,
+            #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"r"},{"PathOnHost":"/dev/zero","PathInContainer":"/dev/test","CgroupPermissions":"r"}]"#,
+            #""DeviceCgroupRules":["x 1:3 r"]"#,
+            #""DeviceCgroupRules":["c 4294967296:3 r"]"#,
+            #""DeviceCgroupRules":["c 1:3 rr"]"#,
+        ]
+        for (index, field) in malformed.enumerated() {
+            let response = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=invalid-device-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":{\(field)}}".utf8)
+            ))
+            #expect(response.status == .badRequest)
         }
     }
 
@@ -3250,7 +3337,7 @@ private actor AuthImageBackend: ContainerBackend {
 
         let update = await router.route(.init(
             method: .POST, uri: "/v1.55/containers/runtime-update/update",
-            body: Data(#"{"Memory":2147483648,"Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/null","CgroupPermissions":"r"}]}"#.utf8)
+            body: Data(#"{"Memory":2147483648,"DeviceRequests":[{"Driver":"cdi","Count":1}]}"#.utf8)
         ))
         #expect(update.status == .notImplemented)
         let inspect = await router.route(.init(method: .GET, uri: "/v1.55/containers/runtime-update/json"))
@@ -3470,7 +3557,7 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
-    @Test func blockIOThrottleValidationDistinguishesBadRequestsFromRootDeviceGap() async throws {
+    @Test func blockIOThrottleValidationAcceptsAnyNormalizedGuestBlockDevice() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let malformed = [
@@ -3486,11 +3573,11 @@ private actor AuthImageBackend: ContainerBackend {
             ))
             #expect(response.status == .badRequest)
         }
-        let unsupported = await router.route(.init(
-            method: .POST, uri: "/v1.55/containers/create?name=unsupported-block-io",
+        let configured = await router.route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=configured-block-io",
             body: Data(#"{"Image":"alpine","HostConfig":{"BlkioDeviceReadBps":[{"Path":"/dev/vdb","Rate":1}]}}"#.utf8)
         ))
-        #expect(unsupported.status == .notImplemented)
+        #expect(configured.status == .created)
     }
 
     @Test func legacyBlockIOUpdatesIgnoreMalformedFieldsBeforeTypedDecoding() async throws {
@@ -3514,7 +3601,6 @@ private actor AuthImageBackend: ContainerBackend {
             (#"{"BlkioDeviceReadBps":{"Path":"/dev/vda","Rate":1}}"#, .badRequest),
             (#"{"BlkioDeviceReadBps":["not-a-device"]}"#, .badRequest),
             (#"{"BlkioDeviceReadBps":[{"Path":"relative","Rate":1}]}"#, .badRequest),
-            (#"{"BlkioDeviceReadBps":[{"Path":"/dev/vdb","Rate":1}]}"#, .notImplemented),
         ]
         for version in ["1.44", "1.54"] {
             for (body, _) in malformed {
@@ -3554,29 +3640,43 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(persisted.blockIOWriteIOps == [.init(path: "/dev/vda", rate: 2_000)])
     }
 
-    @Test func failedLiveBlockIOUpdateDoesNotMutateHostStateOrPersistence() async throws {
+    @Test func failedLiveResourceUpdateDoesNotMutateDevicesOrPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let runtime = try await EngineRuntime(root: root, backend: FailingResourceUpdateBackend())
         let router = DockerRouter(runtime: runtime, root: root)
         var record = ContainerRecord(name: "block-io-rollback", image: "alpine")
         record.blockIOReadBps = [.init(path: "/dev/vda", rate: 1_048_576)]
+        record.devices = [
+            .init(pathOnHost: "/dev/null", pathInContainer: "/dev/test", cgroupPermissions: "r"),
+        ]
+        record.deviceCgroupRules = ["c 1:3 r"]
         record = try await runtime.createContainer(record)
         try await runtime.startContainer(record.id)
 
         let response = await router.route(.init(
             method: .POST, uri: "/v1.55/containers/block-io-rollback/update",
-            body: Data(#"{"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":2097152}]}"#.utf8)
+            body: Data(#"""
+            {"BlkioDeviceReadBps":[{"Path":"/dev/vda","Rate":2097152}],
+             "Devices":[{"PathOnHost":"/dev/zero","PathInContainer":"/dev/test","CgroupPermissions":"rw"}],
+             "DeviceCgroupRules":["c 1:5 rw"]}
+            """#.utf8)
         ))
         #expect(response.status == .internalServerError)
-        #expect(try await runtime.container(record.id).blockIOReadBps == [
+        let current = try await runtime.container(record.id)
+        #expect(current.blockIOReadBps == [
             .init(path: "/dev/vda", rate: 1_048_576),
         ])
+        #expect(current.devices == record.devices)
+        #expect(current.deviceCgroupRules == ["c 1:3 r"])
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: .init())
-        #expect(try #require(durable.containers.first).blockIOReadBps == [
+        let durableRecord = try #require(durable.containers.first)
+        #expect(durableRecord.blockIOReadBps == [
             .init(path: "/dev/vda", rate: 1_048_576),
         ])
+        #expect(durableRecord.devices == record.devices)
+        #expect(durableRecord.deviceCgroupRules == ["c 1:3 r"])
     }
 
     @Test func resourceUpdatePublishesOnlyAfterItsCandidateIsDurable() async throws {
@@ -9386,7 +9486,18 @@ private actor AuthImageBackend: ContainerBackend {
         let stats = await router.route(.init(method: .GET, uri: "/v1.44/containers/observed/stats?stream=false"))
         #expect(stats.status == .ok)
         let statsJSON = try #require(JSONSerialization.jsonObject(with: stats.body) as? [String: Any])
-        #expect((statsJSON["memory_stats"] as? [String: Any])?["usage"] as? Int == 1_024)
+        let memoryStats = try #require(statsJSON["memory_stats"] as? [String: Any])
+        #expect(memoryStats["usage"] as? Int == 1_024)
+        #expect(memoryStats["max_usage"] as? Int == 2_048)
+        let cpuStats = try #require(statsJSON["cpu_stats"] as? [String: Any])
+        let throttling = try #require(cpuStats["throttling_data"] as? [String: Any])
+        #expect(throttling["periods"] as? Int == 8)
+        #expect(throttling["throttled_periods"] as? Int == 3)
+        #expect(throttling["throttled_time"] as? Int == 400)
+        let blockIO = try #require(statsJSON["blkio_stats"] as? [String: Any])
+        let entries = try #require(blockIO["io_service_bytes_recursive"] as? [[String: Any]])
+        #expect(entries.count == 2)
+        #expect(entries.allSatisfy { $0["major"] as? Int == 254 && $0["minor"] as? Int == 1 })
         let top = await router.route(.init(method: .GET, uri: "/v1.44/containers/observed/top?ps_args=-ef"))
         let topJSON = try #require(JSONSerialization.jsonObject(with: top.body) as? [String: Any])
         #expect(topJSON["Titles"] as? [String] == ["PID", "CMD"])

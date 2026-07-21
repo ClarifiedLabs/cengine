@@ -23,12 +23,23 @@ type Statistics struct {
 	CPUTotalNanoseconds  uint64              `json:"cpuTotalNanoseconds"`
 	CPUUserNanoseconds   uint64              `json:"cpuUserNanoseconds"`
 	CPUSystemNanoseconds uint64              `json:"cpuSystemNanoseconds"`
+	CPUPeriods           uint64              `json:"cpuPeriods"`
+	CPUThrottledPeriods  uint64              `json:"cpuThrottledPeriods"`
+	CPUThrottledNS       uint64              `json:"cpuThrottledNanoseconds"`
 	MemoryUsage          uint64              `json:"memoryUsage"`
+	MemoryPeak           uint64              `json:"memoryPeak"`
 	MemoryCache          uint64              `json:"memoryCache"`
 	PIDs                 uint64              `json:"pids"`
 	BlockReadBytes       uint64              `json:"blockReadBytes"`
 	BlockWriteBytes      uint64              `json:"blockWriteBytes"`
+	BlockIO              []BlockIOStatistics `json:"blockIO"`
 	Networks             []NetworkStatistics `json:"networks"`
+}
+type BlockIOStatistics struct {
+	Major      int    `json:"major"`
+	Minor      int    `json:"minor"`
+	ReadBytes  uint64 `json:"readBytes"`
+	WriteBytes uint64 `json:"writeBytes"`
 }
 type NetworkStatistics struct {
 	Name      string `json:"name"`
@@ -1104,7 +1115,7 @@ func readLinkAt(parent int, name string) (string, error) {
 	return "", syscall.ENAMETOOLONG
 }
 
-func Stats(pid int) (Statistics, error) {
+func Stats(pid int, cgroupPaths ...string) (Statistics, error) {
 	var result Statistics
 	fields, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -1134,11 +1145,19 @@ func Stats(pid int) (Statistics, error) {
 			result.BlockWriteBytes = parseValue(line)
 		}
 	}
-	processes, _ := os.ReadDir(fmt.Sprintf("/proc/%d/root/proc", pid))
-	for _, entry := range processes {
-		if entry.IsDir() {
-			if _, err := strconv.Atoi(entry.Name()); err == nil {
-				result.PIDs++
+	usesCgroupAccounting := len(cgroupPaths) > 0 && cgroupPaths[0] != ""
+	if usesCgroupAccounting {
+		if err := readCgroupStats(cgroupPaths[0], &result); err != nil {
+			return result, err
+		}
+	}
+	if !usesCgroupAccounting {
+		processes, _ := os.ReadDir(fmt.Sprintf("/proc/%d/root/proc", pid))
+		for _, entry := range processes {
+			if entry.IsDir() {
+				if _, err := strconv.Atoi(entry.Name()); err == nil {
+					result.PIDs++
+				}
 			}
 		}
 	}
@@ -1152,6 +1171,85 @@ func Stats(pid int) (Statistics, error) {
 		result.Networks = append(result.Networks, NetworkStatistics{Name: entry.Name(), RXBytes: readUint(base + "/rx_bytes"), RXPackets: readUint(base + "/rx_packets"), RXErrors: readUint(base + "/rx_errors"), TXBytes: readUint(base + "/tx_bytes"), TXPackets: readUint(base + "/tx_packets"), TXErrors: readUint(base + "/tx_errors")})
 	}
 	return result, nil
+}
+
+func readCgroupStats(path string, result *Statistics) error {
+	cpu, err := os.ReadFile(filepath.Join(path, "cpu.stat"))
+	if err != nil {
+		return fmt.Errorf("read workload cpu.stat: %w", err)
+	}
+	cpuValues := parseNamedValues(cpu)
+	result.CPUTotalNanoseconds = cpuValues["usage_usec"] * 1000
+	result.CPUUserNanoseconds = cpuValues["user_usec"] * 1000
+	result.CPUSystemNanoseconds = cpuValues["system_usec"] * 1000
+	result.CPUPeriods = cpuValues["nr_periods"]
+	result.CPUThrottledPeriods = cpuValues["nr_throttled"]
+	result.CPUThrottledNS = cpuValues["throttled_usec"] * 1000
+
+	result.MemoryUsage = readUint(filepath.Join(path, "memory.current"))
+	result.MemoryPeak = readUint(filepath.Join(path, "memory.peak"))
+	if result.MemoryPeak == 0 {
+		result.MemoryPeak = result.MemoryUsage
+	}
+	memory, err := os.ReadFile(filepath.Join(path, "memory.stat"))
+	if err != nil {
+		return fmt.Errorf("read workload memory.stat: %w", err)
+	}
+	result.MemoryCache = parseNamedValues(memory)["file"]
+	result.PIDs = readUint(filepath.Join(path, "pids.current"))
+
+	ioData, err := os.ReadFile(filepath.Join(path, "io.stat"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read workload io.stat: %w", err)
+	}
+	result.BlockIO = nil
+	result.BlockReadBytes = 0
+	result.BlockWriteBytes = 0
+	for _, line := range strings.Split(strings.TrimSpace(string(ioData)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		device := strings.Split(fields[0], ":")
+		if len(device) != 2 {
+			return fmt.Errorf("invalid workload io.stat device %q", fields[0])
+		}
+		major, majorErr := strconv.Atoi(device[0])
+		minor, minorErr := strconv.Atoi(device[1])
+		if majorErr != nil || minorErr != nil {
+			return fmt.Errorf("invalid workload io.stat device %q", fields[0])
+		}
+		values := parseNamedFields(fields[1:])
+		entry := BlockIOStatistics{
+			Major: major, Minor: minor, ReadBytes: values["rbytes"], WriteBytes: values["wbytes"],
+		}
+		result.BlockIO = append(result.BlockIO, entry)
+		result.BlockReadBytes += entry.ReadBytes
+		result.BlockWriteBytes += entry.WriteBytes
+	}
+	return nil
+}
+
+func parseNamedValues(data []byte) map[string]uint64 {
+	result := map[string]uint64{}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			result[fields[0]], _ = strconv.ParseUint(fields[1], 10, 64)
+		}
+	}
+	return result
+}
+
+func parseNamedFields(fields []string) map[string]uint64 {
+	result := map[string]uint64{}
+	for _, field := range fields {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) == 2 {
+			result[parts[0]], _ = strconv.ParseUint(parts[1], 10, 64)
+		}
+	}
+	return result
 }
 
 func Top(pid int) ([]Process, error) {

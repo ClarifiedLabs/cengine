@@ -674,7 +674,9 @@ public actor EngineRuntime {
                                 blockIOReadBps: [BlockIOThrottleDeviceRecord]? = nil,
                                 blockIOWriteBps: [BlockIOThrottleDeviceRecord]? = nil,
                                 blockIOReadIOps: [BlockIOThrottleDeviceRecord]? = nil,
-                                blockIOWriteIOps: [BlockIOThrottleDeviceRecord]? = nil) async throws -> ContainerRecord {
+                                blockIOWriteIOps: [BlockIOThrottleDeviceRecord]? = nil,
+                                devices: [DeviceMappingRecord]? = nil,
+                                deviceCgroupRules: [String]? = nil) async throws -> ContainerRecord {
         try requireCanonicalSnapshotWritable()
         let index = try containerIndex(identifier)
         let old = snapshot.containers[index]
@@ -693,12 +695,16 @@ public actor EngineRuntime {
             if let blockIOWriteBps { updated.blockIOWriteBps = blockIOWriteBps }
             if let blockIOReadIOps { updated.blockIOReadIOps = blockIOReadIOps }
             if let blockIOWriteIOps { updated.blockIOWriteIOps = blockIOWriteIOps }
+            if let devices { updated.devices = devices }
+            if let deviceCgroupRules { updated.deviceCgroupRules = deviceCgroupRules }
             let resourcesChanged = old.memoryBytes != updated.memoryBytes || old.cpus != updated.cpus
                 || old.pidsLimit != updated.pidsLimit
                 || old.blockIOReadBps != updated.blockIOReadBps
                 || old.blockIOWriteBps != updated.blockIOWriteBps
                 || old.blockIOReadIOps != updated.blockIOReadIOps
                 || old.blockIOWriteIOps != updated.blockIOWriteIOps
+                || old.devices != updated.devices
+                || old.deviceCgroupRules != updated.deviceCgroupRules
             if resourcesChanged {
                 let resourceIntent = ResourceUpdateIntentRecord(
                     containerID: old.id,
@@ -756,6 +762,8 @@ public actor EngineRuntime {
             if let blockIOWriteBps { merged.blockIOWriteBps = blockIOWriteBps }
             if let blockIOReadIOps { merged.blockIOReadIOps = blockIOReadIOps }
             if let blockIOWriteIOps { merged.blockIOWriteIOps = blockIOWriteIOps }
+            if let devices { merged.devices = devices }
+            if let deviceCgroupRules { merged.deviceCgroupRules = deviceCgroupRules }
             do {
                 let publishedRecord: ContainerRecord
                 if resourcesChanged {
@@ -2811,6 +2819,8 @@ public actor EngineRuntime {
         merged.blockIOWriteBps = candidate.blockIOWriteBps
         merged.blockIOReadIOps = candidate.blockIOReadIOps
         merged.blockIOWriteIOps = candidate.blockIOWriteIOps
+        merged.devices = candidate.devices
+        merged.deviceCgroupRules = candidate.deviceCgroupRules
         return merged
     }
 
@@ -2827,6 +2837,8 @@ public actor EngineRuntime {
             && lhs.blockIOWriteBps == rhs.blockIOWriteBps
             && lhs.blockIOReadIOps == rhs.blockIOReadIOps
             && lhs.blockIOWriteIOps == rhs.blockIOWriteIOps
+            && lhs.devices == rhs.devices
+            && lhs.deviceCgroupRules == rhs.deviceCgroupRules
     }
 
     private func rollbackResourceUpdateAfterPersistenceFailure(

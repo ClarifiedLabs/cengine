@@ -25,6 +25,43 @@ func TestContainerRootUsesRunningProcessRoot(t *testing.T) {
 	}
 }
 
+func TestReadCgroupStatsUsesWorkloadWideAccounting(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"cpu.stat":       "usage_usec 123\nuser_usec 80\nsystem_usec 43\nnr_periods 9\nnr_throttled 2\nthrottled_usec 7\n",
+		"memory.current": "4096\n",
+		"memory.peak":    "8192\n",
+		"memory.stat":    "anon 2048\nfile 1024\n",
+		"pids.current":   "5\n",
+		"io.stat":        "254:0 rbytes=100 wbytes=200 rios=3 wios=4\n254:1 rbytes=7 wbytes=11\n",
+	}
+	for name, value := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(value), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var result Statistics
+	if err := readCgroupStats(root, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.CPUTotalNanoseconds != 123000 || result.CPUUserNanoseconds != 80000 ||
+		result.CPUSystemNanoseconds != 43000 || result.CPUPeriods != 9 ||
+		result.CPUThrottledPeriods != 2 || result.CPUThrottledNS != 7000 {
+		t.Fatalf("unexpected CPU accounting: %#v", result)
+	}
+	if result.MemoryUsage != 4096 || result.MemoryPeak != 8192 ||
+		result.MemoryCache != 1024 || result.PIDs != 5 {
+		t.Fatalf("unexpected memory/PID accounting: %#v", result)
+	}
+	if result.BlockReadBytes != 107 || result.BlockWriteBytes != 211 || len(result.BlockIO) != 2 {
+		t.Fatalf("unexpected block-I/O accounting: %#v", result)
+	}
+	if result.BlockIO[1].Major != 254 || result.BlockIO[1].Minor != 1 ||
+		result.BlockIO[1].ReadBytes != 7 || result.BlockIO[1].WriteBytes != 11 {
+		t.Fatalf("unexpected per-device block-I/O accounting: %#v", result.BlockIO)
+	}
+}
+
 type freezeTestState struct {
 	state               string
 	descendantState     string

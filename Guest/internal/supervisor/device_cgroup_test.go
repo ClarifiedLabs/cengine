@@ -6,6 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"dev.cengine/guest/internal/protocol"
 	"golang.org/x/sys/unix"
 )
 
@@ -60,6 +61,65 @@ func TestDockerDefaultDevicePolicyAllowsStandardDevicesAndDeniesVMDisks(t *testi
 	}
 }
 
+func TestConfiguredDeviceRulesAddMappedAndWildcardAccess(t *testing.T) {
+	major := uint32(10)
+	resources := protocol.Resources{
+		Devices: []protocol.DeviceMapping{{
+			PathOnHost: "/dev/data", PathInContainer: "/dev/container-data",
+			CgroupPermissions: "rw",
+		}},
+		DeviceCgroupRules: []protocol.DeviceCgroupRule{{
+			DeviceType: "c", Major: &major, Access: "r",
+		}},
+	}
+	rules, err := configuredDeviceRules(resources, func(path string, status *unix.Stat_t) error {
+		if path != "/dev/data" {
+			t.Fatalf("lstat path = %q", path)
+		}
+		status.Mode = unix.S_IFBLK | 0660
+		status.Rdev = uint64(unix.Mkdev(254, 7))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readWrite := uint32(unix.BPF_DEVCG_ACC_READ | unix.BPF_DEVCG_ACC_WRITE)
+	if !deviceAccessAllowed(rules, unix.BPF_DEVCG_DEV_BLOCK, 254, 7, readWrite) {
+		t.Fatal("mapped block-device read/write access was denied")
+	}
+	if deviceAccessAllowed(rules, unix.BPF_DEVCG_DEV_BLOCK, 254, 7, unix.BPF_DEVCG_ACC_MKNOD|readWrite) {
+		t.Fatal("mapped block-device mknod access exceeded its configured permissions")
+	}
+	if !deviceAccessAllowed(rules, unix.BPF_DEVCG_DEV_CHAR, 10, 229, unix.BPF_DEVCG_ACC_READ) {
+		t.Fatal("wildcard-minor character-device rule was denied")
+	}
+	if deviceAccessAllowed(rules, unix.BPF_DEVCG_DEV_CHAR, 11, 229, unix.BPF_DEVCG_ACC_READ) {
+		t.Fatal("wildcard-minor character-device rule matched the wrong major")
+	}
+}
+
+func TestConfiguredDeviceRulesRejectNonDevicesAndInvalidPermissions(t *testing.T) {
+	for name, resources := range map[string]protocol.Resources{
+		"regular source": {Devices: []protocol.DeviceMapping{{
+			PathOnHost: "/dev/data", PathInContainer: "/dev/container-data",
+			CgroupPermissions: "rw",
+		}}},
+		"duplicate permission": {DeviceCgroupRules: []protocol.DeviceCgroupRule{{
+			DeviceType: "c", Access: "rr",
+		}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := configuredDeviceRules(resources, func(_ string, status *unix.Stat_t) error {
+				status.Mode = unix.S_IFREG
+				return nil
+			})
+			if err == nil {
+				t.Fatal("invalid device configuration was accepted")
+			}
+		})
+	}
+}
+
 func TestDeviceBPFProgramHasValidForwardRuleJumps(t *testing.T) {
 	instructions := bpfDeviceProgram(dockerDefaultDeviceRules)
 	if unsafe.Sizeof(bpfInstruction{}) != 8 {
@@ -82,6 +142,16 @@ func TestDeviceBPFProgramHasValidForwardRuleJumps(t *testing.T) {
 	}
 	if unsafe.Sizeof(bpfProgramAttachAttribute{}) != 28 {
 		t.Fatalf("BPF program-attach attribute size = %d, want 28", unsafe.Sizeof(bpfProgramAttachAttribute{}))
+	}
+}
+
+func TestDevicePolicyReplacementKeepsMultiAttachMode(t *testing.T) {
+	if flags := devicePolicyAttachFlags(-1); flags != unix.BPF_F_ALLOW_MULTI {
+		t.Fatalf("initial device-policy attach flags = %#x", flags)
+	}
+	want := uint32(unix.BPF_F_ALLOW_MULTI | unix.BPF_F_REPLACE)
+	if flags := devicePolicyAttachFlags(42); flags != want {
+		t.Fatalf("replacement device-policy attach flags = %#x, want %#x", flags, want)
 	}
 }
 

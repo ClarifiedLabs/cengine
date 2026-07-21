@@ -149,6 +149,18 @@ public struct BlockIOThrottleDeviceRecord: Codable, Hashable, Sendable {
     }
 }
 
+public struct DeviceMappingRecord: Codable, Hashable, Sendable {
+    public var pathOnHost: String
+    public var pathInContainer: String
+    public var cgroupPermissions: String
+
+    public init(pathOnHost: String, pathInContainer: String, cgroupPermissions: String) {
+        self.pathOnHost = pathOnHost
+        self.pathInContainer = pathInContainer
+        self.cgroupPermissions = cgroupPermissions
+    }
+}
+
 public struct ContainerRecord: Codable, Sendable {
     public var id: String
     /// Internal immutable identity for one logical container incarnation.
@@ -209,6 +221,11 @@ public struct ContainerRecord: Codable, Sendable {
     public var blockIOWriteBps: [BlockIOThrottleDeviceRecord]?
     public var blockIOReadIOps: [BlockIOThrottleDeviceRecord]?
     public var blockIOWriteIOps: [BlockIOThrottleDeviceRecord]?
+    /// Device nodes exposed from the per-container Linux VM into the workload.
+    public var devices: [DeviceMappingRecord]
+    /// Docker device-cgroup allow rules, normalized but retained in Docker's
+    /// string representation for inspect compatibility.
+    public var deviceCgroupRules: [String]
     public var ulimits: [UlimitRecord]
     public var stopSignal: String
     public var stopTimeoutSeconds: Int
@@ -270,6 +287,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.blockIOWriteBps = nil
         self.blockIOReadIOps = nil
         self.blockIOWriteIOps = nil
+        self.devices = []
+        self.deviceCgroupRules = []
         self.ulimits = []
         self.stopSignal = "SIGTERM"
         self.stopTimeoutSeconds = 10

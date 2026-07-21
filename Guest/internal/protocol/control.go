@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 13
+	Version                         = 14
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -107,14 +107,29 @@ type NetworkEndpoint struct {
 }
 
 type Resources struct {
-	MemoryBytes      uint64            `json:"memoryBytes"`
-	CPUQuota         int64             `json:"cpuQuota"`
-	CPUPeriod        uint64            `json:"cpuPeriod"`
-	PIDs             int64             `json:"pids"`
-	BlockIOReadBps   []BlockIOThrottle `json:"blockIOReadBps"`
-	BlockIOWriteBps  []BlockIOThrottle `json:"blockIOWriteBps"`
-	BlockIOReadIOps  []BlockIOThrottle `json:"blockIOReadIOps"`
-	BlockIOWriteIOps []BlockIOThrottle `json:"blockIOWriteIOps"`
+	MemoryBytes       uint64             `json:"memoryBytes"`
+	CPUQuota          int64              `json:"cpuQuota"`
+	CPUPeriod         uint64             `json:"cpuPeriod"`
+	PIDs              int64              `json:"pids"`
+	BlockIOReadBps    []BlockIOThrottle  `json:"blockIOReadBps"`
+	BlockIOWriteBps   []BlockIOThrottle  `json:"blockIOWriteBps"`
+	BlockIOReadIOps   []BlockIOThrottle  `json:"blockIOReadIOps"`
+	BlockIOWriteIOps  []BlockIOThrottle  `json:"blockIOWriteIOps"`
+	Devices           []DeviceMapping    `json:"devices,omitempty"`
+	DeviceCgroupRules []DeviceCgroupRule `json:"deviceCgroupRules,omitempty"`
+}
+
+type DeviceMapping struct {
+	PathOnHost        string `json:"pathOnHost"`
+	PathInContainer   string `json:"pathInContainer"`
+	CgroupPermissions string `json:"cgroupPermissions"`
+}
+
+type DeviceCgroupRule struct {
+	DeviceType string  `json:"deviceType"`
+	Major      *uint32 `json:"major,omitempty"`
+	Minor      *uint32 `json:"minor,omitempty"`
+	Access     string  `json:"access"`
 }
 
 type BlockIOThrottle struct {

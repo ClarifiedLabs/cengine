@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 13)
+        #expect(GuestProtocol.version == 14)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -29,7 +29,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 13)
+        #expect(GuestProtocol.version == 14)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -70,7 +70,16 @@ import Testing
             blockIOReadBps: [.init(path: "/dev/vda", rate: UInt64(Int64.max) + 1)],
             blockIOWriteBps: [.init(path: "/dev/vda", rate: UInt64.max)],
             blockIOReadIOps: [.init(path: "/dev/vda", rate: 100)],
-            blockIOWriteIOps: [.init(path: "/dev/vda", rate: 200)]
+            blockIOWriteIOps: [.init(path: "/dev/vdb", rate: 200)],
+            devices: [
+                .init(
+                    pathOnHost: "/dev/vdb", pathInContainer: "/dev/data",
+                    cgroupPermissions: "rw"
+                ),
+            ],
+            deviceCgroupRules: [
+                .init(deviceType: "c", major: 10, minor: nil, access: "rwm"),
+            ]
         )
         let data = try JSONEncoder().encode(resources)
         #expect(try JSONDecoder().decode(GuestProtocol.Resources.self, from: data) == resources)
@@ -80,6 +89,15 @@ import Testing
         #expect((readBps.first?["rate"] as? NSNumber)?.uint64Value == UInt64(Int64.max) + 1)
         let writeBps = try #require(object["blockIOWriteBps"] as? [[String: Any]])
         #expect((writeBps.first?["rate"] as? NSNumber)?.uint64Value == UInt64.max)
+        let devices = try #require(object["devices"] as? [[String: Any]])
+        #expect(devices.first?["pathOnHost"] as? String == "/dev/vdb")
+        #expect(devices.first?["pathInContainer"] as? String == "/dev/data")
+        #expect(devices.first?["cgroupPermissions"] as? String == "rw")
+        let deviceRules = try #require(object["deviceCgroupRules"] as? [[String: Any]])
+        #expect(deviceRules.first?["deviceType"] as? String == "c")
+        #expect((deviceRules.first?["major"] as? NSNumber)?.uint32Value == 10)
+        #expect(deviceRules.first?["minor"] == nil)
+        #expect(deviceRules.first?["access"] as? String == "rwm")
 
         let update = GuestProtocol.ResourceUpdate(
             resources: resources, compatibilityFailureAfterWrites: 4

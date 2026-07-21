@@ -271,7 +271,9 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
                 client.api._url("/containers/{0}/update", container.id),
                 data={
                     "Memory": 2 * 1024 * 1024 * 1024,
-                    "DeviceCgroupRules": ["c 1:3 r"],
+                    "DeviceRequests": [{
+                        "Driver": "cdi", "DeviceIDs": ["example.com/device=one"],
+                    }],
                 },
             )
             client.api._raise_for_status(response)
@@ -719,6 +721,258 @@ def test_default_device_policy_blocks_vm_disks_and_survives_recovery(
             cleanup.containers.get(container.id).remove(force=True)
         except docker.errors.NotFound:
             pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-025")
+def test_configured_devices_custom_rules_nonroot_io_and_stats_survive_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    volume = client.volumes.create(name=f"configured-device-{suffix}")
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"configured-device-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["tail", "-f", "/dev/null"],
+            "HostConfig": {
+                "Mounts": [{
+                    "Type": "volume", "Source": volume.name, "Target": "/data",
+                }],
+                "Devices": [{
+                    "PathOnHost": "/dev/vdb",
+                    "PathInContainer": "/dev/cengine-volume",
+                    "CgroupPermissions": "r",
+                }],
+                "BlkioDeviceReadBps": [{
+                    "Path": "/dev/vdb", "Rate": 8 * 1024 * 1024,
+                }],
+            },
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+
+    def inspect(value: docker.models.containers.Container) -> None:
+        value.reload()
+        host = value.attrs["HostConfig"]
+        assert host["Devices"] == [{
+            "PathOnHost": "/dev/vdb",
+            "PathInContainer": "/dev/cengine-volume",
+            "CgroupPermissions": "r",
+        }]
+        assert host["DeviceCgroupRules"] == [f"b {device_number} w"]
+        assert host["BlkioDeviceReadBps"] == [{
+            "Path": "/dev/vdb", "Rate": 8 * 1024 * 1024,
+        }]
+
+    def assert_mapping(value: docker.models.containers.Container, write_allowed: bool) -> None:
+        script = (
+            "test -b /dev/cengine-volume; "
+            "dd if=/dev/cengine-volume of=/dev/null bs=512 count=1 2>/dev/null; "
+            "if dd if=/dev/null of=/dev/cengine-volume count=0 2>/dev/null; "
+            "then write=allowed; else write=denied; fi; "
+            f"test \"$write\" = {'allowed' if write_allowed else 'denied'}"
+        )
+        result = value.exec_run(["sh", "-ec", script])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+
+    try:
+        container.start()
+        number = container.exec_run(["cat", "/sys/class/block/vdb/dev"])
+        assert number.exit_code == 0, number.output.decode(errors="replace")
+        device_number = number.output.decode().strip()
+
+        assert_mapping(container, write_allowed=False)
+        io_max = container.exec_run(["cat", "/sys/fs/cgroup/io.max"])
+        assert io_max.exit_code == 0, io_max.output.decode(errors="replace")
+        assert any(
+            line.startswith(f"{device_number} ") and f"rbps={8 * 1024 * 1024}" in line
+            for line in io_max.output.decode().splitlines()
+        ), io_max.output.decode(errors="replace")
+
+        update = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={"DeviceCgroupRules": [f"b {device_number} w"]},
+        )
+        client.api._raise_for_status(update)
+        assert_mapping(container, write_allowed=True)
+        inspect(container)
+
+        daemon.publish_resource_update_failure(
+            container_id=container.id, failure_after_writes=1,
+        )
+        with pytest.raises(docker.errors.APIError) as error:
+            failed = client.api._post_json(
+                client.api._url("/containers/{0}/update", container.id),
+                data={
+                    "Memory": 512 * 1024 * 1024,
+                    "Devices": [{
+                        "PathOnHost": "/dev/vdb",
+                        "PathInContainer": "/dev/cengine-volume-failed",
+                        "CgroupPermissions": "r",
+                    }],
+                    "DeviceCgroupRules": [],
+                },
+            )
+            client.api._raise_for_status(failed)
+        assert error.value.status_code == 500
+        assert not daemon.resource_update_failure_file.exists()
+        assert_mapping(container, write_allowed=True)
+        failed_node = container.exec_run([
+            "test", "!", "-e", "/dev/cengine-volume-failed",
+        ])
+        assert failed_node.exit_code == 0, failed_node.output.decode(errors="replace")
+        inspect(container)
+
+        generated = container.exec_run([
+            "dd", "if=/dev/zero", "of=/data/accounting", "bs=1M", "count=2", "conv=fsync",
+        ])
+        assert generated.exit_code == 0, generated.output.decode(errors="replace")
+        stats = container.stats(stream=False)
+        entries = stats["blkio_stats"]["io_service_bytes_recursive"]
+        major, minor = [int(value) for value in device_number.split(":", 1)]
+        assert any(
+            entry["major"] == major and entry["minor"] == minor and entry["value"] > 0
+            for entry in entries
+        ), entries
+
+        clear = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={"Devices": [], "DeviceCgroupRules": []},
+        )
+        client.api._raise_for_status(clear)
+        absent = container.exec_run(["test", "!", "-e", "/dev/cengine-volume"])
+        assert absent.exit_code == 0, absent.output.decode(errors="replace")
+
+        restore = client.api._post_json(
+            client.api._url("/containers/{0}/update", container.id),
+            data={
+                "Devices": [{
+                    "PathOnHost": "/dev/vdb",
+                    "PathInContainer": "/dev/cengine-volume",
+                    "CgroupPermissions": "r",
+                }],
+                "DeviceCgroupRules": [f"b {device_number} w"],
+            },
+        )
+        client.api._raise_for_status(restore)
+        assert_mapping(container, write_allowed=True)
+
+        container.restart(timeout=5)
+        assert_mapping(container, write_allowed=True)
+        inspect(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        value = recovered.containers.get(container.id)
+        assert_mapping(value, write_allowed=True)
+        inspect(value)
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        try:
+            cleanup.volumes.get(volume.name).remove(force=True)
+        except (docker.errors.NotFound, docker.errors.APIError):
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-026")
+def test_privileged_cgroup_delegation_and_workload_wide_accounting(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        name=f"cgroup-delegation-{suffix}",
+        privileged=True,
+        detach=True,
+    )
+    unprivileged = client.containers.run(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        name=f"cgroup-readonly-{suffix}",
+        detach=True,
+    )
+    recovered = None
+
+    def assert_delegation(value: docker.models.containers.Container) -> None:
+        result = value.exec_run([
+            "sh", "-ec",
+            "fail() { echo \"cgroup delegation failed: $step\" >&2; exit 1; }; "
+            "step=workload-root-processes; "
+            "test -z \"$(cat /sys/fs/cgroup/cgroup.procs)\" || fail; "
+            "for controller in cpu io memory pids; do "
+            "  step=controller-$controller; "
+            "  grep -qw \"$controller\" /sys/fs/cgroup/cgroup.subtree_control || fail; "
+            "done; "
+            "step=create-child; mkdir /sys/fs/cgroup/nested-test || fail; "
+            "step=cpu-limit; "
+            "echo '50000 100000' >/sys/fs/cgroup/nested-test/cpu.max || fail; "
+            "step=memory-limit; "
+            "echo 16777216 >/sys/fs/cgroup/nested-test/memory.max || fail; "
+            "step=pids-limit; echo 4 >/sys/fs/cgroup/nested-test/pids.max || fail; "
+            "sleep 30 & child=$!; "
+            "step=move-child; "
+            "echo \"$child\" >/sys/fs/cgroup/nested-test/cgroup.procs || fail; "
+            "step=verify-child; "
+            "test -n \"$(cat /sys/fs/cgroup/nested-test/cgroup.procs)\" || fail; "
+            "kill \"$child\"; wait \"$child\" 2>/dev/null || true; "
+            "step=remove-child; rmdir /sys/fs/cgroup/nested-test || fail",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+
+    try:
+        readonly = unprivileged.exec_run([
+            "mkdir", "/sys/fs/cgroup/should-not-exist",
+        ])
+        assert readonly.exit_code != 0
+        assert_delegation(container)
+
+        activity = container.exec_run([
+            "sh", "-ec",
+            "dd if=/dev/zero of=/tmp/cgroup-accounting bs=1M count=4 conv=fsync; "
+            "rm /tmp/cgroup-accounting; i=0; while [ $i -lt 50000 ]; do i=$((i+1)); done",
+        ])
+        assert activity.exit_code == 0, activity.output.decode(errors="replace")
+        stats = container.stats(stream=False)
+        assert stats["pids_stats"]["current"] >= 1
+        assert stats["memory_stats"]["usage"] > 0
+        assert stats["memory_stats"]["max_usage"] >= stats["memory_stats"]["usage"]
+        assert stats["cpu_stats"]["throttling_data"]["periods"] > 0
+        assert stats["cpu_stats"]["cpu_usage"]["total_usage"] > 0
+        assert any(
+            (entry["major"], entry["minor"]) != (0, 0) and entry["value"] > 0
+            for entry in stats["blkio_stats"]["io_service_bytes_recursive"]
+        )
+
+        container.restart(timeout=5)
+        assert_delegation(container)
+
+        unprivileged.remove(force=True)
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_delegation(recovered.containers.get(container.id))
+    finally:
+        cleanup = recovered or client
+        for value in (container, unprivileged):
+            try:
+                cleanup.containers.get(value.id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
         if recovered is not None:
             recovered.close()
 

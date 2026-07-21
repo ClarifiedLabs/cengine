@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 13
+    public static let version: UInt32 = 14
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -195,14 +195,44 @@ public enum GuestProtocol {
         public var blockIOWriteBps: [BlockIOThrottle]
         public var blockIOReadIOps: [BlockIOThrottle]
         public var blockIOWriteIOps: [BlockIOThrottle]
+        public var devices: [DeviceMapping]
+        public var deviceCgroupRules: [DeviceCgroupRule]
         public init(
             memoryBytes: UInt64, cpuQuota: Int64, cpuPeriod: UInt64, pids: Int64,
             blockIOReadBps: [BlockIOThrottle] = [], blockIOWriteBps: [BlockIOThrottle] = [],
-            blockIOReadIOps: [BlockIOThrottle] = [], blockIOWriteIOps: [BlockIOThrottle] = []
+            blockIOReadIOps: [BlockIOThrottle] = [], blockIOWriteIOps: [BlockIOThrottle] = [],
+            devices: [DeviceMapping] = [], deviceCgroupRules: [DeviceCgroupRule] = []
         ) {
             self.memoryBytes = memoryBytes; self.cpuQuota = cpuQuota; self.cpuPeriod = cpuPeriod; self.pids = pids
             self.blockIOReadBps = blockIOReadBps; self.blockIOWriteBps = blockIOWriteBps
             self.blockIOReadIOps = blockIOReadIOps; self.blockIOWriteIOps = blockIOWriteIOps
+            self.devices = devices; self.deviceCgroupRules = deviceCgroupRules
+        }
+    }
+
+    public struct DeviceMapping: Codable, Sendable, Equatable {
+        public var pathOnHost: String
+        public var pathInContainer: String
+        public var cgroupPermissions: String
+
+        public init(pathOnHost: String, pathInContainer: String, cgroupPermissions: String) {
+            self.pathOnHost = pathOnHost
+            self.pathInContainer = pathInContainer
+            self.cgroupPermissions = cgroupPermissions
+        }
+    }
+
+    public struct DeviceCgroupRule: Codable, Sendable, Equatable {
+        public var deviceType: String
+        public var major: UInt32?
+        public var minor: UInt32?
+        public var access: String
+
+        public init(deviceType: String, major: UInt32?, minor: UInt32?, access: String) {
+            self.deviceType = deviceType
+            self.major = major
+            self.minor = minor
+            self.access = access
         }
     }
 

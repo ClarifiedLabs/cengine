@@ -388,7 +388,9 @@ public struct ContainerStatsResponse: Encodable, Sendable {
     public struct Usage: Encodable, Sendable {
         let total_usage: UInt64; let usage_in_kernelmode: UInt64; let usage_in_usermode: UInt64; let percpu_usage: [UInt64]
     }
-    public struct Throttling: Encodable, Sendable { let periods: UInt64 = 0; let throttled_periods: UInt64 = 0; let throttled_time: UInt64 = 0 }
+    public struct Throttling: Encodable, Sendable {
+        let periods: UInt64; let throttled_periods: UInt64; let throttled_time: UInt64
+    }
     public struct Memory: Encodable, Sendable { let usage: UInt64; let max_usage: UInt64; let stats: [String: UInt64]; let limit: UInt64 }
     public struct Network: Encodable, Sendable {
         let rx_bytes: UInt64; let rx_packets: UInt64; let rx_errors: UInt64; let rx_dropped: UInt64 = 0
@@ -404,16 +406,24 @@ public struct ContainerStatsResponse: Encodable, Sendable {
             limit: container.pidsLimit > 0 ? UInt64(container.pidsLimit) : UInt64.max
         )
         num_procs = value.pids
-        blkio_stats = .init(io_service_bytes_recursive: [
+        let blockIOEntries = value.blockIO.flatMap { device in [
+            Entry(major: device.major, minor: device.minor, op: "Read", value: device.readBytes),
+            Entry(major: device.major, minor: device.minor, op: "Write", value: device.writeBytes),
+        ] }
+        blkio_stats = .init(io_service_bytes_recursive: blockIOEntries.isEmpty ? [
             .init(major: 0, minor: 0, op: "Read", value: value.blockReadBytes),
             .init(major: 0, minor: 0, op: "Write", value: value.blockWriteBytes),
-        ])
+        ] : blockIOEntries)
         let usage = Usage(total_usage: value.cpuTotalNanoseconds, usage_in_kernelmode: value.cpuSystemNanoseconds,
                           usage_in_usermode: value.cpuUserNanoseconds, percpu_usage: [value.cpuTotalNanoseconds])
         let system = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000) * UInt64(max(container.cpus, 1))
-        cpu_stats = .init(cpu_usage: usage, system_cpu_usage: system, online_cpus: container.cpus, throttling_data: .init())
-        precpu_stats = .init(cpu_usage: usage, system_cpu_usage: system, online_cpus: container.cpus, throttling_data: .init())
-        memory_stats = .init(usage: value.memoryUsage, max_usage: value.memoryUsage,
+        let throttling = Throttling(
+            periods: value.cpuPeriods, throttled_periods: value.cpuThrottledPeriods,
+            throttled_time: value.cpuThrottledNanoseconds
+        )
+        cpu_stats = .init(cpu_usage: usage, system_cpu_usage: system, online_cpus: container.cpus, throttling_data: throttling)
+        precpu_stats = .init(cpu_usage: usage, system_cpu_usage: system, online_cpus: container.cpus, throttling_data: throttling)
+        memory_stats = .init(usage: value.memoryUsage, max_usage: value.memoryPeak,
                              stats: ["cache": value.memoryCache], limit: value.memoryLimit)
         networks = Dictionary(uniqueKeysWithValues: value.networks.map {
             ($0.name, .init(rx_bytes: $0.rxBytes, rx_packets: $0.rxPackets, rx_errors: $0.rxErrors,

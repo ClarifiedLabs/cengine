@@ -4655,7 +4655,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
             blockIOReadBps: Self.blockIOThrottles(container.blockIOReadBps),
             blockIOWriteBps: Self.blockIOThrottles(container.blockIOWriteBps),
             blockIOReadIOps: Self.blockIOThrottles(container.blockIOReadIOps),
-            blockIOWriteIOps: Self.blockIOThrottles(container.blockIOWriteIOps)
+            blockIOWriteIOps: Self.blockIOThrottles(container.blockIOWriteIOps),
+            devices: Self.devices(container.devices),
+            deviceCgroupRules: try Self.deviceCgroupRules(container.deviceCgroupRules)
         )
         let update = GuestProtocol.ResourceUpdate(
             resources: resources,
@@ -4874,10 +4876,31 @@ public actor RawVirtualizationBackend: ContainerBackend {
         try requireExactContainerOwnership(container)
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         struct Network: Decodable { let name: String; let rxBytes, rxPackets, rxErrors, txBytes, txPackets, txErrors: UInt64 }
-        struct Value: Decodable { let cpuTotalNanoseconds, cpuUserNanoseconds, cpuSystemNanoseconds, memoryUsage, memoryCache, pids, blockReadBytes, blockWriteBytes: UInt64; let networks: [Network] }
+        struct BlockIO: Decodable { let major, minor: Int; let readBytes, writeBytes: UInt64 }
+        struct Value: Decodable {
+            let cpuTotalNanoseconds, cpuUserNanoseconds, cpuSystemNanoseconds: UInt64
+            let cpuPeriods, cpuThrottledPeriods, cpuThrottledNanoseconds: UInt64
+            let memoryUsage, memoryPeak, memoryCache, pids, blockReadBytes, blockWriteBytes: UInt64
+            let blockIO: [BlockIO]; let networks: [Network]
+        }
         struct Empty: Encodable {}
         let value: Value = try await shim.guest(operation: "statistics", payload: Empty(), response: Value.self)
-        return .init(cpuTotalNanoseconds: value.cpuTotalNanoseconds, cpuUserNanoseconds: value.cpuUserNanoseconds, cpuSystemNanoseconds: value.cpuSystemNanoseconds, memoryUsage: value.memoryUsage, memoryLimit: container.memoryBytes, memoryCache: value.memoryCache, pids: value.pids, blockReadBytes: value.blockReadBytes, blockWriteBytes: value.blockWriteBytes, networks: value.networks.map { .init(name: $0.name, rxBytes: $0.rxBytes, rxPackets: $0.rxPackets, rxErrors: $0.rxErrors, txBytes: $0.txBytes, txPackets: $0.txPackets, txErrors: $0.txErrors) })
+        return .init(
+            cpuTotalNanoseconds: value.cpuTotalNanoseconds,
+            cpuUserNanoseconds: value.cpuUserNanoseconds,
+            cpuSystemNanoseconds: value.cpuSystemNanoseconds,
+            memoryUsage: value.memoryUsage, memoryLimit: container.memoryBytes,
+            memoryCache: value.memoryCache, pids: value.pids,
+            blockReadBytes: value.blockReadBytes, blockWriteBytes: value.blockWriteBytes,
+            networks: value.networks.map { .init(name: $0.name, rxBytes: $0.rxBytes, rxPackets: $0.rxPackets, rxErrors: $0.rxErrors, txBytes: $0.txBytes, txPackets: $0.txPackets, txErrors: $0.txErrors) },
+            memoryPeak: value.memoryPeak,
+            blockIO: value.blockIO.map { .init(
+                major: $0.major, minor: $0.minor, readBytes: $0.readBytes, writeBytes: $0.writeBytes
+            ) },
+            cpuPeriods: value.cpuPeriods,
+            cpuThrottledPeriods: value.cpuThrottledPeriods,
+            cpuThrottledNanoseconds: value.cpuThrottledNanoseconds
+        )
     }
 
     public func top(_ container: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]]) {
@@ -6029,7 +6052,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 blockIOReadBps: Self.blockIOThrottles(container.blockIOReadBps),
                 blockIOWriteBps: Self.blockIOThrottles(container.blockIOWriteBps),
                 blockIOReadIOps: Self.blockIOThrottles(container.blockIOReadIOps),
-                blockIOWriteIOps: Self.blockIOThrottles(container.blockIOWriteIOps)
+                blockIOWriteIOps: Self.blockIOThrottles(container.blockIOWriteIOps),
+                devices: Self.devices(container.devices),
+                deviceCgroupRules: try Self.deviceCgroupRules(container.deviceCgroupRules)
             ),
             privileged: container.privileged,
             noNewPrivileges: container.noNewPrivileges ?? !container.privileged,
@@ -6073,6 +6098,38 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ values: [BlockIOThrottleDeviceRecord]?
     ) -> [GuestProtocol.BlockIOThrottle] {
         (values ?? []).map { .init(path: $0.path, rate: $0.rate) }
+    }
+
+    private static func devices(_ values: [DeviceMappingRecord]) -> [GuestProtocol.DeviceMapping] {
+        values.map { .init(
+            pathOnHost: $0.pathOnHost, pathInContainer: $0.pathInContainer,
+            cgroupPermissions: $0.cgroupPermissions
+        ) }
+    }
+
+    private static func deviceCgroupRules(
+        _ values: [String]
+    ) throws -> [GuestProtocol.DeviceCgroupRule] {
+        try values.flatMap { value -> [GuestProtocol.DeviceCgroupRule] in
+            let fields = value.split(separator: " ").map(String.init)
+            let numbers = fields.count > 1 ? fields[1].split(separator: ":").map(String.init) : []
+            guard fields.count == 3, numbers.count == 2 else {
+                throw EngineError(.internalError, "container has an invalid persisted device cgroup rule")
+            }
+            func number(_ value: String) throws -> UInt32? {
+                if value == "*" { return nil }
+                guard let parsed = UInt32(value) else {
+                    throw EngineError(
+                        .internalError, "container has an invalid persisted device cgroup rule"
+                    )
+                }
+                return parsed
+            }
+            let major = try number(numbers[0])
+            let minor = try number(numbers[1])
+            let types = fields[0] == "a" ? ["c", "b"] : [fields[0]]
+            return types.map { .init(deviceType: $0, major: major, minor: minor, access: fields[2]) }
+        }
     }
 
     private static func compatibilityResourceFailureAfterWrites(containerID: String) throws -> UInt32? {

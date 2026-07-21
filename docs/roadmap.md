@@ -39,14 +39,13 @@ master mount. Unprivileged containers use Docker's default Linux capability set 
 fails closed on unknown inputs instead of widening deletion scope. Focused
 `RTM-004`–`RTM-008` contracts cover enforcement and recovery, explicit
 propagation gaps, capability masks, prune selection, and exec stage signal and
-status behavior. Security options, configurable devices, container
-sysctls, health start intervals, and
+status behavior. Remaining security profiles, container sysctls, health start intervals, and
 custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
 
 Docker's `SecurityOpt` no-new-privileges selection now persists, inspects, and
 applies to container init, default and privileged exec, and healthchecks through
-guest protocol v13. Omitted policy retains cengine's existing process-privilege
+guest protocol v13 and carried by current v14. Omitted policy retains cengine's existing process-privilege
 defaults, while explicit true or false selections override them and survive
 container restart and daemon recovery (`RTM-021`). Seccomp and AppArmor/SELinux-
 shaped profiles remain explicit gaps.
@@ -56,12 +55,22 @@ through cgroup-v2 BPF before process placement. Standard devices retain their
 expected access, while a process with Docker's default `CAP_MKNOD` can create a
 VM-disk node but cannot read or write it. Exec leaves inherit the policy, and
 enforcement remains active across container restart and daemon recovery
-(`RTM-024`). Privileged workloads remain unrestricted; configurable devices and
-custom device rules remain explicit gaps.
+(`RTM-024`). Privileged workloads remain unrestricted.
+
+Docker `Devices` mappings and additive `DeviceCgroupRules` now persist, inspect,
+apply, and update live through guest protocol v14 (`RTM-025`). A mapping's
+`PathOnHost` names a real device in the per-container Linux VM—standard guest
+devices and attached virtio block disks are supported—and the guest recreates
+that device at a descriptor-resolved `/dev` destination with the submitted
+`rwm` access. Custom wildcard rules extend the cgroup-v2 BPF policy. Live
+replacement atomically swaps the BPF program, device nodes, and scalar/I/O
+limits, restoring the old selection on failure. Arbitrary macOS character-device
+passthrough and driver/discovery-based `DeviceRequests` remain architecture
+gaps and fail explicitly.
 
 Docker create-time ulimits now persist and apply to container init, exec, and
 healthcheck processes through capability introduced in guest protocol v7 and
-carried by the current guest protocol v13. The final exec command receives
+carried by the current guest protocol v14. The final exec command receives
 limits after namespace and root setup without constraining the guest supervisor
 or its signal/status proxies. `RTM-014` covers inspect, validation without
 side effects, daemon recovery, and container stop/start. Live ulimit updates
@@ -71,7 +80,7 @@ Supported namespace selections now persist, inspect, and survive daemon
 recovery. Docker IPC `none` uses a private IPC namespace without mounting
 `/dev/shm`; the default/private cgroup and IPC selections plus the host userns
 selection introduced in guest protocol v11 reflect guest behavior through the
-current guest protocol v13 (`RTM-016`).
+current guest protocol v14 (`RTM-016`).
 Docker-host and cross-container cgroup, IPC, PID, UTS, and network sharing are
 explicit architecture gaps: separate per-container VM kernels cannot join one
 Linux namespace. OCI namespace paths are likewise not exposed through the
@@ -79,7 +88,7 @@ Docker API or an OCI runtime CLI. These requests fail before container or volume
 mutation (`RTM-017`).
 
 Docker masked and read-only paths now persist, inspect, and enter the guest
-protocol (introduced in v11 and carried by current v13). Omitted lists select
+protocol (introduced in v11 and carried by current v14). Omitted lists select
 Docker's defaults, explicit empty lists disable them,
 and privileged workloads clear them. The guest applies the policy after its
 filesystems and workload root are in place: missing targets are ignored,
@@ -89,7 +98,7 @@ flags. `RTM-018` covers file and directory masks, read-only enforcement,
 restart, and daemon recovery.
 
 Docker's structured bind recursion and read-only controls now persist and enter
-guest protocol v12 and are carried by the current v13 protocol. `NonRecursive`
+guest protocol v12 and are carried by the current v14 protocol. `NonRecursive`
 selects a single bind instead of a recursive bind; read-only binds default to
 recursive `mount_setattr`,
 `ReadOnlyNonRecursive` limits the remount to the bind root, and
@@ -113,7 +122,8 @@ other. `RTM-023` covers init and exec across direct ext4 and shared NFS storage,
 container restart, and daemon recovery.
 
 The four Docker per-device block-I/O throttle arrays now persist and apply to
-the VM root disk `/dev/vda` through cgroup-v2 `io.max`. API v1.55 live updates
+any real guest block device, including the VM root disk `/dev/vda` and attached
+volume disks such as `/dev/vdb`, through cgroup-v2 `io.max`. API v1.55 live updates
 independently replace or clear each BPS/IOPS limit while older update APIs keep
 their historical ignore behavior. `RTM-015` covers inspect, kernel control-state
 readback, direct-I/O enforcement, rollback after a compatibility-injected guest
@@ -136,8 +146,17 @@ unresolved journal reserves the container's stable
 ID/name/creation identity, fences lifecycle, restart-policy, and auto-remove
 work, and is removed atomically with a definitive container deletion.
 Compatibility fault markers are claimed by rename before validation so a
-replacement path cannot be consumed accidentally. Additional devices remain an
-explicit gap.
+replacement path cannot be consumed accidentally. `RTM-025` covers a configured
+volume device and its non-root `io.max` selection.
+
+The workload cgroup now remains the container cgroup-namespace root while init
+moves into a private child leaf. This leaves the namespace root process-free and
+delegates `cpu`, `io`, `memory`, and `pids` controllers to privileged nested
+runtimes without exposing a writable cgroup mount to unprivileged workloads.
+Docker stats read workload-wide cgroup-v2 CPU usage and throttling, current and
+peak memory, file cache, PID count, and per-device I/O rather than init-process
+proxies. `RTM-026` covers nested child-controller use, aggregate accounting,
+restart, and daemon recovery.
 
 Docker block-I/O weights now have an explicit architecture decision. Relative
 weights arbitrate sibling container cgroups sharing one kernel block scheduler;
@@ -200,16 +219,15 @@ Work in this order:
 1. Maintain the completed API v1.55 runtime-input baseline audit as Docker's
    request schema evolves. Apply newly supported fields, reject active gaps
    explicitly, or classify them in the ledger (`RTM-013`).
-2. Close cgroup-v2 IO/device, device,
-   seccomp/security-option, and remaining mount-matrix gaps for
+2. Close seccomp/security-option and remaining mount-matrix gaps for
    functionality cengine already exposes. Namespace inputs, PID limits, private
    bind isolation, and capability add/drop have explicit supported or
    architectural-gap decisions; shared/slave bind propagation is also an
    explicit architecture gap. Docker-relative block-I/O weights are now an
-   explicit architecture gap (`RTM-019`); remaining I/O work concerns
-   non-root configured devices, custom access policies, and accounting rather
-   than guest-only weight readback; the default device allowlist is complete
-   (`RTM-024`). Structured tmpfs execution policy and named-volume remount
+   explicit architecture gap (`RTM-019`); configured guest devices, custom
+   access policies, non-root device throttles, nested cgroup delegation, and
+   workload-wide accounting are complete (`RTM-024`–`RTM-026`). Structured
+   tmpfs execution policy and named-volume remount
    matrices are complete (`RTM-022`, `RTM-023`); remaining mount inputs have
    explicit support or gap classifications in the compatibility ledger.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
@@ -252,7 +270,7 @@ configure, and inspect endpoints is complete:
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
   responses. Recovery support shipped in guest protocol v7 and is carried by
-  the current guest protocol v13 (`NET-019`).
+  the current guest protocol v14 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived
@@ -283,8 +301,8 @@ Use the API v1.44-v1.55 assessment table in
 endpoint-level backlog. Registry search (`IMG-004`) is complete for Docker Hub
 and legacy-v1 custom registries, including authentication, filters, limits, and
 the versioned Docker response shape. Per-device block-I/O updates are complete
-for the VM root disk under API v1.55, with the additional-device limitation
-recorded as an intentional gap.
+for real block devices in the guest under API v1.55, including attached volume
+disks; relative block-I/O weights remain an intentional architecture gap.
 Container annotations, pull/load image events, accurate image counts, and
 versioned native-engine information are complete. Direct-build image `create`
 events remain part of the intentional direct-builder gap. Implement accepted

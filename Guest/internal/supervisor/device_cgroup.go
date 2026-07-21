@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 
+	"dev.cengine/guest/internal/protocol"
 	"golang.org/x/sys/unix"
 )
 
@@ -22,6 +24,100 @@ type deviceAccessRule struct {
 }
 
 func deviceNumber(value uint32) *uint32 { return &value }
+
+func deviceAccessMask(value string) (uint32, error) {
+	var result uint32
+	seen := map[rune]bool{}
+	for _, permission := range value {
+		if seen[permission] {
+			return 0, fmt.Errorf("duplicate device permission %q", permission)
+		}
+		seen[permission] = true
+		switch permission {
+		case 'r':
+			result |= unix.BPF_DEVCG_ACC_READ
+		case 'w':
+			result |= unix.BPF_DEVCG_ACC_WRITE
+		case 'm':
+			result |= unix.BPF_DEVCG_ACC_MKNOD
+		default:
+			return 0, fmt.Errorf("invalid device permission %q", permission)
+		}
+	}
+	if result == 0 {
+		return 0, fmt.Errorf("device permissions must not be empty")
+	}
+	return result, nil
+}
+
+func deviceType(mode uint32) (uint32, error) {
+	switch mode & unix.S_IFMT {
+	case unix.S_IFCHR:
+		return unix.BPF_DEVCG_DEV_CHAR, nil
+	case unix.S_IFBLK:
+		return unix.BPF_DEVCG_DEV_BLOCK, nil
+	default:
+		return 0, fmt.Errorf("path is not a character or block device")
+	}
+}
+
+func configuredDeviceRules(
+	resources protocol.Resources,
+	lstat func(string, *unix.Stat_t) error,
+) ([]deviceAccessRule, error) {
+	rules := append([]deviceAccessRule(nil), dockerDefaultDeviceRules...)
+	for _, device := range resources.Devices {
+		if !strings.HasPrefix(device.PathOnHost, "/dev/") ||
+			!strings.HasPrefix(device.PathInContainer, "/dev/") {
+			return nil, fmt.Errorf("configured devices require normalized /dev paths")
+		}
+		var status unix.Stat_t
+		if err := lstat(device.PathOnHost, &status); err != nil {
+			return nil, fmt.Errorf("inspect configured device %s: %w", device.PathOnHost, err)
+		}
+		kind, err := deviceType(status.Mode)
+		if err != nil {
+			return nil, fmt.Errorf("configured device %s %w", device.PathOnHost, err)
+		}
+		access, err := deviceAccessMask(device.CgroupPermissions)
+		if err != nil {
+			return nil, fmt.Errorf("configured device %s: %w", device.PathOnHost, err)
+		}
+		rules = append(rules, deviceAccessRule{
+			deviceType: kind,
+			major:      deviceNumber(uint32(unix.Major(uint64(status.Rdev)))),
+			minor:      deviceNumber(uint32(unix.Minor(uint64(status.Rdev)))),
+			access:     access,
+		})
+	}
+	for _, configured := range resources.DeviceCgroupRules {
+		access, err := deviceAccessMask(configured.Access)
+		if err != nil {
+			return nil, fmt.Errorf("custom device rule: %w", err)
+		}
+		var kinds []uint32
+		switch configured.DeviceType {
+		case "a":
+			kinds = []uint32{unix.BPF_DEVCG_DEV_CHAR, unix.BPF_DEVCG_DEV_BLOCK}
+		case "c":
+			kinds = []uint32{unix.BPF_DEVCG_DEV_CHAR}
+		case "b":
+			kinds = []uint32{unix.BPF_DEVCG_DEV_BLOCK}
+		default:
+			return nil, fmt.Errorf("invalid custom device rule type %q", configured.DeviceType)
+		}
+		for _, kind := range kinds {
+			rules = append(rules, deviceAccessRule{
+				deviceType: kind, major: configured.Major, minor: configured.Minor, access: access,
+			})
+		}
+	}
+	return rules, nil
+}
+
+func configuredDeviceRulesForHost(resources protocol.Resources) ([]deviceAccessRule, error) {
+	return configuredDeviceRules(resources, unix.Lstat)
+}
 
 var dockerDefaultDeviceRules = []deviceAccessRule{
 	{deviceType: unix.BPF_DEVCG_DEV_CHAR, access: unix.BPF_DEVCG_ACC_MKNOD},
@@ -163,8 +259,8 @@ func retryBPFProgramLoad(load func() (uintptr, unix.Errno)) (uintptr, unix.Errno
 	return programFD, loadErr
 }
 
-func attachDefaultDevicePolicy(cgroupPath string) error {
-	instructions := bpfDeviceProgram(dockerDefaultDeviceRules)
+func loadDevicePolicy(rules []deviceAccessRule) (int, error) {
+	instructions := bpfDeviceProgram(rules)
 	license := []byte("GPL\x00")
 	logBuffer := make([]byte, 64*1024)
 	load := bpfProgramLoadAttribute{
@@ -190,26 +286,52 @@ func attachDefaultDevicePolicy(cgroupPath string) error {
 	if loadErr != 0 {
 		log := string(bytes.TrimRight(logBuffer, "\x00"))
 		if log != "" {
-			return fmt.Errorf("load cgroup device policy: %w: %s", loadErr, log)
+			return -1, fmt.Errorf("load cgroup device policy: %w: %s", loadErr, log)
 		}
-		return fmt.Errorf("load cgroup device policy: %w", loadErr)
+		return -1, fmt.Errorf("load cgroup device policy: %w", loadErr)
 	}
-	defer unix.Close(int(programFD))
+	return int(programFD), nil
+}
+
+func attachDevicePolicy(cgroupPath string, rules []deviceAccessRule, replacedFD int) (int, error) {
+	programFD, err := loadDevicePolicy(rules)
+	if err != nil {
+		return -1, err
+	}
+	attached := false
+	defer func() {
+		if !attached {
+			_ = unix.Close(programFD)
+		}
+	}()
 
 	cgroupFD, err := unix.Open(cgroupPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("open workload cgroup for device policy: %w", err)
+		return -1, fmt.Errorf("open workload cgroup for device policy: %w", err)
 	}
 	defer unix.Close(cgroupFD)
 	attach := bpfProgramAttachAttribute{
 		targetFD: uint32(cgroupFD), programFD: uint32(programFD),
-		attachType: unix.BPF_CGROUP_DEVICE,
+		attachType:  unix.BPF_CGROUP_DEVICE,
+		attachFlags: devicePolicyAttachFlags(replacedFD),
+	}
+	if replacedFD >= 0 {
+		attach.replaceProgramFD = uint32(replacedFD)
 	}
 	_, _, attachErr := unix.Syscall(
 		unix.SYS_BPF, unix.BPF_PROG_ATTACH, uintptr(unsafe.Pointer(&attach)), unsafe.Sizeof(attach),
 	)
 	if attachErr != 0 {
-		return fmt.Errorf("attach cgroup device policy: %w", attachErr)
+		return -1, fmt.Errorf("attach cgroup device policy: %w", attachErr)
 	}
-	return nil
+	attached = true
+	return programFD, nil
+}
+
+func devicePolicyAttachFlags(replacedFD int) uint32 {
+	flags := uint32(unix.BPF_F_ALLOW_MULTI)
+	if replacedFD >= 0 {
+		flags |= unix.BPF_F_REPLACE
+	}
+	return flags
 }

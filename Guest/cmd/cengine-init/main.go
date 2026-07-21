@@ -443,7 +443,7 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 		if pid == 0 {
 			return nil, errors.New("workload is not running")
 		}
-		value, err := operations.Stats(pid)
+		value, err := operations.Stats(pid, state.process.CgroupPath())
 		if err != nil {
 			return nil, err
 		}

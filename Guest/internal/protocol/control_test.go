@@ -6,8 +6,8 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 13 {
-		t.Fatalf("Version = %d, want 13", Version)
+	if Version != 14 {
+		t.Fatalf("Version = %d, want 14", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -62,8 +62,8 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 13 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 13, got %d", Version)
+	if Version != 14 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 14, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {
@@ -77,7 +77,9 @@ func TestBlockIOThrottlesDecodeInCurrentProtocol(t *testing.T) {
 		"memoryBytes":67108864,"cpuQuota":100000,"cpuPeriod":100000,"pids":32,
 		"blockIOReadBps":[{"path":"/dev/vda","rate":9223372036854775808}],
 		"blockIOWriteBps":[{"path":"/dev/vda","rate":18446744073709551615}],
-		"blockIOReadIOps":[],"blockIOWriteIOps":[]
+		"blockIOReadIOps":[],"blockIOWriteIOps":[{"path":"/dev/vdb","rate":200}],
+		"devices":[{"pathOnHost":"/dev/vdb","pathInContainer":"/dev/data","cgroupPermissions":"rw"}],
+		"deviceCgroupRules":[{"deviceType":"c","major":10,"minor":null,"access":"rwm"}]
 	}`), &resources); err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +87,16 @@ func TestBlockIOThrottlesDecodeInCurrentProtocol(t *testing.T) {
 		resources.BlockIOReadBps[0].Rate != uint64(1)<<63 ||
 		len(resources.BlockIOWriteBps) != 1 || resources.BlockIOWriteBps[0].Rate != ^uint64(0) {
 		t.Fatalf("block I/O throttles did not decode: %#v", resources.BlockIOReadBps)
+	}
+	if len(resources.Devices) != 1 || resources.Devices[0].PathOnHost != "/dev/vdb" ||
+		resources.Devices[0].PathInContainer != "/dev/data" ||
+		resources.Devices[0].CgroupPermissions != "rw" {
+		t.Fatalf("configured devices did not decode: %#v", resources.Devices)
+	}
+	if len(resources.DeviceCgroupRules) != 1 || resources.DeviceCgroupRules[0].DeviceType != "c" ||
+		resources.DeviceCgroupRules[0].Major == nil || *resources.DeviceCgroupRules[0].Major != 10 ||
+		resources.DeviceCgroupRules[0].Minor != nil || resources.DeviceCgroupRules[0].Access != "rwm" {
+		t.Fatalf("device cgroup rules did not decode: %#v", resources.DeviceCgroupRules)
 	}
 }
 
