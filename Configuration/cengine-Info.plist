@@ -26,6 +26,8 @@
 	<string>$(CENGINE_TEAM_IDENTIFIER)</string>
 	<key>CEngineNetworkHelperServiceName</key>
 	<string>$(CENGINE_NETWORK_HELPER_SERVICE_NAME)</string>
+	<key>CEngineNetworkHelperIdentifier</key>
+	<string>$(CENGINE_NETWORK_HELPER_IDENTIFIER)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 </dict>

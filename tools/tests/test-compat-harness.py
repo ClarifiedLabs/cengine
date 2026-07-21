@@ -97,8 +97,10 @@ def main() -> None:
     assert 'CENGINE_KERNEL="$(CENGINE_GUEST_OUTPUT)/vmlinux"' in makefile
     assert 'CENGINE_CONTAINER_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/container-initramfs.cpio.gz"' in makefile
     assert 'CENGINE_STORAGE_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/storage-initramfs.cpio.gz"' in makefile
-    assert makefile.count("$(CENGINE_COMPAT_ENV)") == 3
+    assert makefile.count("$(CENGINE_COMPAT_ENV)") == 4
     assert "test-compat-reset-system:" in makefile
+    assert "test-compat-doctor:" in makefile
+    assert "test-compat-helper-uninstall:" in makefile
     assert "Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)" in makefile
     assert "CENGINE_HOST_OS ?= $(shell uname -s)" in makefile
     assert "kernel-build: build" not in makefile
@@ -155,38 +157,40 @@ def main() -> None:
     assert 'LOCK=${CENGINE_COMPAT_LOCK:-"${TMPDIR:-/tmp}/cengine-compat-run.lock"}' in runner
     assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY" in runner
     assert 'stage "preflight reset"' in runner
-    assert 'stage "rebuild runtime and guest assets"' in runner
+    assert 'stage "build and authorize compatibility runtime"' in runner
     assert 'XCODE_COMPAT_SCHEME=${XCODE_COMPAT_SCHEME:-test-compat}' in runner
     assert '-scheme "$XCODE_COMPAT_SCHEME"' in runner
     assert '-configuration "$XCODE_COMPAT_CONFIGURATION"' in runner
     assert 'stage "recreate test environment"' in runner
-    assert 'compat_network_helper_bootstrap_local "$HELPER"' in runner
-    assert 'compat_network_helper_cleanup_local || status=$?' in runner
-    assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME=$compat_network_helper_default_service_name' in runner
+    assert 'HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")' in runner
+    assert 'compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"' in runner
+    assert 'compat_network_helper_cleanup_local' not in runner
+    assert 'CENGINE_COMPAT_IPV4_AUTO_POOL' in runner
+    assert '"$ROOT/Scripts/check-compat-network-pools.py"' in runner
 
     helper_lifecycle = (REPO_ROOT / "Scripts" / "compat-network-helper.sh").read_text()
-    assert 'compat_network_helper_installed_path="/Applications/cengine.app/Contents/MacOS/cengine-network-helper"' in helper_lifecycle
-    assert 'CENGINE_COMPAT_NETWORK_HELPER:-auto' in helper_lifecycle
-    assert 'auto|installed)' in helper_lifecycle
-    assert 'if [ -x "$_cnh_local_helper" ]' not in helper_lifecycle
-    assert 'use CENGINE_COMPAT_NETWORK_HELPER=local only when testing helper changes' in helper_lifecycle
-    assert 'compat_network_helper_test_compat_service_name="dev.cengine.network-helper.test-compat"' in helper_lifecycle
+    assert 'compat_network_helper_root="/Library/Application Support/cengine/compat/' in helper_lifecycle
+    assert 'compat_network_helper_token_path=' in helper_lifecycle
+    assert 'compat_network_helper_manifest_path=' in helper_lifecycle
+    assert 'compat_network_helper_service_name="dev.cengine.network-helper.test-compat"' in helper_lifecycle
     assert 'cengine-network-helper\\n' in helper_lifecycle
     assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME' in helper_lifecycle
+    assert 'CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE' in helper_lifecycle
+    assert 'compat_network_helper_ensure()' in helper_lifecycle
+    assert 'compat_network_helper_uninstall()' in helper_lifecycle
     assert 'launchctl bootstrap system' in helper_lifecycle
     assert 'launchctl bootout "system/$label"' in helper_lifecycle
-    assert 'launchctl kill SIGTERM "system/$label"' in helper_lifecycle
     assert 'launchctl kickstart "system/$label"' in helper_lifecycle
     assert 'launchctl kickstart -k "system/$label"' not in helper_lifecycle
     assert helper_lifecycle.count("/usr/bin/osascript -") == 1
     assert helper_lifecycle.count("with administrator privileges") == 1
-    assert '"$request_root"/restart-*' in helper_lifecycle
-    assert ': > "$_cnh_control_root/requests/stop"' in helper_lifecycle
+    assert "/Applications/cengine.app" not in helper_lifecycle
     assert "/usr/bin/sudo" not in helper_lifecycle
 
     buildx_test = (REPO_ROOT / "Tests" / "Compatibility" / "test_buildx.py").read_text()
-    assert "CENGINE_COMPAT_NETWORK_HELPER_CONTROL_ROOT" in buildx_test
-    assert 'f"restart-{request_id}"' in buildx_test
+    assert '"network-helper", "restart"' in buildx_test
+    assert "CENGINE_COMPAT_NETWORK_HELPER_FINGERPRINT" in buildx_test
+    assert "CENGINE_COMPAT_NETWORK_HELPER_CONTROL_ROOT" not in buildx_test
     assert "/usr/bin/osascript" not in buildx_test
     assert "with administrator privileges" not in buildx_test
     assert "/usr/bin/sudo" not in buildx_test
@@ -195,13 +199,16 @@ def main() -> None:
     assert "binary.is_file()" not in reset
     assert "compatibility_runtime_processes" in reset
     assert "compatibility runtime reset did not reach a clean state" in reset
+    assert "system/dev.cengine.network-helper.test-compat" in reset
+    assert "system/dev.cengine.network-helper 2" not in reset
+    assert "CENGINE_COMPAT_ALLOW_GLOBAL_NETWORK_RESET" in reset
 
     isolated = (REPO_ROOT / "Scripts" / "run-isolated-cengine.sh").read_text()
     assert 'mktemp -d "${TMPDIR:-/tmp}/cengine-compat-tool.XXXXXX"' in isolated
     assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY" in isolated
     assert 'trap cleanup EXIT' in isolated
-    assert 'compat_network_helper_bootstrap_local "$HELPER" "$COMPAT_HELPER_SERVICE" 1' in isolated
-    assert 'compat_network_helper_cleanup_local || status=$?' in isolated
+    assert 'compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"' in isolated
+    assert 'compat_network_helper_cleanup_local' not in isolated
     assert '--binary "$BINARY" --root "$ENGINE_ROOT"' in isolated
     assert isolated.index('--binary "$BINARY" --root "$ENGINE_ROOT"') < isolated.index('> "$WORK/.cengine-compat-owner"')
     assert 'CENGINE_ISOLATED_IMAGE_CACHE' in isolated

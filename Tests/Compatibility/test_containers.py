@@ -17,7 +17,7 @@ import pytest
 from docker import errors
 from docker.types import Mount
 
-from harness import docker_environment
+from harness import compatibility_fixture_ipv4, compatibility_fixture_ipv6, docker_environment
 
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
@@ -893,13 +893,16 @@ def test_explicit_network_address_families_apply_and_survive_recovery(
 ):
     suffix = uuid.uuid4().hex[:8]
     name = f"compat-v6-only-{suffix}"
+    ipv6_subnet = compatibility_fixture_ipv6(0x18, prefix=120)
+    ipv6_gateway = compatibility_fixture_ipv6(0x18, 1, prefix=None)
+    ipv6_prefix = compatibility_fixture_ipv6(0x18, prefix=None)
     response = client.api._post_json(
         client.api._url("/networks/create"),
         data={
             "Name": name,
             "EnableIPv4": False,
             "EnableIPv6": True,
-            "IPAM": {"Config": [{"Subnet": "fd00:18::/120", "Gateway": "fd00:18::1"}]},
+            "IPAM": {"Config": [{"Subnet": ipv6_subnet, "Gateway": ipv6_gateway}]},
         },
     )
     client.api._raise_for_status(response)
@@ -908,12 +911,12 @@ def test_explicit_network_address_families_apply_and_survive_recovery(
     container.start(); container.reload(); network.reload()
     assert network.attrs["EnableIPv4"] is False
     assert network.attrs["EnableIPv6"] is True
-    assert [config["Subnet"] for config in network.attrs["IPAM"]["Config"]] == ["fd00:18::/120"]
+    assert [config["Subnet"] for config in network.attrs["IPAM"]["Config"]] == [ipv6_subnet]
     endpoint = container.attrs["NetworkSettings"]["Networks"][name]
     assert endpoint["IPAddress"] == ""
-    assert endpoint["GlobalIPv6Address"].startswith("fd00:18::")
+    assert endpoint["GlobalIPv6Address"].startswith(ipv6_prefix)
     code, addresses = container.exec_run(["sh", "-c", "ip -o -4 addr show dev eth0; ip -o -6 addr show dev eth0"])
-    assert code == 0 and b" inet " not in addresses and b" inet6 fd00:18::" in addresses
+    assert code == 0 and b" inet " not in addresses and f" inet6 {ipv6_prefix}".encode() in addresses
 
     daemon.restart(kill=True)
     recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
@@ -929,7 +932,7 @@ def test_explicit_network_address_families_apply_and_survive_recovery(
             time.sleep(0.2)
         endpoint = value.attrs["NetworkSettings"]["Networks"][name]
         assert endpoint["IPAddress"] == ""
-        assert endpoint["GlobalIPv6Address"].startswith("fd00:18::")
+        assert endpoint["GlobalIPv6Address"].startswith(ipv6_prefix)
         recovered_network = recovered.networks.get(name)
         assert recovered_network.attrs["EnableIPv4"] is False
         assert recovered_network.attrs["EnableIPv6"] is True
@@ -938,7 +941,7 @@ def test_explicit_network_address_families_apply_and_survive_recovery(
         )
         peer.start()
         code, hosts = peer.exec_run(["getent", "hosts", container.name])
-        assert code == 0 and b"fd00:18::" in hosts
+        assert code == 0 and ipv6_prefix.encode() in hosts
     finally:
         recovered.close()
 
@@ -1004,15 +1007,18 @@ def test_endpoint_sysctls_apply_validate_and_survive_recovery(daemon, client: do
 def test_network_ipam_status_tracks_allocations_and_api_version(client: docker.DockerClient, daemon):
     suffix = uuid.uuid4().hex[:8]
     name = f"compat-ipam-status-{suffix}"
+    subnet = compatibility_fixture_ipv4(30, 2, prefix=29)
+    gateway = compatibility_fixture_ipv4(30, 1, prefix=None)
+    canonical_subnet = compatibility_fixture_ipv4(30, prefix=29)
     response = client.api._post_json(
         client.api._url("/networks/create"),
-        data={"Name": name, "IPAM": {"Config": [{"Subnet": "10.20.30.2/29", "Gateway": "10.20.30.1"}]}},
+        data={"Name": name, "IPAM": {"Config": [{"Subnet": subnet, "Gateway": gateway}]}},
     )
     client.api._raise_for_status(response)
     container = client.containers.create(IMAGE, command="top", network=name)
     network = client.networks.get(name)
     network.reload()
-    status = network.attrs["Status"]["IPAM"]["Subnets"]["10.20.30.0/29"]
+    status = network.attrs["Status"]["IPAM"]["Subnets"][canonical_subnet]
     assert status == {"IPsInUse": 4, "DynamicIPsAvailable": 4}
 
     legacy = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="1.51")
@@ -1043,27 +1049,31 @@ def test_network_ipam_and_family_validation_is_explicit(
     client: docker.DockerClient, daemon,
 ):
     suffix = uuid.uuid4().hex[:8]
+    ipv6_subnet = compatibility_fixture_ipv6(0x22)
+    ipv6_gateway = compatibility_fixture_ipv6(0x22, 0xFE, prefix=None)
     unsupported = [
         {
             "Name": f"aux-{suffix}",
             "IPAM": {"Config": [{
-                "Subnet": "10.210.0.0/24",
-                "AuxiliaryAddresses": {"reserved": "10.210.0.10"},
+                "Subnet": compatibility_fixture_ipv4(512),
+                "AuxiliaryAddresses": {
+                    "reserved": compatibility_fixture_ipv4(512, 10, prefix=None)
+                },
             }]},
         },
         {
             "Name": f"multi-{suffix}",
             "IPAM": {"Config": [
-                {"Subnet": "10.211.0.0/24"},
-                {"Subnet": "10.212.0.0/24"},
+                {"Subnet": compatibility_fixture_ipv4(768)},
+                {"Subnet": compatibility_fixture_ipv4(1024)},
             ]},
         },
         {
             "Name": f"custom-v6-{suffix}",
             "EnableIPv6": True,
             "IPAM": {"Config": [{
-                "Subnet": "fd00:22::/64",
-                "Gateway": "fd00:22::fe",
+                "Subnet": ipv6_subnet,
+                "Gateway": ipv6_gateway,
             }]},
         },
         {
@@ -1087,35 +1097,55 @@ def test_network_ipam_and_family_validation_is_explicit(
         {"Name": f"bogus-cidr-{suffix}", "IPAM": {"Config": [{"Subnet": "bogus/24"}]}},
         {
             "Name": f"wrong-v4-gateway-family-{suffix}",
-            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "fd00:22::1"}]},
+            "IPAM": {"Config": [{
+                "Subnet": compatibility_fixture_ipv4(1280),
+                "Gateway": compatibility_fixture_ipv6(0x22, 1, prefix=None),
+            }]},
         },
         {
             "Name": f"outside-v4-gateway-{suffix}",
-            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "10.214.0.1"}]},
+            "IPAM": {"Config": [{
+                "Subnet": compatibility_fixture_ipv4(1280),
+                "Gateway": compatibility_fixture_ipv4(1536, 1, prefix=None),
+            }]},
         },
         {
             "Name": f"reserved-v4-gateway-{suffix}",
-            "IPAM": {"Config": [{"Subnet": "10.213.0.0/24", "Gateway": "10.213.0.255"}]},
+            "IPAM": {"Config": [{
+                "Subnet": compatibility_fixture_ipv4(1280),
+                "Gateway": compatibility_fixture_ipv4(1280, 255, prefix=None),
+            }]},
         },
         {
             "Name": f"invalid-v6-prefix-{suffix}",
             "EnableIPv6": True,
-            "IPAM": {"Config": [{"Subnet": "fd00:22::/129"}]},
+            "IPAM": {"Config": [{
+                "Subnet": compatibility_fixture_ipv6(0x22, prefix=None) + "/129"
+            }]},
         },
         {
             "Name": f"wrong-v6-gateway-family-{suffix}",
             "EnableIPv6": True,
-            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "10.213.0.1"}]},
+            "IPAM": {"Config": [{
+                "Subnet": ipv6_subnet,
+                "Gateway": compatibility_fixture_ipv4(1280, 1, prefix=None),
+            }]},
         },
         {
             "Name": f"outside-v6-gateway-{suffix}",
             "EnableIPv6": True,
-            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "fd00:23::1"}]},
+            "IPAM": {"Config": [{
+                "Subnet": ipv6_subnet,
+                "Gateway": compatibility_fixture_ipv6(0x23, 1, prefix=None),
+            }]},
         },
         {
             "Name": f"reserved-v6-gateway-{suffix}",
             "EnableIPv6": True,
-            "IPAM": {"Config": [{"Subnet": "fd00:22::/64", "Gateway": "fd00:22::"}]},
+            "IPAM": {"Config": [{
+                "Subnet": ipv6_subnet,
+                "Gateway": compatibility_fixture_ipv6(0x22, prefix=None),
+            }]},
         },
     ]
     for request in invalid:
@@ -1128,16 +1158,22 @@ def test_network_ipam_and_family_validation_is_explicit(
             "Name": f"canonical-{suffix}",
             "EnableIPv6": True,
             "IPAM": {"Config": [
-                {"Subnet": "10.215.0.30/28"},
-                {"Subnet": "FD00:0022:0000:0000:0000:0000:0000:001E/124"},
+                {"Subnet": compatibility_fixture_ipv4(1792, 30, prefix=28)},
+                {"Subnet": compatibility_fixture_ipv6(0x22, 0x1E, prefix=124).upper()},
             ]},
         },
     )
     client.api._raise_for_status(canonical)
     canonical_network = client.networks.get(canonical.json()["Id"])
     assert canonical_network.attrs["IPAM"]["Config"] == [
-        {"Subnet": "10.215.0.16/28", "Gateway": "10.215.0.17"},
-        {"Subnet": "fd00:22::10/124", "Gateway": "fd00:22::11"},
+        {
+            "Subnet": compatibility_fixture_ipv4(1792, 16, prefix=28),
+            "Gateway": compatibility_fixture_ipv4(1792, 17, prefix=None),
+        },
+        {
+            "Subnet": compatibility_fixture_ipv6(0x22, 0x10, prefix=124),
+            "Gateway": compatibility_fixture_ipv6(0x22, 0x11, prefix=None),
+        },
     ]
     canonical_network.remove()
 

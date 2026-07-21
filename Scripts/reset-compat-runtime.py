@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import shutil
 import subprocess
@@ -37,7 +38,7 @@ def main() -> None:
     parser.add_argument(
         "--system-networking",
         action="store_true",
-        help="restart cengine's helper and macOS NetworkSharing to recover leaked vmnet reservations",
+        help="restart the test helper and macOS NetworkSharing to recover leaked vmnet reservations",
     )
     args = parser.parse_args()
 
@@ -55,9 +56,20 @@ def main() -> None:
             removed += 1
 
     if args.system_networking:
+        production_service = f"gui/{os.getuid()}/dev.cengine.engine"
+        production_loaded = subprocess.run(
+            ["/bin/launchctl", "print", production_service],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if production_loaded and os.environ.get("CENGINE_COMPAT_ALLOW_GLOBAL_NETWORK_RESET") != "1":
+            raise SystemExit(
+                "refusing the global vmnet reset while the installed cengine service is loaded; "
+                "stop it first or set CENGINE_COMPAT_ALLOW_GLOBAL_NETWORK_RESET=1"
+            )
         command = (
             "/usr/bin/pkill -9 -x InternetSharing 2>/dev/null || true; "
-            "/bin/launchctl kill SIGKILL system/dev.cengine.network-helper 2>/dev/null || true"
+            "/bin/launchctl kill SIGKILL "
+            "system/dev.cengine.network-helper.test-compat 2>/dev/null || true"
         )
         subprocess.run(
             [

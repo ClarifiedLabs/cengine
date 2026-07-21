@@ -629,7 +629,10 @@ enum VMShimAttachmentResolver {
             guard let network = desired[id] else { continue }
             fabricNetworks[id] = network
             if network.isolated { continue }
-            let uplink = try await VMNetUplink.start(network: network)
+            let uplink = try await VMNetUplink.start(
+                network: network,
+                namespace: specification.networkNamespace
+            )
             await installUplink(uplink, network: network)
         }
     }
@@ -687,7 +690,10 @@ enum VMShimAttachmentResolver {
         while !Task.isCancelled, uplinkRecoveries[id]?.generation == generation,
               uplinks[id] == nil, let network = fabricNetworks[id], !network.isolated {
             do {
-                let replacement = try await VMNetUplink.start(network: network)
+                let replacement = try await VMNetUplink.start(
+                    network: network,
+                    namespace: specification.networkNamespace
+                )
                 guard !Task.isCancelled,
                       uplinkRecoveries[id]?.generation == generation,
                       uplinks[id] == nil,

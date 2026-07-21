@@ -14,7 +14,7 @@ import docker
 import pytest
 from docker.types import Mount
 
-from harness import docker_environment
+from harness import compatibility_environment, docker_environment
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -34,32 +34,16 @@ def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.
 
 
 def restart_compatibility_network_helper() -> None:
-    label = os.environ.get("CENGINE_COMPAT_BOOTSTRAPPED_NETWORK_HELPER_LABEL")
-    control_root_value = os.environ.get("CENGINE_COMPAT_NETWORK_HELPER_CONTROL_ROOT")
-    if not label or not control_root_value:
-        pytest.skip("helper restart requires the isolated compatibility networking helper")
-
-    control_root = pathlib.Path(control_root_value)
-    request_id = uuid.uuid4().hex
-    request = control_root / "requests" / f"restart-{request_id}"
-    response = control_root / "status" / f"restart-{request_id}.status"
-    output = control_root / "status" / f"restart-{request_id}.output"
-    request.touch(exist_ok=False)
-
-    deadline = time.monotonic() + 120
-    while not response.is_file():
-        if not control_root.is_dir():
-            pytest.fail("privileged compatibility networking helper session exited during restart")
-        if time.monotonic() >= deadline:
-            pytest.fail("timed out waiting for compatibility networking helper restart")
-        time.sleep(0.1)
-
-    restart_output = output.read_text(errors="replace") if output.is_file() else ""
-    try:
-        status = int(response.read_text().strip())
-    except ValueError:
-        pytest.fail(f"invalid compatibility networking helper restart status:\n{restart_output}")
-    assert status == 0, f"could not restart compatibility networking helper:\n{restart_output}"
+    binary = os.environ.get("CENGINE_BINARY")
+    assert binary, "CENGINE_BINARY is required to restart the compatibility helper"
+    result = subprocess.run(
+        [binary, "network-helper", "restart"], env=compatibility_environment(), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+    )
+    assert result.returncode == 0, f"could not restart compatibility networking helper:\n{result.stdout}"
+    status = json.loads(result.stdout)
+    assert status["serviceName"] == "dev.cengine.network-helper.test-compat"
+    assert status["buildFingerprint"] == os.environ["CENGINE_COMPAT_NETWORK_HELPER_FINGERPRINT"]
 
 
 @pytest.mark.compat("BLD-001")

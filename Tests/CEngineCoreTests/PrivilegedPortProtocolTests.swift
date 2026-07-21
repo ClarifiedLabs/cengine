@@ -26,6 +26,8 @@ import Testing
 
         #expect(PrivilegedPortProtocol.defaultServiceName == "dev.cengine.network-helper")
         #expect(PrivilegedPortProtocol.testCompatServiceName == "dev.cengine.network-helper.test-compat")
+        #expect(PrivilegedPortProtocol.testCompatEngineIdentifier == "dev.cengine.engine.test-compat")
+        #expect(PrivilegedPortProtocol.testCompatHelperIdentifier == "dev.cengine.network-helper.test-compat")
         #expect(PrivilegedPortProtocol.serviceName(environment: [:]) == PrivilegedPortProtocol.defaultServiceName)
         #expect(
             PrivilegedPortProtocol.serviceName(configured: " \n\t ", environment: [:])
@@ -43,8 +45,24 @@ import Testing
         )
     }
 
+    @Test func authenticationTokenIsReadFromOwnerOnlyFile() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "cengine-helper-token-\(UUID().uuidString)", directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let token = directory.appending(path: "token")
+        try Data(" test-secret\n".utf8).write(to: token)
+
+        #expect(PrivilegedPortProtocol.authenticationToken(environment: [
+            PrivilegedPortProtocol.authenticationTokenFileEnvironmentKey: token.path
+        ]) == "test-secret")
+        #expect(PrivilegedPortProtocol.authenticationToken(environment: [:]) == nil)
+    }
+
     @Test func staticVMNetRequestDisablesDHCPAcrossProtocolEncoding() throws {
         let request = PrivilegedVMNetRequest(
+            namespace: "test-root",
             id: "bridge",
             vlan: 1,
             subnet: "10.240.1.0/24",
@@ -59,7 +77,8 @@ import Testing
             PrivilegedVMNetRequest.self,
             from: JSONEncoder().encode(request)
         )
-        #expect(PrivilegedPortProtocol.version == 4)
+        #expect(PrivilegedPortProtocol.version == 5)
+        #expect(request.resourceID == "test-root/bridge")
         #expect(decoded.gateway == "10.240.1.1")
         #expect(decoded.dhcpEnabled == false)
     }

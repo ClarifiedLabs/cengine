@@ -61,16 +61,15 @@ content store under `.build` and APFS-cloned into each root, avoiding external r
 sharing mutable engine metadata. Pytest stops all VM shims owned by that root before removing it,
 including when a test fails; it does not reuse a daemon or repair resources
 left by a preceding test. The command builds the `test-compat` Xcode scheme and
-uses the installed, already-approved `dev.cengine.network-helper` service by
-default. Normal compatibility and guest-test runs therefore do not request
-administrator authorization. Install cengine, approve Networking once, and then
-disable the per-user engine in the app while leaving its networking helper enabled;
-this keeps installed engine state out of the isolated test lifecycle. Use
-`CENGINE_COMPAT_NETWORK_HELPER=local` only when changing the helper itself. That
-explicit mode signs and bootstraps a temporary root-owned LaunchDaemon and requests
-administrator authorization. `CENGINE_NETWORK_HELPER_PATH` likewise selects an
-explicit helper binary. See [Compatibility testing](compatibility-testing.md) for
-preflight checks. The command uses the guest assets built under `.build/guest`; override
+uses a dedicated persistent `dev.cengine.network-helper.test-compat` LaunchDaemon.
+The first run, or a run after helper inputs change, requests administrator
+authorization near the start and updates the helper transactionally. Unchanged later
+runs reuse it without prompting. The test daemon, helper, authentication token, vmnet
+resource namespace, and automatic address pools are isolated from an installed
+cengine instance, which may remain running. Use `make test-compat-doctor` to verify
+the setup and `make test-compat-helper-uninstall` to remove only the test helper. See
+[Compatibility testing](compatibility-testing.md) for lifecycle and pool overrides.
+The command uses the guest assets built under `.build/guest`; override
 them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and
 `CENGINE_STORAGE_INITRAMFS`, or override the daemon and fixture image with
 `CENGINE_BINARY` and `CENGINE_TEST_IMAGE`.
@@ -93,8 +92,10 @@ running the suite. It deliberately does not touch `/Applications/cengine.app`,
 the installed engine service, or processes from another checkout. If a network
 helper crash left an idle reservation inside macOS `NetworkSharing`, use
 `make test-compat-reset-system` once. That exceptional recovery command requests
-administrator authorization and restarts cengine's helper and the system
-NetworkSharing daemon; normal compatibility runs do not restart system services.
+administrator authorization and restarts the compatibility helper and system
+NetworkSharing daemon. It refuses to proceed while the installed cengine service is
+loaded unless explicitly overridden; normal compatibility runs do not restart system
+services.
 
 Use `make test-compat-soak` to run three fresh-daemon passes with shuffled test
 ordering. To compare normalized behavior with a real Docker Engine, run

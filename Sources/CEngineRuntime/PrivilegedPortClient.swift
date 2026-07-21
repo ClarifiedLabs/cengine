@@ -31,6 +31,11 @@ final class PrivilegedPortClient: @unchecked Sendable {
 
             let message = xpc_dictionary_create(nil, nil, 0)
             xpc_dictionary_set_int64(message, "version", PrivilegedPortProtocol.version)
+            if let token = PrivilegedPortProtocol.authenticationToken() {
+                token.withCString {
+                    xpc_dictionary_set_string(message, "authentication-token", $0)
+                }
+            }
             xpc_dictionary_set_string(message, "operation", "bind")
             request.address.withCString { xpc_dictionary_set_string(message, "address", $0) }
             xpc_dictionary_set_uint64(message, "port", UInt64(request.port))

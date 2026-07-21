@@ -12,5 +12,7 @@
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
     <key>CEngineTeamIdentifier</key><string>$(CENGINE_TEAM_IDENTIFIER)</string>
     <key>CEngineNetworkHelperServiceName</key><string>$(CENGINE_NETWORK_HELPER_SERVICE_NAME)</string>
+    <key>CEngineNetworkHelperClientIdentifier</key><string>$(CENGINE_NETWORK_HELPER_CLIENT_IDENTIFIER)</string>
+    <key>CEngineNetworkHelperBuildFingerprint</key><string>$(CENGINE_NETWORK_HELPER_BUILD_FINGERPRINT)</string>
 </dict>
 </plist>

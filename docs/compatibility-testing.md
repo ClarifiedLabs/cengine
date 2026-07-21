@@ -13,43 +13,54 @@ runner owns the complete lifecycle so every run begins from a known state.
 2. Remove Docker and Buildx environment overrides inherited from the caller.
 3. Stop compatibility daemons and VM shims owned by this cengine binary, remove their
    temporary engine roots, and assert that both processes and roots are gone.
-4. Rebuild the macOS runtime and Linux guest initramfs from the current checkout.
-5. Validate the exact pinned guest kernel, build the `test-compat` Xcode scheme,
-   sign the test binary, and use the installed, already-approved
-   `dev.cengine.network-helper` service. Normal runs never request administrator
-   authorization. Set `CENGINE_COMPAT_NETWORK_HELPER=local` only while changing
-   the helper itself; that explicit mode signs the local helper and requests
-   authorization to bootstrap a temporary root-owned LaunchDaemon.
+4. Fingerprint the helper's sources and toolchain, build and ad-hoc sign the isolated
+   `test-compat` daemon and helper identities, and check the dedicated persistent
+   `dev.cengine.network-helper.test-compat` LaunchDaemon. If it is missing or stale,
+   replace it in one administrator-authorized transaction and perform an authenticated
+   health check. This happens before guest assets are built, so any authorization
+   prompt appears near the beginning of the run.
+5. Rebuild the Linux guest initramfs, validate the exact pinned guest kernel, and reject
+   compatibility address pools that overlap an active host interface or specific route.
 6. Delete and recreate the Python virtual environment from the pinned requirements.
 7. Let the pytest harness create a unique engine root and Docker configuration for the
    run, then execute the requested tests.
 8. On success, failure, or interruption, stop all owned processes, remove temporary
-   roots, remove any temporary local networking helper, assert the state is clean,
-   and release the lock.
+   roots, assert the state is clean, and release the lock. The test helper remains
+   installed for later runs.
 
 Compiler intermediates and the pinned kernel build are caches, not runtime state. They
 remain between runs; Xcode dependency tracking rebuilds changed sources, guest assets
 are repacked on every run, and the kernel hash/version check prevents a stale or
 unapproved kernel from entering a VM.
 
-## One-time non-interactive host setup
+## Managed compatibility helper
 
-Install cengine, open the app once, and approve Networking. The privileged helper
-can remain registered while the per-user engine is disabled in Settings, allowing
-the isolated compatibility daemon to own all engine state without authentication
-prompts or interference from the installed daemon.
+The first compatibility run requests administrator authorization to install the test
+helper under `/Library/Application Support/cengine/compat/`. Later runs do not prompt
+unless the helper fingerprint changes, the helper is damaged, or a different macOS
+user takes ownership of the test service. No installed cengine app is required.
 
-Verify that setup before a long run:
+The test helper has a distinct service name, executable identity, client identity,
+authentication token, and per-engine-root vmnet resource namespace. Its automatic
+IPv4 and IPv6 pools also differ from the production defaults. An installed cengine
+daemon and its `dev.cengine.network-helper` service may remain running while the suite
+executes.
+
+Inspect the setup before a long run, or remove it explicitly:
 
 ```sh
-/bin/launchctl print system/dev.cengine.network-helper >/dev/null
-! /bin/launchctl print "gui/$(id -u)/dev.cengine.engine" >/dev/null 2>&1
+make test-compat-doctor
+make test-compat-helper-uninstall
 ```
 
-Automatic helper selection requires this installed helper and does not fall back
-to a privileged local bootstrap. This is the normal setup for compatibility and
-guest tests. `CENGINE_COMPAT_NETWORK_HELPER=local` is an explicit, interactive
-developer path for networking-helper changes only.
+Uninstall affects only `dev.cengine.network-helper.test-compat`; it does not stop or
+modify the production helper.
+
+The runner defaults to `10.192.0.0/12` and `fdcc::/16` for automatically allocated
+test networks, with `10.208.0.0/12` and `fdcd::/16` reserved for explicit fixtures.
+Override these with `CENGINE_COMPAT_IPV4_AUTO_POOL`,
+`CENGINE_COMPAT_IPV6_AUTO_PREFIX`, `CENGINE_COMPAT_IPV4_FIXTURE_POOL`, and
+`CENGINE_COMPAT_IPV6_FIXTURE_PREFIX` when a host VPN or LAN uses those ranges.
 
 ## Focused and repeated runs
 
@@ -75,5 +86,7 @@ make test-compat
 ```
 
 The system recovery is intentionally not part of every run: it restarts macOS
-NetworkSharing and the installed cengine helper, affects host-global networking, and
-requires administrator authorization. A normal run must never silently depend on it.
+NetworkSharing and the compatibility helper, affects host-global networking, and
+requires administrator authorization. It refuses to run while the production cengine
+service is loaded unless `CENGINE_COMPAT_ALLOW_GLOBAL_NETWORK_RESET=1` is explicitly
+set. A normal run never silently depends on it.

@@ -23,10 +23,24 @@ private struct OwnedHelperVMNetUplink {
     private static let uplinkLock = NSLock()
     nonisolated(unsafe) private static var uplinks: [String: OwnedHelperVMNetUplink] = [:]
     nonisolated(unsafe) private static var isTerminating = false
+    private static let environment = ProcessInfo.processInfo.environment
+    private static let expectedAuthenticationToken = PrivilegedPortProtocol.authenticationToken(
+        environment: environment
+    )
+    private static let testControlEnabled = environment[
+        PrivilegedPortProtocol.testControlEnvironmentKey
+    ] == "1"
 
     static func main() {
         guard geteuid() == 0 else {
             FileHandle.standardError.write(Data("cengine-network-helper must run as root\n".utf8))
+            exit(1)
+        }
+        if environment[PrivilegedPortProtocol.authenticationTokenFileEnvironmentKey] != nil,
+           expectedAuthenticationToken == nil {
+            FileHandle.standardError.write(Data(
+                "cengine-network-helper could not load its authentication token\n".utf8
+            ))
             exit(1)
         }
         let listener = xpc_connection_create_mach_service(
@@ -77,10 +91,38 @@ private struct OwnedHelperVMNetUplink {
             guard xpc_dictionary_get_int64(message, "version") == PrivilegedPortProtocol.version else {
                 throw EngineError(.unsupported, "incompatible privileged networking helper protocol")
             }
+            try authenticate(message)
             guard let operationValue = xpc_dictionary_get_string(message, "operation") else {
                 throw EngineError(.badRequest, "privileged networking helper request has no operation")
             }
             switch String(cString: operationValue) {
+            case "status":
+                xpc_dictionary_set_bool(reply, "ok", true)
+                xpc_dictionary_set_int64(
+                    reply, "protocol-version", PrivilegedPortProtocol.version
+                )
+                PrivilegedPortProtocol.buildFingerprint.withCString {
+                    xpc_dictionary_set_string(reply, "build-fingerprint", $0)
+                }
+                PrivilegedPortProtocol.serviceName.withCString {
+                    xpc_dictionary_set_string(reply, "service-name", $0)
+                }
+                xpc_dictionary_set_uint64(reply, "owner-uid", UInt64(ownerUID()))
+                xpc_dictionary_set_int64(reply, "pid", Int64(getpid()))
+            case "restart":
+                guard testControlEnabled else {
+                    throw EngineError(.unsupported, "networking helper restart control is disabled")
+                }
+                xpc_dictionary_set_bool(reply, "ok", true)
+                xpc_connection_send_message(peer, reply)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    guard beginTermination() else { return }
+                    Task {
+                        await stopAllUplinks()
+                        exit(0)
+                    }
+                }
+                return
             case "bind":
                 let descriptor = try boundSocket(for: try bindRequest(message))
                 xpc_dictionary_set_bool(reply, "ok", true)
@@ -96,14 +138,15 @@ private struct OwnedHelperVMNetUplink {
                     from: Data(bytes: bytes, count: length)
                 )
                 try validate(request)
+                let resourceID = request.resourceID
                 let replyBox = SendableXPCObject(reply)
                 let peerBox = SendableXPCObject(peer)
                 Task {
                     do {
                         let previous = uplinkLock.withLock { () -> HelperVMNetUplink? in
                             guard !isTerminating, !session.isClosed else { return nil }
-                            guard let previous = uplinks.removeValue(forKey: request.id) else { return nil }
-                            previous.owner.networkIDs.remove(request.id)
+                            guard let previous = uplinks.removeValue(forKey: resourceID) else { return nil }
+                            previous.owner.networkIDs.remove(resourceID)
                             return previous.uplink
                         }
                         await previous?.stop()
@@ -113,10 +156,10 @@ private struct OwnedHelperVMNetUplink {
                         let (uplink, clientDescriptor) = try await HelperVMNetUplink.start(request: request)
                         let registration = uplinkLock.withLock { () -> (Bool, HelperVMNetUplink?) in
                             guard !isTerminating, !session.isClosed else { return (false, nil) }
-                            let displaced = uplinks.removeValue(forKey: request.id)
-                            displaced?.owner.networkIDs.remove(request.id)
-                            uplinks[request.id] = OwnedHelperVMNetUplink(owner: session, uplink: uplink)
-                            session.networkIDs.insert(request.id)
+                            let displaced = uplinks.removeValue(forKey: resourceID)
+                            displaced?.owner.networkIDs.remove(resourceID)
+                            uplinks[resourceID] = OwnedHelperVMNetUplink(owner: session, uplink: uplink)
+                            session.networkIDs.insert(resourceID)
                             return (true, displaced?.uplink)
                         }
                         guard registration.0 else {
@@ -218,7 +261,24 @@ private struct OwnedHelperVMNetUplink {
         return try PrivilegedPortRequest(address: String(cString: addressValue), port: port, transport: transport)
     }
 
+    private static func authenticate(_ message: xpc_object_t) throws {
+        guard let expectedAuthenticationToken else { return }
+        guard let value = xpc_dictionary_get_string(message, "authentication-token"),
+              String(cString: value) == expectedAuthenticationToken else {
+            throw EngineError(.unauthorized, "privileged networking helper authentication failed")
+        }
+    }
+
+    private static func ownerUID() -> uid_t {
+        guard let value = environment[PrivilegedPortProtocol.ownerUIDEnvironmentKey],
+              let owner = uid_t(value) else { return 0 }
+        return owner
+    }
+
     private static func validate(_ request: PrivilegedVMNetRequest) throws {
+        guard !request.namespace.isEmpty, request.namespace.utf8.count <= 128 else {
+            throw EngineError(.badRequest, "invalid vmnet namespace")
+        }
         guard !request.id.isEmpty, request.id.utf8.count <= 128 else {
             throw EngineError(.badRequest, "invalid vmnet network id")
         }

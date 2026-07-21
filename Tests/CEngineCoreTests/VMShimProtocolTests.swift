@@ -386,11 +386,14 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             macAddress: "02:ce:00:00:00:04",
             socketRelays: [.init(path: "/tmp/docker.sock", port: GuestProtocol.socketProxyPortBase)],
             socketPath: "/tmp/control.sock",
-            logPath: "/tmp/shim.log"
+            logPath: "/tmp/shim.log",
+            networkNamespace: "engine-root-namespace"
         )
 
         let data = try JSONEncoder().encode(specification)
-        #expect(try JSONDecoder().decode(VMShimProtocol.Specification.self, from: data) == specification)
+        let decoded = try JSONDecoder().decode(VMShimProtocol.Specification.self, from: data)
+        #expect(decoded == specification)
+        #expect(decoded.networkNamespace == "engine-root-namespace")
     }
 
     @Test func managementVLANIsReservedFromDockerNetworks() {

@@ -115,12 +115,13 @@ import Testing
 
     @Test func privilegedVMNetRequestRoundTripsAcrossXPCPayload() throws {
         let request = PrivilegedVMNetRequest(
-            id: "bridge", vlan: 42, subnet: "172.24.0.0/16", gateway: "172.24.0.1", ipv6Subnet: "fd00:24::/64",
+            namespace: "test-root", id: "bridge", vlan: 42, subnet: "172.24.0.0/16", gateway: "172.24.0.1", ipv6Subnet: "fd00:24::/64",
             internalNetwork: false,
             dhcpEnabled: false,
             ports: [.init(proto: "tcp", externalPort: 8080, internalAddress: "172.24.0.2", internalPort: 80)]
         )
-        #expect(PrivilegedPortProtocol.version == 4)
+        #expect(PrivilegedPortProtocol.version == 5)
+        #expect(request.resourceID == "test-root/bridge")
         let decoded = try JSONDecoder().decode(PrivilegedVMNetRequest.self, from: JSONEncoder().encode(request))
         #expect(decoded == request)
         #expect(decoded.dhcpEnabled == false)
@@ -139,6 +140,46 @@ import Testing
         #expect(last.subnet == "10.255.253.0/24")
         #expect(last.gateway == "10.255.253.1")
         #expect(RawVirtualizationBackend.nextAvailableVLAN(used: Set(1...4093)) == nil)
+    }
+
+    @Test func compatibilityAutomaticNetworkPoolIsIndependentFromProduction() throws {
+        let pool = try AutomaticNetworkPool(
+            ipv4CIDR: "10.192.0.0/12", ipv6Prefix: "fdcc::/16"
+        )
+        let first = pool.ipv4Network(vlan: 1)
+        let last = pool.ipv4Network(vlan: 4093)
+        #expect(first.subnet == "10.192.1.0/24")
+        #expect(first.gateway == "10.192.1.1")
+        #expect(last.subnet == "10.207.253.0/24")
+        #expect(pool.ipv6Network(vlan: 42).subnet == "fdcc:2a::/64")
+        #expect(pool.ipv6Network(vlan: 42).gateway == "fdcc:2a::1")
+    }
+
+    @Test(arguments: [
+        ("10.193.0.0/12", "fdcc::/16"),
+        ("192.168.0.0/12", "fdcc::/16"),
+        ("10.192.0.0/16", "fdcc::/16"),
+        ("10.192.0.0/12", "2001::/16"),
+        ("10.192.0.0/12", "fdcc::/48"),
+    ])
+    func rejectsInvalidAutomaticNetworkPools(_ ipv4: String, _ ipv6: String) {
+        #expect(throws: EngineError.self) {
+            _ = try AutomaticNetworkPool(ipv4CIDR: ipv4, ipv6Prefix: ipv6)
+        }
+    }
+
+    @Test func vmnetResourceIDsAreScopedToEngineRootNamespace() {
+        let first = PrivilegedVMNetRequest(
+            namespace: "root-a", id: "same-network", vlan: 1,
+            subnet: "10.192.1.0/24", gateway: "10.192.1.1", ipv6Subnet: "",
+            internalNetwork: false, dhcpEnabled: false, ports: []
+        )
+        let second = PrivilegedVMNetRequest(
+            namespace: "root-b", id: "same-network", vlan: 1,
+            subnet: "10.192.1.0/24", gateway: "10.192.1.1", ipv6Subnet: "",
+            internalNetwork: false, dhcpEnabled: false, ports: []
+        )
+        #expect(first.resourceID != second.resourceID)
     }
 
     @Test func failedNetworkCreateRollsBackRecordAndVLAN() {

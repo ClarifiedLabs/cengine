@@ -42,7 +42,6 @@ cleanup() {
     fi
     python3 "$ROOT/Scripts/reset-compat-runtime.py" \
         --binary "$BINARY" --root "$ENGINE_ROOT" >/dev/null 2>&1 || true
-    compat_network_helper_cleanup_local || status=$?
     if [ "$status" -ne 0 ] && [ -f "$LOG" ]; then
         echo "cengine isolated daemon log (last 200 lines):" >&2
         tail -n 200 "$LOG" >&2
@@ -55,15 +54,14 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")
 "$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
-HELPER=$(compat_network_helper_for_binary "$BINARY")
-if compat_network_helper_is_installed "$HELPER"; then
-    CENGINE_NETWORK_HELPER_SERVICE_NAME=$compat_network_helper_default_service_name
-    export CENGINE_NETWORK_HELPER_SERVICE_NAME
-else
-    COMPAT_HELPER_SERVICE=$(compat_network_helper_dynamic_label)
-    compat_network_helper_bootstrap_local "$HELPER" "$COMPAT_HELPER_SERVICE" 1
-fi
+HELPER=$(compat_network_helper_local_for_binary "$BINARY")
+compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"
+
+CENGINE_COMPAT_IPV4_AUTO_POOL=${CENGINE_COMPAT_IPV4_AUTO_POOL:-10.192.0.0/12}
+CENGINE_COMPAT_IPV6_AUTO_PREFIX=${CENGINE_COMPAT_IPV6_AUTO_PREFIX:-fdcc::/16}
+export CENGINE_COMPAT_IPV4_AUTO_POOL CENGINE_COMPAT_IPV6_AUTO_PREFIX
 
 python3 "$ROOT/Scripts/reset-compat-runtime.py" \
     --binary "$BINARY" --root "$ENGINE_ROOT"
@@ -78,7 +76,9 @@ printf '%s\n' "$(CDPATH= cd -- "$(dirname -- "$BINARY")" && pwd)/$(basename -- "
     --root "$ENGINE_ROOT" \
     --kernel "$KERNEL" \
     --container-initramfs "$CONTAINER_INITRAMFS" \
-    --storage-initramfs "$STORAGE_INITRAMFS" >"$LOG" 2>&1 &
+    --storage-initramfs "$STORAGE_INITRAMFS" \
+    --automatic-ipv4-pool "$CENGINE_COMPAT_IPV4_AUTO_POOL" \
+    --automatic-ipv6-prefix "$CENGINE_COMPAT_IPV6_AUTO_PREFIX" >"$LOG" 2>&1 &
 daemon_pid=$!
 
 attempt=0

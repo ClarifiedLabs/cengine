@@ -7,6 +7,11 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 MODE=${1:-suite}
 shift || true
 BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/test-compat/cengine"}
+CENGINE_BINARY=$BINARY
+CENGINE_KERNEL=${CENGINE_KERNEL:-"$ROOT/.build/guest/vmlinux"}
+CENGINE_CONTAINER_INITRAMFS=${CENGINE_CONTAINER_INITRAMFS:-"$ROOT/.build/guest/container-initramfs.cpio.gz"}
+CENGINE_STORAGE_INITRAMFS=${CENGINE_STORAGE_INITRAMFS:-"$ROOT/.build/guest/storage-initramfs.cpio.gz"}
+export CENGINE_BINARY CENGINE_KERNEL CENGINE_CONTAINER_INITRAMFS CENGINE_STORAGE_INITRAMFS
 XCODEBUILD=${XCODEBUILD:-xcodebuild}
 XCODE_PROJECT=${XCODE_PROJECT:-cengine.xcodeproj}
 XCODE_DERIVED_DATA=${XCODE_DERIVED_DATA:-.build/xcode-derived}
@@ -43,7 +48,6 @@ cleanup() {
     trap - EXIT HUP INT TERM
     stage "cleanup"
     $RESET || status=$?
-    compat_network_helper_cleanup_local || status=$?
     rm -rf "$LOCK"
     exit "$status"
 }
@@ -54,27 +58,32 @@ trap cleanup EXIT HUP INT TERM
 unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY
 unset BUILDX_BUILDER CONTAINER_HOST
 
+CENGINE_COMPAT_IPV4_AUTO_POOL=${CENGINE_COMPAT_IPV4_AUTO_POOL:-10.192.0.0/12}
+CENGINE_COMPAT_IPV6_AUTO_PREFIX=${CENGINE_COMPAT_IPV6_AUTO_PREFIX:-fdcc::/16}
+CENGINE_COMPAT_IPV4_FIXTURE_POOL=${CENGINE_COMPAT_IPV4_FIXTURE_POOL:-10.208.0.0/12}
+CENGINE_COMPAT_IPV6_FIXTURE_PREFIX=${CENGINE_COMPAT_IPV6_FIXTURE_PREFIX:-fdcd::/16}
+export CENGINE_COMPAT_IPV4_AUTO_POOL CENGINE_COMPAT_IPV6_AUTO_PREFIX
+export CENGINE_COMPAT_IPV4_FIXTURE_POOL CENGINE_COMPAT_IPV6_FIXTURE_PREFIX
+
 stage "preflight reset"
 $RESET
 
-stage "rebuild runtime and guest assets"
-make -C "$ROOT" --no-print-directory guest-initramfs
+stage "build and authorize compatibility runtime"
+HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")
 "$XCODEBUILD" -project "$ROOT/$XCODE_PROJECT" -scheme "$XCODE_COMPAT_SCHEME" \
     -configuration "$XCODE_COMPAT_CONFIGURATION" -derivedDataPath "$ROOT/$XCODE_DERIVED_DATA" \
     -clonedSourcePackagesDirPath "$ROOT/$XCODE_SOURCE_PACKAGES" \
     $XCODE_COMMON_FLAGS CENGINE_GIT_COMMIT="${CENGINE_GIT_COMMIT:-unknown}" \
-    CENGINE_BUILD_TIME="${CENGINE_BUILD_TIME:-}" build
-
-stage "validate immutable guest inputs"
-"$ROOT/Scripts/check-guest-kernel.sh"
+    CENGINE_BUILD_TIME="${CENGINE_BUILD_TIME:-}" \
+    CENGINE_NETWORK_HELPER_BUILD_FINGERPRINT="$HELPER_FINGERPRINT" build
 "$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
-HELPER=$(compat_network_helper_for_binary "$BINARY")
-if compat_network_helper_is_installed "$HELPER"; then
-    CENGINE_NETWORK_HELPER_SERVICE_NAME=$compat_network_helper_default_service_name
-    export CENGINE_NETWORK_HELPER_SERVICE_NAME
-else
-    compat_network_helper_bootstrap_local "$HELPER"
-fi
+HELPER=$(compat_network_helper_local_for_binary "$BINARY")
+compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"
+
+stage "rebuild and validate guest assets"
+make -C "$ROOT" --no-print-directory guest-initramfs
+"$ROOT/Scripts/check-guest-kernel.sh"
+"$ROOT/Scripts/check-compat-network-pools.py"
 
 stage "recreate test environment"
 rm -rf "$ROOT/.build/compat-venv"

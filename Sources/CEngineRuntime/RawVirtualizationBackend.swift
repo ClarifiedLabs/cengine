@@ -2897,6 +2897,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private let deletedContainersStateDirectory: PersistentStateDirectory
     private let kernel: URL
     private let containerInitialRamdisk: URL
+    private let automaticNetworkPool: AutomaticNetworkPool
     private let store: OCIContentStore
     private let tokenIssuer: VolumeAccessToken
     private let infrastructure: VMShimClient
@@ -2959,11 +2960,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private var volumeStorageModes: [String: VolumeStorageMode] = [:]
     private var containerDirectoryIdentities: [String: PersistentFileIdentity] = [:]
 
-    public init(root: URL, kernel: URL, containerInitialRamdisk: URL, storageInitialRamdisk: URL) async throws {
+    public init(
+        root: URL,
+        kernel: URL,
+        containerInitialRamdisk: URL,
+        storageInitialRamdisk: URL,
+        automaticNetworkPool: AutomaticNetworkPool = .default
+    ) async throws {
         let dataRoot = try Self.canonicalDataRoot(root)
         self.root = dataRoot
         self.kernel = kernel
         self.containerInitialRamdisk = containerInitialRamdisk
+        self.automaticNetworkPool = automaticNetworkPool
         let containers = dataRoot.appending(path: "containers", directoryHint: .isDirectory)
         let deletedContainers = dataRoot.appending(
             path: "deleted-containers", directoryHint: .isDirectory
@@ -3002,6 +3010,23 @@ public actor RawVirtualizationBackend: ContainerBackend {
         }
         tokenIssuer = try VolumeAccessToken(secret: secret)
 
+        let networkNamespaceURL = infrastructureRoot.appending(path: "network-namespace")
+        let networkNamespace: String
+        if let data = try? Data(contentsOf: networkNamespaceURL),
+           let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty {
+            networkNamespace = value
+        } else {
+            networkNamespace = Identifier.random()
+            try Data("\(networkNamespace)\n".utf8).write(
+                to: networkNamespaceURL, options: .atomic
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: networkNamespaceURL.path
+            )
+        }
+
         let disk = infrastructureRoot.appending(path: "volumes.ext4")
         try Self.createSparseFile(at: disk, size: Self.defaultStorageDiskBytes)
         let infrastructureDiskIdentity = try PersistentStateDirectory.open(
@@ -3032,6 +3057,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             ],
             fileSystemSocketPath: try Self.makeRuntimeSocketPath(),
             networkSocketPath: try Self.makeRuntimeSocketPath(),
+            networkNamespace: networkNamespace,
             vlans: [VMShimProtocol.managementVLAN]
         )
         infrastructure = try await Self.recoverOrLaunch(infrastructureSpec)
@@ -4771,14 +4797,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let vlan = try allocateVLAN()
         var value = network
         if value.enableIPv4, value.subnet.isEmpty {
-            let automaticNetwork = Self.automaticIPv4Network(vlan: vlan)
+            let automaticNetwork = automaticNetworkPool.ipv4Network(vlan: vlan)
             value.subnet = automaticNetwork.subnet
             value.gateway = automaticNetwork.gateway
         }
         if !value.enableIPv4 { value.subnet = ""; value.gateway = "" }
         if value.enableIPv6, value.ipv6Subnet.isEmpty {
-            value.ipv6Subnet = String(format: "fdce:%x::/64", vlan)
-            value.ipv6Gateway = String(format: "fdce:%x::1", vlan)
+            let automaticNetwork = automaticNetworkPool.ipv6Network(vlan: vlan)
+            value.ipv6Subnet = automaticNetwork.subnet
+            value.ipv6Gateway = automaticNetwork.gateway
         }
         if !value.enableIPv6 { value.ipv6Subnet = ""; value.ipv6Gateway = "" }
         let transaction = RawNetworkStateTransaction(
@@ -6268,12 +6295,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     static func automaticIPv4Network(vlan: UInt16) -> (subnet: String, gateway: String) {
-        precondition((1..<VMShimProtocol.managementVLAN).contains(vlan), "VLAN must be in the allocatable range")
-        let slot = Int(vlan)
-        let secondOctet = 240 + (slot / 256)
-        let thirdOctet = slot % 256
-        let prefix = "10.\(secondOctet).\(thirdOctet)"
-        return ("\(prefix).0/24", "\(prefix).1")
+        AutomaticNetworkPool.default.ipv4Network(vlan: vlan)
     }
 
     private func allocateVLAN() throws -> UInt16 {

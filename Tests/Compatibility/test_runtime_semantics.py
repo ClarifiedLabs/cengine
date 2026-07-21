@@ -13,7 +13,7 @@ import uuid
 import docker
 import pytest
 from docker.types import Mount
-from harness import persisted_container_record
+from harness import compatibility_fixture_ipv6, persisted_container_record
 
 
 DIND_IMAGE = "docker:29.6.2-dind"
@@ -162,7 +162,7 @@ def test_default_routes_are_selected_per_address_family(client: docker.DockerCli
         config["Gateway"] for config in ipv4.attrs["IPAM"]["Config"]
         if ":" not in config["Gateway"]
     )
-    ipv6_gateway = f"fd00:4:{suffix[:4]}::1"
+    ipv6_gateway = compatibility_fixture_ipv6(4, 1, prefix=None)
     response = client.api._post_json(
         client.api._url("/networks/create"),
         data={
@@ -170,7 +170,7 @@ def test_default_routes_are_selected_per_address_family(client: docker.DockerCli
             "EnableIPv4": False,
             "EnableIPv6": True,
             "IPAM": {"Config": [{
-                "Subnet": f"fd00:4:{suffix[:4]}::/64",
+                "Subnet": compatibility_fixture_ipv6(4),
                 "Gateway": ipv6_gateway,
             }]},
         },

@@ -36,7 +36,7 @@ CENGINE_COMPAT_RESET = python3 Scripts/reset-compat-runtime.py --binary "$(XCODE
 
 export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME CENGINE_HOST_OS
 
-.PHONY: all build guest-assets guest-initramfs kernel kernel-build test test-guest test-compat test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system dist-cli package release release-list test-release clean help
+.PHONY: all build guest-assets guest-initramfs kernel kernel-build test test-guest test-compat test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system test-compat-doctor test-compat-helper-uninstall dist-cli package release release-list test-release clean help
 
 all: dist-cli
 
@@ -55,6 +55,8 @@ help:
 		'make test-compat-oracle  Compare deterministic contracts with DOCKER_REFERENCE_HOST' \
 		'make test-compat-reset  Stop this worktree’s orphaned compatibility VMs and remove temporary roots' \
 		'make test-compat-reset-system  Also restart vmnet system state after a helper crash' \
+		'make test-compat-doctor  Check compatibility identities, helper health, and network pools' \
+		'make test-compat-helper-uninstall  Remove the persistent compatibility helper' \
 		'make dist-cli      Run tests and build the signed dist/cengine binary' \
 		'make package       Build a local unsigned PKG release artifact' \
 		'make release       Create a release tag (VERSION optional for COMPONENT=kernel)' \
@@ -110,6 +112,12 @@ test-compat-reset:
 
 test-compat-reset-system:
 	@$(CENGINE_COMPAT_RESET) --system-networking
+
+test-compat-doctor:
+	@$(CENGINE_COMPAT_ENV) Scripts/compat-doctor.sh
+
+test-compat-helper-uninstall:
+	@. Scripts/compat-network-helper.sh && compat_network_helper_uninstall
 
 dist-cli: test guest-assets
 	XCODE_DERIVED_DATA="$(XCODE_DERIVED_DATA)" XCODE_SOURCE_PACKAGES="$(XCODE_SOURCE_PACKAGES)" ./Scripts/build-release.sh

@@ -147,7 +147,13 @@ class Daemon:
         self.process = subprocess.Popen(
             [str(self.binary), "daemon", "--root", str(self.root), "--socket", str(self.socket),
              "--kernel", str(self.kernel), "--container-initramfs", str(self.container_initramfs),
-             "--storage-initramfs", str(self.storage_initramfs)],
+             "--storage-initramfs", str(self.storage_initramfs),
+             "--automatic-ipv4-pool", environment.get(
+                 "CENGINE_COMPAT_IPV4_AUTO_POOL", "10.192.0.0/12"
+             ),
+             "--automatic-ipv6-prefix", environment.get(
+                 "CENGINE_COMPAT_IPV6_AUTO_PREFIX", "fdcc::/16"
+             )],
             stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT,
             env=environment,
         )

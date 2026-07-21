@@ -106,6 +106,7 @@ public enum VMShimProtocol {
         public var kernelArguments: [String]
         public var fileSystemSocketPath: String?
         public var networkSocketPath: String?
+        public var networkNamespace: String
         public var vlans: [UInt16]
 
         public init(
@@ -130,6 +131,7 @@ public enum VMShimProtocol {
             kernelArguments: [String] = [],
             fileSystemSocketPath: String? = nil,
             networkSocketPath: String? = nil,
+            networkNamespace: String = "",
             vlans: [UInt16] = []
         ) {
             self.kind = kind
@@ -153,6 +155,7 @@ public enum VMShimProtocol {
             self.kernelArguments = kernelArguments
             self.fileSystemSocketPath = fileSystemSocketPath
             self.networkSocketPath = networkSocketPath
+            self.networkNamespace = networkNamespace
             self.vlans = vlans
         }
     }

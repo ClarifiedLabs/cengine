@@ -6,15 +6,44 @@ public enum PrivilegedPortProtocol {
     public static let testCompatServiceName = "dev.cengine.network-helper.test-compat"
     public static let serviceNameInfoKey = "CEngineNetworkHelperServiceName"
     public static let serviceNameEnvironmentKey = "CENGINE_NETWORK_HELPER_SERVICE_NAME"
+    public static let clientIdentifierInfoKey = "CEngineNetworkHelperClientIdentifier"
+    public static let helperIdentifierInfoKey = "CEngineNetworkHelperIdentifier"
+    public static let buildFingerprintInfoKey = "CEngineNetworkHelperBuildFingerprint"
+    public static let clientIdentifierEnvironmentKey = "CENGINE_NETWORK_HELPER_CLIENT_IDENTIFIER"
+    public static let helperIdentifierEnvironmentKey = "CENGINE_NETWORK_HELPER_IDENTIFIER"
+    public static let buildFingerprintEnvironmentKey = "CENGINE_NETWORK_HELPER_BUILD_FINGERPRINT"
+    public static let authenticationTokenFileEnvironmentKey = "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE"
+    public static let ownerUIDEnvironmentKey = "CENGINE_NETWORK_HELPER_OWNER_UID"
+    public static let testControlEnvironmentKey = "CENGINE_NETWORK_HELPER_TEST_CONTROL"
     public static var serviceName: String {
         serviceName(
             configured: Bundle.main.object(forInfoDictionaryKey: serviceNameInfoKey) as? String,
             environment: ProcessInfo.processInfo.environment
         )
     }
-    public static let version: Int64 = 4
-    public static let engineIdentifier = "dev.cengine.engine"
-    public static let helperIdentifier = "dev.cengine.network-helper"
+    public static let version: Int64 = 5
+    public static let defaultEngineIdentifier = "dev.cengine.engine"
+    public static let defaultHelperIdentifier = "dev.cengine.network-helper"
+    public static let testCompatEngineIdentifier = "dev.cengine.engine.test-compat"
+    public static let testCompatHelperIdentifier = "dev.cengine.network-helper.test-compat"
+
+    public static var engineIdentifier: String {
+        normalized(ProcessInfo.processInfo.environment[clientIdentifierEnvironmentKey])
+            ?? normalized(Bundle.main.object(forInfoDictionaryKey: clientIdentifierInfoKey) as? String)
+            ?? defaultEngineIdentifier
+    }
+
+    public static var helperIdentifier: String {
+        normalized(ProcessInfo.processInfo.environment[helperIdentifierEnvironmentKey])
+            ?? normalized(Bundle.main.object(forInfoDictionaryKey: helperIdentifierInfoKey) as? String)
+            ?? defaultHelperIdentifier
+    }
+
+    public static var buildFingerprint: String {
+        normalized(ProcessInfo.processInfo.environment[buildFingerprintEnvironmentKey])
+            ?? normalized(Bundle.main.object(forInfoDictionaryKey: buildFingerprintInfoKey) as? String)
+            ?? "unknown"
+    }
 
     public static func serviceName(environment: [String: String]) -> String {
         serviceName(configured: nil, environment: environment)
@@ -24,6 +53,15 @@ public enum PrivilegedPortProtocol {
         if let configured = normalized(environment[serviceNameEnvironmentKey]) { return configured }
         if let configured = normalized(configured) { return configured }
         return defaultServiceName
+    }
+
+    public static func authenticationToken(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        guard let path = normalized(environment[authenticationTokenFileEnvironmentKey]),
+              let data = FileManager.default.contents(atPath: path),
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        return normalized(value)
     }
 
     private static func normalized(_ value: String?) -> String? {
@@ -77,6 +115,7 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
         }
     }
 
+    public let namespace: String
     public let id: String
     public let vlan: UInt16
     public let subnet: String
@@ -87,6 +126,7 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
     public let ports: [Port]
 
     public init(
+        namespace: String,
         id: String,
         vlan: UInt16,
         subnet: String,
@@ -96,6 +136,7 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
         dhcpEnabled: Bool,
         ports: [Port]
     ) {
+        self.namespace = namespace
         self.id = id
         self.vlan = vlan
         self.subnet = subnet
@@ -105,6 +146,8 @@ public struct PrivilegedVMNetRequest: Codable, Equatable, Sendable {
         self.dhcpEnabled = dhcpEnabled
         self.ports = ports
     }
+
+    public var resourceID: String { "\(namespace)/\(id)" }
 }
 
 public struct PrivilegedPortRequest: Equatable, Sendable {

@@ -67,7 +67,7 @@ def main() -> None:
         'if [ -n "$(VERSION)" ]; then args+=(--version "$(VERSION)"); fi',
     ):
         require_contains(makefile, needle, "Makefile")
-    if makefile.count("$(CENGINE_COMPAT_ENV)") != 3:
+    if makefile.count("$(CENGINE_COMPAT_ENV)") != 4:
         raise AssertionError("all compatibility test targets must pass isolated runtime assets")
     guest_builder = read(REPO_ROOT / "Scripts/build-guest-assets.sh")
     require_absent(guest_builder, "docker buildx build", "build-guest-assets.sh")
@@ -77,23 +77,23 @@ def main() -> None:
     compat_helper = read(REPO_ROOT / "Scripts/compat-network-helper.sh")
     compat_scheme = read(REPO_ROOT / "cengine.xcodeproj/xcshareddata/xcschemes/test-compat.xcscheme")
     for needle in (
-        "compat_network_helper_for_binary",
-        "dev.cengine.engine",
+        "compat_network_helper_local_for_binary",
+        "dev.cengine.engine.test-compat",
+        "dev.cengine.network-helper.test-compat",
         "Configuration/cengine.entitlements",
-        "security find-identity -v -p codesigning",
         "PackageFrameworks",
         "-name '*.framework'",
         "-name '*.dylib'",
     ):
         require_contains(compat_sign, needle, "sign-compat-binary.sh")
     for needle in (
-        "/Applications/cengine.app/Contents/MacOS/cengine-network-helper",
-        "CENGINE_COMPAT_NETWORK_HELPER",
+        "/Library/Application Support/cengine/compat/",
         "dev.cengine.network-helper.test-compat",
         "CENGINE_NETWORK_HELPER_SERVICE_NAME",
-        "compat_network_helper_bootstrap_local",
+        "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE",
+        "compat_network_helper_ensure",
         "launchctl bootstrap system",
-        "compat_network_helper_cleanup_local",
+        "compat_network_helper_uninstall",
         "/usr/bin/osascript -",
         "with administrator privileges",
     ):

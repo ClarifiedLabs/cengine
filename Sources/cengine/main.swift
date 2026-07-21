@@ -41,6 +41,7 @@ private final class DaemonLock {
             case "container": try container(arguments)
             case "run": try await run(arguments)
             case "vm-shim": try await vmShim(arguments)
+            case "network-helper": try await networkHelper(arguments)
             case "version", "--version": print("cengine \(CEngineVersion.shortVersion())")
             case "system": try await system(arguments)
             case "help", "--help", "-h": usage()
@@ -80,11 +81,18 @@ private final class DaemonLock {
                   FileManager.default.fileExists(atPath: storageInitialRamdisk.path) else {
                 throw EngineError(.notFound, "cengine guest initramfs assets are not installed; run `cengine system install`")
             }
+            let automaticNetworkPool = try AutomaticNetworkPool(
+                ipv4CIDR: option("--automatic-ipv4-pool", in: arguments)
+                    ?? AutomaticNetworkPool.default.ipv4CIDR,
+                ipv6Prefix: option("--automatic-ipv6-prefix", in: arguments)
+                    ?? AutomaticNetworkPool.default.ipv6Prefix
+            )
             backend = try await RawVirtualizationBackend(
                 root: root,
                 kernel: kernel,
                 containerInitialRamdisk: containerInitialRamdisk,
-                storageInitialRamdisk: storageInitialRamdisk
+                storageInitialRamdisk: storageInitialRamdisk,
+                automaticNetworkPool: automaticNetworkPool
             )
         }
         let runtime = try await EngineRuntime(root: root, backend: backend)
@@ -231,6 +239,22 @@ private final class DaemonLock {
         case "uninstall": try SystemManager.uninstall(paths: EnginePaths())
         default: throw EngineError(.badRequest, "system command is not implemented yet")
         }
+    }
+
+    private static func networkHelper(_ arguments: [String]) async throws {
+        let status: NetworkHelperStatus
+        switch arguments.first ?? "status" {
+        case "status": status = try await NetworkHelperControl.status()
+        case "restart": status = try await NetworkHelperControl.restart()
+        default: throw EngineError(.badRequest, "network-helper command is not implemented")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(status)
+        guard let output = String(data: data, encoding: .utf8) else {
+            throw EngineError(.internalError, "could not encode networking helper status")
+        }
+        print(output)
     }
 
     private static func builder(_ arguments: [String]) async throws {
@@ -398,7 +422,8 @@ private final class DaemonLock {
           builder resources [--cpus COUNT] [--memory GiB]
           container resources [--cpus COUNT] [--memory GiB]
           run [--socket PATH] [--cpus COUNT] [--memory GiB] -- COMMAND [ARGS...]
-          daemon [--socket PATH] [--root PATH] [--kernel PATH] [--container-initramfs PATH] [--storage-initramfs PATH] [--metadata-only]
+          daemon [--socket PATH] [--root PATH] [--kernel PATH] [--container-initramfs PATH] [--storage-initramfs PATH] [--automatic-ipv4-pool CIDR] [--automatic-ipv6-prefix CIDR] [--metadata-only]
+          network-helper status|restart
           service run
           system status|doctor|install|uninstall
           version

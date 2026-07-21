@@ -18,8 +18,12 @@ final class VMNetUplink: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
 
-    static func start(network: VMShimClient.FabricNetwork) async throws -> VMNetUplink {
+    static func start(
+        network: VMShimClient.FabricNetwork,
+        namespace: String
+    ) async throws -> VMNetUplink {
         let request = PrivilegedVMNetRequest(
+            namespace: namespace,
             id: network.id,
             vlan: network.vlan,
             subnet: network.subnet,
@@ -44,7 +48,7 @@ final class VMNetUplink: @unchecked Sendable {
             teamIdentifier: teamIdentifier
         )
         return VMNetUplink(
-            networkID: request.id,
+            networkID: request.resourceID,
             descriptor: transport.descriptor,
             connection: transport.connection,
             events: transport.events
@@ -77,8 +81,10 @@ final class VMNetUplink: @unchecked Sendable {
         try? fabricFileHandle.close()
 
         let message = xpc_dictionary_create(nil, nil, 0)
-        xpc_dictionary_set_int64(message, "version", PrivilegedPortProtocol.version)
+        Self.configure(message)
         xpc_dictionary_set_string(message, "operation", "stop-vmnet")
+        // The opaque resource ID includes the engine-root namespace and cannot
+        // collide with an identically named Docker network in another daemon.
         networkID.withCString { xpc_dictionary_set_string(message, "network-id", $0) }
         await withCheckedContinuation { continuation in
             xpc_connection_send_message_with_reply(connection, message, nil) { _ in
@@ -98,7 +104,10 @@ final class VMNetUplink: @unchecked Sendable {
             let connection = xpc_connection_create_mach_service(serviceName, nil, 0)
             let events = VMNetUplinkEvents()
             reply.attach(connection)
-            let requirement = signingRequirement(identifier: PrivilegedPortProtocol.helperIdentifier, teamIdentifier: teamIdentifier)
+            let requirement = signingRequirement(
+                identifier: PrivilegedPortProtocol.helperIdentifier,
+                teamIdentifier: teamIdentifier
+            )
             let status = requirement.withCString {
                 xpc_connection_set_peer_code_signing_requirement(connection, $0)
             }
@@ -113,7 +122,7 @@ final class VMNetUplink: @unchecked Sendable {
             }
             xpc_connection_activate(connection)
             let message = xpc_dictionary_create(nil, nil, 0)
-            xpc_dictionary_set_int64(message, "version", PrivilegedPortProtocol.version)
+            configure(message)
             xpc_dictionary_set_string(message, "operation", "start-vmnet")
             encoded.withUnsafeBytes { bytes in
                 xpc_dictionary_set_data(message, "request", bytes.baseAddress, bytes.count)
@@ -188,6 +197,13 @@ final class VMNetUplink: @unchecked Sendable {
     private static func signingRequirement(identifier: String, teamIdentifier: String) -> String {
         guard !teamIdentifier.isEmpty else { return "identifier \"\(identifier)\"" }
         return "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+    }
+
+    private static func configure(_ message: xpc_object_t) {
+        xpc_dictionary_set_int64(message, "version", PrivilegedPortProtocol.version)
+        if let token = PrivilegedPortProtocol.authenticationToken() {
+            token.withCString { xpc_dictionary_set_string(message, "authentication-token", $0) }
+        }
     }
 
     static func tag(_ frame: Data, vlan: UInt16) -> Data {

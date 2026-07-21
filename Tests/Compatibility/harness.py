@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -18,6 +19,32 @@ DOCKER_ENDPOINT_VARIABLES = (
     "DOCKER_TLS",
     "DOCKER_TLS_VERIFY",
 )
+
+
+def compatibility_fixture_ipv4(
+    subnet: int, host: int = 0, *, prefix: int | None = 24,
+) -> str:
+    pool = ipaddress.ip_network(
+        os.environ.get("CENGINE_COMPAT_IPV4_FIXTURE_POOL", "10.208.0.0/12"),
+        strict=True,
+    )
+    if pool.version != 4 or pool.prefixlen != 12 or not 0 <= subnet < 4096:
+        raise ValueError("the compatibility IPv4 fixture pool must be a /12")
+    address = pool.network_address + subnet * 256 + host
+    return str(address) if prefix is None else f"{address}/{prefix}"
+
+
+def compatibility_fixture_ipv6(
+    subnet: int, host: int = 0, *, prefix: int | None = 64,
+) -> str:
+    pool = ipaddress.ip_network(
+        os.environ.get("CENGINE_COMPAT_IPV6_FIXTURE_PREFIX", "fdcd::/16"),
+        strict=True,
+    )
+    if pool.version != 6 or pool.prefixlen != 16 or not 0 <= subnet <= 0xFFFF:
+        raise ValueError("the compatibility IPv6 fixture pool must be a /16")
+    address = pool.network_address + (subnet << 96) + host
+    return str(address) if prefix is None else f"{address}/{prefix}"
 
 
 def compatibility_image_cache_key(seeds: list[tuple[str, str]]) -> str:
