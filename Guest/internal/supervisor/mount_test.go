@@ -111,3 +111,38 @@ func TestRecursiveReadOnlyFallbackAndForceBehavior(t *testing.T) {
 		t.Fatal("conflicting read-only modes unexpectedly succeeded")
 	}
 }
+
+func TestTmpfsMountConfigurationDefaultsToNoexecAndAppliesLastOverride(t *testing.T) {
+	tests := []struct {
+		name       string
+		options    []string
+		wantNoexec bool
+		wantData   string
+	}{
+		{name: "default", options: []string{"size=1048576", "mode=700"}, wantNoexec: true, wantData: "size=1048576,mode=700"},
+		{name: "exec", options: []string{"size=1048576", "exec"}, wantNoexec: false, wantData: "size=1048576"},
+		{name: "last noexec wins", options: []string{"exec", "noexec"}, wantNoexec: true},
+		{name: "last exec wins", options: []string{"noexec", "exec"}, wantNoexec: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			flags, data, err := tmpfsMountConfiguration(test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if flags&unix.MS_NOSUID == 0 || flags&unix.MS_NODEV == 0 {
+				t.Fatalf("tmpfs safety flags = %#x, want nosuid and nodev", flags)
+			}
+			if got := flags&unix.MS_NOEXEC != 0; got != test.wantNoexec {
+				t.Fatalf("noexec = %t, want %t", got, test.wantNoexec)
+			}
+			if data != test.wantData {
+				t.Fatalf("mount data = %q, want %q", data, test.wantData)
+			}
+		})
+	}
+
+	if _, _, err := tmpfsMountConfiguration([]string{"uid=1000"}); err == nil {
+		t.Fatal("unsupported tmpfs option unexpectedly accepted")
+	}
+}

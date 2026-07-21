@@ -35,6 +35,10 @@ public struct MountRecord: Codable, Hashable, Sendable {
     public var subpath: String?
     public var tmpfsSizeBytes: Int64?
     public var tmpfsMode: UInt32?
+    /// Docker's structured tmpfs flag options. The API currently exposes
+    /// `exec` and `noexec`; the guest applies Docker's `noexec` default when
+    /// this selection is omitted.
+    public var tmpfsOptions: [[String]]?
     public var createSourceIfMissing: Bool?
     public var propagation: Propagation?
     /// Whether a bind excludes mounts nested beneath its source.
@@ -46,11 +50,13 @@ public struct MountRecord: Codable, Hashable, Sendable {
 
     public init(kind: Kind, source: String, destination: String, readOnly: Bool = false, noCopy: Bool = false,
                 subpath: String? = nil, tmpfsSizeBytes: Int64? = nil, tmpfsMode: UInt32? = nil,
+                tmpfsOptions: [[String]]? = nil,
                 createSourceIfMissing: Bool? = nil, propagation: Propagation? = nil,
                 nonRecursive: Bool = false, readOnlyNonRecursive: Bool = false,
                 readOnlyForceRecursive: Bool = false) {
         self.kind = kind; self.source = source; self.destination = destination; self.readOnly = readOnly
         self.noCopy = noCopy; self.subpath = subpath; self.tmpfsSizeBytes = tmpfsSizeBytes; self.tmpfsMode = tmpfsMode
+        self.tmpfsOptions = tmpfsOptions
         self.createSourceIfMissing = createSourceIfMissing
         self.propagation = propagation
         self.nonRecursive = nonRecursive

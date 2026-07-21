@@ -1521,7 +1521,11 @@ func applyMount(root string, mount protocol.Mount) error {
 		if err := os.MkdirAll(destination, 0755); err != nil {
 			return err
 		}
-		return unix.Mount("tmpfs", destination, "tmpfs", flags|unix.MS_NOSUID|unix.MS_NODEV, joinOptions(mount.Options))
+		tmpfsFlags, data, err := tmpfsMountConfiguration(mount.Options)
+		if err != nil {
+			return err
+		}
+		return unix.Mount("tmpfs", destination, "tmpfs", flags|tmpfsFlags, data)
 	case "bind":
 		staging := filepath.Join("/run/cengine/binds", mount.Source)
 		if err := os.MkdirAll(staging, 0755); err != nil {
@@ -1562,6 +1566,24 @@ func applyMount(root string, mount protocol.Mount) error {
 	default:
 		return fmt.Errorf("unsupported mount kind %q", mount.Kind)
 	}
+}
+
+func tmpfsMountConfiguration(options []string) (uintptr, string, error) {
+	flags := uintptr(unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC)
+	data := make([]string, 0, len(options))
+	for _, option := range options {
+		switch {
+		case option == "exec":
+			flags &^= unix.MS_NOEXEC
+		case option == "noexec":
+			flags |= unix.MS_NOEXEC
+		case strings.HasPrefix(option, "size=") || strings.HasPrefix(option, "mode="):
+			data = append(data, option)
+		default:
+			return 0, "", fmt.Errorf("unsupported tmpfs mount option %q", option)
+		}
+	}
+	return flags, joinOptions(data), nil
 }
 
 type mountOperation func(source, target, filesystem string, flags uintptr, data string) error

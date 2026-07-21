@@ -1828,17 +1828,13 @@ public struct DockerRouter: Sendable {
             if let mode = mount.TmpfsOptions?.Mode, mode > 0o7777 {
                 throw EngineError(.badRequest, "TmpfsOptions.Mode is invalid")
             }
-            if let options = mount.TmpfsOptions?.Options, !options.isEmpty {
-                guard options.allSatisfy({ $0.count == 1 || $0.count == 2 }) else {
-                    throw EngineError(.badRequest, "TmpfsOptions.Options entries require one or two values")
-                }
-                throw EngineError(.unsupported, "TmpfsOptions.Options is not supported")
-            }
+            let tmpfsOptions = try normalizedTmpfsOptions(mount.TmpfsOptions?.Options)
             return MountRecord(
                 kind: kind,
                 source: mount.Source ?? "", destination: mount.Target, readOnly: mount.ReadOnly ?? false,
                 noCopy: mount.VolumeOptions?.NoCopy ?? false, subpath: mount.VolumeOptions?.Subpath,
                 tmpfsSizeBytes: mount.TmpfsOptions?.SizeBytes, tmpfsMode: mount.TmpfsOptions?.Mode,
+                tmpfsOptions: tmpfsOptions,
                 createSourceIfMissing: kind == .bind ? (bindOptions?.CreateMountpoint ?? false) : nil,
                 propagation: kind == .bind ? try validatedMountPropagation(bindOptions?.Propagation) : nil,
                 nonRecursive: kind == .bind ? (bindOptions?.NonRecursive ?? false) : false,
@@ -1910,8 +1906,8 @@ public struct DockerRouter: Sendable {
             var mode: UInt32?
             for value in values {
                 switch value {
-                case "ro", "rw", "exec", "nosuid", "nodev": break
-                case "noexec", "suid", "dev":
+                case "ro", "rw", "exec", "noexec", "nosuid", "nodev": break
+                case "suid", "dev":
                     throw EngineError(.unsupported, "tmpfs option \(value) is not supported")
                 default:
                     if value.hasPrefix("size=") {
@@ -1937,7 +1933,8 @@ public struct DockerRouter: Sendable {
                 kind: .tmpfs, source: options, destination: destination,
                 readOnly: values.contains("ro"),
                 tmpfsSizeBytes: size,
-                tmpfsMode: mode
+                tmpfsMode: mode,
+                tmpfsOptions: values.filter { $0 == "exec" || $0 == "noexec" }.map { [$0] }
             ))
         }
         if let duplicate = Dictionary(grouping: result, by: \.destination)
@@ -1945,6 +1942,22 @@ public struct DockerRouter: Sendable {
             throw EngineError(.badRequest, "duplicate mount target: \(duplicate)")
         }
         return result
+    }
+
+    private func normalizedTmpfsOptions(_ options: [[String]]?) throws -> [[String]]? {
+        guard let options else { return nil }
+        for option in options {
+            guard option.count == 1 else {
+                throw EngineError(
+                    .badRequest,
+                    "TmpfsOptions.Options flag entries require exactly one value"
+                )
+            }
+            guard option[0] == "exec" || option[0] == "noexec" else {
+                throw EngineError(.badRequest, "invalid tmpfs option: \(option[0])")
+            }
+        }
+        return options
     }
 
     private func validatedPidsLimit(_ value: Int64?) throws -> Int64? {
@@ -2175,7 +2188,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Driver: String; let Mode: String; let RW: Bool; let Propagation: String
         let VolumeOptions: VolumeOptionsResponse?; let TmpfsOptions: TmpfsOptionsResponse?
         struct VolumeOptionsResponse: Codable, Sendable { let NoCopy: Bool; let Subpath: String? }
-        struct TmpfsOptionsResponse: Codable, Sendable { let SizeBytes: Int64?; let Mode: UInt32? }
+        struct TmpfsOptionsResponse: Codable, Sendable {
+            let SizeBytes: Int64?; let Mode: UInt32?; let Options: [[String]]?
+        }
     }
     public struct NetworkSettingsResponse: Codable, Sendable {
         let Bridge: String?; let SandboxID: String; let HairpinMode: Bool?
@@ -2208,7 +2223,11 @@ public struct ContainerInspectResponse: Codable, Sendable {
                 Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly,
                 Propagation: mount.propagation?.rawValue ?? "",
                 VolumeOptions: mount.kind == .volume ? .init(NoCopy: mount.noCopy, Subpath: mount.subpath) : nil,
-                TmpfsOptions: mount.kind == .tmpfs ? .init(SizeBytes: mount.tmpfsSizeBytes, Mode: mount.tmpfsMode) : nil
+                TmpfsOptions: mount.kind == .tmpfs ? .init(
+                    SizeBytes: mount.tmpfsSizeBytes,
+                    Mode: mount.tmpfsMode,
+                    Options: version >= .init(major: 1, minor: 46) ? mount.tmpfsOptions : nil
+                ) : nil
             )
         }
         let portBindings = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {

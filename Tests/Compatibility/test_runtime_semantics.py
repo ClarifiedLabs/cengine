@@ -216,14 +216,6 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
         {"Image": ALPINE_IMAGE, "HostConfig": {"PidMode": "host"}},
         {
             "Image": ALPINE_IMAGE,
-            "Mounts": [{
-                "Type": "tmpfs",
-                "Target": "/run",
-                "TmpfsOptions": {"Options": [["uid", "1000"]]},
-            }],
-        },
-        {
-            "Image": ALPINE_IMAGE,
             "Healthcheck": {
                 "Test": ["CMD", "true"],
                 "StartInterval": 1_000_000,
@@ -416,6 +408,111 @@ def test_ulimits_apply_to_init_exec_healthchecks_and_survive_recovery(
         cleanup_client = recovered or client
         try:
             cleanup_client.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-022")
+def test_structured_tmpfs_execution_options_apply_restart_and_survive_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"tmpfs-execution-options-{suffix}"
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": name},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["sh", "-ec", "while :; do sleep 1; done"],
+            "HostConfig": {"Mounts": [
+                {"Type": "tmpfs", "Target": "/default"},
+                {
+                    "Type": "tmpfs", "Target": "/executable",
+                    "TmpfsOptions": {"Options": [["exec"]]},
+                },
+                {
+                    "Type": "tmpfs", "Target": "/restricted",
+                    "TmpfsOptions": {"Options": [["exec"], ["noexec"]]},
+                },
+            ]},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+
+    def assert_options(value: docker.models.containers.Container) -> None:
+        result = value.exec_run([
+            "sh", "-ec",
+            "for path in default executable restricted; do "
+            "  printf '#!/bin/sh\\nexit 0\\n' >/$path/probe; chmod 755 /$path/probe; "
+            "done; "
+            "if /default/probe 2>/dev/null; then exit 40; fi; "
+            "/executable/probe; "
+            "if /restricted/probe 2>/dev/null; then exit 41; fi; "
+            "for path in default restricted; do "
+            "  options=$(awk -v target=/$path '$2 == target { print $4; exit }' /proc/mounts); "
+            "  case ,$options, in *,noexec,*) ;; *) exit 42 ;; esac; "
+            "done; "
+            "options=$(awk '$2 == \"/executable\" { print $4; exit }' /proc/mounts); "
+            "case ,$options, in *,noexec,*) exit 43 ;; esac; "
+            "printf tmpfs-options-ok",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output == b"tmpfs-options-ok"
+        value.reload()
+        mounts = {
+            mount["Destination"]: mount for mount in value.attrs["HostConfig"]["Mounts"]
+        }
+        assert mounts["/executable"]["TmpfsOptions"]["Options"] == [["exec"]]
+        assert mounts["/restricted"]["TmpfsOptions"]["Options"] == [
+            ["exec"], ["noexec"],
+        ]
+
+    try:
+        container.start()
+        assert_options(container)
+        state = json.loads((daemon.root / "engine.json").read_text())
+        record = persisted_container_record(state, container.id)
+        mounts = {mount["destination"]: mount for mount in record["mounts"]}
+        assert mounts["/default"].get("tmpfsOptions") is None
+        assert mounts["/executable"]["tmpfsOptions"] == [["exec"]]
+        assert mounts["/restricted"]["tmpfsOptions"] == [["exec"], ["noexec"]]
+
+        container.restart(timeout=5)
+        assert_options(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_options(recovered.containers.get(container.id))
+
+        initial_volumes = {volume.name for volume in recovered.volumes.list()}
+        with pytest.raises(docker.errors.APIError) as error:
+            invalid = recovered.api._post_json(
+                recovered.api._url("/containers/create"),
+                params={"name": f"invalid-tmpfs-option-{suffix}"},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/leaked": {}},
+                    "HostConfig": {"Mounts": [{
+                        "Type": "tmpfs", "Target": "/run",
+                        "TmpfsOptions": {"Options": [["uid", "1000"]]},
+                    }]},
+                },
+            )
+            recovered.api._raise_for_status(invalid)
+        assert error.value.status_code == 400
+        assert {volume.name for volume in recovered.volumes.list()} == initial_volumes
+        with pytest.raises(docker.errors.NotFound):
+            recovered.containers.get(f"invalid-tmpfs-option-{suffix}")
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
         except docker.errors.NotFound:
             pass
         if recovered is not None:

@@ -89,6 +89,13 @@ recursive `mount_setattr`,
 fail before mutation, and `RTM-020` covers application, restart, and daemon
 recovery.
 
+Docker's API v1.46 structured tmpfs execution flags now persist and inspect with
+versioned response behavior. Tmpfs mounts use Docker's writable
+`noexec,nosuid,nodev` defaults, while explicit `exec` and `noexec` options apply
+in submitted order so the final execution selection wins. Unknown options and
+non-flag-shaped arrays fail before mutation, and `RTM-022` covers application,
+container restart, and daemon recovery.
+
 The four Docker per-device block-I/O throttle arrays now persist and apply to
 the VM root disk `/dev/vda` through cgroup-v2 `io.max`. API v1.55 live updates
 independently replace or clear each BPS/IOPS limit while older update APIs keep
@@ -185,7 +192,9 @@ Work in this order:
    explicit architecture gap. Docker-relative block-I/O weights are now an
    explicit architecture gap (`RTM-019`); remaining I/O work concerns
    non-root devices, device access, and accounting rather than guest-only
-   weight readback.
+   weight readback. Structured tmpfs execution policy is complete (`RTM-022`);
+   remaining mount work concerns volume remount matrices and explicitly
+   classified filesystem options.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused
    cengine contracts have stabilized the expected behavior.
 4. Implement otherwise unexposed OCI features only when cengine adopts them as

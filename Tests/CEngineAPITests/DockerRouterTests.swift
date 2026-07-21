@@ -2512,6 +2512,93 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(conflict.status == .badRequest)
     }
 
+    @Test func structuredTmpfsExecutionOptionsPersistInspectAndRejectInvalidValues() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let create = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=tmpfs-execution-options",
+            body: Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/default"},{"Type":"tmpfs","Target":"/executable","TmpfsOptions":{"Options":[["exec"]]}},{"Type":"tmpfs","Target":"/restricted","TmpfsOptions":{"Options":[["exec"],["noexec"]]}}]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        func assertOptions(_ runtime: EngineRuntime, _ router: DockerRouter) async throws {
+            let record = try await runtime.container("tmpfs-execution-options")
+            let mounts = Dictionary(uniqueKeysWithValues: record.mounts.map { ($0.destination, $0) })
+            #expect(mounts["/default"]?.tmpfsOptions == nil)
+            #expect(mounts["/executable"]?.tmpfsOptions == [["exec"]])
+            #expect(mounts["/restricted"]?.tmpfsOptions == [["exec"], ["noexec"]])
+
+            let current = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/tmpfs-execution-options/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: current.body) as? [String: Any]
+            )
+            let host = try #require(object["HostConfig"] as? [String: Any])
+            let inspected = try #require(host["Mounts"] as? [[String: Any]])
+            let byTarget = Dictionary(uniqueKeysWithValues: inspected.compactMap { mount in
+                (mount["Destination"] as? String).map { ($0, mount) }
+            })
+            let executable = try #require(
+                byTarget["/executable"]?["TmpfsOptions"] as? [String: Any]
+            )
+            #expect(executable["Options"] as? [[String]] == [["exec"]])
+            let restricted = try #require(
+                byTarget["/restricted"]?["TmpfsOptions"] as? [String: Any]
+            )
+            #expect(restricted["Options"] as? [[String]] == [["exec"], ["noexec"]])
+
+            let legacy = await router.route(.init(
+                method: .GET, uri: "/v1.45/containers/tmpfs-execution-options/json"
+            ))
+            let legacyObject = try #require(
+                JSONSerialization.jsonObject(with: legacy.body) as? [String: Any]
+            )
+            let legacyHost = try #require(legacyObject["HostConfig"] as? [String: Any])
+            let legacyMounts = try #require(legacyHost["Mounts"] as? [[String: Any]])
+            for mount in legacyMounts where mount["Type"] as? String == "tmpfs" {
+                let options = try #require(mount["TmpfsOptions"] as? [String: Any])
+                #expect(options["Options"] == nil)
+            }
+        }
+        try await assertOptions(try #require(runtime), try #require(router))
+
+        router = nil
+        runtime = nil
+        runtime = try await EngineRuntime(root: root)
+        router = DockerRouter(runtime: try #require(runtime), root: root)
+        try await assertOptions(try #require(runtime), try #require(router))
+
+        for (index, options) in [
+            #"[["uid","1000"]]"#,
+            #"[["exec","unexpected"]]"#,
+            #"[[]]"#,
+        ].enumerated() {
+            let body = "{\"Image\":\"alpine\",\"Volumes\":{\"/leaked\":{}},"
+                + "\"HostConfig\":{\"Mounts\":[{\"Type\":\"tmpfs\",\"Target\":\"/run\","
+                + "\"TmpfsOptions\":{\"Options\":\(options)}}]}}"
+            let response = try await #require(router).route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=invalid-tmpfs-option-\(index)",
+                body: Data(body.utf8)
+            ))
+            #expect(response.status == .badRequest)
+        }
+        let containers = try await #require(router).route(.init(
+            method: .GET, uri: "/v1.55/containers/json?all=true"
+        ))
+        let listed = try #require(
+            JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]]
+        )
+        #expect(listed.count == 1)
+        let volumes = try await #require(router).route(.init(method: .GET, uri: "/v1.55/volumes"))
+        let volumeEnvelope = try #require(
+            JSONSerialization.jsonObject(with: volumes.body) as? [String: Any]
+        )
+        #expect((volumeEnvelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+    }
+
     @Test func capabilityChangesRoundTripAndUnsupportedSecurityFieldsAreRejected() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2760,7 +2847,6 @@ private actor AuthImageBackend: ContainerBackend {
             #""HostConfig":{"ShmSize":33554432}"#,
             #""HostConfig":{"Isolation":"process"}"#,
             #""Mounts":[{"Type":"image","Source":"alpine","Target":"/image"}]"#,
-            #""Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["uid","1000"]]}}]"#,
             #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","VolumeOptions":{"Labels":{"owner":"test"}}}]"#,
             #""Mounts":[{"Type":"bind","Source":"/tmp","Target":"/data","Consistency":"cached"}]"#,
             #""Healthcheck":{"Test":["CMD","true"],"StartInterval":1000000}"#,
@@ -3139,6 +3225,9 @@ private actor AuthImageBackend: ContainerBackend {
             #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","Consistency":"sideways"}]"#,
             #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","ClusterOptions":{}}]"#,
             #""Mounts":[{"Type":"volume","Source":"one","Target":"/data"},{"Type":"volume","Source":"two","Target":"/data"}]"#,
+            #""Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["uid","1000"]]}}]"#,
+            #""Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["exec","unexpected"]]}}]"#,
+            #""Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[[]]}}]"#,
             #""HostConfig":{"Tmpfs":{"/run":"rw,sideways"}}"#,
         ]
         for (index, field) in fields.enumerated() {

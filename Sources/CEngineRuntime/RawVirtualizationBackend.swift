@@ -5965,7 +5965,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 guard let source = bindSources[index], case .virtioFS(let share) = source else { return mount.subpath }
                 return [share.subpath, mount.subpath].compactMap { $0 }.joined(separator: "/").nilIfEmpty
             }()
-            let options = mount.kind == .tmpfs ? ["size=\(max(mount.tmpfsSizeBytes ?? 64 * 1_024 * 1_024, 0))", String(format: "mode=%o", mount.tmpfsMode ?? 0o1777)] : []
+            let options = mount.kind == .tmpfs
+                ? [
+                    "size=\(max(mount.tmpfsSizeBytes ?? 64 * 1_024 * 1_024, 0))",
+                    String(format: "mode=%o", mount.tmpfsMode ?? 0o1777),
+                ] + (mount.tmpfsOptions ?? []).map { $0[0] }
+                : []
             return GuestProtocol.Mount(
                 kind: mount.kind.rawValue,
                 source: mount.kind == .bind ? "bind-\(index)" : mount.source,

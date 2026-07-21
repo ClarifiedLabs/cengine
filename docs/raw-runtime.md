@@ -23,7 +23,9 @@ not merely installed as a chroot beneath an initramfs mount root. This distincti
 is required by nested runtimes, which reopen a process root through `/proc` and
 expect it to be the namespace root. A read-only root remount therefore applies to
 both the init process and later exec processes, while mounts such as tmpfs retain
-their own write policy.
+their own write policy. Workload tmpfs mounts remain writable but default to
+`noexec,nosuid,nodev`; Docker's structured `exec`/`noexec` selection can change
+only the execution flag.
 
 Exec uses three guest stages. The first joins the workload UTS, IPC, network, and
 cgroup namespaces while retaining access to supervisor resources. It captures
