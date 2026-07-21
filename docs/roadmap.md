@@ -51,6 +51,14 @@ defaults, while explicit true or false selections override them and survive
 container restart and daemon recovery (`RTM-021`). Seccomp and AppArmor/SELinux-
 shaped profiles remain explicit gaps.
 
+Unprivileged workload cgroups now receive Docker/runc's default device allowlist
+through cgroup-v2 BPF before process placement. Standard devices retain their
+expected access, while a process with Docker's default `CAP_MKNOD` can create a
+VM-disk node but cannot read or write it. Exec leaves inherit the policy, and
+enforcement remains active across container restart and daemon recovery
+(`RTM-024`). Privileged workloads remain unrestricted; configurable devices and
+custom device rules remain explicit gaps.
+
 Docker create-time ulimits now persist and apply to container init, exec, and
 healthcheck processes through capability introduced in guest protocol v7 and
 carried by the current guest protocol v13. The final exec command receives
@@ -199,8 +207,9 @@ Work in this order:
    architectural-gap decisions; shared/slave bind propagation is also an
    explicit architecture gap. Docker-relative block-I/O weights are now an
    explicit architecture gap (`RTM-019`); remaining I/O work concerns
-   non-root devices, device access, and accounting rather than guest-only
-   weight readback. Structured tmpfs execution policy and named-volume remount
+   non-root configured devices, custom access policies, and accounting rather
+   than guest-only weight readback; the default device allowlist is complete
+   (`RTM-024`). Structured tmpfs execution policy and named-volume remount
    matrices are complete (`RTM-022`, `RTM-023`); remaining mount inputs have
    explicit support or gap classifications in the compatibility ledger.
 3. Add curated Moby/runc test ports and an OCI-runtime test adapter after focused

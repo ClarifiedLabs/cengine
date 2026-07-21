@@ -673,6 +673,56 @@ def test_volume_readonly_matrix_orders_nested_mounts_and_survives_recovery(
             recovered.close()
 
 
+@pytest.mark.compat("RTM-024")
+def test_default_device_policy_blocks_vm_disks_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        ["sh", "-ec", "while :; do sleep 1; done"],
+        name=f"default-device-policy-{suffix}",
+        detach=True,
+    )
+    recovered = None
+
+    def assert_policy(value: docker.models.containers.Container) -> None:
+        result = value.exec_run([
+            "sh", "-ec",
+            "rm -f /dev/cengine-root-device /dev/cengine-null-device; "
+            "test ! -e /dev/vda; "
+            "numbers=$(cat /sys/class/block/vda/dev); "
+            "major=${numbers%:*}; minor=${numbers#*:}; "
+            "mknod /dev/cengine-root-device b \"$major\" \"$minor\"; "
+            "if dd if=/dev/cengine-root-device of=/dev/null bs=512 count=1 2>/dev/null; "
+            "then exit 40; fi; "
+            "mknod /dev/cengine-null-device c 1 3; "
+            "printf device-policy-ok >/dev/cengine-null-device; "
+            "printf device-policy-ok",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output == b"device-policy-ok"
+
+    try:
+        assert_policy(container)
+        container.restart(timeout=5)
+        assert_policy(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_policy(recovered.containers.get(container.id))
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-015")
 def test_block_io_throttles_apply_update_enforce_and_survive_recovery(
     daemon, client: docker.DockerClient,

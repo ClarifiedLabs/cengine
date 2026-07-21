@@ -29,18 +29,19 @@ const stage2Argument = "cengine-workload-stage2"
 const workloadReadyFD = 5
 
 type Supervisor struct {
-	mu          sync.Mutex
-	spec        *protocol.WorkloadSpec
-	command     *exec.Cmd
-	status      protocol.ProcessStatus
-	waiters     []chan protocol.ProcessStatus
-	execs       map[string]*exec.Cmd
-	execTargets map[string]int
-	execCgroups map[string]string
-	execStatus  map[string]protocol.ProcessStatus
-	processIO   *pinnedProcessIO
-	execIO      map[string]*pinnedProcessIO
-	execSpecs   map[string]protocol.ExecSpec
+	mu                    sync.Mutex
+	spec                  *protocol.WorkloadSpec
+	command               *exec.Cmd
+	status                protocol.ProcessStatus
+	waiters               []chan protocol.ProcessStatus
+	execs                 map[string]*exec.Cmd
+	execTargets           map[string]int
+	execCgroups           map[string]string
+	execStatus            map[string]protocol.ProcessStatus
+	processIO             *pinnedProcessIO
+	execIO                map[string]*pinnedProcessIO
+	execSpecs             map[string]protocol.ExecSpec
+	devicePolicyInstalled bool
 }
 
 func New() *Supervisor {
@@ -320,7 +321,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		return s.status, err
 	}
 	writer.Close()
-	if err := applyCgroup(s.spec, command.Process.Pid); err != nil {
+	if err := s.applyCgroup(s.spec, command.Process.Pid); err != nil {
 		readyReader.Close()
 		gateWriter.Close()
 		_ = command.Process.Kill()
@@ -422,7 +423,7 @@ func pumpTerminalInput(source, closed *os.File, destination io.Writer, command *
 	}
 }
 
-func applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
+func (s *Supervisor) applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
 	root := "/sys/fs/cgroup"
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return err
@@ -447,6 +448,12 @@ func applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
 	}
 	if err := writeCgroupResourceLimits(path, spec.Resources, true); err != nil {
 		return err
+	}
+	if !spec.Privileged && !s.devicePolicyInstalled {
+		if err := attachDefaultDevicePolicy(path); err != nil {
+			return err
+		}
+		s.devicePolicyInstalled = true
 	}
 	return os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0644)
 }
