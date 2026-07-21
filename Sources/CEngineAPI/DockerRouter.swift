@@ -173,6 +173,8 @@ public struct DockerRouter: Sendable {
             record.capabilityAdd = try normalizedCapabilities(input.HostConfig?.CapAdd ?? [])
             record.capabilityDrop = try normalizedCapabilities(input.HostConfig?.CapDrop ?? [])
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
+            record.maskedPaths = input.HostConfig?.MaskedPaths
+            record.readonlyPaths = input.HostConfig?.ReadonlyPaths
             record.useInit = input.HostConfig?.Init ?? false
             record.cgroupNamespaceMode = normalizedPrivateNamespaceMode(
                 input.HostConfig?.CgroupnsMode
@@ -1299,14 +1301,14 @@ public struct DockerRouter: Sendable {
             (!(host?.Devices ?? []).isEmpty, "Devices"),
             (!(host?.DeviceCgroupRules ?? []).isEmpty, "DeviceCgroupRules"),
             (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
-            (!(host?.MaskedPaths ?? []).isEmpty, "MaskedPaths"),
-            (!(host?.ReadonlyPaths ?? []).isEmpty, "ReadonlyPaths"),
             (!(host?.VolumesFrom ?? []).isEmpty, "VolumesFrom"),
             (!(host?.GroupAdd ?? []).isEmpty, "GroupAdd"),
             (!(host?.StorageOpt ?? [:]).isEmpty, "StorageOpt"),
             (!(host?.Runtime ?? "").isEmpty, "Runtime"),
         ])
         try validateSecurityOptions(host?.SecurityOpt, privileged: host?.Privileged == true)
+        try validateContainerPaths(host?.MaskedPaths, field: "HostConfig.MaskedPaths")
+        try validateContainerPaths(host?.ReadonlyPaths, field: "HostConfig.ReadonlyPaths")
         try validateConsoleSize(
             host?.ConsoleSize,
             field: "HostConfig.ConsoleSize",
@@ -1360,6 +1362,14 @@ public struct DockerRouter: Sendable {
         let privilegedDefaults: Set<String> = ["seccomp=unconfined", "apparmor=unconfined"]
         if privileged, values.allSatisfy(privilegedDefaults.contains) { return }
         throw EngineError(.unsupported, "HostConfig.SecurityOpt is not supported")
+    }
+
+    private func validateContainerPaths(_ values: [String]?, field: String) throws {
+        for path in values ?? [] {
+            guard path.hasPrefix("/"), !path.utf8.contains(0) else {
+                throw EngineError(.badRequest, "\(field) entries must be absolute paths")
+            }
+        }
     }
 
     private func validateResourceValues(
@@ -2012,7 +2022,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Ulimits: [UlimitResponse]
         let AutoRemove: Bool; let Privileged: Bool
         let CapAdd: [String]; let CapDrop: [String]
-        let ReadonlyRootfs: Bool; let Init: Bool; let RestartPolicy: RestartPolicy
+        let ReadonlyRootfs: Bool; let MaskedPaths: [String]?; let ReadonlyPaths: [String]?
+        let Init: Bool; let RestartPolicy: RestartPolicy
         let CgroupnsMode: String; let IpcMode: String; let PidMode: String
         let UTSMode: String; let UsernsMode: String
         let Annotations: [String: String]?
@@ -2027,7 +2038,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
         enum CodingKeys: String, CodingKey {
             case Memory, NanoCpus, PidsLimit
             case BlkioDeviceReadBps, BlkioDeviceWriteBps, BlkioDeviceReadIOps, BlkioDeviceWriteIOps
-            case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, ReadonlyRootfs, Init, RestartPolicy
+            case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, ReadonlyRootfs
+            case MaskedPaths, ReadonlyPaths, Init, RestartPolicy
             case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode
             case Annotations, Binds, Mounts, PortBindings, NetworkMode, LogConfig
         }
@@ -2047,6 +2059,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(CapAdd, forKey: .CapAdd)
             try container.encode(CapDrop, forKey: .CapDrop)
             try container.encode(ReadonlyRootfs, forKey: .ReadonlyRootfs)
+            try container.encode(MaskedPaths, forKey: .MaskedPaths)
+            try container.encode(ReadonlyPaths, forKey: .ReadonlyPaths)
             try container.encode(Init, forKey: .Init)
             try container.encode(self.RestartPolicy, forKey: .RestartPolicy)
             try container.encode(CgroupnsMode, forKey: .CgroupnsMode)
@@ -2120,7 +2134,9 @@ public struct ContainerInspectResponse: Codable, Sendable {
             Ulimits: record.ulimits.map { .init(Name: $0.name, Soft: $0.soft, Hard: $0.hard) },
             AutoRemove: record.autoRemove, Privileged: record.privileged,
             CapAdd: record.capabilityAdd, CapDrop: record.capabilityDrop,
-            ReadonlyRootfs: record.readOnlyRootfs, Init: record.useInit,
+            ReadonlyRootfs: record.readOnlyRootfs,
+            MaskedPaths: record.maskedPaths, ReadonlyPaths: record.readonlyPaths,
+            Init: record.useInit,
             RestartPolicy: .init(Name: record.restartPolicy.name, MaximumRetryCount: record.restartPolicy.maximumRetryCount),
             CgroupnsMode: record.cgroupNamespaceMode, IpcMode: record.ipcMode,
             PidMode: record.pidMode, UTSMode: record.utsMode,

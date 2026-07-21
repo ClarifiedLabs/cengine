@@ -3,8 +3,8 @@ import Testing
 @testable import CEngineCore
 
 @Suite struct GuestProtocolTests {
-    @Test func execPayloadUsesVersionTenIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 10)
+    @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
+        #expect(GuestProtocol.version == 11)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -28,8 +28,8 @@ import Testing
         #expect(limits.first?["soft"] as? UInt64 == 1_024)
     }
 
-    @Test func endpointSysctlsRemainAvailableInGuestProtocolVersionTen() throws {
-        #expect(GuestProtocol.version == 10)
+    @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
+        #expect(GuestProtocol.version == 11)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -48,7 +48,7 @@ import Testing
         #expect(endpointObject["sysctls"] as? [String] == ["net.ipv4.conf.IFNAME.forwarding=1"])
     }
 
-    @Test func blockIOThrottleResourcesRoundTripInProtocolVersionTen() throws {
+    @Test func blockIOThrottleResourcesRoundTripInCurrentProtocol() throws {
         let resources = GuestProtocol.Resources(
             memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 32,
             blockIOReadBps: [.init(path: "/dev/vda", rate: UInt64(Int64.max) + 1)],
@@ -76,7 +76,9 @@ import Testing
         let value = GuestProtocol.Workload(
             id: "container-1", rootDevice: "/dev/vda", arguments: ["true"],
             environment: [], workingDirectory: "/", hostname: "container-1", user: .init(),
-            terminal: false, readOnlyRoot: false, stopSignal: "SIGTERM", mounts: [], networks: [],
+            terminal: false, readOnlyRoot: false,
+            maskedPaths: ["/proc/kcore"], readonlyPaths: ["/proc/sys"],
+            stopSignal: "SIGTERM", mounts: [], networks: [],
             resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
             annotations: ["io.example.owner": "runtime"],
             capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"],
@@ -93,6 +95,8 @@ import Testing
         #expect(object["capabilityDrop"] as? [String] == ["CAP_CHOWN"])
         #expect((object["rlimits"] as? [[String: Any]])?.first?["type"] as? String == "core")
         #expect(object["ipcMode"] as? String == "none")
+        #expect(object["maskedPaths"] as? [String] == ["/proc/kcore"])
+        #expect(object["readonlyPaths"] as? [String] == ["/proc/sys"])
         #expect(object["ioClaim"] as? String == "container-claim")
     }
 

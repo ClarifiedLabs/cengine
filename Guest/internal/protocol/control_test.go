@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
-	if Version != 10 {
-		t.Fatalf("Version = %d, want 10", Version)
+func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
+	if Version != 11 {
+		t.Fatalf("Version = %d, want 11", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -15,6 +15,8 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
 		"ioClaim":"container-claim",
 		"annotations":{"io.example.owner":"runtime"},
 		"ipcMode":"none",
+		"maskedPaths":["/proc/kcore"],
+		"readonlyPaths":["/proc/sys"],
 		"rlimits":[{"type":"nofile","soft":1024,"hard":18446744073709551615}]
 	}`), &spec); err != nil {
 		t.Fatal(err)
@@ -27,6 +29,12 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsAndRlimits(t *testing.T) {
 	}
 	if spec.IPCMode != "none" {
 		t.Fatalf("IPCMode = %q, want none", spec.IPCMode)
+	}
+	if len(spec.MaskedPaths) != 1 || spec.MaskedPaths[0] != "/proc/kcore" {
+		t.Fatalf("MaskedPaths did not decode: %#v", spec.MaskedPaths)
+	}
+	if len(spec.ReadonlyPaths) != 1 || spec.ReadonlyPaths[0] != "/proc/sys" {
+		t.Fatalf("ReadonlyPaths did not decode: %#v", spec.ReadonlyPaths)
 	}
 	if len(spec.Rlimits) != 1 || spec.Rlimits[0].Type != "nofile" ||
 		spec.Rlimits[0].Soft != 1024 || spec.Rlimits[0].Hard != ^uint64(0) {
@@ -44,9 +52,9 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 	}
 }
 
-func TestEndpointSysctlsRemainAvailableInProtocolVersionTen(t *testing.T) {
-	if Version != 10 {
-		t.Fatalf("endpoint sysctls require guest protocol version 10, got %d", Version)
+func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
+	if Version != 11 {
+		t.Fatalf("endpoint sysctls require guest protocol version 11, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {
@@ -54,7 +62,7 @@ func TestEndpointSysctlsRemainAvailableInProtocolVersionTen(t *testing.T) {
 	}
 }
 
-func TestBlockIOThrottlesDecodeInProtocolVersionTen(t *testing.T) {
+func TestBlockIOThrottlesDecodeInCurrentProtocol(t *testing.T) {
 	var resources Resources
 	if err := json.Unmarshal([]byte(`{
 		"memoryBytes":67108864,"cpuQuota":100000,"cpuPeriod":100000,"pids":32,

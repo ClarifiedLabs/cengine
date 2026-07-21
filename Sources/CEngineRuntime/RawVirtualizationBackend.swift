@@ -5969,12 +5969,20 @@ public actor RawVirtualizationBackend: ContainerBackend {
     ) throws -> GuestProtocol.Workload {
         let arguments = (container.entrypoint ?? config?.entrypoint ?? []) + (container.command ?? config?.command ?? [])
         guard !arguments.isEmpty else { throw EngineError(.badRequest, "container has no command") }
+        let maskedPaths = container.privileged
+            ? []
+            : container.maskedPaths ?? dockerDefaultMaskedPaths(cpus: container.cpus)
+        let readonlyPaths = container.privileged
+            ? []
+            : container.readonlyPaths ?? dockerDefaultReadonlyPaths
         return GuestProtocol.Workload(
             id: container.id, rootDevice: "/dev/vda", arguments: arguments,
             environment: Self.mergeEnvironment(image: config?.environment ?? [], container: container.environment),
             workingDirectory: container.workingDirectory.isEmpty ? (config?.workingDirectory ?? "/") : container.workingDirectory,
             hostname: container.hostname, user: Self.user(container.user.isEmpty ? config?.user : container.user),
-            terminal: container.tty, readOnlyRoot: container.readOnlyRootfs, stopSignal: container.stopSignal,
+            terminal: container.tty, readOnlyRoot: container.readOnlyRootfs,
+            maskedPaths: maskedPaths, readonlyPaths: readonlyPaths,
+            stopSignal: container.stopSignal,
             volumeServer: volumeServer,
             mounts: mounts, networks: networks, hosts: hosts,
             resources: .init(
@@ -5990,6 +5998,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
             rlimits: try Self.rlimits(container.ulimits), ipcMode: container.ipcMode,
             ioClaim: ioClaim
         )
+    }
+
+    private static let dockerDefaultMaskedPaths = [
+        "/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore", "/proc/keys",
+        "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list",
+        "/proc/timer_stats", "/sys/devices/virtual/powercap", "/sys/firmware",
+    ]
+
+    private static let dockerDefaultReadonlyPaths = [
+        "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+    ]
+
+    private static func dockerDefaultMaskedPaths(cpus: Int) -> [String] {
+        dockerDefaultMaskedPaths + (0..<max(cpus, 1)).map {
+            "/sys/devices/system/cpu/cpu\($0)/thermal_throttle"
+        }
     }
 
     private static func rlimits(_ values: [UlimitRecord]) throws -> [GuestProtocol.Rlimit] {

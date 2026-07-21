@@ -2496,8 +2496,6 @@ private actor AuthImageBackend: ContainerBackend {
             #""Devices":[{"PathOnHost":"/dev/null","PathInContainer":"/dev/test","CgroupPermissions":"rwm"}]"#,
             #""DeviceCgroupRules":["c 1:3 rwm"]"#,
             #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
-            #""MaskedPaths":["/proc/kcore"]"#,
-            #""ReadonlyPaths":["/proc/sys"]"#,
         ]
         for (index, field) in unsupportedFields.enumerated() {
             let body = "{\"Image\":\"alpine\",\"HostConfig\":{\(field)}}"
@@ -2506,6 +2504,48 @@ private actor AuthImageBackend: ContainerBackend {
                 body: Data(body.utf8)
             ))
             #expect(rejected.status == .notImplemented)
+        }
+    }
+
+    @Test func maskedAndReadonlyPathsPersistInspectAndRequireAbsolutePaths() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let create = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=path-policy",
+            body: Data(#"{"Image":"alpine","HostConfig":{"MaskedPaths":["/proc/kcore","/sys/firmware"],"ReadonlyPaths":["/proc/sys"]}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+
+        func inspectPaths(_ router: DockerRouter) async throws {
+            let response = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/path-policy/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            )
+            let host = try #require(object["HostConfig"] as? [String: Any])
+            #expect(host["MaskedPaths"] as? [String] == ["/proc/kcore", "/sys/firmware"])
+            #expect(host["ReadonlyPaths"] as? [String] == ["/proc/sys"])
+        }
+        try await inspectPaths(try #require(router))
+
+        router = nil
+        runtime = nil
+        runtime = try await EngineRuntime(root: root)
+        router = DockerRouter(runtime: try #require(runtime), root: root)
+        try await inspectPaths(try #require(router))
+
+        for (index, field) in [
+            #""MaskedPaths":["proc/kcore"]"#,
+            #""ReadonlyPaths":[""]"#,
+        ].enumerated() {
+            let rejected = try await #require(router).route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=invalid-path-policy-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":{\(field)}}".utf8)
+            ))
+            #expect(rejected.status == .badRequest)
         }
     }
 

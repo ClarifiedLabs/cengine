@@ -735,6 +735,81 @@ def test_same_kernel_namespace_sharing_fails_closed(client: docker.DockerClient)
     assert {volume.name for volume in client.volumes.list()} == initial_volumes
 
 
+@pytest.mark.compat("RTM-018")
+def test_masked_and_readonly_paths_apply_restart_and_survive_recovery(
+    daemon, client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    suffix = uuid.uuid4().hex[:8]
+    masked_source = tmp_path / "masked-source"
+    masked_source.mkdir()
+    (masked_source / "secret").write_text("not visible in the workload")
+    group_file = tmp_path / "group"
+    group_file.write_text("root:x:0:\npath-policy:x:2346:root\n")
+    recovered = None
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"runtime-path-policy-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["top"],
+            "User": "root",
+            "HostConfig": {
+                "Binds": [
+                    f"{masked_source}:/masked-source:ro",
+                    f"{group_file}:/etc/group:ro",
+                ],
+                "MaskedPaths": [
+                    "/masked-source", "/etc/passwd", "/missing-masked-path",
+                ],
+                "ReadonlyPaths": ["/tmp", "/missing-readonly-path"],
+            },
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+
+    def assert_path_policy(value: docker.models.containers.Container) -> None:
+        value.reload()
+        host = value.attrs["HostConfig"]
+        assert host["MaskedPaths"] == [
+            "/masked-source", "/etc/passwd", "/missing-masked-path",
+        ]
+        assert host["ReadonlyPaths"] == ["/tmp", "/missing-readonly-path"]
+        result = value.exec_run([
+            "sh", "-ec",
+            "test ! -e /masked-source/secret; "
+            "if touch /masked-source/new 2>/dev/null; then exit 20; fi; "
+            "test \"$(stat -c '%t:%T' /etc/passwd)\" = 1:3; "
+            "if touch /tmp/readonly-probe 2>/dev/null; then exit 21; fi; "
+            "case \" $(id -G) \" in *\" 2346 \"*) ;; *) exit 22 ;; esac; "
+            "printf path-policy-ok",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output == b"path-policy-ok"
+
+    try:
+        container.start()
+        assert_path_policy(container)
+
+        container.restart(timeout=5)
+        assert_path_policy(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        container = recovered.containers.get(container.id)
+        assert_path_policy(container)
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,

@@ -6458,6 +6458,60 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(workload.ipcMode == "none")
     }
 
+    @Test func containerPathPoliciesReachGuestWorkloadSpecification() throws {
+        var container = ContainerRecord(
+            id: "path-policy-container", name: "path-policy", image: "alpine:latest",
+            processArguments: ["true"]
+        )
+        container.maskedPaths = ["/proc/kcore", "/sys/firmware"]
+        container.readonlyPaths = ["/proc/sys"]
+
+        let workload = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+
+        #expect(workload.maskedPaths == container.maskedPaths)
+        #expect(workload.readonlyPaths == container.readonlyPaths)
+    }
+
+    @Test func containerPathPolicyDefaultsOverridesAndPrivilegedModeMatchDocker() throws {
+        var container = ContainerRecord(
+            id: "default-path-policy-container", name: "default-path-policy",
+            image: "alpine:latest", processArguments: ["true"]
+        )
+        container.cpus = 2
+
+        func workload() throws -> GuestProtocol.Workload {
+            try RawVirtualizationBackend.workloadSpecification(
+                container: container, imageConfiguration: nil, mounts: [], networks: [],
+                hosts: [:], volumeServer: nil
+            )
+        }
+
+        #expect(try workload().maskedPaths == [
+            "/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore", "/proc/keys",
+            "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi", "/proc/timer_list",
+            "/proc/timer_stats", "/sys/devices/virtual/powercap", "/sys/firmware",
+            "/sys/devices/system/cpu/cpu0/thermal_throttle",
+            "/sys/devices/system/cpu/cpu1/thermal_throttle",
+        ])
+        #expect(try workload().readonlyPaths == [
+            "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+        ])
+
+        container.maskedPaths = []
+        container.readonlyPaths = []
+        #expect(try workload().maskedPaths.isEmpty)
+        #expect(try workload().readonlyPaths.isEmpty)
+
+        container.maskedPaths = ["/etc/passwd"]
+        container.readonlyPaths = ["/tmp"]
+        container.privileged = true
+        #expect(try workload().maskedPaths.isEmpty)
+        #expect(try workload().readonlyPaths.isEmpty)
+    }
+
     @Test func multiContainerVolumesUseSharedStorageBeforeVMsStart() throws {
         let modes = try RawVirtualizationBackend.resolveVolumeStorageModes(
             names: ["compose-data", "buildkit-state"],

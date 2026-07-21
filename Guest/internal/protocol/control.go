@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 10
+	Version                         = 11
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -44,6 +44,8 @@ type WorkloadSpec struct {
 	User             User              `json:"user"`
 	Terminal         bool              `json:"terminal"`
 	ReadOnlyRoot     bool              `json:"readOnlyRoot"`
+	MaskedPaths      []string          `json:"maskedPaths,omitempty"`
+	ReadonlyPaths    []string          `json:"readonlyPaths,omitempty"`
 	StopSignal       string            `json:"stopSignal"`
 	VolumeServer     string            `json:"volumeServer,omitempty"`
 	Mounts           []Mount           `json:"mounts"`

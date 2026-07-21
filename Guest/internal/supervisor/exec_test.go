@@ -450,6 +450,50 @@ func TestExecUsesWorkloadUserAndSupplementaryGroupResolution(t *testing.T) {
 	}
 }
 
+func TestExecNormalizesNamedUserBeforeMaskedIdentityFilesTakeEffect(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "etc/passwd"),
+		[]byte("app:x:1000:1000:app:/home/app:/bin/sh\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "etc/group"),
+		[]byte("app:x:1000:\nlogs:x:2000:app\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if err := snapshotUserDatabase(root, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/passwd"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/group"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	user, err := normalizeExecUserFromSnapshot(protocol.User{
+		Username: "app", AdditionalGroups: []uint32{3000},
+	}, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := protocol.User{UID: 1000, GID: 1000, AdditionalGroups: []uint32{3000, 2000}}
+	if !reflect.DeepEqual(user, want) {
+		t.Fatalf("normalized exec user = %#v, want %#v", user, want)
+	}
+	if user.Username != "" {
+		t.Fatalf("normalized exec retained masked-file dependency %q", user.Username)
+	}
+}
+
 func TestExecAppliesNoNewPrivilegesWhenRequested(t *testing.T) {
 	var calls [][]uintptr
 	prctl := func(option int, arg2, arg3, arg4, arg5 uintptr) error {

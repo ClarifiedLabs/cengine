@@ -429,6 +429,15 @@ func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
 		processIO.close()
 		return errors.New("workload is not running")
 	}
+	if s.spec != nil && pathPolicyMasksUserDatabase(s.spec.MaskedPaths) {
+		spec.User, err = normalizeExecUserFromSnapshot(
+			spec.User, workloadUserDatabaseSnapshotPath,
+		)
+		if err != nil {
+			processIO.close()
+			return fmt.Errorf("resolve exec user before masked identity files: %w", err)
+		}
+	}
 	if _, exists := s.execStatus[spec.ID]; exists {
 		processIO.close()
 		return errors.New("exec already exists")
@@ -437,6 +446,37 @@ func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
 	s.execIO[spec.ID] = processIO
 	s.execStatus[spec.ID] = protocol.ProcessStatus{Status: "created"}
 	return nil
+}
+
+func normalizeExecUserFromSnapshot(
+	user protocol.User, snapshot string,
+) (protocol.User, error) {
+	if user.Username == "" {
+		return user, nil
+	}
+	passwd, err := os.ReadFile(filepath.Join(snapshot, "passwd"))
+	if err != nil {
+		return protocol.User{}, err
+	}
+	groupData, err := os.ReadFile(filepath.Join(snapshot, "group"))
+	if err != nil {
+		return protocol.User{}, err
+	}
+	uid, gid, namedGroups, err := resolveUserFromData(user, passwd, groupData)
+	if err != nil {
+		return protocol.User{}, err
+	}
+	if uid < 0 || uint64(uid) > uint64(^uint32(0)) || gid < 0 || uint64(gid) > uint64(^uint32(0)) {
+		return protocol.User{}, errors.New("resolved exec user is outside the Linux ID range")
+	}
+	groups := append([]uint32(nil), user.AdditionalGroups...)
+	for _, group := range namedGroups {
+		if group < 0 || uint64(group) > uint64(^uint32(0)) {
+			return protocol.User{}, errors.New("resolved exec group is outside the Linux ID range")
+		}
+		groups = append(groups, uint32(group))
+	}
+	return protocol.User{UID: uint32(uid), GID: uint32(gid), AdditionalGroups: groups}, nil
 }
 
 func (s *Supervisor) DiscardExec(id string) error {

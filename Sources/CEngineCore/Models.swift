@@ -164,6 +164,10 @@ public struct ContainerRecord: Codable, Sendable {
     public var capabilityAdd: [String]
     public var capabilityDrop: [String]
     public var readOnlyRootfs: Bool
+    /// OCI Linux paths whose contents are hidden from the workload.
+    public var maskedPaths: [String]?
+    /// OCI Linux paths remounted read-only inside the workload mount namespace.
+    public var readonlyPaths: [String]?
     public var autoRemove: Bool
     public var useInit: Bool
     /// Docker namespace selections that cengine can faithfully apply inside a
@@ -225,6 +229,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.capabilityAdd = []
         self.capabilityDrop = []
         self.readOnlyRootfs = false
+        self.maskedPaths = nil
+        self.readonlyPaths = nil
         self.autoRemove = false
         self.useInit = false
         self.cgroupNamespaceMode = "private"

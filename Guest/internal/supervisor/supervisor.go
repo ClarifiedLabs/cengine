@@ -1120,9 +1120,24 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 			return err
 		}
 	}
+	if pathPolicyMasksUserDatabase(spec.MaskedPaths) {
+		if err := snapshotUserDatabase(root, workloadUserDatabaseSnapshotPath); err != nil {
+			return err
+		}
+	}
 	if err := switchWorkloadRoot(root, rootSwitchOperations{
 		chdir: unix.Chdir, mount: unix.Mount, chroot: unix.Chroot,
 	}); err != nil {
+		return err
+	}
+	uid, gid, namedGroups, err := resolveUser(spec.User)
+	if err != nil {
+		return err
+	}
+	if err := applyReadonlyPaths(spec.ReadonlyPaths, unix.Mount, unix.Statfs); err != nil {
+		return err
+	}
+	if err := applyMaskedPaths(spec.MaskedPaths); err != nil {
 		return err
 	}
 	if err := startSocketProxies(spec.Mounts); err != nil {
@@ -1136,10 +1151,6 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 		return err
 	}
 	if err := os.Chdir(workingDirectory); err != nil {
-		return err
-	}
-	uid, gid, namedGroups, err := resolveUser(spec.User)
-	if err != nil {
 		return err
 	}
 	capabilities, err := capabilityMask(spec.CapabilityAdd, spec.CapabilityDrop, spec.Privileged)
@@ -1276,11 +1287,15 @@ func resolveUser(user protocol.User) (int, int, []int, error) {
 	if user.Username == "" {
 		return int(user.UID), int(user.GID), nil, nil
 	}
-	passwd, err := os.ReadFile("/etc/passwd")
+	return resolveUserAtRoot(user, "/")
+}
+
+func resolveUserAtRoot(user protocol.User, root string) (int, int, []int, error) {
+	passwd, err := os.ReadFile(filepath.Join(root, "etc/passwd"))
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	groupData, err := os.ReadFile("/etc/group")
+	groupData, err := os.ReadFile(filepath.Join(root, "etc/group"))
 	if err != nil {
 		return 0, 0, nil, err
 	}
