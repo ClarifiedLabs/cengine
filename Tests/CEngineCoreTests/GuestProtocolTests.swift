@@ -4,14 +4,14 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 14)
+        #expect(GuestProtocol.version == 15)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
             workingDirectory: "/work",
             user: .init(uid: 1_000, gid: 2_000, additionalGroups: [3_000]),
             terminal: false, attachStdin: false, attachStdout: true, attachStderr: true,
-            noNewPrivileges: true,
+            noNewPrivileges: true, seccompDefault: true,
             rlimits: [.init(type: "nofile", soft: 1_024, hard: UInt64.max)],
             ioClaim: "exec-claim"
         )
@@ -22,6 +22,7 @@ import Testing
         let user = try #require(object["user"] as? [String: Any])
         #expect(user["uid"] as? Int == 1_000)
         #expect(object["noNewPrivileges"] as? Bool == true)
+        #expect(object["seccompDefault"] as? Bool == true)
         #expect(object["ioClaim"] as? String == "exec-claim")
         let limits = try #require(object["rlimits"] as? [[String: Any]])
         #expect(limits.first?["type"] as? String == "nofile")
@@ -29,7 +30,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 14)
+        #expect(GuestProtocol.version == 15)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,

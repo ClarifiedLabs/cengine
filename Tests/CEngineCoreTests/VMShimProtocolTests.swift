@@ -4964,13 +4964,32 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
 
         #expect(workload.noNewPrivileges)
         #expect(exec.noNewPrivileges)
+        #expect(!workload.seccompDefault)
 
         container.privileged = false
         container.noNewPrivileges = false
-        #expect(try !RawVirtualizationBackend.workloadSpecification(
+        let unprivileged = try RawVirtualizationBackend.workloadSpecification(
             container: container, imageConfiguration: nil, mounts: [], networks: [],
             hosts: [:], volumeServer: nil
-        ).noNewPrivileges)
+        )
+        #expect(!unprivileged.noNewPrivileges)
+        #expect(unprivileged.seccompDefault)
+
+        container.seccompProfile = "unconfined"
+        let unconfined = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+        #expect(!unconfined.noNewPrivileges)
+        #expect(!unconfined.seccompDefault)
+        container.privileged = true
+        container.seccompProfile = "builtin"
+        let privilegedBuiltin = try RawVirtualizationBackend.workloadSpecification(
+            container: container, imageConfiguration: nil, mounts: [], networks: [],
+            hosts: [:], volumeServer: nil
+        )
+        #expect(privilegedBuiltin.seccompDefault)
+        #expect(!privilegedBuiltin.noNewPrivileges)
     }
 
     @Test func healthcheckExecLifecycleRetiresMoreThanJournalActiveLimit() async throws {

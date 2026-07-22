@@ -3860,7 +3860,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 workingDirectory: context.workingDirectory, user: context.user,
                 terminal: configuration.tty, attachStdin: configuration.attachStdin,
                 attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
-                noNewPrivileges: context.noNewPrivileges, privileged: context.privileged,
+                noNewPrivileges: context.noNewPrivileges,
+                privileged: context.privileged,
+                seccompDefault: Self.usesDefaultSeccomp(container),
                 capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
                 rlimits: try Self.rlimits(container.ulimits), ioClaim: ioClaim
             ),
@@ -6058,11 +6060,20 @@ public actor RawVirtualizationBackend: ContainerBackend {
             ),
             privileged: container.privileged,
             noNewPrivileges: container.noNewPrivileges ?? !container.privileged,
+            seccompDefault: Self.usesDefaultSeccomp(container),
             annotations: container.annotations,
             capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
             rlimits: try Self.rlimits(container.ulimits), ipcMode: container.ipcMode,
             ioClaim: ioClaim
         )
+    }
+
+    static func usesDefaultSeccomp(_ container: ContainerRecord) -> Bool {
+        switch container.seccompProfile {
+        case "builtin": true
+        case "unconfined": false
+        default: !container.privileged
+        }
     }
 
     private static let dockerDefaultMaskedPaths = [

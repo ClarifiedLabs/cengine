@@ -18,6 +18,7 @@ def test_info(client: docker.DockerClient):
     assert info["OSType"] == "linux"
     assert info["Architecture"] == "arm64"
     assert info["DockerRootDir"]
+    assert "name=seccomp,profile=builtin" in info["SecurityOptions"]
 
 
 @pytest.mark.compat("SYS-002")

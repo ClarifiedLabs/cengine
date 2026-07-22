@@ -28,7 +28,7 @@ and pinned Docker-in-Docker exec and healthchecks without kind.
 
 Default exec and healthcheck context now resolves image and container cwd, user,
 groups, and environment consistently. The guest protocol carries structured
-identity and `no_new_privs` policy for exec. Compatibility tests normally use the
+identity, `no_new_privs`, and built-in seccomp policy for exec. Compatibility tests normally use the
 installed, pre-approved networking helper without interactive authorization.
 
 Docker PID limits now persist across recovery and drive cgroup-v2 `pids.max` on
@@ -45,10 +45,22 @@ silently ignored.
 
 Docker's `SecurityOpt` no-new-privileges selection now persists, inspects, and
 applies to container init, default and privileged exec, and healthchecks through
-guest protocol v13 and carried by current v14. Omitted policy retains cengine's existing process-privilege
-defaults, while explicit true or false selections override them and survive
-container restart and daemon recovery (`RTM-021`). Seccomp and AppArmor/SELinux-
-shaped profiles remain explicit gaps.
+guest protocol v13 and is carried by current v15. Omitted policy retains cengine's
+existing process-privilege defaults, while explicit true or false selections
+persist and survive container restart and daemon recovery (`RTM-021`). Seccomp
+selection remains independent: a staging process installs the filter while still
+privileged, then applies the workload's selected no-new-privileges state.
+
+Unprivileged containers now receive an arm64 adaptation of Moby's built-in
+seccomp profile by default. `seccomp=builtin` and `seccomp=unconfined` select the
+profile explicitly, while privileged containers remain unconfined unless the
+built-in profile is requested. The selection persists and applies to init, exec, and healthchecks across container
+restart and daemon recovery through guest protocol v15 (`RTM-028`). Filters are
+installed after root, mount, and rlimit setup but before the staging process drops
+its administrative capability, preserving Docker's independent no-new-privileges
+semantics. The filter rejects every non-AArch64 audit architecture; AArch32
+compatibility processes are therefore unsupported while it is active. Custom
+seccomp JSON and AppArmor/SELinux-shaped profiles remain explicit gaps.
 
 Unprivileged workload cgroups now receive Docker/runc's default device allowlist
 through cgroup-v2 BPF before process placement. Standard devices retain their
@@ -58,7 +70,8 @@ enforcement remains active across container restart and daemon recovery
 (`RTM-024`). Privileged workloads remain unrestricted.
 
 Docker `Devices` mappings and additive `DeviceCgroupRules` now persist, inspect,
-apply, and update live through guest protocol v14 (`RTM-025`). A mapping's
+apply, and update live through functionality introduced in guest protocol v14
+and carried by current v15 (`RTM-025`). A mapping's
 `PathOnHost` names a real device in the per-container Linux VM—standard guest
 devices and attached virtio block disks are supported—and the guest recreates
 that device at a descriptor-resolved `/dev` destination with the submitted
@@ -70,7 +83,7 @@ gaps and fail explicitly.
 
 Docker create-time ulimits now persist and apply to container init, exec, and
 healthcheck processes through capability introduced in guest protocol v7 and
-carried by the current guest protocol v14. The final exec command receives
+carried by the current guest protocol v15. The final exec command receives
 limits after namespace and root setup without constraining the guest supervisor
 or its signal/status proxies. `RTM-014` covers inspect, validation without
 side effects, daemon recovery, and container stop/start. Live ulimit updates
@@ -80,7 +93,7 @@ Supported namespace selections now persist, inspect, and survive daemon
 recovery. Docker IPC `none` uses a private IPC namespace without mounting
 `/dev/shm`; the default/private cgroup and IPC selections plus the host userns
 selection introduced in guest protocol v11 reflect guest behavior through the
-current guest protocol v14 (`RTM-016`).
+current guest protocol v15 (`RTM-016`).
 Docker-host and cross-container cgroup, IPC, PID, UTS, and network sharing are
 explicit architecture gaps: separate per-container VM kernels cannot join one
 Linux namespace. OCI namespace paths are likewise not exposed through the
@@ -88,7 +101,7 @@ Docker API or an OCI runtime CLI. These requests fail before container or volume
 mutation (`RTM-017`).
 
 Docker masked and read-only paths now persist, inspect, and enter the guest
-protocol (introduced in v11 and carried by current v14). Omitted lists select
+protocol (introduced in v11 and carried by current v15). Omitted lists select
 Docker's defaults, explicit empty lists disable them,
 and privileged workloads clear them. The guest applies the policy after its
 filesystems and workload root are in place: missing targets are ignored,
@@ -98,7 +111,7 @@ flags. `RTM-018` covers file and directory masks, read-only enforcement,
 restart, and daemon recovery.
 
 Docker's structured bind recursion and read-only controls now persist and enter
-guest protocol v12 and are carried by the current v14 protocol. `NonRecursive`
+guest protocol v12 and are carried by the current v15 protocol. `NonRecursive`
 selects a single bind instead of a recursive bind; read-only binds default to
 recursive `mount_setattr`,
 `ReadOnlyNonRecursive` limits the remount to the bind root, and
@@ -221,8 +234,9 @@ Work in this order:
 1. Maintain the completed API v1.55 runtime-input baseline audit as Docker's
    request schema evolves. Apply newly supported fields, reject active gaps
    explicitly, or classify them in the ledger (`RTM-013`).
-2. Close seccomp/security-option and remaining mount-matrix gaps for
-   functionality cengine already exposes. Namespace inputs, PID limits, private
+2. Close the remaining custom security-profile and mount-matrix gaps for
+   functionality cengine already exposes. Docker's built-in seccomp profile and
+   explicit unconfined selection are complete (`RTM-028`). Namespace inputs, PID limits, private
    bind isolation, and capability add/drop have explicit supported or
    architectural-gap decisions; shared/slave bind propagation is also an
    explicit architecture gap. Docker-relative block-I/O weights are now an
@@ -272,7 +286,7 @@ configure, and inspect endpoints is complete:
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
   responses. Recovery support shipped in guest protocol v7 and is carried by
-  the current guest protocol v14 (`NET-019`).
+  the current guest protocol v15 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived

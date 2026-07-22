@@ -6,8 +6,8 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 14 {
-		t.Fatalf("Version = %d, want 14", Version)
+	if Version != 15 {
+		t.Fatalf("Version = %d, want 15", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -15,6 +15,7 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 		"ioClaim":"container-claim",
 		"annotations":{"io.example.owner":"runtime"},
 		"noNewPrivileges":true,
+		"seccompDefault":true,
 		"ipcMode":"none",
 		"maskedPaths":["/proc/kcore"],
 		"readonlyPaths":["/proc/sys"],
@@ -31,6 +32,9 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 	}
 	if !spec.NoNewPrivileges {
 		t.Fatal("NoNewPrivileges did not decode")
+	}
+	if !spec.SeccompDefault {
+		t.Fatal("SeccompDefault did not decode")
 	}
 	if spec.IPCMode != "none" {
 		t.Fatalf("IPCMode = %q, want none", spec.IPCMode)
@@ -53,17 +57,20 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 
 func TestExecSpecDecodesIOClaim(t *testing.T) {
 	var spec ExecSpec
-	if err := json.Unmarshal([]byte(`{"id":"exec-1","ioClaim":"exec-claim"}`), &spec); err != nil {
+	if err := json.Unmarshal([]byte(`{"id":"exec-1","ioClaim":"exec-claim","seccompDefault":true}`), &spec); err != nil {
 		t.Fatal(err)
 	}
 	if spec.IOClaim != "exec-claim" {
 		t.Fatalf("IOClaim = %q, want exec-claim", spec.IOClaim)
 	}
+	if !spec.SeccompDefault {
+		t.Fatal("SeccompDefault did not decode")
+	}
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 14 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 14, got %d", Version)
+	if Version != 15 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 15, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {

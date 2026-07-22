@@ -198,6 +198,9 @@ public struct ContainerRecord: Codable, Sendable {
     /// default remains enabled for unprivileged processes and disabled for
     /// privileged processes.
     public var noNewPrivileges: Bool?
+    /// An explicit Docker seccomp profile selection. `nil` uses Docker's built-in
+    /// profile for unprivileged containers and no profile for privileged containers.
+    public var seccompProfile: String?
     public var readOnlyRootfs: Bool
     /// OCI Linux paths whose contents are hidden from the workload.
     public var maskedPaths: [String]?
@@ -270,6 +273,7 @@ public struct ContainerRecord: Codable, Sendable {
         self.capabilityDrop = []
         self.securityOptions = []
         self.noNewPrivileges = nil
+        self.seccompProfile = nil
         self.readOnlyRootfs = false
         self.maskedPaths = nil
         self.readonlyPaths = nil

@@ -174,6 +174,7 @@ public struct DockerRouter: Sendable {
             record.capabilityDrop = try normalizedCapabilities(input.HostConfig?.CapDrop ?? [])
             record.securityOptions = validated.security.options
             record.noNewPrivileges = validated.security.noNewPrivileges
+            record.seccompProfile = validated.security.seccompProfile
             record.readOnlyRootfs = input.HostConfig?.ReadonlyRootfs ?? false
             record.maskedPaths = input.HostConfig?.MaskedPaths
             record.readonlyPaths = input.HostConfig?.ReadonlyPaths
@@ -1162,6 +1163,7 @@ public struct DockerRouter: Sendable {
     private struct SecurityConfiguration {
         var options: [String]
         var noNewPrivileges: Bool?
+        var seccompProfile: String?
     }
 
     private func decodeContainerUpdate(
@@ -1413,6 +1415,7 @@ public struct DockerRouter: Sendable {
     ) throws -> SecurityConfiguration {
         let values = values ?? []
         var noNewPrivileges: Bool?
+        var seccompProfile: String?
         for value in values {
             if value == "no-new-privileges" {
                 noNewPrivileges = true
@@ -1437,7 +1440,14 @@ public struct DockerRouter: Sendable {
                         "HostConfig.SecurityOpt no-new-privileges requires a boolean value"
                     )
                 }
-            case "seccomp", "apparmor":
+            case "seccomp":
+                guard option == "builtin" || option == "unconfined" else {
+                    throw EngineError(
+                        .unsupported, "HostConfig.SecurityOpt option \(value) is not supported"
+                    )
+                }
+                seccompProfile = option
+            case "apparmor":
                 guard privileged, option == "unconfined" else {
                     throw EngineError(
                         .unsupported, "HostConfig.SecurityOpt option \(value) is not supported"
@@ -1449,7 +1459,9 @@ public struct DockerRouter: Sendable {
                 )
             }
         }
-        return SecurityConfiguration(options: values, noNewPrivileges: noNewPrivileges)
+        return SecurityConfiguration(
+            options: values, noNewPrivileges: noNewPrivileges, seccompProfile: seccompProfile
+        )
     }
 
     private func validateContainerPaths(_ values: [String]?, field: String) throws {

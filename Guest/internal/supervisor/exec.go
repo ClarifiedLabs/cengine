@@ -262,6 +262,11 @@ func RunExecStage3() error {
 	if err := applyRlimits(spec.Rlimits, unix.Setrlimit); err != nil {
 		return err
 	}
+	// Install while the staging process retains CAP_SYS_ADMIN so seccomp does
+	// not force the workload's independently selected no-new-privileges state.
+	if err := applyDefaultSeccomp(spec.SeccompDefault, capabilities); err != nil {
+		return err
+	}
 	if err := applyCapabilityBoundingSet(capabilities, unix.Prctl); err != nil {
 		return err
 	}

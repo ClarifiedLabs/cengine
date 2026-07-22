@@ -95,7 +95,7 @@ public struct DockerInfoResponse: Encodable, Sendable {
     public let MemTotal = ProcessInfo.processInfo.physicalMemory
     public let CgroupDriver = "cgroupfs"
     public let CgroupVersion = "2"
-    public let SecurityOptions = ["name=vm"]
+    public let SecurityOptions = ["name=vm", "name=seccomp,profile=builtin"]
     public let Containerd: ContainerdInfo?
     public let FirewallBackend: FirewallInfo?
     public let DiscoveredDevices: [DeviceInfo]?

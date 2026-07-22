@@ -2763,7 +2763,9 @@ private actor AuthImageBackend: ContainerBackend {
             body: Data(#"{"Image":"alpine","HostConfig":{"Privileged":true,"SecurityOpt":["no-new-privileges","seccomp:unconfined","apparmor=unconfined"]}}"#.utf8)
         ))
         #expect(privileged.status == .created)
-        #expect(try await #require(runtime).container("privileged-security-policy").noNewPrivileges == true)
+        let privilegedRecord = try await #require(runtime).container("privileged-security-policy")
+        #expect(privilegedRecord.noNewPrivileges == true)
+        #expect(privilegedRecord.seccompProfile == "unconfined")
 
         router = nil
         runtime = nil
@@ -3275,22 +3277,27 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
-    @Test func privilegedUnconfinedSecurityDefaultsRemainAcceptedForKind() async throws {
+    @Test func builtInAndUnconfinedSeccompSelectionsAreAccepted() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let accepted = await router.route(.init(
-            method: .POST, uri: "/v1.55/containers/create?name=kind-security-defaults",
-            body: Data(#"{"Image":"alpine","HostConfig":{"Privileged":true,"SecurityOpt":["seccomp=unconfined","apparmor=unconfined"]}}"#.utf8)
-        ))
-        #expect(accepted.status == .created)
-
         for (index, hostConfig) in [
             #"{"SecurityOpt":["seccomp=unconfined"]}"#,
-            #"{"Privileged":true,"SecurityOpt":["seccomp=default"]}"#,
+            #"{"Privileged":true,"SecurityOpt":["seccomp=builtin"]}"#,
+            #"{"Privileged":true,"SecurityOpt":["seccomp=unconfined","apparmor=unconfined"]}"#,
         ].enumerated() {
+            let accepted = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=accepted-security-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
+            ))
+            #expect(accepted.status == .created)
+        }
+
+        for (index, option) in ["seccomp=default", "seccomp={}", "apparmor=unconfined"].enumerated() {
             let rejected = await router.route(.init(
                 method: .POST, uri: "/v1.55/containers/create?name=rejected-security-\(index)",
-                body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
+                body: try JSONSerialization.data(withJSONObject: [
+                    "Image": "alpine", "HostConfig": ["SecurityOpt": [option]],
+                ])
             ))
             #expect(rejected.status == .notImplemented)
         }

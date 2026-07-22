@@ -1710,6 +1710,137 @@ def test_no_new_privileges_security_option_applies_restart_and_survives_recovery
             recovered.close()
 
 
+@pytest.mark.compat("RTM-028")
+def test_default_seccomp_applies_to_init_exec_healthcheck_restart_and_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"default-seccomp-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": [
+                "sh", "-ec",
+                "awk '/^Seccomp:/ { print $2 }' /proc/self/status >/tmp/init-seccomp; "
+                "while :; do sleep 1; done",
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "test \"$(awk '/^Seccomp:/ { print $2 }' /proc/self/status)\" = 2",
+                ],
+                "Interval": 1_000_000_000,
+                "Timeout": 2_000_000_000,
+                "Retries": 5,
+            },
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+    recovered = None
+    probe_ids = []
+
+    def assert_default_profile(value: docker.models.containers.Container) -> None:
+        deadline = time.monotonic() + 30
+        result = None
+        while time.monotonic() < deadline:
+            result = value.exec_run([
+                "sh", "-ec",
+                "test \"$(cat /tmp/init-seccomp)\" = 2; "
+                "awk '/^Seccomp:/ { print $2 }' /proc/self/status",
+            ])
+            value.reload()
+            if result.exit_code == 0 and value.attrs["State"]["Health"]["Status"] == "healthy":
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "default seccomp init/exec/healthcheck policy was not ready: "
+                f"{result.output.decode(errors='replace') if result else 'no exec result'}"
+            )
+        assert result.output.strip() == b"2"
+        assert not value.attrs["HostConfig"]["SecurityOpt"]
+
+    try:
+        container.start()
+        assert_default_profile(container)
+        state = json.loads((daemon.root / "engine.json").read_text())
+        record = persisted_container_record(state, container.id)
+        assert record["securityOptions"] == []
+        assert record.get("seccompProfile") is None
+
+        container.restart(timeout=5)
+        assert_default_profile(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_default_profile(recovered.containers.get(container.id))
+
+        probe_expectations = [
+            ("unconfined", False, ["seccomp=unconfined"], b"0", b"1"),
+            ("privileged-default", True, [], b"0", b"0"),
+            ("privileged-builtin", True, ["seccomp=builtin"], b"2", b"0"),
+            (
+                "explicit-false-builtin", False,
+                ["no-new-privileges=false", "seccomp=builtin"], b"2", b"0",
+            ),
+        ]
+
+        def assert_probe(
+            value: docker.models.containers.Container,
+            security_options: list[str], expected_seccomp: bytes, expected_nnp: bytes,
+        ) -> None:
+            mode = value.exec_run([
+                "sh", "-ec",
+                "for pid in 1 self; do "
+                "printf '%s %s\\n' "
+                "\"$(awk '/^Seccomp:/ { print $2 }' /proc/$pid/status)\" "
+                "\"$(awk '/^NoNewPrivs:/ { print $2 }' /proc/$pid/status)\"; "
+                "done",
+            ])
+            assert mode.exit_code == 0, mode.output
+            expected = expected_seccomp + b" " + expected_nnp
+            assert mode.output.splitlines() == [expected, expected]
+            value.reload()
+            if security_options:
+                assert value.attrs["HostConfig"]["SecurityOpt"] == security_options
+            else:
+                assert not value.attrs["HostConfig"]["SecurityOpt"]
+
+        for name, privileged, security_options, expected_seccomp, expected_nnp in probe_expectations:
+            probe = recovered.containers.run(
+                ALPINE_IMAGE, ["tail", "-f", "/dev/null"], detach=True,
+                name=f"seccomp-{name}-{suffix}", privileged=privileged,
+                security_opt=security_options,
+            )
+            probe_ids.append(probe.id)
+            assert_probe(probe, security_options, expected_seccomp, expected_nnp)
+
+        daemon.restart(kill=True)
+        recovered.close()
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        for probe_id, expectation in zip(probe_ids, probe_expectations, strict=True):
+            _, _, security_options, expected_seccomp, expected_nnp = expectation
+            assert_probe(
+                recovered.containers.get(probe_id), security_options,
+                expected_seccomp, expected_nnp,
+            )
+    finally:
+        cleanup = recovered or client
+        for container_id in [container.id, *probe_ids]:
+            try:
+                cleanup.containers.get(container_id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-004")
 def test_pids_limit_enforces_live_updates_and_survives_recovery(
     daemon, client: docker.DockerClient,

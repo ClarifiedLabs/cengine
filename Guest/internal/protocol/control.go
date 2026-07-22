@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 14
+	Version                         = 15
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -54,6 +54,7 @@ type WorkloadSpec struct {
 	Resources        Resources         `json:"resources"`
 	Privileged       bool              `json:"privileged"`
 	NoNewPrivileges  bool              `json:"noNewPrivileges"`
+	SeccompDefault   bool              `json:"seccompDefault"`
 	Annotations      map[string]string `json:"annotations,omitempty"`
 	CapabilityAdd    []string          `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string          `json:"capabilityDrop,omitempty"`
@@ -169,6 +170,7 @@ type ExecSpec struct {
 	AttachStderr     bool     `json:"attachStderr"`
 	NoNewPrivileges  bool     `json:"noNewPrivileges"`
 	Privileged       bool     `json:"privileged"`
+	SeccompDefault   bool     `json:"seccompDefault"`
 	CapabilityAdd    []string `json:"capabilityAdd,omitempty"`
 	CapabilityDrop   []string `json:"capabilityDrop,omitempty"`
 	Rlimits          []Rlimit `json:"rlimits,omitempty"`
