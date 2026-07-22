@@ -955,7 +955,7 @@ func enableCgroupControllers(path string, requireIO bool) error {
 	if requireIO && !available["io"] {
 		return fmt.Errorf("cgroup at %s does not expose the required io controller", path)
 	}
-	for _, name := range []string{"cpu", "io", "memory", "pids"} {
+	for _, name := range []string{"cpuset", "cpu", "io", "memory", "pids"} {
 		if available[name] {
 			directives = append(directives, "+"+name)
 		}

@@ -151,12 +151,13 @@ volume device and its non-root `io.max` selection.
 
 The workload cgroup now remains the container cgroup-namespace root while init
 moves into a private child leaf. This leaves the namespace root process-free and
-delegates `cpu`, `io`, `memory`, and `pids` controllers to privileged nested
-runtimes without exposing a writable cgroup mount to unprivileged workloads.
-Docker stats read workload-wide cgroup-v2 CPU usage and throttling, current and
-peak memory, file cache, PID count, and per-device I/O rather than init-process
-proxies. `RTM-026` covers nested child-controller use, aggregate accounting,
-restart, and daemon recovery.
+delegates `cpuset`, `cpu`, `io`, `memory`, and `pids` controllers to privileged
+nested runtimes without exposing a writable cgroup mount to unprivileged
+workloads. Docker stats read workload-wide cgroup-v2 CPU usage and throttling,
+current and peak memory, file cache, PID count, and per-device I/O rather than
+init-process proxies. `RTM-026` covers nested child-controller use, aggregate
+accounting, restart, and daemon recovery; `RTM-027` covers top-down cpuset
+delegation and inherited effective CPU and memory-node masks.
 
 Docker block-I/O weights now have an explicit architecture decision. Relative
 weights arbitrate sibling container cgroups sharing one kernel block scheduler;

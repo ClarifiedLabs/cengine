@@ -57,7 +57,7 @@ func (gate *recordingCgroupDelegation) Write(value []byte) (int, error) {
 	return len(value), nil
 }
 
-func TestEnableCgroupControllersDelegatesDockerResourceControllers(t *testing.T) {
+func TestEnableCgroupControllersDelegatesAvailableResourceControllers(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpuset cpu io memory pids\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestEnableCgroupControllersDelegatesDockerResourceControllers(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(value) != "+cpu +io +memory +pids" {
+	if string(value) != "+cpuset +cpu +io +memory +pids" {
 		t.Fatalf("unexpected controller delegation %q", value)
 	}
 }

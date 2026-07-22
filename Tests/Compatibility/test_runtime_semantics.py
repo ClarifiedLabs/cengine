@@ -977,6 +977,53 @@ def test_privileged_cgroup_delegation_and_workload_wide_accounting(
             recovered.close()
 
 
+@pytest.mark.compat("RTM-027")
+def test_privileged_cpuset_delegation_reaches_private_cgroup_namespace(
+    client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        privileged=True,
+        detach=True,
+    )
+    try:
+        result = container.exec_run([
+            "sh", "-ec",
+            "fail() { echo \"cpuset delegation failed: $step\" >&2; exit 1; }; "
+            "step=private-namespace-root; "
+            "test \"$(cat /proc/1/cgroup)\" = '0::/.cengine-init' || fail; "
+            "step=controller-available; "
+            "grep -qw cpuset /sys/fs/cgroup/cgroup.controllers || fail; "
+            "step=controller-delegated; "
+            "grep -qw cpuset /sys/fs/cgroup/cgroup.subtree_control || fail; "
+            "step=root-cpu-mask; cpus=$(cat /sys/fs/cgroup/cpuset.cpus.effective); "
+            "test -n \"$cpus\" || fail; "
+            "step=root-memory-mask; mems=$(cat /sys/fs/cgroup/cpuset.mems.effective); "
+            "test -n \"$mems\" || fail; "
+            "step=create-child; mkdir /sys/fs/cgroup/cpuset-test || fail; "
+            "step=child-files; "
+            "test -e /sys/fs/cgroup/cpuset-test/cpuset.cpus || fail; "
+            "test -e /sys/fs/cgroup/cpuset-test/cpuset.mems || fail; "
+            "step=set-child-cpus; "
+            "echo \"$cpus\" >/sys/fs/cgroup/cpuset-test/cpuset.cpus || fail; "
+            "step=set-child-mems; "
+            "echo \"$mems\" >/sys/fs/cgroup/cpuset-test/cpuset.mems || fail; "
+            "step=verify-child-cpus; "
+            "test \"$(cat /sys/fs/cgroup/cpuset-test/cpuset.cpus)\" = \"$cpus\" || fail; "
+            "sleep 30 & child=$!; "
+            "step=move-child; "
+            "echo \"$child\" >/sys/fs/cgroup/cpuset-test/cgroup.procs || fail; "
+            "step=verify-child; "
+            "test -n \"$(cat /sys/fs/cgroup/cpuset-test/cgroup.procs)\" || fail; "
+            "kill \"$child\"; wait \"$child\" 2>/dev/null || true; "
+            "step=remove-child; rmdir /sys/fs/cgroup/cpuset-test || fail",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+    finally:
+        container.remove(force=True)
+
+
 @pytest.mark.compat("RTM-015")
 def test_block_io_throttles_apply_update_enforce_and_survive_recovery(
     daemon, client: docker.DockerClient,
