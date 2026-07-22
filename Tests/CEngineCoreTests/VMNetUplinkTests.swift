@@ -335,7 +335,9 @@ import Testing
 
         let task = Task {
             try await VMNetUplink.awaitUplinkReply(
-                timeout: .seconds(5),
+                // The full suite can delay this test task before it issues cancellation.
+                // Keep the guard timeout independent from the latency assertion below.
+                timeout: .seconds(30),
                 completionHook: {
                     completionTime.record()
                     completionCount.record()
