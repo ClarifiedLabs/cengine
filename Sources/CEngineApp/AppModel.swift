@@ -522,7 +522,12 @@ extension SMAppService: AppService {}
             return
         }
         refreshTask?.cancel()
-        await CEngineServices.teardownServices()
+        do {
+            try await CEngineServices.teardownServices(agent: agent, helper: helper)
+        } catch {
+            self.error = "Uninstall did not continue because cengine VMs could not be stopped: \(error.localizedDescription)"
+            return
+        }
         let removal = DockerIntegration.remove(
             recordingActiveContextTo: deleteData ? nil : activeContextMarkerURL
         )

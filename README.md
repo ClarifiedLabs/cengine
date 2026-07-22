@@ -164,10 +164,11 @@ provides the same non-destructive uninstall:
 brew uninstall --cask cengine
 ```
 
-It unregisters the background services and removes the `cengine` Docker context
-and `cengine-builder` Buildx builder, but preserves all VM disks and engine data
-for a later reinstall. If `cengine` was the active Docker context, a standard
-reinstall restores it on the next managed engine start. To uninstall **and**
+It stops all cengine VMs, unregisters the background services, and removes the
+`cengine` Docker context and `cengine-builder` Buildx builder, but preserves all
+VM disks and engine data for a later reinstall. If `cengine` was the active
+Docker context, a standard reinstall restores it on the next managed engine
+start. To uninstall **and**
 remove containers, images, volumes, downloaded guest assets, runtime files,
 logs, app preferences, and the saved context selection, use the explicit
 destructive form:

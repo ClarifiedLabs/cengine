@@ -28,6 +28,29 @@ import CEngineCore
         #expect(arguments == ["kickstart", "-k", "gui/\(getuid())/dev.cengine.engine"])
     }
 
+    @MainActor @Test func uninstallStopsShimsAfterEngineAndBeforeNetworkingHelper() async throws {
+        let sequence = TeardownSequenceRecorder()
+        let agent = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onUnregister: { sequence.record("engine") }
+        )
+        let helper = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onUnregister: { sequence.record("helper") }
+        )
+
+        try await CEngineServices.teardownServices(
+            agent: agent,
+            helper: helper,
+            waitForEngineExit: { sequence.record("engine-exited") },
+            stopVirtualMachines: { sequence.record("shims") }
+        )
+
+        #expect(sequence.entries == ["engine", "engine-exited", "shims", "helper"])
+    }
+
     @MainActor @Test func requiredNetworkingRegistersBeforeEngineAndOpensApprovalFromOnboarding() async {
         let suiteName = "AppModelTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -290,17 +313,20 @@ private actor RestartRecorder {
     var status: SMAppService.Status
     let statusAfterRegistration: SMAppService.Status
     let registrationError: Error?
+    let onUnregister: (() -> Void)?
     var registerCount = 0
     var unregisterCount = 0
 
     init(
         status: SMAppService.Status,
         statusAfterRegistration: SMAppService.Status,
-        registrationError: Error? = nil
+        registrationError: Error? = nil,
+        onUnregister: (() -> Void)? = nil
     ) {
         self.status = status
         self.statusAfterRegistration = statusAfterRegistration
         self.registrationError = registrationError
+        self.onUnregister = onUnregister
     }
 
     func register() throws {
@@ -311,8 +337,14 @@ private actor RestartRecorder {
 
     func unregister() async throws {
         unregisterCount += 1
+        onUnregister?()
         status = .notRegistered
     }
+}
+
+@MainActor private final class TeardownSequenceRecorder {
+    private(set) var entries: [String] = []
+    func record(_ value: String) { entries.append(value) }
 }
 
 @Suite struct EngineAvailabilityTests {

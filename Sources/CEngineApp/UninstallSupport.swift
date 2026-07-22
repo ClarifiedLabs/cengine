@@ -22,27 +22,48 @@ enum CEngineServices {
         try runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(engineLabel)"])
     }
 
-    /// Unregisters the network-helper daemon and then the engine agent,
-    /// tolerating already-removed services so repeated teardowns stay idempotent.
-    static func teardownServices() async {
-        let services = [
-            SMAppService.daemon(plistName: helperPlist),
-            SMAppService.agent(plistName: agentPlist),
-        ]
-        for service in services {
-            let status = service.status
-            guard status != .notRegistered, status != .notFound else { continue }
-            do {
-                try await service.unregister()
-            } catch {
-                FileHandle.standardError.write(Data("cengine uninstall: \(error.localizedDescription)\n".utf8))
-            }
+    /// Quiesces the engine, stops every persistent VM shim, and only then
+    /// unregisters the privileged helper. Keeping this order prevents an old
+    /// infrastructure shim from reconnecting and reclaiming vmnet during zap.
+    @MainActor static func teardownServices(
+        agent: any AppService = SMAppService.agent(plistName: agentPlist),
+        helper: any AppService = SMAppService.daemon(plistName: helperPlist),
+        waitForEngineExit: @MainActor () async throws -> Void = {
+            try await Task.sleep(for: .seconds(2))
+        },
+        stopVirtualMachines: @MainActor () async throws -> Void = {
+            try await runVirtualMachineShutdown()
+        }
+    ) async throws {
+        let agentWasRegistered = !needsRegistration(agent.status)
+        if agentWasRegistered {
+            try await agent.unregister()
+            try await waitForEngineExit()
+        }
+        try await stopVirtualMachines()
+        if !needsRegistration(helper.status) {
+            try await helper.unregister()
         }
     }
 
+    private static func runVirtualMachineShutdown() async throws {
+        let executable = Bundle.main.bundleURL
+            .appending(path: "Contents/MacOS/cengine-engine")
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw EngineError(.notFound, "bundled cengine engine is missing")
+        }
+        try await Task.detached {
+            try run(executable.path, ["system", "shutdown"])
+        }.value
+    }
+
     private static func runLaunchctl(_ arguments: [String]) throws {
+        try run("/bin/launchctl", arguments)
+    }
+
+    private static func run(_ executable: String, _ arguments: [String]) throws {
         let process = Process()
-        process.executableURL = URL(filePath: "/bin/launchctl")
+        process.executableURL = URL(filePath: executable)
         process.arguments = arguments
         let output = Pipe()
         process.standardOutput = output
@@ -54,7 +75,7 @@ enum CEngineServices {
         guard process.terminationStatus == 0 else {
             throw EngineError(
                 .internalError,
-                "launchctl \(arguments.joined(separator: " ")) failed"
+                "\(([executable] + arguments).joined(separator: " ")) failed"
                     + (message.isEmpty ? "" : ": \(message)")
             )
         }
@@ -111,7 +132,14 @@ enum UninstallSupport {
             exit(1) // watchdog: brew must never hang on a wedged teardown
         }
         Task {
-            await CEngineServices.teardownServices()
+            do {
+                try await CEngineServices.teardownServices()
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "cengine uninstall: \(error.localizedDescription)\n".utf8
+                ))
+                exit(1)
+            }
             let removal = DockerIntegration.remove(
                 recordingActiveContextTo: EnginePaths().activeContextMarker
             )

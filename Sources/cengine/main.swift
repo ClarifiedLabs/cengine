@@ -235,6 +235,9 @@ private final class DaemonLock {
             #else
             throw EngineError(.unsupported, "Apple silicon is required")
             #endif
+        case "shutdown":
+            let count = try await VMShimTeardown.terminateAll(in: EnginePaths().data)
+            print("stopped \(count) cengine VM shim\(count == 1 ? "" : "s")")
         case "install": try await SystemManager.install(paths: EnginePaths())
         case "uninstall": try SystemManager.uninstall(paths: EnginePaths())
         default: throw EngineError(.badRequest, "system command is not implemented yet")
@@ -425,7 +428,7 @@ private final class DaemonLock {
           daemon [--socket PATH] [--root PATH] [--kernel PATH] [--container-initramfs PATH] [--storage-initramfs PATH] [--automatic-ipv4-pool CIDR] [--automatic-ipv6-prefix CIDR] [--metadata-only]
           network-helper status|restart
           service run
-          system status|doctor|install|uninstall
+          system status|doctor|shutdown|install|uninstall
           version
         """)
     }

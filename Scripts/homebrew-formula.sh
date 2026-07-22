@@ -40,7 +40,7 @@ cask "cengine" do
                 "--",
                 "/Applications/cengine.app/Contents/MacOS/cengine",
               ],
-              must_succeed: false,
+              must_succeed: true,
             },
             launchctl: ["dev.cengine.engine", "dev.cengine.network-helper"],
             quit: "dev.cengine.app",
