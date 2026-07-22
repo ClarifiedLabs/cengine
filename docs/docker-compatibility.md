@@ -54,7 +54,7 @@ reference beneath the Docker API.
 | Container lifecycle and inspect | `CTR-001`–`CTR-048`, `EVT-001`–`EVT-005`, `CLI-002`–`CLI-004`, `CLI-008` | Concurrent VM creation/start is covered at twelve containers; lifecycle event filters include the creating image and accept both Docker filter encodings; longer-running high-volume churn is not assessed. |
 | Archive, exec, observability, update | `CTR-015`, `CTR-024`–`CTR-033`, `CTR-036`, `CTR-038`–`CTR-047`, `CLI-006` | Disk usage, filtered logs, historical events, and multi-container stats have black-box coverage. |
 | Networks, ports, and volumes | `CTR-002`, `CTR-004`, `CTR-034`–`CTR-035`, `NET-001`–`NET-022`, `VOL-001`–`VOL-006`, `CLI-005`, `KND-001` | Address-family control, endpoint sysctls, IPAM validation/status and filtered pruning, MAC application, and gateway priority are covered. SCTP publishing is an intentional gap (`NET-017`). |
-| Images and build | `IMG-001`–`IMG-023`, `BLD-001`–`BLD-003`, `EVT-003` | Multi-platform graph selection, archives, descriptors, identity, attestations, Docker Hub search, authenticated registry round trips, and pull/load events are covered. |
+| Images and build | `IMG-001`–`IMG-024`, `BLD-001`–`BLD-003`, `EVT-003` | Multi-platform graph selection, single- and multi-repository archives, descriptors, identity, attestations, Docker Hub search, authenticated registry round trips, and pull/load events are covered. |
 | Compose and recovery | `CMP-001`–`CMP-007`, `REC-001`–`REC-006` | Recovery covers live workloads, log and stats streams, active networking, restart-policy semantics, and vmnet reservation release. |
 | Testcontainers | `TST-001`–`TST-004` | Ryuk is exercised with default and privileged container configurations against the bound cengine Docker socket, including shell-less exec probing and concurrent control connections. |
 | Differential behavior | `ORC-001`–`ORC-002` | Optional lifecycle and multi-platform image response-shape comparisons require an explicit reference Docker Engine. |
@@ -270,7 +270,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `IMG-006` | `test_remove_image` | ✅ Pass | Support | Missing-image and successful removal behavior. |
 | `IMG-007` | `test_image_history` | ✅ Pass | Support | History includes the image identifier. |
 | `IMG-008` | `test_get_image_exists_not` | ✅ Pass | Support | Missing images return NotFound. |
-| `IMG-009` | `test_save_image` | ✅ Pass | Support | Docker archive export from the backend OCI store. |
+| `IMG-009` | `test_save_image` | ✅ Pass | Support | Per-image Docker archive export from the backend OCI store. |
 | `IMG-010` | `test_load_image` | ✅ Pass | Support | Docker save/load round trips. |
 | `IMG-011` | `test_load_corrupt_image` | ✅ Pass | Support | Corrupt archives are rejected. |
 | `IMG-012` | `test_build_image` | ❌ Known fail | Intentional gap | Direct build is intentionally unsupported. |
@@ -285,6 +285,7 @@ Docker Engine semantics or observed Docker Compose 5.3.1 behavior.
 | `IMG-021` | `test_image_identity_records_trusted_pull_origin` | ✅ Pass | Support | **cengine-owned.** Inspect and identity-enabled list responses report daemon-recorded pull origins. |
 | `IMG-022` | `test_image_attestations_support_filters_and_statement_opt_in` | ✅ Pass | Support | **cengine-owned.** Attestation metadata avoids reading statements until opted in and supports predicate filtering. |
 | `IMG-023` | `test_manifest_options_reject_conflicts_and_preserve_identity_after_retag` | ✅ Pass | Support | **cengine-owned.** Inspect rejects conflicting selectors, and retagging cannot manufacture trusted identity origins. |
+| `IMG-024` | `test_docker_cli_saves_multiple_images` | ✅ Pass | Support | **cengine-owned.** Docker CLI collection export preserves every requested image and its repository tags in one archive, as required by `GET /images/get` and consumed by kind image loading. |
 
 ## System
 

@@ -7,6 +7,8 @@ import io
 import json
 import os
 import pathlib
+import subprocess
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +17,8 @@ import uuid
 import docker
 import pytest
 from docker import errors
+
+from harness import docker_environment
 
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
@@ -336,3 +340,29 @@ def test_manifest_options_reject_conflicts_and_preserve_identity_after_retag(cli
     alias = f"identity-retag-{uuid.uuid4().hex[:8]}:latest"
     assert client.images.get(MULTI_PLATFORM_IMAGE).tag(alias)
     assert image_request(client, f"/images/{alias}/json")["Identity"] == original
+
+
+@pytest.mark.compat("IMG-024")
+def test_docker_cli_saves_multiple_images(client: docker.DockerClient, daemon, tmp_path: pathlib.Path):
+    archive_path = tmp_path / "images.tar"
+    result = subprocess.run(
+        ["docker", "image", "save", "--output", str(archive_path), IMAGE, BUSYBOX],
+        env=docker_environment(daemon.socket), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout
+
+    expected_configs = {
+        client.images.get(reference).id.removeprefix("sha256:")
+        for reference in (IMAGE, BUSYBOX)
+    }
+    with tarfile.open(archive_path) as archive:
+        manifest_file = archive.extractfile("manifest.json")
+        assert manifest_file is not None
+        manifest = json.load(manifest_file)
+    exported_configs = {
+        pathlib.PurePosixPath(entry["Config"]).name
+        for entry in manifest
+    }
+    assert expected_configs <= exported_configs
+    assert all(entry["RepoTags"] and all(entry["RepoTags"]) for entry in manifest)

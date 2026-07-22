@@ -986,6 +986,7 @@ private actor ParentTeardownExecBackend: ContainerBackend {
 private actor ImageStoreBackend: ContainerBackend {
     private var references = ["docker.io/library/existing:latest"]
     private var deleted: [String] = []
+    private var exported: [String] = []
     func pullImage(_ reference: String, platform _: String) async throws { references.append(reference) }
     func prepare(_ container: ContainerRecord) async throws {
         let reference = ImageReference.normalized(container.image)
@@ -1005,7 +1006,12 @@ private actor ImageStoreBackend: ContainerBackend {
         references.removeAll { $0 == reference }
         deleted.append(reference)
     }
+    func saveImages(references: [String], platforms _: [OCIPlatform]) async throws -> Data {
+        exported = references
+        return Data("archive".utf8)
+    }
     func deletedReferences() -> [String] { deleted }
+    func exportedReferences() -> [String] { exported }
 }
 
 private func multiPlatformBackendImage() -> BackendImage {
@@ -6418,6 +6424,27 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(selections.attestation?.architecture == "arm64")
         #expect(selections.types == ["https://spdx.dev/Document", "https://slsa.dev/provenance/v1"])
         #expect(selections.statement)
+    }
+
+    @Test func collectionImageExportPreservesAllRequestedNames() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ImageStoreBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        _ = try await runtime.pullImage("busybox:latest")
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        let response = await router.route(.init(
+            method: .GET,
+            uri: "/v1.55/images/get?names=existing%3Alatest&names=busybox%3Alatest"
+        ))
+
+        #expect(response.status == .ok)
+        #expect(response.body == Data("archive".utf8))
+        #expect(await backend.exportedReferences() == [
+            "docker.io/library/existing:latest",
+            "docker.io/library/busybox:latest",
+        ])
     }
 
     @Test func pullImageByDigestUsesDigestSeparator() async throws {

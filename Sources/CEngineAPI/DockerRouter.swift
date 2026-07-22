@@ -649,6 +649,21 @@ public struct DockerRouter: Sendable {
                 output = "{\"errorDetail\":{\"message\":\"\(escaped)\"},\"error\":\"\(escaped)\"}\n"
             }
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
+        case (.GET, "/images/get"):
+            let platforms = version >= .init(major: 1, minor: 48)
+                ? try imagePlatforms(
+                    queries["platform"] ?? [],
+                    repeated: version >= .init(major: 1, minor: 52)
+                )
+                : []
+            return APIResponse(
+                status: .ok,
+                headers: ["Content-Type": "application/x-tar"],
+                body: try await runtime.saveImages(
+                    queries["names"] ?? [],
+                    platforms: platforms
+                )
+            )
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/get"):
             let id = String(value.dropFirst("/images/".count).dropLast("/get".count)).removingPercentEncoding ?? value
             let platforms = version >= .init(major: 1, minor: 48)

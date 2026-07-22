@@ -187,8 +187,9 @@ attestations. Identity intentionally omits build and signature claims because
 cengine does not have verified evidence for either.
 
 The VM-backed compatibility suite covers successful and missing platform
-selection, multi-platform archive round trips, selective deletion, identity,
-attestations, and optional differential response-shape comparison.
+selection, multi-platform archive round trips, multi-repository Docker CLI
+exports used by kind image loading, selective deletion, identity, attestations,
+and optional differential response-shape comparison.
 
 ### Client-visible metadata and image events
 

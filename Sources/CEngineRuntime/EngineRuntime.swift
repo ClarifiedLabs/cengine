@@ -1429,6 +1429,7 @@ public actor EngineRuntime {
     }
 
     public func image(_ identifier: String) throws -> ImageRecord {
+        guard !identifier.isEmpty else { throw EngineError(.notFound, "No such image: \(identifier)") }
         let normalized = ImageReference.normalized(identifier)
         guard let image = snapshot.images.first(where: {
             $0.id == identifier || $0.id.hasPrefix(identifier) || $0.references.contains(identifier) || $0.references.contains(normalized)
@@ -1503,8 +1504,15 @@ public actor EngineRuntime {
     }
 
     public func saveImage(_ identifier: String, platforms: [OCIPlatform] = []) async throws -> Data {
-        _ = try image(identifier)
-        return try await backend.saveImages(references: [ImageReference.normalized(identifier)], platforms: platforms)
+        try await saveImages([identifier], platforms: platforms)
+    }
+
+    public func saveImages(_ identifiers: [String], platforms: [OCIPlatform] = []) async throws -> Data {
+        for identifier in identifiers { _ = try image(identifier) }
+        return try await backend.saveImages(
+            references: identifiers.map(ImageReference.normalized),
+            platforms: platforms
+        )
     }
 
     public func imageAttestations(
