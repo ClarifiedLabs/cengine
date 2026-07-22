@@ -721,6 +721,12 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 
     @Test func disconnectAfterMultiplePipelinedReadCyclesCancelsRegistrySearch() async throws {
+        try await withDockerServerTestIsolation {
+            try await runDisconnectAfterMultiplePipelinedReadCyclesCancelsRegistrySearch()
+        }
+    }
+
+    private func runDisconnectAfterMultiplePipelinedReadCyclesCancelsRegistrySearch() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -771,6 +777,12 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 
     @Test func excessivePipelinedBytesCloseConnectionAndCancelRegistrySearch() async throws {
+        try await withDockerServerTestIsolation {
+            try await runExcessivePipelinedBytesCloseConnectionAndCancelRegistrySearch()
+        }
+    }
+
+    private func runExcessivePipelinedBytesCloseConnectionAndCancelRegistrySearch() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -824,6 +836,12 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 
     @Test func sameWritePipelinedBytesAreCappedAfterAsyncRequestBegins() async throws {
+        try await withDockerServerTestIsolation {
+            try await runSameWritePipelinedBytesAreCappedAfterAsyncRequestBegins()
+        }
+    }
+
+    private func runSameWritePipelinedBytesAreCappedAfterAsyncRequestBegins() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -867,6 +885,12 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 
     @Test func excessiveChunkedPipelinedPartsCloseConnectionAndCancelRegistrySearch() async throws {
+        try await withDockerServerTestIsolation {
+            try await runExcessiveChunkedPipelinedPartsCloseConnectionAndCancelRegistrySearch()
+        }
+    }
+
+    private func runExcessiveChunkedPipelinedPartsCloseConnectionAndCancelRegistrySearch() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -920,6 +944,12 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 
     @Test func pendingPartBudgetSpansResponseBoundaries() async throws {
+        try await withDockerServerTestIsolation {
+            try await runPendingPartBudgetSpansResponseBoundaries()
+        }
+    }
+
+    private func runPendingPartBudgetSpansResponseBoundaries() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -986,6 +1016,12 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 
     @Test func pipelinedRegistrySearchesPreserveKeepAliveResponseOrdering() async throws {
+        try await withDockerServerTestIsolation {
+            try await runPipelinedRegistrySearchesPreserveKeepAliveResponseOrdering()
+        }
+    }
+
+    private func runPipelinedRegistrySearchesPreserveKeepAliveResponseOrdering() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

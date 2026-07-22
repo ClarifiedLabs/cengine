@@ -78,6 +78,21 @@ private func upgradedExecStart(socketPath: String, execID: String, body: String)
     )
 }
 
+private func withRunningDockerServer<T>(
+    _ server: DockerServer,
+    operation: () async throws -> T
+) async throws -> T {
+    try await server.start()
+    do {
+        let result = try await operation()
+        try await server.shutdown()
+        return result
+    } catch {
+        try? await server.shutdown()
+        throw error
+    }
+}
+
 private actor CompletionBackend: ContainerBackend {
     private var continuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private let log: Data
@@ -4977,6 +4992,12 @@ private actor AuthImageBackend: ContainerBackend {
     }
 
     @Test func resourceScopeSocketFollowsOwnerProcessLifetime() async throws {
+        try await withDockerServerTestIsolation {
+            try await runResourceScopeSocketFollowsOwnerProcessLifetime()
+        }
+    }
+
+    private func runResourceScopeSocketFollowsOwnerProcessLifetime() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let sockets = URL(filePath: "/tmp/cengine-scope-test-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer {
@@ -5017,6 +5038,12 @@ private actor AuthImageBackend: ContainerBackend {
     }
 
     @Test func resourceScopeControlEndpointCreatesAndDeletesSocket() async throws {
+        try await withDockerServerTestIsolation {
+            try await runResourceScopeControlEndpointCreatesAndDeletesSocket()
+        }
+    }
+
+    private func runResourceScopeControlEndpointCreatesAndDeletesSocket() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let sockets = URL(filePath: "/tmp/cengine-scope-api-test-\(UUID().uuidString)", directoryHint: .isDirectory)
         defer {
@@ -7049,6 +7076,12 @@ private actor AuthImageBackend: ContainerBackend {
     }
 
     @Test func successfulAttachAndExecUpgradesSurviveDisconnectMonitoringRemoval() async throws {
+        try await withDockerServerTestIsolation {
+            try await runSuccessfulAttachAndExecUpgradesSurviveDisconnectMonitoringRemoval()
+        }
+    }
+
+    private func runSuccessfulAttachAndExecUpgradesSurviveDisconnectMonitoringRemoval() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -7067,26 +7100,31 @@ private actor AuthImageBackend: ContainerBackend {
             configuration: .init(arguments: ["true"], tty: false)
         )
         let server = DockerServer(socketPath: socket, router: router)
-        try await server.start()
-        defer { Task { try? await server.shutdown() } }
+        try await withRunningDockerServer(server) {
+            let attach = try await upgradedDockerRequest(
+                socketPath: socket,
+                path: "/v1.44/containers/\(container.id)/attach?stream=1&stdout=1&stderr=1",
+                body: "",
+                maximumTimeSeconds: 1
+            )
+            #expect(attach.contains("101 Switching Protocols"), "curl output: \(attach)")
 
-        let attach = try await upgradedDockerRequest(
-            socketPath: socket,
-            path: "/v1.44/containers/\(container.id)/attach?stream=1&stdout=1&stderr=1",
-            body: "",
-            maximumTimeSeconds: 1
-        )
-        #expect(attach.contains("101 Switching Protocols"), "curl output: \(attach)")
-
-        let execStart = try await upgradedExecStart(
-            socketPath: socket,
-            execID: exec.id,
-            body: #"{"Detach":false,"Tty":false}"#
-        )
-        #expect(execStart.contains("101 Switching Protocols"), "curl output: \(execStart)")
+            let execStart = try await upgradedExecStart(
+                socketPath: socket,
+                execID: exec.id,
+                body: #"{"Detach":false,"Tty":false}"#
+            )
+            #expect(execStart.contains("101 Switching Protocols"), "curl output: \(execStart)")
+        }
     }
 
     @Test func attachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
+        try await withDockerServerTestIsolation {
+            try await runAttachedUpgradeValidatesExecStartBodyBeforeHijacking()
+        }
+    }
+
+    private func runAttachedUpgradeValidatesExecStartBodyBeforeHijacking() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let socket = root.appending(path: "engine.sock").path
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -7100,22 +7138,27 @@ private actor AuthImageBackend: ContainerBackend {
             configuration: .init(arguments: ["true"], tty: false)
         )
         let server = DockerServer(socketPath: socket, router: router)
-        try await server.start()
-        defer { Task { try? await server.shutdown() } }
-
-        let detached = try await upgradedExecStart(
-            socketPath: socket, execID: exec.id, body: #"{"Detach":true,"Tty":false}"#
-        )
-        #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
-        let mismatchedTTY = try await upgradedExecStart(
-            socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
-        )
-        #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
-        #expect(try await runtime.exec(exec.id).running == false)
-        #expect(try await runtime.exec(exec.id).exitCode == nil)
+        try await withRunningDockerServer(server) {
+            let detached = try await upgradedExecStart(
+                socketPath: socket, execID: exec.id, body: #"{"Detach":true,"Tty":false}"#
+            )
+            #expect(detached.contains("400 Bad Request"), "curl output: \(detached)")
+            let mismatchedTTY = try await upgradedExecStart(
+                socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
+            )
+            #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
+            #expect(try await runtime.exec(exec.id).running == false)
+            #expect(try await runtime.exec(exec.id).exitCode == nil)
+        }
     }
 
     @Test func scopedSocketValidatesExecUpgradeBodyBeforeHijacking() async throws {
+        try await withDockerServerTestIsolation {
+            try await runScopedSocketValidatesExecUpgradeBodyBeforeHijacking()
+        }
+    }
+
+    private func runScopedSocketValidatesExecUpgradeBodyBeforeHijacking() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let sockets = URL(
             filePath: "/tmp/cengine-scope-upgrade-test-\(UUID().uuidString)",
