@@ -5200,6 +5200,61 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(!wideDeleted.map { $0["Deleted"] }.contains(usedDangling.id))
     }
 
+    @Test func imageListFiltersAndReportsConfigurationLabels() async throws {
+        func image(id: String, sessionID: String) -> ImageRecord {
+            let descriptor = OCIDescriptor(
+                mediaType: "application/vnd.oci.image.manifest.v1+json",
+                digest: "\(id)-manifest",
+                size: 1
+            )
+            return ImageRecord(
+                id: id,
+                references: ["docker.io/library/\(sessionID):latest"],
+                createdAt: Date(),
+                size: 1,
+                architecture: "arm64",
+                os: "linux",
+                manifests: [
+                    .init(
+                        descriptor: descriptor,
+                        imageID: id,
+                        available: true,
+                        kind: .image,
+                        configuration: .init(labels: [
+                            "org.testcontainers.sessionId": sessionID,
+                            "org.testcontainers.ryuk": "true",
+                        ])
+                    ),
+                ],
+                preferredManifestDigest: descriptor.digest
+            )
+        }
+
+        let matching = image(id: "sha256:session-a", sessionID: "session-a")
+        let unrelated = image(id: "sha256:session-b", sessionID: "session-b")
+        let (router, root) = try await fixture(snapshot: .init(images: [matching, unrelated]))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let filtered = await router.route(.init(
+            method: .GET,
+            uri: "/v1.55/images/json?filters=%7B%22label%22%3A%7B%22org.testcontainers.sessionId%3Dsession-a%22%3Atrue%7D%7D"
+        ))
+        #expect(filtered.status == .ok)
+        let images = try #require(JSONSerialization.jsonObject(with: filtered.body) as? [[String: Any]])
+        #expect(images.count == 1)
+        #expect(images.first?["Id"] as? String == matching.id)
+        let labels = try #require(images.first?["Labels"] as? [String: String])
+        #expect(labels["org.testcontainers.sessionId"] == "session-a")
+        #expect(labels["org.testcontainers.ryuk"] == "true")
+
+        let absent = await router.route(.init(
+            method: .GET,
+            uri: "/v1.55/images/json?filters=%7B%22label%22%3A%5B%22org.testcontainers.sessionId%3Dmissing%22%5D%7D"
+        ))
+        #expect(absent.status == .ok)
+        #expect((try JSONSerialization.jsonObject(with: absent.body) as? [[String: Any]])?.isEmpty == true)
+    }
+
     @Test func volumePruneDefaultsToUnusedAnonymousAndCanExplicitlyWiden() async throws {
         let named = VolumeRecord(name: "keep-named", sizeBytes: 1, anonymous: false)
         let anonymous = VolumeRecord(name: "remove-anonymous", sizeBytes: 1, anonymous: true)
@@ -8607,6 +8662,42 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(conflicts == 1)
         #expect(await backend.prepareCount() == 1)
         #expect(await runtime.listContainers(all: true).count == 1)
+    }
+
+    @Test func pendingContainerCreateReservesItsImageFromRemovalAndPruning() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = ImageRecord(
+            id: "sha256:pending-create",
+            references: ["docker.io/library/debian:latest"],
+            createdAt: Date(),
+            size: 1,
+            architecture: "arm64",
+            os: "linux"
+        )
+        let store = AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+        try await store.save(.init(images: [image]))
+        let backend = BlockingPrepareBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let create = Task {
+            try await runtime.createContainer(
+                ContainerRecord(name: "pending-image-consumer", image: "debian")
+            )
+        }
+        while await backend.prepareCount() == 0 { await Task.yield() }
+
+        do {
+            _ = try await runtime.removeImage("debian", force: true)
+            Issue.record("forced image removal succeeded during container preparation")
+        } catch let error as EngineError {
+            #expect(error.code == .conflict)
+            #expect(error.message.contains("pending container create"))
+        }
+        #expect(try await runtime.pruneImages(scope: .allUnused).isEmpty)
+
+        await backend.releasePreparations()
+        _ = try await create.value
+        #expect(await runtime.listImages().map(\.id) == [image.id])
     }
 
     @Test func concurrentCreatesReserveEndpointAddressesBeforeBackendPreparation() async throws {

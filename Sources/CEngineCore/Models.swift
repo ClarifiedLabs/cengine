@@ -448,4 +448,8 @@ public struct ImageRecord: Codable, Sendable {
         preferredManifestDigest.flatMap { digest in manifests.first { $0.descriptor.digest == digest } }
             ?? manifests.first { $0.kind == .image && $0.available }
     }
+
+    public var labels: [String: String] {
+        preferredManifest?.configuration?.labels ?? [:]
+    }
 }

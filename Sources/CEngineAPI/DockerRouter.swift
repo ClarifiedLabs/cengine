@@ -1093,6 +1093,7 @@ public struct DockerRouter: Sendable {
 
     private func filteredImages(_ images: [ImageRecord], filters: String?) -> [ImageRecord] {
         let references = filterValues(filters, key: "reference")
+        let labels = filterValues(filters, key: "label")
         let dangling = filterValues(filters, key: "dangling").first.flatMap(parseBool)
         return images.filter { image in
             let referenceMatches = references.isEmpty || references.contains { pattern in
@@ -1101,7 +1102,9 @@ public struct DockerRouter: Sendable {
                     return reference == ImageReference.normalized(pattern)
                 }
             }
-            return referenceMatches && (dangling == nil || dangling == image.references.isEmpty)
+            return referenceMatches
+                && labelsMatch(image.labels, expressions: labels)
+                && (dangling == nil || dangling == image.references.isEmpty)
         }
     }
 

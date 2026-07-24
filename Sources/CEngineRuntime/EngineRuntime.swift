@@ -1471,9 +1471,10 @@ public actor EngineRuntime {
     public func removeImage(_ identifier: String, force: Bool, platforms: [OCIPlatform] = []) async throws -> [String] {
         try requireCanonicalSnapshotWritable()
         let image = try image(identifier)
-        guard force || !snapshot.containers.contains(where: {
-            $0.imageID == image.id || image.references.contains($0.image) || image.references.contains(ImageReference.normalized($0.image))
-        }) else {
+        guard !pendingContainers.values.contains(where: { Self.image(image, isUsedBy: $0) }) else {
+            throw EngineError(.conflict, "conflict: image is being used by a pending container create")
+        }
+        guard force || !snapshot.containers.contains(where: { Self.image(image, isUsedBy: $0) }) else {
             throw EngineError(.conflict, "conflict: image is being used by a container")
         }
         let reference = image.references.first(where: {
@@ -1809,19 +1810,22 @@ public actor EngineRuntime {
     public func pruneImages(scope: ImagePruneScope = .dangling) async throws -> [ImageRecord] {
         try requireCanonicalSnapshotWritable()
         let removed = snapshot.images.filter { image in
-            let used = snapshot.containers.contains { container in
-                container.image == image.id
-                    || container.imageID == image.id
-                    || image.manifests.contains { $0.imageID == container.imageID }
-                    || image.references.contains(container.image)
-                    || image.references.contains(ImageReference.normalized(container.image))
-            }
+            let used = snapshot.containers.contains { Self.image(image, isUsedBy: $0) }
+                || pendingContainers.values.contains { Self.image(image, isUsedBy: $0) }
             guard !used else { return false }
             return scope == .allUnused || image.references.isEmpty
         }
         for image in removed { for reference in image.references { try await backend.deleteImage(reference: reference) } }
         let ids = Set(removed.map(\.id)); snapshot.images.removeAll { ids.contains($0.id) }
         try await persist(); return removed
+    }
+
+    private static func image(_ image: ImageRecord, isUsedBy container: ContainerRecord) -> Bool {
+        container.image == image.id
+            || container.imageID == image.id
+            || image.manifests.contains { $0.imageID == container.imageID }
+            || image.references.contains(container.image)
+            || image.references.contains(ImageReference.normalized(container.image))
     }
 
     public func pruneVolumes(scope: VolumePruneScope = .anonymous) async throws -> [String] {

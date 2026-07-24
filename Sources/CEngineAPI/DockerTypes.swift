@@ -773,7 +773,8 @@ public struct ImageSummaryResponse: Encodable, Sendable {
         RepoTags = image.references.filter { !$0.contains("@") }.map(dockerDisplayReference)
         RepoDigests = image.references.filter { $0.contains("@") }.map(dockerDisplayReference)
         ParentId = ""; Containers = containers
-        Created = Int64(image.createdAt.timeIntervalSince1970); Size = image.size; SharedSize = 0; Labels = [:]
+        Created = Int64(image.createdAt.timeIntervalSince1970); Size = image.size; SharedSize = 0
+        Labels = image.labels
         Descriptor = includeDescriptor ? image.targetDescriptor : nil
         Manifests = includeManifests ? image.manifests.map { manifest in
             ImageManifestSummaryResponse(

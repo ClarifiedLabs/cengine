@@ -18,6 +18,7 @@ from harness import compatibility_fixture_ipv6, persisted_container_record
 
 DIND_IMAGE = "docker:29.6.2-dind"
 ALPINE_IMAGE = "alpine:latest"
+RYUK_IMAGE = "testcontainers/ryuk:0.13.0"
 SNAPSHOT_SCRIPT = r"""
 snapshot() {
     for namespace in mnt pid uts ipc net cgroup; do
@@ -367,6 +368,28 @@ def test_console_size_applies_to_container_and_exec_ptys(client: docker.DockerCl
         wait_for_size("/tmp/exec-size", b"55 145")
     finally:
         container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-031")
+def test_image_label_filters_isolate_testcontainers_cleanup_sessions(
+    client: docker.DockerClient,
+):
+    ryuk = client.images.get(RYUK_IMAGE)
+    labels = ryuk.attrs["Config"]["Labels"]
+    assert labels["org.testcontainers.ryuk"] == "true"
+
+    by_key = client.images.list(filters={"label": "org.testcontainers.ryuk"})
+    assert {image.id for image in by_key} == {ryuk.id}
+
+    by_value = client.images.list(filters={"label": "org.testcontainers.ryuk=true"})
+    assert {image.id for image in by_value} == {ryuk.id}
+
+    unrelated_session = client.images.list(filters={
+        "label": f"org.testcontainers.sessionId=missing-{uuid.uuid4().hex}",
+    })
+    assert unrelated_session == []
+    assert client.images.get(ALPINE_IMAGE).id
+    assert client.images.get(RYUK_IMAGE).id == ryuk.id
 
 
 @pytest.mark.compat("RTM-014")
