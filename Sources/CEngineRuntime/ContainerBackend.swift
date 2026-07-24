@@ -249,7 +249,9 @@ public protocol ContainerBackend: Sendable {
     func discardExec(_ exec: ExecRecord) async
     func retireExec(_ exec: ExecRecord) async
     func startExec(_ exec: ExecRecord) async throws
+    func startExec(_ exec: ExecRecord, consoleSize: TerminalSize?) async throws
     func startAttachedExec(_ exec: ExecRecord) async throws -> CInt?
+    func startAttachedExec(_ exec: ExecRecord, consoleSize: TerminalSize?) async throws -> CInt?
     func execCompletion(_ exec: ExecRecord) async -> Int32?
     func execIO(_ exec: ExecRecord) async throws -> ContainerIOBridge
     func execPID(_ exec: ExecRecord) async -> Int32
@@ -299,7 +301,9 @@ public extension ContainerBackend {
     func io(for _: ContainerRecord) async throws -> ContainerIOBridge {
         throw EngineError(.unsupported, "container I/O is unavailable for this backend")
     }
-    func resize(_: ContainerRecord, width _: UInt16, height _: UInt16) async throws {}
+    func resize(_: ContainerRecord, width _: UInt16, height _: UInt16) async throws {
+        throw EngineError(.unsupported, "container resize is unavailable for this backend")
+    }
     func completion(_: ContainerRecord) async -> Int32? { nil }
     func logs(for _: ContainerRecord) async throws -> Data { Data() }
     func kill(_: ContainerRecord, signal _: String) async throws {}
@@ -309,12 +313,22 @@ public extension ContainerBackend {
     func discardExec(_: ExecRecord) async {}
     func retireExec(_ exec: ExecRecord) async { await discardExec(exec) }
     func startExec(_: ExecRecord) async throws { throw EngineError(.unsupported, "exec is unavailable for this backend") }
+    func startExec(_ exec: ExecRecord, consoleSize _: TerminalSize?) async throws {
+        try await startExec(exec)
+    }
     func startAttachedExec(_: ExecRecord) async throws -> CInt? { nil }
+    func startAttachedExec(
+        _ exec: ExecRecord, consoleSize _: TerminalSize?
+    ) async throws -> CInt? {
+        try await startAttachedExec(exec)
+    }
     func execCompletion(_: ExecRecord) async -> Int32? { nil }
     func execIO(_: ExecRecord) async throws -> ContainerIOBridge { throw EngineError(.notFound, "exec I/O is unavailable") }
     func execPID(_: ExecRecord) async -> Int32 { 0 }
     func execStatus(_: ExecRecord) async -> Int32? { nil }
-    func resizeExec(_: ExecRecord, width _: UInt16, height _: UInt16) async throws {}
+    func resizeExec(_: ExecRecord, width _: UInt16, height _: UInt16) async throws {
+        throw EngineError(.unsupported, "exec resize is unavailable for this backend")
+    }
     func copyIn(_: ContainerRecord, extractedDirectory _: URL, destination _: String,
                 ownership _: [ArchiveOwnership]) async throws {
         throw EngineError(.unsupported, "archive copy is unavailable for this backend")

@@ -648,7 +648,17 @@ public actor EngineRuntime {
         try requireCanonicalSnapshotWritable()
         let record = try container(identifier)
         try requireBackendExecutionAvailable(record)
+        guard record.phase == .running else {
+            throw EngineError(.conflict, "Container is not running")
+        }
+        guard record.tty else {
+            throw EngineError(.badRequest, "container does not have a TTY")
+        }
         try await backend.resize(record, width: width, height: height)
+        emit(containerEvent(
+            "resize", record,
+            extra: ["height": String(height), "width": String(width)]
+        ))
     }
 
     public func containerLogs(_ identifier: String, options: DockerLogOptions = .init()) async throws -> Data {
@@ -1071,7 +1081,9 @@ public actor EngineRuntime {
         return try await backend.execIO(value)
     }
 
-    public func startExec(_ identifier: String) async throws {
+    public func startExec(
+        _ identifier: String, consoleSize: TerminalSize? = nil
+    ) async throws {
         try requireCanonicalSnapshotWritable()
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
@@ -1082,7 +1094,7 @@ public actor EngineRuntime {
         }
         defer { startingExecIDs.remove(identifier) }
         do {
-            try await backend.startExec(exec)
+            try await backend.startExec(exec, consoleSize: consoleSize)
         } catch let contained as BackendExecStartContainedError {
             // A crossed start boundary is never retryable. The backend has
             // selected a terminal result and retired (or durably quarantined)
@@ -1119,7 +1131,9 @@ public actor EngineRuntime {
         Task { [weak self] in await self?.monitorExec(identifier) }
     }
 
-    public func startAttachedExec(_ identifier: String) async throws -> CInt? {
+    public func startAttachedExec(
+        _ identifier: String, consoleSize: TerminalSize? = nil
+    ) async throws -> CInt? {
         try requireCanonicalSnapshotWritable()
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else {
@@ -1131,7 +1145,9 @@ public actor EngineRuntime {
             throw EngineError(.conflict, "exec instance is already starting")
         }
         defer { startingExecIDs.remove(identifier) }
-        guard let descriptor = try await backend.startAttachedExec(exec) else { return nil }
+        guard let descriptor = try await backend.startAttachedExec(
+            exec, consoleSize: consoleSize
+        ) else { return nil }
         guard execs[identifier]?.exitCode == nil,
               let container = try? container(exec.containerID), container.phase == .running else {
             Darwin.close(descriptor)
@@ -1149,6 +1165,12 @@ public actor EngineRuntime {
         try requireCanonicalSnapshotWritable()
         let value = try exec(identifier)
         try requireBackendExecutionAvailable(container(value.containerID))
+        guard value.configuration.tty else {
+            throw EngineError(.badRequest, "exec instance does not have a TTY")
+        }
+        guard value.running, value.exitCode == nil else {
+            throw EngineError(.badRequest, "exec instance is not running")
+        }
         try await backend.resizeExec(value, width: width, height: height)
     }
 

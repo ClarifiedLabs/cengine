@@ -282,24 +282,90 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
         assert container.attrs["HostConfig"]["Memory"] == 1024 * 1024 * 1024
 
         container.start()
-        with pytest.raises(docker.errors.APIError) as error:
-            response = client.api._post_json(
-                client.api._url("/containers/{0}/exec", container.id),
-                data={"Cmd": ["true"], "ConsoleSize": [24, 80]},
-            )
-            client.api._raise_for_status(response)
-        assert error.value.status_code == 501
-
-        exec_id = client.api.exec_create(container.id, ["true"])["Id"]
-        with pytest.raises(docker.errors.APIError) as error:
-            response = client.api._post_json(
-                client.api._url("/exec/{0}/start", exec_id),
-                data={"Detach": True, "ConsoleSize": [24, 80]},
-            )
-            client.api._raise_for_status(response)
-        assert error.value.status_code == 501
+        response = client.api._post_json(
+            client.api._url("/containers/{0}/exec", container.id),
+            data={"Cmd": ["true"], "ConsoleSize": [24, 80]},
+        )
+        client.api._raise_for_status(response)
+        exec_id = response.json()["Id"]
+        response = client.api._post_json(
+            client.api._url("/exec/{0}/start", exec_id),
+            data={"Detach": True, "Tty": False, "ConsoleSize": [24, 80]},
+        )
+        client.api._raise_for_status(response)
     finally:
         inert_container.remove(force=True)
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-030")
+def test_console_size_applies_to_container_and_exec_ptys(client: docker.DockerClient):
+    suffix = uuid.uuid4().hex[:8]
+    create = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"console-size-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": [
+                "sh", "-c",
+                "stty size >/tmp/container-size; "
+                "trap 'stty size >/tmp/container-size' WINCH; "
+                "while :; do sleep 1; done",
+            ],
+            "Tty": True,
+            "HostConfig": {"ConsoleSize": [33, 101]},
+        },
+    )
+    client.api._raise_for_status(create)
+    container = client.containers.get(create.json()["Id"])
+
+    def wait_for_size(path: str, expected: bytes) -> None:
+        deadline = time.monotonic() + 10
+        observed = b""
+        while time.monotonic() < deadline:
+            result = container.exec_run(["sh", "-c", f"cat {path} 2>/dev/null || true"])
+            observed = result.output.strip()
+            if observed == expected:
+                return
+            time.sleep(0.05)
+        pytest.fail(f"{path} contained {observed!r}, want {expected!r}")
+
+    try:
+        container.reload()
+        assert container.attrs["HostConfig"]["ConsoleSize"] == [33, 101]
+        container.start()
+        wait_for_size("/tmp/container-size", b"33 101")
+
+        container.resize(height=44, width=122)
+        wait_for_size("/tmp/container-size", b"44 122")
+
+        exec_create = client.api._post_json(
+            client.api._url("/containers/{0}/exec", container.id),
+            data={
+                "AttachStdout": False,
+                "AttachStderr": False,
+                "Cmd": [
+                    "sh", "-c",
+                    "stty size >/tmp/exec-size; "
+                    "trap 'stty size >/tmp/exec-size' WINCH; "
+                    "while :; do sleep 1; done",
+                ],
+                "Tty": True,
+                "ConsoleSize": [35, 105],
+            },
+        )
+        client.api._raise_for_status(exec_create)
+        exec_id = exec_create.json()["Id"]
+        exec_start = client.api._post_json(
+            client.api._url("/exec/{0}/start", exec_id),
+            data={"Detach": True, "Tty": True, "ConsoleSize": [45, 125]},
+        )
+        client.api._raise_for_status(exec_start)
+        wait_for_size("/tmp/exec-size", b"45 125")
+
+        client.api.exec_resize(exec_id, height=55, width=145)
+        wait_for_size("/tmp/exec-size", b"55 145")
+    finally:
         container.remove(force=True)
 
 

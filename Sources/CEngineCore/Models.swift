@@ -161,6 +161,21 @@ public struct DeviceMappingRecord: Codable, Hashable, Sendable {
     }
 }
 
+public struct TerminalSize: Codable, Hashable, Sendable {
+    public static let zero = TerminalSize(height: 0, width: 0)
+    public static let defaultPTY = TerminalSize(height: 24, width: 80)
+
+    public var height: UInt16
+    public var width: UInt16
+
+    public init(height: UInt16, width: UInt16) {
+        self.height = height
+        self.width = width
+    }
+
+    public var isZero: Bool { height == 0 && width == 0 }
+}
+
 public struct ContainerRecord: Codable, Sendable {
     public var id: String
     /// Internal immutable identity for one logical container incarnation.
@@ -187,6 +202,9 @@ public struct ContainerRecord: Codable, Sendable {
     public var labels: [String: String]
     public var annotations: [String: String]
     public var tty: Bool
+    /// Initial Docker console size in `[height, width]` order. A zero size uses
+    /// the guest's conventional 24x80 PTY default.
+    public var consoleSize: TerminalSize
     public var attachStdin: Bool
     public var openStdin: Bool
     public var privileged: Bool
@@ -266,6 +284,7 @@ public struct ContainerRecord: Codable, Sendable {
         self.labels = [:]
         self.annotations = [:]
         self.tty = false
+        self.consoleSize = .zero
         self.attachStdin = false
         self.openStdin = false
         self.privileged = false

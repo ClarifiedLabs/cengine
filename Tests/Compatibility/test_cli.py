@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 import pathlib
+import pty
+import select
+import struct
 import subprocess
+import termios
 import time
 import uuid
 
@@ -60,6 +66,47 @@ def test_cli_run_attached_output(daemon):
 def test_cli_run_attached_stdin(daemon):
     result = docker(daemon, "run", "--rm", "-i", IMAGE, "cat", input="stdin-roundtrip\n")
     assert result.stdout == "stdin-roundtrip\n"
+
+
+@pytest.mark.compat("CLI-009")
+def test_cli_run_interactive_tty_uses_client_console_size(daemon):
+    socket = daemon["socket"]
+    assert isinstance(socket, pathlib.Path)
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 43, 137, 0, 0))
+    process = subprocess.Popen(
+        ["docker", "run", "--rm", "-it", IMAGE, "sh", "-c", "stty size"],
+        env=docker_environment(socket),
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not chunk:
+                    break
+                output.extend(chunk)
+            if process.poll() is not None and not readable:
+                break
+        assert process.wait(timeout=5) == 0, output.decode(errors="replace")
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+    assert b"43 137" in output.replace(b"\r\n", b"\n")
 
 
 @pytest.mark.compat("CLI-005")

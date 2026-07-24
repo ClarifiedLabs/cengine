@@ -747,7 +747,7 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
     private let requestBodies: DockerUpgradeRequestBodyStore
     private let lock = NSLock()
     private enum Pending: Sendable {
-        case buffered(io: ContainerIOBridge, execID: String?)
+        case buffered(io: ContainerIOBridge, execID: String?, consoleSize: TerminalSize?)
         case stream(Channel)
     }
     private var pending: [ObjectIdentifier: Pending] = [:]
@@ -777,10 +777,16 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
                 let pending: Pending
                 switch target {
                 case .container(let id):
-                    pending = try await .buffered(io: router.containerIO(id), execID: nil)
+                    pending = try await .buffered(
+                        io: router.containerIO(id), execID: nil, consoleSize: nil
+                    )
                 case .exec(let id):
-                    try await router.validateAttachedExecStart(id, body: requestBody)
-                    if let descriptor = try await router.startAttachedExec(id) {
+                    let consoleSize = try await router.validateAttachedExecStart(
+                        id, body: requestBody
+                    )
+                    if let descriptor = try await router.startAttachedExec(
+                        id, consoleSize: consoleSize
+                    ) {
                         let stream = try await ClientBootstrap(group: channel.eventLoop)
                             .channelOption(ChannelOptions.autoRead, value: false)
                             .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
@@ -788,7 +794,9 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
                             .get()
                         pending = .stream(stream)
                     } else {
-                        pending = try await .buffered(io: router.execIO(id), execID: id)
+                        pending = try await .buffered(
+                            io: router.execIO(id), execID: id, consoleSize: consoleSize
+                        )
                     }
                 }
                 let key = ObjectIdentifier(channel as AnyObject)
@@ -822,13 +830,17 @@ final class DockerTCPUpgrader: HTTPServerProtocolUpgrader, @unchecked Sendable {
             pipeline.removeHandler(name: "docker-http")
         }.flatMap {
             switch pending {
-            case .buffered(let io, let execID):
+            case .buffered(let io, let execID, let consoleSize):
                 return pipeline.addHandler(ContainerAttachHandler(io: io)).flatMap {
                     channel.setOption(ChannelOptions.autoRead, value: true)
                 }.map {
                     if let execID {
                         Task {
-                            do { try await self.router.startExec(execID) }
+                            do {
+                                try await self.router.startExec(
+                                    execID, consoleSize: consoleSize
+                                )
+                            }
                             catch { io.finishOutput() }
                         }
                     }

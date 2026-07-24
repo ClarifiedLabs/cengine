@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 15
+    public static let version: UInt32 = 16
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -52,6 +52,7 @@ public enum GuestProtocol {
         public var hostname: String
         public var user: User
         public var terminal: Bool
+        public var consoleSize: TerminalSize?
         public var readOnlyRoot: Bool
         public var maskedPaths: [String]
         public var readonlyPaths: [String]
@@ -71,9 +72,10 @@ public enum GuestProtocol {
         public var ipcMode: String
         public var ioClaim: String
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, readOnlyRoot: Bool, maskedPaths: [String] = [], readonlyPaths: [String] = [], stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, noNewPrivileges: Bool = true, seccompDefault: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", ioClaim: String = "") {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, consoleSize: TerminalSize? = nil, readOnlyRoot: Bool, maskedPaths: [String] = [], readonlyPaths: [String] = [], stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, noNewPrivileges: Bool = true, seccompDefault: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", ioClaim: String = "") {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
+            self.consoleSize = consoleSize
             self.readOnlyRoot = readOnlyRoot; self.maskedPaths = maskedPaths; self.readonlyPaths = readonlyPaths
             self.stopSignal = stopSignal; self.volumeServer = volumeServer; self.mounts = mounts; self.networks = networks; self.hosts = hosts; self.resources = resources; self.privileged = privileged; self.noNewPrivileges = noNewPrivileges; self.seccompDefault = seccompDefault
             self.annotations = annotations; self.capabilityAdd = capabilityAdd; self.capabilityDrop = capabilityDrop
@@ -98,6 +100,7 @@ public enum GuestProtocol {
         public var workingDirectory: String
         public var user: User
         public var terminal: Bool
+        public var consoleSize: TerminalSize?
         public var attachStdin: Bool
         public var attachStdout: Bool
         public var attachStderr: Bool
@@ -111,7 +114,8 @@ public enum GuestProtocol {
 
         public init(
             id: String, arguments: [String], environment: [String], workingDirectory: String,
-            user: User, terminal: Bool, attachStdin: Bool, attachStdout: Bool,
+            user: User, terminal: Bool, consoleSize: TerminalSize? = nil,
+            attachStdin: Bool, attachStdout: Bool,
             attachStderr: Bool, noNewPrivileges: Bool, privileged: Bool = false,
             seccompDefault: Bool = false, capabilityAdd: [String] = [],
             capabilityDrop: [String] = [], rlimits: [Rlimit] = [],
@@ -123,6 +127,7 @@ public enum GuestProtocol {
             self.workingDirectory = workingDirectory
             self.user = user
             self.terminal = terminal
+            self.consoleSize = consoleSize
             self.attachStdin = attachStdin
             self.attachStdout = attachStdout
             self.attachStderr = attachStderr

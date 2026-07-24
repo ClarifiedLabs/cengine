@@ -102,6 +102,7 @@ private actor CompletionBackend: ContainerBackend {
     private var execBridges: [String: ContainerIOBridge] = [:]
     private var retiredExecIDs = Set<String>()
     private var execRetirementCalls = 0
+    private var lastExecStartConsoleSize: TerminalSize?
 
     init(
         log: Data = Data(),
@@ -128,6 +129,7 @@ private actor CompletionBackend: ContainerBackend {
     func io(for container: ContainerRecord) async throws -> ContainerIOBridge {
         ContainerIOBridge(tty: container.tty)
     }
+    func resize(_: ContainerRecord, width _: UInt16, height _: UInt16) async throws {}
     func finish(_ id: String, code: Int32) { continuations.removeValue(forKey: id)?.resume(returning: code) }
     func isWaitingForCompletion(_ id: String) -> Bool { continuations[id] != nil }
     func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
@@ -149,6 +151,11 @@ private actor CompletionBackend: ContainerBackend {
         try execBridges[exec.id]?.writer(.stdout).write(Data("exec-ok\n".utf8))
         execBridges[exec.id]?.finishOutput()
     }
+    func startExec(_ exec: ExecRecord, consoleSize: TerminalSize?) async throws {
+        lastExecStartConsoleSize = consoleSize
+        try await startExec(exec)
+    }
+    func recordedExecStartConsoleSize() -> TerminalSize? { lastExecStartConsoleSize }
     func execCompletion(_: ExecRecord) async -> Int32? { 0 }
     func retireExec(_ exec: ExecRecord) async {
         execRetirementCalls += 1
@@ -3143,7 +3150,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect((envelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
     }
 
-    @Test func dockerCLIConsoleSizeIsIgnoredForNonTTYCreateAcrossSupportedAPIVersions() async throws {
+    @Test func dockerCLIConsoleSizeIsAcceptedAndPersistedAcrossSupportedAPIVersions() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -3282,13 +3289,24 @@ private actor AuthImageBackend: ContainerBackend {
             )
             let config = try #require(inspected["Config"] as? [String: Any])
             #expect(config["Tty"] as? Bool == false)
+            let host = try #require(inspected["HostConfig"] as? [String: Any])
+            #expect(host["ConsoleSize"] as? [Int] == [24, 80])
 
-            let rejected = await router.route(.init(
+            let ttyAccepted = await router.route(.init(
                 method: .POST,
                 uri: "/v\(version)/containers/create?name=tty-console-\(version)",
                 body: ttyBody
             ))
-            #expect(rejected.status == .notImplemented)
+            #expect(ttyAccepted.status == .created)
+            let ttyInspect = await router.route(.init(
+                method: .GET,
+                uri: "/v\(version)/containers/tty-console-\(version)/json"
+            ))
+            let ttyObject = try #require(
+                JSONSerialization.jsonObject(with: ttyInspect.body) as? [String: Any]
+            )
+            let ttyHost = try #require(ttyObject["HostConfig"] as? [String: Any])
+            #expect(ttyHost["ConsoleSize"] as? [Int] == [24, 80])
         }
     }
 
@@ -3324,6 +3342,8 @@ private actor AuthImageBackend: ContainerBackend {
         let fields = [
             #""HostConfig":{"CgroupnsMode":"shared"}"#,
             #""HostConfig":{"ConsoleSize":[24]}"#,
+            #""HostConfig":{"ConsoleSize":[-1,80]}"#,
+            #""HostConfig":{"ConsoleSize":[24,65536]}"#,
             #""HostConfig":{"OomScoreAdj":1001}"#,
             #""HostConfig":{"BlkioWeight":1001}"#,
             #""HostConfig":{"BlkioWeight":1}"#,
@@ -3354,7 +3374,7 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
-    @Test func unsupportedUpdateAndExecRuntimeInputsFailBeforeMutationOrLookup() async throws {
+    @Test func unsupportedUpdateFailsBeforeMutationAndValidExecConsoleSizesReachLookup() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let create = await router.route(.init(
@@ -3377,7 +3397,7 @@ private actor AuthImageBackend: ContainerBackend {
             method: .POST, uri: "/v1.55/containers/missing/exec",
             body: Data(#"{"Cmd":["true"],"ConsoleSize":[24,80]}"#.utf8)
         ))
-        #expect(execCreate.status == .notImplemented)
+        #expect(execCreate.status == .notFound)
         let inertExecCreate = await router.route(.init(
             method: .POST, uri: "/v1.55/containers/missing/exec",
             body: Data(#"{"Cmd":["true"],"ConsoleSize":[0,0]}"#.utf8)
@@ -3388,7 +3408,7 @@ private actor AuthImageBackend: ContainerBackend {
             method: .POST, uri: "/v1.55/exec/missing/start",
             body: Data(#"{"Detach":true,"ConsoleSize":[24,80]}"#.utf8)
         ))
-        #expect(execStart.status == .notImplemented)
+        #expect(execStart.status == .notFound)
     }
 
     @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
@@ -6226,7 +6246,7 @@ private actor AuthImageBackend: ContainerBackend {
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = CompletionBackend()
         let router = DockerRouter(runtime: try await EngineRuntime(root: root, backend: backend), root: root)
-        let create = await router.route(.init(method: .POST, uri: "/v1.44/containers/create?name=waiter", body: Data(#"{"Image":"debian","Cmd":["true"]}"#.utf8)))
+        let create = await router.route(.init(method: .POST, uri: "/v1.44/containers/create?name=waiter", body: Data(#"{"Image":"debian","Cmd":["true"],"Tty":true}"#.utf8)))
         let body = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
         let id = try #require(body["Id"] as? String)
         _ = await router.route(.init(method: .POST, uri: "/v1.44/containers/\(id)/start", body: Data()))
@@ -6659,18 +6679,25 @@ private actor AuthImageBackend: ContainerBackend {
 
         let create = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/\(container.id)/exec",
-            body: Data(#"{"AttachStdout":true,"AttachStderr":true,"Cmd":["echo","ok"]}"#.utf8)
+            body: Data(#"{"AttachStdout":true,"AttachStderr":true,"Tty":true,"ConsoleSize":[24,80],"Cmd":["echo","ok"]}"#.utf8)
         ))
         #expect(create.status == .created)
         let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
         let execID = try #require(created["Id"] as? String)
         let mismatchedTTY = await router.route(.init(
             method: .POST, uri: "/v1.44/exec/\(execID)/start",
-            body: Data(#"{"Detach":true,"Tty":true}"#.utf8)
+            body: Data(#"{"Detach":true,"Tty":false}"#.utf8)
         ))
         #expect(mismatchedTTY.status == .badRequest)
-        let start = await router.route(.init(method: .POST, uri: "/v1.44/exec/\(execID)/start", body: Data(#"{"Detach":true,"Tty":false}"#.utf8)))
+        let start = await router.route(.init(
+            method: .POST, uri: "/v1.44/exec/\(execID)/start",
+            body: Data(#"{"Detach":true,"Tty":true,"ConsoleSize":[40,120]}"#.utf8)
+        ))
         #expect(start.status == .ok)
+        #expect(
+            await backend.recordedExecStartConsoleSize()
+                == TerminalSize(height: 40, width: 120)
+        )
         for _ in 0..<20 {
             if try await runtime.exec(execID).exitCode != nil { break }
             await Task.yield()

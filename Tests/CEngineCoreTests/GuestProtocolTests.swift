@@ -4,13 +4,14 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 15)
+        #expect(GuestProtocol.version == 16)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
             workingDirectory: "/work",
             user: .init(uid: 1_000, gid: 2_000, additionalGroups: [3_000]),
-            terminal: false, attachStdin: false, attachStdout: true, attachStderr: true,
+            terminal: true, consoleSize: .init(height: 36, width: 132),
+            attachStdin: false, attachStdout: true, attachStderr: true,
             noNewPrivileges: true, seccompDefault: true,
             rlimits: [.init(type: "nofile", soft: 1_024, hard: UInt64.max)],
             ioClaim: "exec-claim"
@@ -24,13 +25,16 @@ import Testing
         #expect(object["noNewPrivileges"] as? Bool == true)
         #expect(object["seccompDefault"] as? Bool == true)
         #expect(object["ioClaim"] as? String == "exec-claim")
+        let consoleSize = try #require(object["consoleSize"] as? [String: Any])
+        #expect(consoleSize["height"] as? Int == 36)
+        #expect(consoleSize["width"] as? Int == 132)
         let limits = try #require(object["rlimits"] as? [[String: Any]])
         #expect(limits.first?["type"] as? String == "nofile")
         #expect(limits.first?["soft"] as? UInt64 == 1_024)
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 15)
+        #expect(GuestProtocol.version == 16)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -111,7 +115,8 @@ import Testing
         let value = GuestProtocol.Workload(
             id: "container-1", rootDevice: "/dev/vda", arguments: ["true"],
             environment: [], workingDirectory: "/", hostname: "container-1", user: .init(),
-            terminal: false, readOnlyRoot: false,
+            terminal: true, consoleSize: .init(height: 40, width: 120),
+            readOnlyRoot: false,
             maskedPaths: ["/proc/kcore"], readonlyPaths: ["/proc/sys"],
             stopSignal: "SIGTERM", mounts: [], networks: [],
             resources: .init(memoryBytes: 64 * 1_024 * 1_024, cpuQuota: 100_000, cpuPeriod: 100_000, pids: 0),
@@ -135,6 +140,9 @@ import Testing
         #expect(object["readonlyPaths"] as? [String] == ["/proc/sys"])
         #expect(object["noNewPrivileges"] as? Bool == false)
         #expect(object["ioClaim"] as? String == "container-claim")
+        let consoleSize = try #require(object["consoleSize"] as? [String: Any])
+        #expect(consoleSize["height"] as? Int == 40)
+        #expect(consoleSize["width"] as? Int == 120)
     }
 
     @Test func controlEnvelopeRoundTripsWithLengthPrefix() throws {

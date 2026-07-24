@@ -3742,6 +3742,25 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return try ensureIO(container, replacingStoppedSession: true)
     }
 
+    public func resize(
+        _ container: ContainerRecord, width: UInt16, height: UInt16
+    ) async throws {
+        try requireExactContainerOwnership(container)
+        try requireActiveContainerExecution(container)
+        guard let shim = shims[container.id] else {
+            throw EngineError(.notFound, "container VM shim is unavailable")
+        }
+        struct Status: Decodable { let status: String }
+        let status: Status = try await shim.guest(
+            operation: "resize",
+            payload: TerminalSize(height: height, width: width),
+            response: Status.self
+        )
+        guard status.status == "resized" else {
+            throw EngineError(.internalError, "guest did not resize the container terminal")
+        }
+    }
+
     public func logs(for container: ContainerRecord) async throws -> Data {
         try requireExactContainerOwnership(container)
         return try ensureIO(container).logData()
@@ -3898,7 +3917,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 payload: GuestProtocol.Exec(
                     id: exec.id, arguments: configuration.arguments, environment: context.environment,
                     workingDirectory: context.workingDirectory, user: context.user,
-                    terminal: configuration.tty, attachStdin: configuration.attachStdin,
+                    terminal: configuration.tty,
+                    consoleSize: configuration.tty && !configuration.consoleSize.isZero
+                        ? configuration.consoleSize : nil,
+                    attachStdin: configuration.attachStdin,
                     attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
                     noNewPrivileges: context.noNewPrivileges,
                     privileged: context.privileged,
@@ -4310,6 +4332,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func startExec(_ exec: ExecRecord) async throws {
+        try await startExec(exec, consoleSize: nil)
+    }
+
+    public func startExec(
+        _ exec: ExecRecord, consoleSize: TerminalSize?
+    ) async throws {
         try requireExactExecOwnership(exec)
         guard let shim = execShims[exec.id] else {
             throw EngineError(.notFound, "exec is unavailable")
@@ -4318,7 +4346,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
             afterMilliseconds: Self.execStartRequestTimeoutMilliseconds
         )
         do {
-            try await startExec(exec, deadlineNanoseconds: deadline)
+            try await startExec(
+                exec, consoleSize: consoleSize, deadlineNanoseconds: deadline
+            )
         } catch {
             let startError = error
             var exitCode = Self.execStartNeverRanExitCode
@@ -4383,22 +4413,27 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func startExec(
         _ exec: ExecRecord,
+        consoleSize: TerminalSize? = nil,
         deadlineNanoseconds: UInt64?
     ) async throws {
         guard let shim = execShims[exec.id] else { throw EngineError(.notFound, "exec is unavailable") }
-        struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let pid: Int? }
+        struct Request: Encodable {
+            let id: String
+            let consoleSize: TerminalSize?
+        }
+        struct Status: Decodable { let status: String; let pid: Int? }
         let status: Status
         if let deadlineNanoseconds {
             status = try await shim.guest(
                 operation: "start-exec",
-                payload: Request(id: exec.id),
+                payload: Request(id: exec.id, consoleSize: consoleSize),
                 response: Status.self,
                 deadlineNanoseconds: deadlineNanoseconds
             )
         } else {
             status = try await shim.guest(
                 operation: "start-exec",
-                payload: Request(id: exec.id),
+                payload: Request(id: exec.id, consoleSize: consoleSize),
                 response: Status.self
             )
         }
@@ -4406,9 +4441,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func startAttachedExec(_ exec: ExecRecord) async throws -> CInt? {
+        try await startAttachedExec(exec, consoleSize: nil)
+    }
+
+    public func startAttachedExec(
+        _ exec: ExecRecord, consoleSize: TerminalSize?
+    ) async throws -> CInt? {
         try requireExactExecOwnership(exec)
         guard let shim = execShims[exec.id] else { throw EngineError(.notFound, "exec is unavailable") }
-        return try await shim.startExecStream(id: exec.id)
+        return try await shim.startExecStream(id: exec.id, consoleSize: consoleSize)
     }
 
     public func execCompletion(_ exec: ExecRecord) async -> Int32? {
@@ -4474,6 +4515,29 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 preserveBridge: true
             )
             return nil
+        }
+    }
+
+    public func resizeExec(
+        _ exec: ExecRecord, width: UInt16, height: UInt16
+    ) async throws {
+        try requireExactExecOwnership(exec)
+        guard let shim = execShims[exec.id] else {
+            throw EngineError(.notFound, "exec is unavailable")
+        }
+        struct Request: Encodable {
+            let id: String
+            let height: UInt16
+            let width: UInt16
+        }
+        struct Status: Decodable { let status: String }
+        let status: Status = try await shim.guest(
+            operation: "resize-exec",
+            payload: Request(id: exec.id, height: height, width: width),
+            response: Status.self
+        )
+        guard status.status == "resized" else {
+            throw EngineError(.internalError, "guest did not resize the exec terminal")
         }
     }
 
@@ -6125,7 +6189,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
             environment: Self.mergeEnvironment(image: config?.environment ?? [], container: container.environment),
             workingDirectory: container.workingDirectory.isEmpty ? (config?.workingDirectory ?? "/") : container.workingDirectory,
             hostname: container.hostname, user: Self.user(container.user.isEmpty ? config?.user : container.user),
-            terminal: container.tty, readOnlyRoot: container.readOnlyRootfs,
+            terminal: container.tty,
+            consoleSize: container.tty && !container.consoleSize.isZero
+                ? container.consoleSize : nil,
+            readOnlyRoot: container.readOnlyRootfs,
             maskedPaths: maskedPaths, readonlyPaths: readonlyPaths,
             stopSignal: container.stopSignal,
             volumeServer: volumeServer,

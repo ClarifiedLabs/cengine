@@ -293,7 +293,8 @@ func (state *controlServer) handleExecIO(connection net.Conn) {
 		return
 	}
 	var value struct {
-		ID string `json:"id"`
+		ID          string                 `json:"id"`
+		ConsoleSize *protocol.TerminalSize `json:"consoleSize,omitempty"`
 	}
 	if err := json.Unmarshal(request.Payload, &value); err != nil {
 		response.Error = &protocol.Error{Code: "invalid_request", Message: err.Error()}
@@ -302,7 +303,7 @@ func (state *controlServer) handleExecIO(connection net.Conn) {
 	}
 
 	prepared := false
-	_, err = state.process.StartExecAttached(value.ID, connection, func(protocol.ProcessStatus) error {
+	_, err = state.process.StartExecAttached(value.ID, value.ConsoleSize, connection, func(protocol.ProcessStatus) error {
 		prepared = true
 		return nil
 	})
@@ -505,16 +506,38 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 		return json.Marshal(map[string]string{"status": "discarded"})
 	case "start-exec":
 		var value struct {
-			ID string `json:"id"`
+			ID          string                 `json:"id"`
+			ConsoleSize *protocol.TerminalSize `json:"consoleSize,omitempty"`
 		}
 		if err := json.Unmarshal(request.Payload, &value); err != nil {
 			return nil, err
 		}
-		status, err := state.process.StartExec(value.ID)
+		status, err := state.process.StartExec(value.ID, value.ConsoleSize)
 		if err != nil {
 			return nil, err
 		}
 		return json.Marshal(status)
+	case "resize":
+		var value protocol.TerminalSize
+		if err := json.Unmarshal(request.Payload, &value); err != nil {
+			return nil, err
+		}
+		if err := state.process.Resize(value); err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]string{"status": "resized"})
+	case "resize-exec":
+		var value struct {
+			ID string `json:"id"`
+			protocol.TerminalSize
+		}
+		if err := json.Unmarshal(request.Payload, &value); err != nil {
+			return nil, err
+		}
+		if err := state.process.ResizeExec(value.ID, value.TerminalSize); err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]string{"status": "resized"})
 	case "exec-status":
 		var value struct {
 			ID string `json:"id"`

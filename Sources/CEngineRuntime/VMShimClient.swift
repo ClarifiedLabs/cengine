@@ -1543,7 +1543,10 @@ public final class VMShimClient: @unchecked Sendable {
         }
     }
     public struct RootFSRequest: Codable, Sendable { public var contentStorePath: String; public var layers: [OCIDescriptor] }
-    public struct ExecStreamRequest: Codable, Sendable { public var id: String }
+    public struct ExecStreamRequest: Codable, Sendable {
+        public var id: String
+        public var consoleSize: TerminalSize?
+    }
     public struct PortStreamRequest: Codable, Sendable {
         public var transport: String
         public var port: UInt16
@@ -3425,8 +3428,13 @@ public final class VMShimClient: @unchecked Sendable {
         )
     }
 
-    public func startExecStream(id: String) async throws -> CInt {
-        try await upgradedStream(.startExecStream, payload: ExecStreamRequest(id: id))
+    public func startExecStream(
+        id: String, consoleSize: TerminalSize? = nil
+    ) async throws -> CInt {
+        try await upgradedStream(
+            .startExecStream,
+            payload: ExecStreamRequest(id: id, consoleSize: consoleSize)
+        )
     }
 
     public func startPortStream(transport: String, port: UInt16, ipv6: Bool) async throws -> CInt {

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 15
+	Version                         = 16
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -43,6 +43,7 @@ type WorkloadSpec struct {
 	Hostname         string            `json:"hostname"`
 	User             User              `json:"user"`
 	Terminal         bool              `json:"terminal"`
+	ConsoleSize      *TerminalSize     `json:"consoleSize,omitempty"`
 	ReadOnlyRoot     bool              `json:"readOnlyRoot"`
 	MaskedPaths      []string          `json:"maskedPaths,omitempty"`
 	ReadonlyPaths    []string          `json:"readonlyPaths,omitempty"`
@@ -61,6 +62,11 @@ type WorkloadSpec struct {
 	Rlimits          []Rlimit          `json:"rlimits,omitempty"`
 	IPCMode          string            `json:"ipcMode"`
 	IOClaim          string            `json:"ioClaim"`
+}
+
+type TerminalSize struct {
+	Height uint16 `json:"height"`
+	Width  uint16 `json:"width"`
 }
 
 type User struct {
@@ -159,22 +165,23 @@ type NetworkRequest struct {
 }
 
 type ExecSpec struct {
-	ID               string   `json:"id"`
-	Arguments        []string `json:"arguments"`
-	Environment      []string `json:"environment"`
-	WorkingDirectory string   `json:"workingDirectory"`
-	User             User     `json:"user"`
-	Terminal         bool     `json:"terminal"`
-	AttachStdin      bool     `json:"attachStdin"`
-	AttachStdout     bool     `json:"attachStdout"`
-	AttachStderr     bool     `json:"attachStderr"`
-	NoNewPrivileges  bool     `json:"noNewPrivileges"`
-	Privileged       bool     `json:"privileged"`
-	SeccompDefault   bool     `json:"seccompDefault"`
-	CapabilityAdd    []string `json:"capabilityAdd,omitempty"`
-	CapabilityDrop   []string `json:"capabilityDrop,omitempty"`
-	Rlimits          []Rlimit `json:"rlimits,omitempty"`
-	IOClaim          string   `json:"ioClaim"`
+	ID               string        `json:"id"`
+	Arguments        []string      `json:"arguments"`
+	Environment      []string      `json:"environment"`
+	WorkingDirectory string        `json:"workingDirectory"`
+	User             User          `json:"user"`
+	Terminal         bool          `json:"terminal"`
+	ConsoleSize      *TerminalSize `json:"consoleSize,omitempty"`
+	AttachStdin      bool          `json:"attachStdin"`
+	AttachStdout     bool          `json:"attachStdout"`
+	AttachStderr     bool          `json:"attachStderr"`
+	NoNewPrivileges  bool          `json:"noNewPrivileges"`
+	Privileged       bool          `json:"privileged"`
+	SeccompDefault   bool          `json:"seccompDefault"`
+	CapabilityAdd    []string      `json:"capabilityAdd,omitempty"`
+	CapabilityDrop   []string      `json:"capabilityDrop,omitempty"`
+	Rlimits          []Rlimit      `json:"rlimits,omitempty"`
+	IOClaim          string        `json:"ioClaim"`
 }
 
 type RootFSLayer struct {

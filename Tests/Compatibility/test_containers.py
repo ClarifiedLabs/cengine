@@ -484,12 +484,48 @@ def test_streaming_stats_produces_multiple_samples(top):
 
 @pytest.mark.compat("CTR-031")
 def test_container_and_exec_tty_resize(client: docker.DockerClient):
-    container = client.containers.create(IMAGE, command="top", tty=True)
+    container = client.containers.create(
+        IMAGE,
+        command=[
+            "sh", "-c",
+            "stty size >/tmp/container-size; "
+            "trap 'stty size >/tmp/container-size' WINCH; "
+            "while :; do sleep 1; done",
+        ],
+        tty=True,
+    )
     container.start()
     container.resize(height=40, width=120)
-    exec_id = client.api.exec_create(container.id, ["sh", "-c", "sleep 10"], tty=True)["Id"]
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        size = container.exec_run(["cat", "/tmp/container-size"]).output.strip()
+        if size == b"40 120":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"container terminal size was {size!r}, want b'40 120'")
+
+    exec_id = client.api.exec_create(
+        container.id,
+        [
+            "sh", "-c",
+            "stty size >/tmp/exec-size; "
+            "trap 'stty size >/tmp/exec-size' WINCH; "
+            "while :; do sleep 1; done",
+        ],
+        tty=True,
+    )["Id"]
     client.api.exec_start(exec_id, detach=True, tty=True)
     client.api.exec_resize(exec_id, height=50, width=140)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        size = container.exec_run(["cat", "/tmp/exec-size"]).output.strip()
+        if size == b"50 140":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"exec terminal size was {size!r}, want b'50 140'")
 
 
 @pytest.mark.compat("CTR-032")

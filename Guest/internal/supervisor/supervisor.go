@@ -41,6 +41,8 @@ type Supervisor struct {
 	processIO      *pinnedProcessIO
 	execIO         map[string]*pinnedProcessIO
 	execSpecs      map[string]protocol.ExecSpec
+	terminal       *os.File
+	execTerminals  map[string]*os.File
 	devicePolicyFD int
 }
 
@@ -53,6 +55,7 @@ func New() *Supervisor {
 		execStatus:     map[string]protocol.ProcessStatus{},
 		execIO:         map[string]*pinnedProcessIO{},
 		execSpecs:      map[string]protocol.ExecSpec{},
+		execTerminals:  map[string]*os.File{},
 		devicePolicyFD: -1,
 	}
 }
@@ -247,12 +250,41 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	var stdinWriter *io.PipeWriter
 	var terminalMaster *os.File
 	var terminalSlave *os.File
+	var terminalInput *os.File
+	var terminalOutput *os.File
 	if s.spec.Terminal {
-		terminalMaster, terminalSlave, err = openPseudoTerminal()
+		terminalMaster, terminalSlave, err = openPseudoTerminal(s.spec.ConsoleSize)
 		if err != nil {
 			readyReader.Close()
 			readyWriter.Close()
 			stdout.Close()
+			reader.Close()
+			writer.Close()
+			gateReader.Close()
+			gateWriter.Close()
+			return s.status, err
+		}
+		terminalInput, err = duplicateFile(terminalMaster, "terminal-input")
+		if err != nil {
+			terminalMaster.Close()
+			terminalSlave.Close()
+			stdout.Close()
+			readyReader.Close()
+			readyWriter.Close()
+			reader.Close()
+			writer.Close()
+			gateReader.Close()
+			gateWriter.Close()
+			return s.status, err
+		}
+		terminalOutput, err = duplicateFile(terminalMaster, "terminal-output")
+		if err != nil {
+			terminalInput.Close()
+			terminalMaster.Close()
+			terminalSlave.Close()
+			stdout.Close()
+			readyReader.Close()
+			readyWriter.Close()
 			reader.Close()
 			writer.Close()
 			gateReader.Close()
@@ -304,6 +336,12 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		if terminalMaster != nil {
 			terminalMaster.Close()
 		}
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalOutput != nil {
+			terminalOutput.Close()
+		}
 		if terminalSlave != nil {
 			terminalSlave.Close()
 		}
@@ -316,7 +354,7 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 	readyWriter.Close()
 	if terminalSlave != nil {
 		terminalSlave.Close()
-		go pumpTerminalOutput(terminalMaster, stdout, command)
+		go pumpTerminalOutput(terminalOutput, stdout, command)
 	} else {
 		stdout.Close()
 		stderr.Close()
@@ -381,15 +419,19 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		if terminalMaster != nil {
 			terminalMaster.Close()
 		}
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
 		_ = command.Wait()
 		return s.status, fmt.Errorf("workload failed before becoming ready: %w", err)
 	}
 	readyReader.Close()
 	s.command = command
+	s.terminal = terminalMaster
 	s.status = protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
 	go s.reap(command)
 	if terminalMaster != nil {
-		go pumpTerminalInput(processIO.stdin, processIO.stdinClosed, terminalMaster, command)
+		go pumpTerminalInput(processIO.stdin, processIO.stdinClosed, terminalInput, command)
 	} else {
 		go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
 	}
@@ -407,7 +449,7 @@ func cgroupDelegationSocketPair() (*os.File, *os.File, error) {
 		os.NewFile(uintptr(descriptors[1]), "cgroup-delegation-parent"), nil
 }
 
-func openPseudoTerminal() (*os.File, *os.File, error) {
+func openPseudoTerminal(sizes ...*protocol.TerminalSize) (*os.File, *os.File, error) {
 	masterFD, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, err
@@ -427,13 +469,40 @@ func openPseudoTerminal() (*os.File, *os.File, error) {
 		master.Close()
 		return nil, nil, err
 	}
-	_ = unix.IoctlSetWinsize(masterFD, unix.TIOCSWINSZ, &unix.Winsize{Row: 24, Col: 80})
+	size := effectiveTerminalSize(nil)
+	if len(sizes) > 0 {
+		size = effectiveTerminalSize(sizes[0])
+	}
+	if err := setTerminalSize(master, size); err != nil {
+		slave.Close()
+		master.Close()
+		return nil, nil, err
+	}
 	return master, slave, nil
 }
 
-func pumpTerminalOutput(master, destination *os.File, command *exec.Cmd) {
+func effectiveTerminalSize(size *protocol.TerminalSize) protocol.TerminalSize {
+	if size == nil || (size.Height == 0 && size.Width == 0) {
+		return protocol.TerminalSize{Height: 24, Width: 80}
+	}
+	return *size
+}
+
+func setTerminalSize(terminal *os.File, size protocol.TerminalSize) error {
+	if terminal == nil {
+		return errors.New("terminal is unavailable")
+	}
+	return unix.IoctlSetWinsize(
+		int(terminal.Fd()), unix.TIOCSWINSZ,
+		&unix.Winsize{Row: size.Height, Col: size.Width},
+	)
+}
+
+func pumpTerminalOutput(master *os.File, destination io.Writer, command *exec.Cmd) {
 	defer master.Close()
-	defer destination.Close()
+	if closer, ok := destination.(io.Closer); ok {
+		defer closer.Close()
+	}
 	buffer := make([]byte, 32*1024)
 	for {
 		count, err := master.Read(buffer)
@@ -453,7 +522,8 @@ func pumpTerminalOutput(master, destination *os.File, command *exec.Cmd) {
 	}
 }
 
-func pumpTerminalInput(source, closed *os.File, destination io.Writer, command *exec.Cmd) {
+func pumpTerminalInput(source, closed, destination *os.File, command *exec.Cmd) {
+	defer destination.Close()
 	for {
 		inputClosed, err := pumpInputStep(source, closed, destination)
 		if err != nil || inputClosed {
@@ -464,6 +534,18 @@ func pumpTerminalInput(source, closed *os.File, destination io.Writer, command *
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func (s *Supervisor) Resize(size protocol.TerminalSize) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.spec == nil || !s.spec.Terminal {
+		return errors.New("workload does not have a terminal")
+	}
+	if s.command == nil || s.status.Status != "running" || s.terminal == nil {
+		return errors.New("workload is not running")
+	}
+	return setTerminalSize(s.terminal, size)
 }
 
 func (s *Supervisor) applyCgroup(spec *protocol.WorkloadSpec, pid int) error {
@@ -1101,12 +1183,17 @@ func (s *Supervisor) reap(command *exec.Cmd) {
 		exitCode = 0
 	}
 	s.mu.Lock()
+	terminal := s.terminal
+	s.terminal = nil
 	s.command = nil
 	s.status = protocol.ProcessStatus{Status: "exited", ExitCode: &exitCode}
 	waiters := s.waiters
 	s.waiters = nil
 	status := s.status
 	s.mu.Unlock()
+	if terminal != nil {
+		terminal.Close()
+	}
 	for _, waiter := range waiters {
 		waiter <- status
 		close(waiter)

@@ -166,6 +166,7 @@ public struct DockerRouter: Sendable {
                 record.annotations = input.HostConfig?.Annotations ?? [:]
             }
             record.tty = input.Tty ?? false
+            record.consoleSize = validated.consoleSize
             record.attachStdin = input.AttachStdin ?? false
             record.openStdin = input.OpenStdin ?? false
             record.autoRemove = input.HostConfig?.AutoRemove ?? false
@@ -371,10 +372,11 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/exec"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/exec".count))
             let input = try decoder.decode(ExecCreateRequest.self, from: request.body)
-            try validateRuntimeInput(input)
+            let consoleSize = try validateRuntimeInput(input)
             let exec = try await runtime.createExec(container: id, configuration: .init(
                 arguments: input.Cmd, environment: input.Env ?? [], workingDirectory: input.WorkingDir ?? "",
-                user: input.User ?? "", tty: input.Tty ?? false, attachStdin: input.AttachStdin ?? false,
+                user: input.User ?? "", tty: input.Tty ?? false, consoleSize: consoleSize,
+                attachStdin: input.AttachStdin ?? false,
                 attachStdout: input.AttachStdout ?? true, attachStderr: input.AttachStderr ?? true,
                 privileged: input.Privileged ?? false
             ))
@@ -382,13 +384,17 @@ public struct DockerRouter: Sendable {
         case (.POST, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/start"):
             let id = String(value.dropFirst("/exec/".count).dropLast("/start".count))
             let input = try decoder.decode(ExecStartRequest.self, from: request.body)
-            try validateRuntimeInput(input)
+            let consoleSize = try validateRuntimeInput(input)
             guard input.Detach == true else { throw EngineError(.badRequest, "attached exec requires a connection upgrade") }
             let exec = try await runtime.inspectExec(id)
             if let tty = input.Tty, tty != exec.configuration.tty {
                 throw EngineError(.badRequest, "exec start Tty must match the exec configuration")
             }
-            try await runtime.startExec(id)
+            try await runtime.startExec(
+                id,
+                consoleSize: exec.configuration.tty && input.Tty != false && !consoleSize.isZero
+                    ? consoleSize : nil
+            )
             return APIResponse(status: .ok)
         case (.GET, let value) where value.hasPrefix("/exec/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/exec/".count).dropLast("/json".count))
@@ -1134,10 +1140,16 @@ public struct DockerRouter: Sendable {
     }
 
     public func execIO(_ identifier: String) async throws -> ContainerIOBridge { try await runtime.execIO(identifier) }
-    public func startExec(_ identifier: String) async throws { try await runtime.startExec(identifier) }
-    public func validateAttachedExecStart(_ identifier: String, body: Data) async throws {
+    public func startExec(
+        _ identifier: String, consoleSize: TerminalSize? = nil
+    ) async throws {
+        try await runtime.startExec(identifier, consoleSize: consoleSize)
+    }
+    public func validateAttachedExecStart(
+        _ identifier: String, body: Data
+    ) async throws -> TerminalSize? {
         let input = try decoder.decode(ExecStartRequest.self, from: body)
-        try validateRuntimeInput(input)
+        let consoleSize = try validateRuntimeInput(input)
         guard input.Detach != true else {
             throw EngineError(.badRequest, "attached exec start requires Detach=false")
         }
@@ -1145,8 +1157,14 @@ public struct DockerRouter: Sendable {
         if let tty = input.Tty, tty != exec.configuration.tty {
             throw EngineError(.badRequest, "exec start Tty must match the exec configuration")
         }
+        return exec.configuration.tty && input.Tty != false && !consoleSize.isZero
+            ? consoleSize : nil
     }
-    public func startAttachedExec(_ identifier: String) async throws -> CInt? { try await runtime.startAttachedExec(identifier) }
+    public func startAttachedExec(
+        _ identifier: String, consoleSize: TerminalSize? = nil
+    ) async throws -> CInt? {
+        try await runtime.startAttachedExec(identifier, consoleSize: consoleSize)
+    }
     public func containerWait(_ identifier: String, condition: String?) async throws -> ContainerWaitSubscription {
         try await runtime.subscribeContainerWait(identifier, condition: condition)
     }
@@ -1196,7 +1214,7 @@ public struct DockerRouter: Sendable {
     private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (
         mounts: [MountRecord], ulimits: [UlimitRecord], devices: [DeviceMappingRecord],
         deviceCgroupRules: [String], blockIO: BlockIOConfiguration,
-        security: SecurityConfiguration
+        security: SecurityConfiguration, consoleSize: TerminalSize
     ) {
         try rejectActiveRuntimeFields([
             (!(input.Domainname ?? "").isEmpty, "Domainname"),
@@ -1209,7 +1227,7 @@ public struct DockerRouter: Sendable {
         }
         try validateStopSignal(input.StopSignal)
         try validateHealthcheck(input.Healthcheck)
-        let security = try validateHostRuntimeInput(input.HostConfig, tty: input.Tty == true)
+        let host = try validateHostRuntimeInput(input.HostConfig)
         try validateVolumeDrivers(in: input)
         return (
             try mounts(from: input),
@@ -1225,7 +1243,8 @@ public struct DockerRouter: Sendable {
                 writeIOps: input.HostConfig?.BlkioDeviceWriteIOps,
                 prefix: "HostConfig"
             ),
-            security
+            host.security,
+            host.consoleSize
         )
     }
 
@@ -1297,21 +1316,20 @@ public struct DockerRouter: Sendable {
         )
     }
 
-    private func validateRuntimeInput(_ input: ExecCreateRequest) throws {
+    private func validateRuntimeInput(_ input: ExecCreateRequest) throws -> TerminalSize {
         if let detachKeys = input.DetachKeys, !detachKeys.isEmpty {
             throw EngineError(.unsupported, "ExecConfig.DetachKeys is not supported")
         }
-        try validateConsoleSize(input.ConsoleSize, field: "ExecConfig.ConsoleSize")
+        return try normalizedConsoleSize(input.ConsoleSize, field: "ExecConfig.ConsoleSize")
     }
 
-    private func validateRuntimeInput(_ input: ExecStartRequest) throws {
-        try validateConsoleSize(input.ConsoleSize, field: "ExecStartConfig.ConsoleSize")
+    private func validateRuntimeInput(_ input: ExecStartRequest) throws -> TerminalSize {
+        try normalizedConsoleSize(input.ConsoleSize, field: "ExecStartConfig.ConsoleSize")
     }
 
     private func validateHostRuntimeInput(
-        _ host: ContainerCreateRequest.HostConfig?,
-        tty: Bool
-    ) throws -> SecurityConfiguration {
+        _ host: ContainerCreateRequest.HostConfig?
+    ) throws -> (security: SecurityConfiguration, consoleSize: TerminalSize) {
         try validateResourceValues(
             memory: host?.Memory, nanoCPUs: host?.NanoCpus,
             cpuPeriod: host?.CpuPeriod, cpuQuota: host?.CpuQuota,
@@ -1361,10 +1379,8 @@ public struct DockerRouter: Sendable {
         )
         try validateContainerPaths(host?.MaskedPaths, field: "HostConfig.MaskedPaths")
         try validateContainerPaths(host?.ReadonlyPaths, field: "HostConfig.ReadonlyPaths")
-        try validateConsoleSize(
-            host?.ConsoleSize,
-            field: "HostConfig.ConsoleSize",
-            isApplicable: tty
+        let consoleSize = try normalizedConsoleSize(
+            host?.ConsoleSize, field: "HostConfig.ConsoleSize"
         )
         try validateNamespaceModes(host)
         try validateOOMScore(host?.OomScoreAdj)
@@ -1378,7 +1394,7 @@ public struct DockerRouter: Sendable {
         if host?.AutoRemove == true && restartName != "" && restartName != "no" {
             throw EngineError(.badRequest, "AutoRemove cannot be combined with a restart policy")
         }
-        return security
+        return (security, consoleSize)
     }
 
     private func normalizedUlimits(
@@ -1754,18 +1770,18 @@ public struct DockerRouter: Sendable {
         throw EngineError(.badRequest, "invalid HostConfig.Isolation value: \(value)")
     }
 
-    private func validateConsoleSize(
-        _ value: [Int]?,
-        field: String,
-        isApplicable: Bool = true
-    ) throws {
-        guard let value else { return }
-        guard value.count == 2, value.allSatisfy({ $0 >= 0 }) else {
-            throw EngineError(.badRequest, "\(field) must be [height, width] with non-negative values")
+    private func normalizedConsoleSize(
+        _ value: [Int]?, field: String
+    ) throws -> TerminalSize {
+        guard let value else { return .zero }
+        guard value.count == 2,
+              value.allSatisfy({ (0...Int(UInt16.max)).contains($0) }) else {
+            throw EngineError(
+                .badRequest,
+                "\(field) must be [height, width] with values between 0 and \(UInt16.max)"
+            )
         }
-        if isApplicable, value.contains(where: { $0 != 0 }) {
-            throw EngineError(.unsupported, "\(field) is not supported")
-        }
+        return TerminalSize(height: UInt16(value[0]), width: UInt16(value[1]))
     }
 
     private func validateRestartPolicy(name: String?, maximumRetryCount: Int?) throws {
@@ -2216,6 +2232,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
     }
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let PidsLimit: Int64
+        let ConsoleSize: [UInt16]
         let BlkioWeight: UInt16
         let BlkioWeightDevice: [WeightDeviceResponse]?
         let BlkioDeviceReadBps: [ThrottleDeviceResponse]?
@@ -2247,7 +2264,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         }
 
         enum CodingKeys: String, CodingKey {
-            case Memory, NanoCpus, PidsLimit
+            case Memory, NanoCpus, PidsLimit, ConsoleSize
             case BlkioWeight, BlkioWeightDevice, BlkioDeviceReadBps, BlkioDeviceWriteBps
             case BlkioDeviceReadIOps, BlkioDeviceWriteIOps
             case Devices, DeviceCgroupRules, DeviceRequests
@@ -2262,6 +2279,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(Memory, forKey: .Memory)
             try container.encode(NanoCpus, forKey: .NanoCpus)
             try container.encode(PidsLimit, forKey: .PidsLimit)
+            try container.encode(ConsoleSize, forKey: .ConsoleSize)
             try container.encode(BlkioWeight, forKey: .BlkioWeight)
             try container.encode(BlkioWeightDevice, forKey: .BlkioWeightDevice)
             try container.encode(BlkioDeviceReadBps, forKey: .BlkioDeviceReadBps)
@@ -2352,6 +2370,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         HostConfig = .init(
             Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
             PidsLimit: record.pidsLimit,
+            ConsoleSize: [record.consoleSize.height, record.consoleSize.width],
             BlkioWeight: 0, BlkioWeightDevice: nil,
             BlkioDeviceReadBps: record.blockIOReadBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },
             BlkioDeviceWriteBps: record.blockIOWriteBps.map { $0.map { .init(Path: $0.path, Rate: $0.rate) } },

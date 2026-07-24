@@ -494,17 +494,22 @@ func (s *Supervisor) DiscardExec(id string) error {
 		return errors.New("exec is still running")
 	}
 	processIO := s.execIO[id]
+	terminal := s.execTerminals[id]
 	delete(s.execIO, id)
+	delete(s.execTerminals, id)
 	delete(s.execSpecs, id)
 	delete(s.execStatus, id)
 	s.mu.Unlock()
 	if processIO != nil {
 		processIO.close()
 	}
+	if terminal != nil {
+		terminal.Close()
+	}
 	return nil
 }
 
-func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err error) {
+func (s *Supervisor) StartExec(id string, consoleSize *protocol.TerminalSize) (status protocol.ProcessStatus, err error) {
 	s.mu.Lock()
 	if s.command == nil || s.command.Process == nil {
 		s.mu.Unlock()
@@ -573,6 +578,46 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		return protocol.ProcessStatus{}, err
 	}
 	stdinReader, stdinWriter := io.Pipe()
+	var terminalMaster *os.File
+	var terminalSlave *os.File
+	var terminalInput *os.File
+	var terminalOutput *os.File
+	if spec.Terminal {
+		terminalMaster, terminalSlave, err = openPseudoTerminal(
+			selectedTerminalSize(consoleSize, spec.ConsoleSize),
+		)
+		if err == nil {
+			terminalInput, err = duplicateFile(terminalMaster, "exec-"+id+"-terminal-input")
+		}
+		if err == nil {
+			terminalOutput, err = duplicateFile(terminalMaster, "exec-"+id+"-terminal-output")
+		}
+		if err != nil {
+			if terminalOutput != nil {
+				terminalOutput.Close()
+			}
+			if terminalInput != nil {
+				terminalInput.Close()
+			}
+			if terminalSlave != nil {
+				terminalSlave.Close()
+			}
+			if terminalMaster != nil {
+				terminalMaster.Close()
+			}
+			reader.Close()
+			writer.Close()
+			gateReader.Close()
+			gateWriter.Close()
+			targetPIDReader.Close()
+			targetPIDWriter.Close()
+			stdout.Close()
+			stderr.Close()
+			stdinReader.Close()
+			stdinWriter.Close()
+			return protocol.ProcessStatus{}, err
+		}
+	}
 	cgroup, err := openExecCgroup("/sys/fs/cgroup", workloadID, id)
 	if err != nil {
 		reader.Close()
@@ -585,6 +630,18 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		stderr.Close()
 		stdinReader.Close()
 		stdinWriter.Close()
+		if terminalOutput != nil {
+			terminalOutput.Close()
+		}
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalSlave != nil {
+			terminalSlave.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
 		return protocol.ProcessStatus{}, err
 	}
 	cgroupPath := cgroup.Name()
@@ -595,9 +652,16 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 	}()
 	command := exec.Command("/proc/self/exe", execStage1Argument, strconv.Itoa(pid))
 	command.ExtraFiles = []*os.File{reader, gateReader, cgroup, targetPIDWriter}
-	command.Stdout = stdout
-	command.Stderr = stderr
-	command.Stdin = stdinReader
+	if spec.Terminal {
+		command.Stdin = terminalSlave
+		command.Stdout = terminalSlave
+		command.Stderr = terminalSlave
+		command.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	} else {
+		command.Stdout = stdout
+		command.Stderr = stderr
+		command.Stdin = stdinReader
+	}
 	if err := command.Start(); err != nil {
 		cgroup.Close()
 		reader.Close()
@@ -610,19 +674,44 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		stderr.Close()
 		stdinReader.Close()
 		stdinWriter.Close()
+		if terminalOutput != nil {
+			terminalOutput.Close()
+		}
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalSlave != nil {
+			terminalSlave.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
 		return protocol.ProcessStatus{}, err
+	}
+	if terminalSlave != nil {
+		terminalSlave.Close()
 	}
 	cgroup.Close()
 	reader.Close()
 	gateReader.Close()
 	targetPIDWriter.Close()
-	stdout.Close()
+	if terminalOutput != nil {
+		go pumpTerminalOutput(terminalOutput, stdout, command)
+	} else {
+		stdout.Close()
+	}
 	stderr.Close()
 	if _, err := writer.Write(data); err != nil {
 		writer.Close()
 		gateWriter.Close()
 		targetPIDReader.Close()
 		stdinWriter.Close()
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
@@ -632,6 +721,12 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 		gateWriter.Close()
 		targetPIDReader.Close()
 		stdinWriter.Close()
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
@@ -641,6 +736,12 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 	targetPIDReader.Close()
 	if err != nil {
 		stdinWriter.Close()
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
@@ -650,15 +751,24 @@ func (s *Supervisor) StartExec(id string) (status protocol.ProcessStatus, err er
 	s.execs[id] = command
 	s.execTargets[id] = targetPID
 	s.execCgroups[id] = cgroupPath
+	if terminalMaster != nil {
+		s.execTerminals[id] = terminalMaster
+	}
 	s.execStatus[id] = status
 	s.mu.Unlock()
 	committed = true
 	go s.reapExec(id, command)
-	go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
+	if terminalInput != nil {
+		stdinWriter.Close()
+		stdinReader.Close()
+		go pumpTerminalInput(processIO.stdin, processIO.stdinClosed, terminalInput, command)
+	} else {
+		go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
+	}
 	return status, nil
 }
 
-func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready func(protocol.ProcessStatus) error) (status protocol.ProcessStatus, err error) {
+func (s *Supervisor) StartExecAttached(id string, consoleSize *protocol.TerminalSize, stream io.ReadWriter, ready func(protocol.ProcessStatus) error) (status protocol.ProcessStatus, err error) {
 	s.mu.Lock()
 	if s.command == nil || s.command.Process == nil {
 		s.mu.Unlock()
@@ -726,7 +836,47 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	command.ExtraFiles = []*os.File{reader, gateReader, cgroup, targetPIDWriter}
 	var stdinFile *os.File
 	var cancelStdin func()
-	if spec.AttachStdin {
+	var terminalMaster *os.File
+	var terminalSlave *os.File
+	var terminalInput *os.File
+	var terminalOutput *os.File
+	if spec.Terminal {
+		terminalMaster, terminalSlave, err = openPseudoTerminal(
+			selectedTerminalSize(consoleSize, spec.ConsoleSize),
+		)
+		if err == nil && spec.AttachStdin {
+			terminalInput, err = duplicateFile(terminalMaster, "exec-"+id+"-attached-terminal-input")
+		}
+		if err == nil && spec.AttachStdout {
+			terminalOutput, err = duplicateFile(terminalMaster, "exec-"+id+"-attached-terminal-output")
+		}
+		if err != nil {
+			cgroup.Close()
+			if terminalOutput != nil {
+				terminalOutput.Close()
+			}
+			if terminalInput != nil {
+				terminalInput.Close()
+			}
+			if terminalSlave != nil {
+				terminalSlave.Close()
+			}
+			if terminalMaster != nil {
+				terminalMaster.Close()
+			}
+			reader.Close()
+			writer.Close()
+			gateReader.Close()
+			gateWriter.Close()
+			targetPIDReader.Close()
+			targetPIDWriter.Close()
+			return protocol.ProcessStatus{}, err
+		}
+		command.Stdin = terminalSlave
+		command.Stdout = terminalSlave
+		command.Stderr = terminalSlave
+		command.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	} else if spec.AttachStdin {
 		stdinFile, cancelStdin, err = attachedExecStdin(stream)
 		if err != nil {
 			cgroup.Close()
@@ -740,10 +890,10 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		}
 		command.Stdin = stdinFile
 	}
-	if spec.AttachStdout {
+	if !spec.Terminal && spec.AttachStdout {
 		command.Stdout = mux.stream(1)
 	}
-	if spec.AttachStderr {
+	if !spec.Terminal && spec.AttachStderr {
 		command.Stderr = mux.stream(2)
 	}
 	if err := command.Start(); err != nil {
@@ -753,6 +903,18 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		}
 		if stdinFile != nil {
 			stdinFile.Close()
+		}
+		if terminalOutput != nil {
+			terminalOutput.Close()
+		}
+		if terminalInput != nil {
+			terminalInput.Close()
+		}
+		if terminalSlave != nil {
+			terminalSlave.Close()
+		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
 		}
 		reader.Close()
 		writer.Close()
@@ -766,6 +928,15 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	if stdinFile != nil {
 		stdinFile.Close()
 	}
+	if terminalSlave != nil {
+		terminalSlave.Close()
+	}
+	if terminalOutput != nil {
+		go pumpTerminalOutput(terminalOutput, mux.stream(1), command)
+	}
+	if terminalInput != nil {
+		cancelStdin = attachedTerminalInput(stream, terminalInput)
+	}
 	reader.Close()
 	gateReader.Close()
 	targetPIDWriter.Close()
@@ -776,6 +947,9 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 		if cancelStdin != nil {
 			cancelStdin()
 		}
+		if terminalMaster != nil {
+			terminalMaster.Close()
+		}
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		return protocol.ProcessStatus{}, err
@@ -785,6 +959,9 @@ func (s *Supervisor) StartExecAttached(id string, stream io.ReadWriter, ready fu
 	s.mu.Lock()
 	s.execs[id] = command
 	s.execCgroups[id] = cgroupPath
+	if terminalMaster != nil {
+		s.execTerminals[id] = terminalMaster
+	}
 	s.execStatus[id] = status
 	s.mu.Unlock()
 	committed = true
@@ -875,6 +1052,29 @@ func attachedExecStdin(stream io.Reader) (*os.File, func(), error) {
 		_ = writer.Close()
 	}()
 	return reader, cancel, nil
+}
+
+func attachedTerminalInput(stream io.Reader, destination *os.File) func() {
+	cancel := func() {
+		_ = destination.Close()
+		if closer, ok := stream.(interface{ CloseRead() error }); ok {
+			_ = closer.CloseRead()
+		}
+	}
+	go func() {
+		_, _ = io.Copy(destination, stream)
+		_ = destination.Close()
+	}()
+	return cancel
+}
+
+func selectedTerminalSize(
+	start, configured *protocol.TerminalSize,
+) *protocol.TerminalSize {
+	if start != nil && (start.Height != 0 || start.Width != 0) {
+		return start
+	}
+	return configured
 }
 
 type dockerStreamMux struct {
@@ -984,6 +1184,20 @@ func (s *Supervisor) ExecStatus(id string) protocol.ProcessStatus {
 	defer s.mu.Unlock()
 	return s.execStatus[id]
 }
+
+func (s *Supervisor) ResizeExec(id string, size protocol.TerminalSize) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	spec, exists := s.execSpecs[id]
+	if !exists || !spec.Terminal {
+		return errors.New("exec does not have a terminal")
+	}
+	if s.execStatus[id].Status != "running" {
+		return errors.New("exec is not running")
+	}
+	return setTerminalSize(s.execTerminals[id], size)
+}
+
 func (s *Supervisor) SignalExec(id string, signal int) error {
 	s.mu.Lock()
 	command := s.execs[id]
@@ -1050,6 +1264,7 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	s.mu.Lock()
 	cgroup := s.execCgroups[id]
 	processIO := s.execIO[id]
+	terminal := s.execTerminals[id]
 	inspectPID := s.execStatus[id].PID
 	if inspectPID == 0 {
 		inspectPID = execInspectPID(s.execTargets[id])
@@ -1058,11 +1273,15 @@ func (s *Supervisor) reapExec(id string, command *exec.Cmd, afterWait ...func())
 	delete(s.execTargets, id)
 	delete(s.execCgroups, id)
 	delete(s.execIO, id)
+	delete(s.execTerminals, id)
 	delete(s.execSpecs, id)
 	s.execStatus[id] = protocol.ProcessStatus{Status: "exited", PID: inspectPID, ExitCode: &code}
 	s.mu.Unlock()
 	if processIO != nil {
 		processIO.close()
+	}
+	if terminal != nil {
+		terminal.Close()
 	}
 	if cgroup != "" {
 		_ = os.Remove(cgroup)

@@ -1,3 +1,4 @@
+import CEngineCore
 import Foundation
 
 public struct ExecConfiguration: Sendable {
@@ -6,6 +7,7 @@ public struct ExecConfiguration: Sendable {
     public var workingDirectory: String
     public var user: String
     public var tty: Bool
+    public var consoleSize: TerminalSize
     public var attachStdin: Bool
     public var attachStdout: Bool
     public var attachStderr: Bool
@@ -13,11 +15,13 @@ public struct ExecConfiguration: Sendable {
 
     public init(
         arguments: [String], environment: [String] = [], workingDirectory: String = "", user: String = "",
-        tty: Bool = false, attachStdin: Bool = false, attachStdout: Bool = true,
+        tty: Bool = false, consoleSize: TerminalSize = .zero,
+        attachStdin: Bool = false, attachStdout: Bool = true,
         attachStderr: Bool = true, privileged: Bool = false
     ) {
         self.arguments = arguments; self.environment = environment; self.workingDirectory = workingDirectory
-        self.user = user; self.tty = tty; self.attachStdin = attachStdin; self.attachStdout = attachStdout
+        self.user = user; self.tty = tty; self.consoleSize = consoleSize
+        self.attachStdin = attachStdin; self.attachStdout = attachStdout
         self.attachStderr = attachStderr; self.privileged = privileged
     }
 }

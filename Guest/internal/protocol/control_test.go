@@ -6,8 +6,8 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 15 {
-		t.Fatalf("Version = %d, want 15", Version)
+	if Version != 16 {
+		t.Fatalf("Version = %d, want 16", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -69,8 +69,8 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 15 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 15, got %d", Version)
+	if Version != 16 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 16, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {
