@@ -6,8 +6,8 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 16 {
-		t.Fatalf("Version = %d, want 16", Version)
+	if Version != 17 {
+		t.Fatalf("Version = %d, want 17", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -69,12 +69,33 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 16 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 16, got %d", Version)
+	if Version != 17 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 17, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {
 		t.Fatalf("endpoint sysctls did not round-trip through protocol model: %#v", endpoint.Sysctls)
+	}
+}
+
+func TestWallClockTimeRequiresBothFields(t *testing.T) {
+	var value WallClockTime
+	if err := json.Unmarshal(
+		[]byte(`{"seconds":1784920000,"microseconds":123456}`), &value,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if value.Seconds != 1_784_920_000 || value.Microseconds != 123_456 {
+		t.Fatalf("WallClockTime = %#v", value)
+	}
+	for _, payload := range []string{
+		`{"seconds":1784920000}`,
+		`{"microseconds":123456}`,
+		`{"seconds":"invalid","microseconds":123456}`,
+	} {
+		if err := json.Unmarshal([]byte(payload), &value); err == nil {
+			t.Fatalf("WallClockTime accepted %s", payload)
+		}
 	}
 }
 

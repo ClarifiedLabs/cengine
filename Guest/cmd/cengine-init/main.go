@@ -26,6 +26,7 @@ import (
 
 type controlServer struct {
 	process *supervisor.Supervisor
+	setTime func(seconds, microseconds int64) error
 }
 
 func main() {
@@ -106,7 +107,7 @@ func main() {
 	}
 	defer rootListener.Close()
 	go serveRootFS(rootListener)
-	state := &controlServer{process: supervisor.New()}
+	state := &controlServer{process: supervisor.New(), setTime: operations.SetTime}
 	execListener, err := vsock.Listen(protocol.ExecIOPort)
 	if err != nil {
 		log.Fatalf("listen on exec I/O vsock: %v", err)
@@ -376,6 +377,19 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 	switch request.Operation {
 	case "ping":
 		return json.RawMessage(`{"status":"ready"}`), nil
+	case "set-time":
+		var value protocol.WallClockTime
+		if err := json.Unmarshal(request.Payload, &value); err != nil {
+			return nil, fmt.Errorf("decode wall clock time: %w", err)
+		}
+		setTime := state.setTime
+		if setTime == nil {
+			setTime = operations.SetTime
+		}
+		if err := setTime(value.Seconds, value.Microseconds); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"status":"synchronized"}`), nil
 	case "prepare-memory-reclaim":
 		status, err := operations.PrepareMemoryReclaim()
 		if err != nil {

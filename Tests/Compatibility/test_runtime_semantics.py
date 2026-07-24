@@ -392,6 +392,109 @@ def test_image_label_filters_isolate_testcontainers_cleanup_sessions(
     assert client.images.get(RYUK_IMAGE).id == ryuk.id
 
 
+@pytest.mark.compat("RTM-032")
+def test_guest_wall_clock_is_synchronized_across_vm_lifecycle(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    containers: list[docker.models.containers.Container] = []
+    recovered = None
+
+    def assert_clock(
+        value: docker.models.containers.Container, phase: str,
+    ) -> None:
+        before = time.time_ns()
+        result = value.exec_run([
+            "sh", "-ec",
+            "probe=/tmp/cengine-clock-probe; : >$probe; stat -c '%Y|%y' $probe",
+        ])
+        after = time.time_ns()
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+
+        epoch, separator, formatted = result.output.decode().strip().partition("|")
+        assert separator, f"{phase}: unexpected stat timestamp {result.output!r}"
+        fraction_separator = formatted.rfind(".")
+        assert fraction_separator >= 0, f"{phase}: stat timestamp lacks subsecond precision: {formatted}"
+        fraction = formatted[fraction_separator + 1:].split()[0]
+        assert fraction.isdigit() and 1 <= len(fraction) <= 9, (
+            f"{phase}: invalid stat timestamp fraction: {formatted}"
+        )
+        guest = int(epoch) * 1_000_000_000 + int(fraction.ljust(9, "0"))
+
+        tolerance = 25_000_000
+        assert before - tolerance <= guest <= after + tolerance, (
+            f"{phase}: guest timestamp {guest} outside host bracket "
+            f"{before}..{after} with {tolerance}ns tolerance"
+        )
+
+    def running_generation(
+        container_id: str,
+    ) -> tuple[pathlib.Path, dict[str, object], dict[str, object]]:
+        generations = daemon.root / "containers" / container_id / "shim-generations"
+        running = []
+        for specification_path in generations.glob("*/spec.json"):
+            specification = json.loads(specification_path.read_text())
+            status_path = pathlib.Path(str(specification["socketPath"]) + ".status")
+            if not status_path.exists():
+                continue
+            status = json.loads(status_path.read_text())
+            if status["state"] in {"running", "paused"}:
+                running.append((specification_path, specification, status))
+        assert len(running) == 1, f"active VM shim generations: {running}"
+        return running[0]
+
+    try:
+        for index in range(4):
+            value = client.containers.run(
+                ALPINE_IMAGE,
+                ["tail", "-f", "/dev/null"],
+                name=f"clock-{suffix}-{index}",
+                detach=True,
+            )
+            containers.append(value)
+            assert_clock(value, f"fresh VM {index + 1}")
+
+        retained = containers[-1]
+        retained.pause()
+        time.sleep(1.25)
+        retained.unpause()
+        assert_clock(retained, "resume")
+
+        specification_path, specification, status = running_generation(retained.id)
+        generation = specification_path.parent.name
+        shim_pid = status["processIdentifier"]
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        retained = recovered.containers.get(retained.id)
+        retained.reload()
+        assert retained.status == "running"
+
+        recovered_specification_path, recovered_specification, recovered_status = (
+            running_generation(retained.id)
+        )
+        assert recovered_specification_path.parent.name == generation
+        assert recovered_specification == specification
+        assert recovered_status["processIdentifier"] == shim_pid
+        assert_clock(retained, "daemon recovery")
+
+        retained.pause()
+        time.sleep(1.25)
+        retained.unpause()
+        assert_clock(retained, "post-recovery resume")
+    finally:
+        cleanup_client = recovered or client
+        for value in containers:
+            try:
+                cleanup_client.containers.get(value.id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-014")
 def test_ulimits_apply_to_init_exec_healthchecks_and_survive_recovery(
     daemon, client: docker.DockerClient,

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version                         = 16
+	Version                         = 17
 	ControlPort                     = 4100
 	FileSystemPort                  = 4101
 	RootFSContentPort               = 4102
@@ -32,6 +32,27 @@ type Envelope struct {
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type WallClockTime struct {
+	Seconds      int64 `json:"seconds"`
+	Microseconds int64 `json:"microseconds"`
+}
+
+func (value *WallClockTime) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Seconds      *int64 `json:"seconds"`
+		Microseconds *int64 `json:"microseconds"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Seconds == nil || wire.Microseconds == nil {
+		return errors.New("wall clock time requires seconds and microseconds")
+	}
+	value.Seconds = *wire.Seconds
+	value.Microseconds = *wire.Microseconds
+	return nil
 }
 
 type WorkloadSpec struct {

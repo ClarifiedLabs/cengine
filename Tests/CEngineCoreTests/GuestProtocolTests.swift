@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 16)
+        #expect(GuestProtocol.version == 17)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -34,7 +34,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 16)
+        #expect(GuestProtocol.version == 17)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -152,6 +152,22 @@ import Testing
         let decoded = try GuestProtocol.decode(encoded)
 
         #expect(decoded == envelope)
+    }
+
+    @Test func wallClockTimeRoundTripsInCurrentProtocol() throws {
+        #expect(GuestProtocol.version == 17)
+        let value = GuestProtocol.WallClockTime(
+            seconds: 1_784_920_000, microseconds: 123_456
+        )
+
+        let data = try JSONEncoder().encode(value)
+
+        #expect(try JSONDecoder().decode(GuestProtocol.WallClockTime.self, from: data) == value)
+        let object = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        #expect((object["seconds"] as? NSNumber)?.int64Value == 1_784_920_000)
+        #expect((object["microseconds"] as? NSNumber)?.int32Value == 123_456)
     }
 
     @Test func controlEnvelopeEncodesPayloadAsRawJSONForTheGoGuest() throws {

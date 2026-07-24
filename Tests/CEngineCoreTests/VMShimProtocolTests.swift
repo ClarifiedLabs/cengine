@@ -24,6 +24,26 @@ private final class LockedUptimeBox: @unchecked Sendable {
     func load() -> UInt64? { lock.withLock { value } }
 }
 
+@MainActor private final class GuestTimeSyncTestState {
+    enum Failure: Error { case injected }
+
+    var attempts = 0
+    var reportedFailures = 0
+    var failuresRemaining = 0
+
+    func synchronize() async throws {
+        attempts += 1
+        if failuresRemaining > 0 {
+            failuresRemaining -= 1
+            throw Failure.injected
+        }
+    }
+
+    func report(_: Error) {
+        reportedFailures += 1
+    }
+}
+
 private final class RuntimeArtifactFault: @unchecked Sendable {
     enum Failure: Error { case injected }
     private let lock = NSLock()
@@ -6724,6 +6744,102 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         }
         resolver?(.success(42))
         #expect(disposed == [42])
+    }
+
+    @MainActor @Test func guestTimeSynchronizerRetriesAndOwnsOnePeriodicTask() async throws {
+        let state = GuestTimeSyncTestState()
+        state.failuresRemaining = 1
+        let synchronizer = GuestTimeSynchronizer(
+            interval: .milliseconds(5),
+            synchronize: { try await state.synchronize() },
+            failureHandler: { state.report($0) }
+        )
+
+        synchronizer.startPeriodic()
+        synchronizer.startPeriodic()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while state.attempts < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+
+        #expect(state.attempts >= 2)
+        #expect(state.reportedFailures == 1)
+        #expect(synchronizer.hasPeriodicTask)
+
+        await synchronizer.stop()
+        let stoppedAttempts = state.attempts
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(state.attempts == stoppedAttempts)
+        #expect(!synchronizer.hasPeriodicTask)
+
+        synchronizer.startPeriodic()
+        let restartDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while state.attempts == stoppedAttempts, ContinuousClock.now < restartDeadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(state.attempts > stoppedAttempts)
+        await synchronizer.stop()
+    }
+
+    @MainActor @Test func guestStartupSynchronizationFailureRunsTeardown() async {
+        var teardownCalls = 0
+
+        await #expect(throws: GuestTimeSyncTestState.Failure.self) {
+            let _: Bool = try await GuestTimeSynchronizationTransaction.start {
+                throw GuestTimeSyncTestState.Failure.injected
+            } teardown: {
+                teardownCalls += 1
+            }
+        }
+
+        #expect(teardownCalls == 1)
+    }
+
+    @MainActor @Test func guestStartupTeardownFailureIsRollbackIncomplete() async {
+        struct TeardownFailure: Error {}
+
+        await #expect(throws: BackendResourceRollbackIncompleteError.self) {
+            let _: Bool = try await GuestTimeSynchronizationTransaction.start {
+                throw GuestTimeSyncTestState.Failure.injected
+            } teardown: {
+                throw TeardownFailure()
+            }
+        }
+    }
+
+    @MainActor @Test func resumeSynchronizationFailureRepausesBeforeReturningError() async {
+        var repauseCalls = 0
+        var containmentCalls = 0
+
+        await #expect(throws: GuestTimeSyncTestState.Failure.self) {
+            try await GuestTimeSynchronizationTransaction.resume {
+                throw GuestTimeSyncTestState.Failure.injected
+            } repause: {
+                repauseCalls += 1
+            } contain: {
+                containmentCalls += 1
+            }
+        }
+
+        #expect(repauseCalls == 1)
+        #expect(containmentCalls == 0)
+    }
+
+    @MainActor @Test func resumeSynchronizationRollbackFailureContainsGeneration() async {
+        struct RepauseFailure: Error {}
+        var containmentCalls = 0
+
+        await #expect(throws: BackendResourceRollbackIncompleteError.self) {
+            try await GuestTimeSynchronizationTransaction.resume {
+                throw GuestTimeSyncTestState.Failure.injected
+            } repause: {
+                throw RepauseFailure()
+            } contain: {
+                containmentCalls += 1
+            }
+        }
+
+        #expect(containmentCalls == 1)
     }
 
     @Test func guestConnectUsesOnlyTheAbsoluteDeadlineRemainder() throws {

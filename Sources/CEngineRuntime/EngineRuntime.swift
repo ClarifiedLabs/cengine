@@ -892,6 +892,18 @@ public actor EngineRuntime {
             emit(containerEvent("unpause", resumed))
             endLifecycleIntent(intent, for: record.id)
             await reconcileDeferredCompletion(record.id)
+        } catch let error as BackendResourceRollbackIncompleteError {
+            let containmentFailure = await containTaintedExecution(
+                record, clearingResourceIntent: false, quarantineExitCode: 137
+            )
+            endLifecycleIntent(intent, for: record.id)
+            await reconcileDeferredCompletion(record.id)
+            let outcome = containmentFailure.map { "workload remains quarantined: \($0)" }
+                ?? "workload was stopped and removed from the backend execution"
+            throw EngineError(
+                .internalError,
+                "resume rollback was incomplete: \(EngineError.message(for: error)); \(outcome)"
+            )
         } catch {
             endLifecycleIntent(intent, for: record.id)
             await reconcileDeferredCompletion(record.id)
@@ -2725,17 +2737,23 @@ public actor EngineRuntime {
         Self.removeResourceIntent(containerID, from: &snapshot)
     }
 
-    private func persistResourceContainmentCompletion(_ stopped: ContainerRecord) async throws {
+    private func persistContainmentCompletion(
+        _ stopped: ContainerRecord,
+        clearingResourceIntent: Bool
+    ) async throws {
         try await acquirePersistence()
         defer { releasePersistence() }
         try await beforePersistence?()
         var value = snapshot
-        guard let index = value.containers.firstIndex(where: { $0.id == stopped.id }),
-              let intent = value.resourceUpdateIntents?.first(where: {
+        guard let index = value.containers.firstIndex(where: { $0.id == stopped.id }) else {
+            throw EngineError(.conflict, "container \(stopped.id) disappeared during execution containment")
+        }
+        if clearingResourceIntent {
+            guard let intent = value.resourceUpdateIntents?.first(where: {
                 $0.containerID == stopped.id
-              }),
-              Self.resourceUpdateIntentIsValid(intent, current: value.containers[index]) else {
-            throw EngineError(.conflict, "container \(stopped.id) disappeared during resource containment")
+            }), Self.resourceUpdateIntentIsValid(intent, current: value.containers[index]) else {
+                throw EngineError(.conflict, "container \(stopped.id) disappeared during execution containment")
+            }
         }
         value.containers[index] = stopped
         if var cleanup = value.cleanupPendingContainerIDs {
@@ -2747,12 +2765,16 @@ public actor EngineRuntime {
             identities.removeValue(forKey: stopped.id)
             value.containerFenceInstanceIDs = identities.isEmpty ? nil : identities
         }
-        Self.removeResourceIntent(stopped.id, from: &value)
+        if clearingResourceIntent {
+            Self.removeResourceIntent(stopped.id, from: &value)
+        }
         try await saveEngineSnapshot(value)
         guard let current = snapshot.containers.firstIndex(where: { $0.id == stopped.id }) else { return }
         snapshot.containers[current] = stopped
         clearCleanupPending(stopped.id)
-        Self.removeResourceIntent(stopped.id, from: &snapshot)
+        if clearingResourceIntent {
+            Self.removeResourceIntent(stopped.id, from: &snapshot)
+        }
     }
 
     private static func removeResourceIntent(_ containerID: String, from snapshot: inout EngineSnapshot) {
@@ -2999,6 +3021,14 @@ public actor EngineRuntime {
     /// old durable record. The public record is quarantined before teardown;
     /// only verified backend deletion permits an exited publication.
     private func containTaintedResourceUpdate(_ record: ContainerRecord) async -> String? {
+        await containTaintedExecution(record, clearingResourceIntent: true)
+    }
+
+    private func containTaintedExecution(
+        _ record: ContainerRecord,
+        clearingResourceIntent: Bool,
+        quarantineExitCode: Int32? = nil
+    ) async -> String? {
         healthTasks.removeValue(forKey: record.id)?.cancel()
         cancelCompletionMonitor(record.id)
         guard let index = try? containerIndex(record.id) else {
@@ -3011,10 +3041,13 @@ public actor EngineRuntime {
         }
 
         snapshot.containers[index].phase = .dead
+        if let quarantineExitCode {
+            snapshot.containers[index].finishedAt = Date()
+            snapshot.containers[index].exitCode = quarantineExitCode
+        }
         markCleanupPending(record.id)
-        // The pre-mutation resource journal is already a durable fence. Still
-        // try to publish the stronger dead+cleanup fence and retain its failure
-        // for diagnostics if physical teardown cannot be verified either.
+        // Publish the dead+cleanup fence before teardown and retain its failure
+        // for diagnostics if physical containment cannot be verified either.
         let fenceFailure: Error?
         do {
             try await persist()
@@ -3059,7 +3092,9 @@ public actor EngineRuntime {
         stopped.finishedAt = Date()
         stopped.exitCode = stopCode ?? 137
         do {
-            try await persistResourceContainmentCompletion(stopped)
+            try await persistContainmentCompletion(
+                stopped, clearingResourceIntent: clearingResourceIntent
+            )
         } catch {
             guard let quarantined = try? containerIndex(record.id) else {
                 return "backend teardown succeeded but the safe terminal state could not be persisted: \(EngineError.message(for: error))"

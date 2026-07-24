@@ -418,7 +418,15 @@ enum VMShimAttachmentResolver {
             try await machine.pause(); state = .paused; try persist(); return try JSONEncoder().encode(status())
         case .resume:
             guard let machine else { throw EngineError(.conflict, "VM is not booted") }
-            try await machine.resume(); state = .running; try persist(); return try JSONEncoder().encode(status())
+            do {
+                try await machine.resume()
+            } catch let error as BackendResourceRollbackIncompleteError {
+                state = .failed
+                failure = error.localizedDescription
+                try? persist()
+                throw error
+            }
+            state = .running; failure = nil; try persist(); return try JSONEncoder().encode(status())
         case .stop:
             if let machine { try await machine.forceStop() }
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }

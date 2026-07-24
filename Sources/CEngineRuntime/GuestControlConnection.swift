@@ -16,9 +16,14 @@ public actor GuestControlConnection {
     public func request<Payload: Encodable, Response: Decodable>(
         operation: String,
         payload: Payload,
-        response: Response.Type
+        response: Response.Type,
+        deadlineNanoseconds: UInt64? = nil
     ) throws -> Response {
-        let data = try requestRaw(operation: operation, payload: JSONEncoder().encode(payload))
+        let data = try requestRaw(
+            operation: operation,
+            payload: JSONEncoder().encode(payload),
+            deadlineNanoseconds: deadlineNanoseconds
+        )
         return try JSONDecoder().decode(response, from: data)
     }
 
@@ -38,6 +43,7 @@ public actor GuestControlConnection {
                     .internalError, "could not configure guest control request deadline"
                 )
             }
+            defer { _ = Darwin.fcntl(descriptor, F_SETFL, flags) }
             try Self.writeExactly(
                 GuestProtocol.encode(envelope),
                 to: descriptor,
@@ -66,12 +72,41 @@ public actor GuestControlConnection {
         return data
     }
 
-    public func ping() throws {
+    public func ping(deadlineNanoseconds: UInt64? = nil) throws {
         struct Empty: Codable {}
         struct Status: Decodable { let status: String }
-        let status: Status = try request(operation: "ping", payload: Empty(), response: Status.self)
+        let status: Status = try request(
+            operation: "ping",
+            payload: Empty(),
+            response: Status.self,
+            deadlineNanoseconds: deadlineNanoseconds
+        )
         guard status.status == "ready" else {
             throw EngineError(.internalError, "guest returned unexpected status \(status.status)")
+        }
+    }
+
+    public func synchronizeTime(deadlineNanoseconds: UInt64) throws {
+        struct Status: Decodable { let status: String }
+        var sample = timeval()
+        guard Darwin.gettimeofday(&sample, nil) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard let microseconds = Int32(exactly: sample.tv_usec) else {
+            throw EngineError(.internalError, "host wall clock microseconds are out of range")
+        }
+        let status: Status = try request(
+            operation: "set-time",
+            payload: GuestProtocol.WallClockTime(
+                seconds: Int64(sample.tv_sec), microseconds: microseconds
+            ),
+            response: Status.self,
+            deadlineNanoseconds: deadlineNanoseconds
+        )
+        guard status.status == "synchronized" else {
+            throw EngineError(
+                .internalError, "guest returned unexpected time synchronization status \(status.status)"
+            )
         }
     }
 

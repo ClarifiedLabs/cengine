@@ -15,6 +15,17 @@ import Foundation
     private let maximumMemoryBytes: UInt64
     private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
     private var memoryPressureState = MemoryBalloonPressureState()
+    private lazy var timeSynchronizer = GuestTimeSynchronizer(
+        synchronize: { [weak self] in
+            guard let self else { throw CancellationError() }
+            try await self.synchronizeTime()
+        },
+        failureHandler: { [weak self] error in
+            self?.logTimeSynchronization(
+                "periodic synchronization failed; retrying: \(error.localizedDescription)"
+            )
+        }
+    )
 
     public init(configuration: RawVirtualMachineConfiguration) throws {
         identifier = configuration.id
@@ -44,22 +55,56 @@ import Foundation
 
     public func start() async throws {
         try await machine.start()
+        let guest = try await GuestTimeSynchronizationTransaction.start {
+            let guest = try await self.awaitGuestControl()
+            try await self.timeSynchronizer.synchronizeNow()
+            return guest
+        } teardown: {
+            await self.timeSynchronizer.stop()
+            self.control = nil
+            if self.machine.canStop {
+                try await self.machine.stop()
+            }
+        }
+        control = guest
+        timeSynchronizer.startPeriodic()
+        startMemoryPressureMonitoring()
+    }
+
+    private func awaitGuestControl() async throws -> GuestControlConnection {
         var lastError: Error?
         for attempt in 0..<100 {
+            var connection: VZVirtioSocketConnection?
             do {
-                let connection = try await connect(toPort: GuestProtocol.controlPort, timeout: .milliseconds(100))
-                let guest = GuestControlConnection(connection: SendableVirtioSocketConnection(connection))
-                try await guest.ping()
-                control = guest
-                startMemoryPressureMonitoring()
-                return
+                let deadline = DispatchTime.now().uptimeNanoseconds &+ 100_000_000
+                let value = try await connect(
+                    toPort: GuestProtocol.controlPort, timeout: .milliseconds(100)
+                )
+                connection = value
+                let guest = GuestControlConnection(
+                    connection: SendableVirtioSocketConnection(value)
+                )
+                try await guest.ping(deadlineNanoseconds: deadline)
+                return guest
             } catch {
+                connection?.close()
                 lastError = error
                 try await Task.sleep(for: .milliseconds(min(25 * (attempt + 1), 250)))
             }
         }
-        try? await machine.stop()
         throw lastError ?? EngineError(.internalError, "guest control service did not become ready")
+    }
+
+    private func synchronizeTime() async throws {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ 1_000_000_000
+        let connection = try await connect(
+            toPort: GuestProtocol.controlPort, timeout: .seconds(1)
+        )
+        defer { connection.close() }
+        let guest = GuestControlConnection(
+            connection: SendableVirtioSocketConnection(connection)
+        )
+        try await guest.synchronizeTime(deadlineNanoseconds: deadline)
     }
 
     public func startInfrastructure(servicePort: UInt32) async throws {
@@ -139,15 +184,35 @@ import Foundation
 
     public func pause() async throws {
         guard machine.canPause else { throw EngineError(.conflict, "container VM cannot be paused") }
-        try await machine.pause()
+        await timeSynchronizer.stop()
+        do {
+            try await machine.pause()
+        } catch {
+            if machine.state == .running {
+                timeSynchronizer.startPeriodic()
+            }
+            throw error
+        }
     }
 
     public func resume() async throws {
         guard machine.canResume else { throw EngineError(.conflict, "container VM cannot be resumed") }
         try await machine.resume()
+        try await GuestTimeSynchronizationTransaction.resume {
+            try await self.timeSynchronizer.synchronizeNow()
+        } repause: {
+            guard self.machine.canPause else {
+                throw EngineError(.conflict, "resumed container VM cannot be re-paused")
+            }
+            try await self.machine.pause()
+        } contain: {
+            try await self.forceStop()
+        }
+        timeSynchronizer.startPeriodic()
     }
 
     public func forceStop() async throws {
+        await timeSynchronizer.stop()
         stopMemoryPressureMonitoring()
         control = nil
         guard machine.canStop else { return }
@@ -155,12 +220,14 @@ import Foundation
     }
 
     public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        timeSynchronizer.cancel()
         stopMemoryPressureMonitoring()
         control = nil
     }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
         stopError = error
+        timeSynchronizer.cancel()
         stopMemoryPressureMonitoring()
         control = nil
     }
@@ -237,6 +304,12 @@ import Foundation
 
     private func logMemoryBalloon(_ message: String) {
         FileHandle.standardError.write(Data("vm \(identifier) memory balloon: \(message)\n".utf8))
+    }
+
+    private func logTimeSynchronization(_ message: String) {
+        FileHandle.standardError.write(
+            Data("vm \(identifier) time synchronization: \(message)\n".utf8)
+        )
     }
 }
 

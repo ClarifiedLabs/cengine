@@ -340,6 +340,46 @@ private actor BlockingPauseResumeBackend: ContainerBackend {
     func releaseResume() { resumeContinuation?.resume(); resumeContinuation = nil }
 }
 
+private actor ResumeRollbackBackend: ContainerBackend {
+    enum Failure: Error { case stop, deletion }
+
+    private var running = Set<String>()
+    private var rejectCleanup: Bool
+    private var stops = 0
+    private var deletes = 0
+
+    init(rejectCleanup: Bool = false) {
+        self.rejectCleanup = rejectCleanup
+    }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        running.insert(container.id)
+        return container.ports
+    }
+    func stop(_ container: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 {
+        stops += 1
+        if rejectCleanup { throw Failure.stop }
+        running.remove(container.id)
+        return 137
+    }
+    func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func delete(_ container: ContainerRecord) async throws {
+        deletes += 1
+        if rejectCleanup { throw Failure.deletion }
+        running.remove(container.id)
+    }
+    func pause(_: ContainerRecord) async throws {}
+    func resume(_: ContainerRecord) async throws {
+        throw BackendResourceRollbackIncompleteError("injected resume rollback failure")
+    }
+
+    func allowCleanup() { rejectCleanup = false }
+    func isRunning(_ identifier: String) -> Bool { running.contains(identifier) }
+    func counts() -> (stops: Int, deletes: Int) { (stops, deletes) }
+}
+
 private actor PauseExitRaceBackend: ContainerBackend {
     private var completionContinuation: CheckedContinuation<Int32?, Never>?
     private var pauseContinuation: CheckedContinuation<Void, Never>?
@@ -9529,6 +9569,69 @@ private actor AuthImageBackend: ContainerBackend {
         let restarted = try await runtime.container(record.id)
         #expect(restarted.phase == .running)
         #expect(restarted.restartCount == 1)
+    }
+
+    @Test func incompleteResumeRollbackStopsAndRetiresBackendExecution() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ResumeRollbackBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "resume-rollback-contained", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        try await runtime.pauseContainer(record.id)
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.resumeContainer(record.id)
+        }
+
+        let contained = try await runtime.container(record.id)
+        #expect(contained.phase == .exited)
+        #expect(contained.exitCode == 137)
+        #expect(!(await backend.isRunning(record.id)))
+        let counts = await backend.counts()
+        #expect(counts.stops == 1)
+        #expect(counts.deletes == 1)
+        let durable = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: EngineSnapshot())
+        #expect(durable.containers.first(where: { $0.id == record.id })?.phase == .exited)
+        #expect(durable.cleanupPendingContainerIDs?.contains(record.id) != true)
+        await runtime.shutdown()
+    }
+
+    @Test func incompleteResumeRollbackStaysQuarantinedWhenCleanupCannotBeVerified() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = ResumeRollbackBackend(rejectCleanup: true)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let record = try await runtime.createContainer(
+            ContainerRecord(name: "resume-rollback-quarantined", image: "debian")
+        )
+        try await runtime.startContainer(record.id)
+        try await runtime.pauseContainer(record.id)
+
+        await #expect(throws: EngineError.self) {
+            try await runtime.resumeContainer(record.id)
+        }
+
+        #expect(try await runtime.container(record.id).phase == .dead)
+        #expect(await backend.isRunning(record.id))
+        let durable = try await AtomicStore<EngineSnapshot>(
+            url: root.appending(path: "engine.json")
+        ).load(default: EngineSnapshot())
+        #expect(durable.containers.first(where: { $0.id == record.id })?.phase == .dead)
+        #expect(durable.cleanupPendingContainerIDs?.contains(record.id) == true)
+
+        await runtime.shutdown()
+        await backend.allowCleanup()
+        let reloaded = try await EngineRuntime(root: root, backend: backend)
+        let recovered = try await reloaded.container(record.id)
+        #expect(recovered.phase == .exited)
+        #expect(recovered.exitCode == 137)
+        #expect(!(await backend.isRunning(record.id)))
+        await reloaded.shutdown()
     }
 
     @Test func pauseAndResumeReResolveByIDAndReserveTheirContainer() async throws {

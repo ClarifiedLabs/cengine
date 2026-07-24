@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 16
+    public static let version: UInt32 = 17
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -40,6 +40,16 @@ public enum GuestProtocol {
         public init(code: String, message: String) {
             self.code = code
             self.message = message
+        }
+    }
+
+    public struct WallClockTime: Codable, Sendable, Equatable {
+        public var seconds: Int64
+        public var microseconds: Int32
+
+        public init(seconds: Int64, microseconds: Int32) {
+            self.seconds = seconds
+            self.microseconds = microseconds
         }
     }
 
