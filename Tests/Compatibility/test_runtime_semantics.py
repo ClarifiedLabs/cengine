@@ -2096,6 +2096,30 @@ def test_attached_exec_inspect_publishes_pid_and_terminal_status(
         container.remove(force=True)
 
 
+@pytest.mark.compat("RTM-029")
+def test_exec_create_racing_init_exit_reports_container_not_running(
+    client: docker.DockerClient,
+):
+    rejected = 0
+    for _ in range(4):
+        container = client.containers.create(
+            ALPINE_IMAGE, ["sh", "-c", "exit 0"],
+        )
+        try:
+            container.start()
+            try:
+                client.api.exec_create(container.id, ["true"])
+            except docker.errors.APIError as error:
+                rejected += 1
+                assert error.status_code == 409
+                assert "is not running" in error.explanation
+                assert "VM shim" not in error.explanation
+        finally:
+            container.remove(force=True)
+
+    assert rejected > 0, "immediate init exit did not exercise exec-create rejection"
+
+
 @pytest.mark.compat("RTM-010")
 def test_paused_stop_restart_and_force_remove_complete(client: docker.DockerClient):
     stopped = client.containers.run(

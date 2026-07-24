@@ -347,6 +347,21 @@ enum RawExactContainerOwnershipGuard {
     }
 }
 
+enum RawActiveContainerExecutionGuard {
+    static func require(
+        _ container: ContainerRecord,
+        activeInstanceID: UUID?,
+        hasCompletion: Bool
+    ) throws {
+        guard !hasCompletion,
+              activeInstanceID == container.instanceID else {
+            throw EngineError(
+                .conflict, "Container \(container.id) is not running"
+            )
+        }
+    }
+}
+
 struct RawExecCleanupKey: Hashable, Sendable {
     let containerID: String
     let containerInstanceID: UUID
@@ -3588,6 +3603,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         }
         if let existing = completionTasks[container.id], existing.generation == generation {
             let code: Int32
+            var terminated = false
             do {
                 code = try await AsyncTimeout.run(seconds: Int64(max(0, timeoutSeconds))) {
                     await existing.task.value
@@ -3605,9 +3621,22 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 } catch {
                     try await terminateShim(container.id, shim: shim)
                     code = 137
+                    terminated = true
                 }
             }
-            return try await recordCompletion(container, code: code, generation: generation)
+            let published = try await recordCompletion(
+                container, code: code, generation: generation
+            )
+            if !terminated {
+                do {
+                    _ = try await AsyncTimeout.run(seconds: Self.forcedStopWaitSeconds) {
+                        try await shim.stop()
+                    }
+                } catch {
+                    try await terminateShim(container.id, shim: shim)
+                }
+            }
+            return published
         }
         completionTasks.removeValue(forKey: container.id)?.task.cancel()
         let task = Task {
@@ -3655,12 +3684,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
             completionTasks.removeValue(forKey: container.id)?.task.cancel()
             task = Task {
                 let value: Status? = try? await shim.guest(operation: "wait", payload: Empty(), response: Status.self)
-                _ = try? await shim.stop()
                 return value.map { Int32($0.exitCode ?? 0) } ?? container.exitCode ?? 137
             }
             completionTasks[container.id] = (generation, task)
         }
-        return try await recordCompletion(container, code: task.value, generation: generation)
+        let published = try await recordCompletion(
+            container, code: task.value, generation: generation
+        )
+        // Publish terminal backend state while guest control is still available.
+        // An exec-create request can otherwise re-enter this actor after the VM
+        // stops but before completion becomes visible and leak a shim error.
+        _ = try? await shim.stop()
+        return published
     }
 
     public func completion(_ container: ContainerRecord) async -> Int32? {
@@ -3787,11 +3822,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge {
         try requireExactContainerOwnership(container)
+        try requireActiveContainerExecution(container)
         guard exec.containerID == container.id,
               exec.containerInstanceID == container.instanceID else {
             throw EngineError(.conflict, "exec owner does not match container instance")
         }
         try await recoverFailedExecArtifactCleanup(for: container)
+        try requireActiveContainerExecution(container)
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         let image = try await resolvedImage(container.image, platform: container.platform)
         let containerDirectory = try containerStateDirectory(for: container.id)
@@ -3853,21 +3890,29 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let ioClaim = RawExecArtifactTransaction.guestClaim(
             for: preparedExecArtifacts.record
         )
-        let status: Status = try await shim.guest(
-            operation: "prepare-exec",
-            payload: GuestProtocol.Exec(
-                id: exec.id, arguments: configuration.arguments, environment: context.environment,
-                workingDirectory: context.workingDirectory, user: context.user,
-                terminal: configuration.tty, attachStdin: configuration.attachStdin,
-                attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
-                noNewPrivileges: context.noNewPrivileges,
-                privileged: context.privileged,
-                seccompDefault: Self.usesDefaultSeccomp(container),
-                capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
-                rlimits: try Self.rlimits(container.ulimits), ioClaim: ioClaim
-            ),
-            response: Status.self
-        )
+        try requireActiveContainerExecution(container)
+        let status: Status
+        do {
+            status = try await shim.guest(
+                operation: "prepare-exec",
+                payload: GuestProtocol.Exec(
+                    id: exec.id, arguments: configuration.arguments, environment: context.environment,
+                    workingDirectory: context.workingDirectory, user: context.user,
+                    terminal: configuration.tty, attachStdin: configuration.attachStdin,
+                    attachStdout: configuration.attachStdout, attachStderr: configuration.attachStderr,
+                    noNewPrivileges: context.noNewPrivileges,
+                    privileged: context.privileged,
+                    seccompDefault: Self.usesDefaultSeccomp(container),
+                    capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
+                    rlimits: try Self.rlimits(container.ulimits), ioClaim: ioClaim
+                ),
+                response: Status.self
+            )
+        } catch {
+            throw await normalizedExecPreparationError(
+                error, container: container, shim: shim
+            )
+        }
         guard status.status == "created" else {
             throw EngineError(.internalError, "guest did not prepare exec")
         }
@@ -5065,6 +5110,43 @@ public actor RawVirtualizationBackend: ContainerBackend {
             cleanupPendingGenerationCount:
                 (cleanupPendingShims[container.id] ?? []).count
         )
+    }
+
+    private func requireActiveContainerExecution(
+        _ container: ContainerRecord
+    ) throws {
+        try RawActiveContainerExecutionGuard.require(
+            container,
+            activeInstanceID: activeContainers[container.id]?.instanceID,
+            hasCompletion: completions[container.id] != nil
+        )
+    }
+
+    private func normalizedExecPreparationError(
+        _ error: Error,
+        container: ContainerRecord,
+        shim: VMShimClient
+    ) async -> Error {
+        if (try? requireActiveContainerExecution(container)) == nil {
+            return EngineError(
+                .conflict, "Container \(container.id) is not running"
+            )
+        }
+        struct Empty: Encodable {}
+        struct Status: Decodable { let status: String }
+        if let status: Status = try? await shim.guest(
+            operation: "status", payload: Empty(), response: Status.self
+        ), status.status != "running" {
+            return EngineError(
+                .conflict, "Container \(container.id) is not running"
+            )
+        }
+        if (try? requireActiveContainerExecution(container)) == nil {
+            return EngineError(
+                .conflict, "Container \(container.id) is not running"
+            )
+        }
+        return error
     }
 
     private func requireExactExecOwnership(_ exec: ExecRecord) throws {

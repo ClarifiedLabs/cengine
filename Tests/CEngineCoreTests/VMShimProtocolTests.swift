@@ -2950,6 +2950,38 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
 
     }
 
+    @Test func activeContainerExecutionGuardRejectsCompletedOrReplacedExecutions() throws {
+        let container = ContainerRecord(
+            id: "exec-completion-race",
+            name: "exec-completion-race",
+            image: "alpine"
+        )
+
+        try RawActiveContainerExecutionGuard.require(
+            container,
+            activeInstanceID: container.instanceID,
+            hasCompletion: false
+        )
+
+        for state in [
+            (activeInstanceID: Optional<UUID>.none, hasCompletion: false),
+            (activeInstanceID: Optional(UUID()), hasCompletion: false),
+            (activeInstanceID: Optional(container.instanceID), hasCompletion: true),
+        ] {
+            do {
+                try RawActiveContainerExecutionGuard.require(
+                    container,
+                    activeInstanceID: state.activeInstanceID,
+                    hasCompletion: state.hasCompletion
+                )
+                Issue.record("inactive execution passed the exec preparation guard")
+            } catch let error as EngineError {
+                #expect(error.code == .conflict)
+                #expect(error.message == "Container \(container.id) is not running")
+            }
+        }
+    }
+
     @Test func containerGuestClaimsAreDurableDeterministicAndRecoveredWithoutAccumulation() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let containerID = "container-claim-recovery"
