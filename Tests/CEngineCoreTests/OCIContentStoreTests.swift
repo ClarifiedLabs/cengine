@@ -79,7 +79,7 @@ import Testing
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try OCIContentStore(root: root)
         let encoder = JSONEncoder()
-        let configData = Data(#"{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#.utf8)
+        let configData = Data(#"{"architecture":"arm64","os":"linux","config":{"Healthcheck":{"Test":["CMD","true"],"Interval":9000000000,"Timeout":8000000000,"Retries":4,"StartPeriod":7000000000,"StartInterval":6000000000}},"rootfs":{"type":"layers","diff_ids":[]}}"#.utf8)
         let config = try await store.put(configData, mediaType: "application/vnd.oci.image.config.v1+json")
         let manifestData = try encoder.encode(OCIManifest(
             schemaVersion: 2,
@@ -117,7 +117,13 @@ import Testing
         #expect(summaries.first?.architecture == "arm64")
         #expect(summaries.first?.targetDescriptor?.digest == index.digest)
         #expect(summaries.first?.manifests.count == 2)
-        #expect(summaries.first?.manifests.first(where: { $0.descriptor.digest == storedManifest.digest })?.available == true)
+        let available = summaries.first?.manifests.first {
+            $0.descriptor.digest == storedManifest.digest
+        }
+        #expect(available?.available == true)
+        #expect(available?.configuration?.healthcheck?.test == ["CMD", "true"])
+        #expect(available?.configuration?.healthcheck?.intervalNanoseconds == 9_000_000_000)
+        #expect(available?.configuration?.healthcheck?.startIntervalNanoseconds == 6_000_000_000)
         #expect(summaries.first?.manifests.first(where: { $0.descriptor.digest == missingManifest.digest })?.available == false)
     }
 

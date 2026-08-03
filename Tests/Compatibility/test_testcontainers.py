@@ -20,6 +20,23 @@ def _container_logs(container) -> str:
         return "<container was already auto-removed>"
 
 
+def _remove_after_lifecycle_operation(container, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            container.remove(force=True)
+            return
+        except docker.errors.NotFound:
+            return
+        except docker.errors.APIError as error:
+            if error.response.status_code != 409 \
+                    or "lifecycle operation in progress" not in str(error).lower():
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def _wait_for_ryuk_port(container) -> tuple[str, int]:
     deadline = time.monotonic() + 15
     last_state = "created"
@@ -113,10 +130,7 @@ def _assert_ryuk_reaps(client: docker.DockerClient, daemon, *, privileged: bool)
                 target.remove(force=True)
             except (docker.errors.NotFound, docker.errors.APIError):
                 pass
-        try:
-            reaper.remove(force=True)
-        except docker.errors.NotFound:
-            pass
+        _remove_after_lifecycle_operation(reaper)
 
 
 @pytest.mark.compat("TST-001")
@@ -147,10 +161,7 @@ def test_shellless_ryuk_exec_reports_command_not_found(client: docker.DockerClie
         result = reaper.exec_run(["/bin/sh", "-c", "true"])
         assert result.exit_code in (126, 127), result.output.decode(errors="replace")
     finally:
-        try:
-            reaper.remove(force=True)
-        except docker.errors.NotFound:
-            pass
+        _remove_after_lifecycle_operation(reaper)
 
 
 @pytest.mark.compat("TST-004")
@@ -198,7 +209,4 @@ def test_ryuk_keeps_multiple_control_connections_open(client: docker.DockerClien
                 target.remove(force=True)
             except (docker.errors.NotFound, docker.errors.APIError):
                 pass
-        try:
-            reaper.remove(force=True)
-        except docker.errors.NotFound:
-            pass
+        _remove_after_lifecycle_operation(reaper)

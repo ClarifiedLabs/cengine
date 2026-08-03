@@ -393,6 +393,7 @@ public actor EngineRuntime {
                     restarted.networks[endpoint].ipv6Address = Self.nonEmptyBackendAddress(address.ipv6Address)
                 }
                 let startedAt = Date(); restarted.startedAt = startedAt
+                Self.resetHealthState(&restarted)
                 snapshot.containers[index] = restarted
                 clearCleanupPending(restarted.id)
                 try await persist()
@@ -513,6 +514,7 @@ public actor EngineRuntime {
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
         }
+        var imageHealthcheck: HealthcheckRecord?
         if let image = try? image(record.image) {
             if let platform = try? OCIPlatform(record.platform) {
                 let selected = image.manifests.first {
@@ -520,8 +522,13 @@ public actor EngineRuntime {
                 }
                 record.imageID = selected?.imageID ?? image.id
                 record.imageManifestDescriptor = selected?.descriptor
+                imageHealthcheck = selected?.configuration?.healthcheck
             }
         }
+        record.healthcheck = Self.resolvedHealthcheck(
+            container: record.healthcheck, image: imageHealthcheck
+        )
+        Self.resetHealthState(&record)
         snapshot.containers.append(record)
         try await backend.updateNetworkRecords(snapshot.containers)
         try await persist()
@@ -602,6 +609,7 @@ public actor EngineRuntime {
             started.startedAt = startedAt
             started.finishedAt = nil
             started.exitCode = nil
+            Self.resetHealthState(&started)
             started = await applyingEndpointAddresses(to: started)
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
@@ -995,6 +1003,7 @@ public actor EngineRuntime {
             restarted.finishedAt = nil
             restarted.exitCode = nil
             restarted.restartCount += 1
+            Self.resetHealthState(&restarted)
             for endpoint in restarted.networks.indices {
                 guard let address = addresses[restarted.networks[endpoint].networkID] else { continue }
                 restarted.networks[endpoint].ipv4Address = Self.nonEmptyBackendAddress(address.ipv4Address)
@@ -3787,7 +3796,8 @@ public actor EngineRuntime {
 
     private func startHealthMonitor(_ identifier: String) {
         healthTasks.removeValue(forKey: identifier)?.cancel()
-        guard let record = try? container(identifier), record.healthcheck != nil else { return }
+        guard let record = try? container(identifier),
+              Self.healthcheckIsEnabled(record.healthcheck) else { return }
         healthTasks[identifier] = Task { [weak self] in await self?.runHealthMonitor(identifier) }
     }
 
@@ -3800,15 +3810,9 @@ public actor EngineRuntime {
     }
 
     private func runHealthMonitor(_ identifier: String) async {
-        guard let initial = try? container(identifier), let health = initial.healthcheck else { return }
-        let startedAt = initial.startedAt
-        if health.startPeriodNanoseconds > 0 {
-            do {
-                try await Task.sleep(for: .nanoseconds(health.startPeriodNanoseconds))
-            } catch {
-                return
-            }
-        }
+        guard let initial = try? container(identifier),
+              let health = initial.healthcheck,
+              let startedAt = initial.startedAt else { return }
         while !Task.isCancelled {
             guard let index = try? containerIndex(identifier),
                   snapshot.containers[index].phase == .running,
@@ -3821,7 +3825,26 @@ public actor EngineRuntime {
                 }
                 continue
             }
-            let record = snapshot.containers[index]
+            let currentStatus = snapshot.containers[index].healthStatus ?? "starting"
+            let elapsed = max(
+                Int64(0),
+                Int64(Date().timeIntervalSince(startedAt) * 1_000_000_000)
+            )
+            let delay = Self.healthProbeDelay(
+                health, status: currentStatus, elapsedNanoseconds: elapsed
+            )
+            do {
+                try await Task.sleep(for: .nanoseconds(delay))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled,
+                  let current = try? containerIndex(identifier),
+                  snapshot.containers[current].phase == .running,
+                  snapshot.containers[current].startedAt == startedAt else { return }
+            if resourceUpdateIsPending(identifier) || cleanupIsPending(identifier) { continue }
+            let record = snapshot.containers[current]
             let arguments: [String]
             switch health.test.first {
             case "CMD": arguments = Array(health.test.dropFirst())
@@ -3834,27 +3857,80 @@ public actor EngineRuntime {
                 timeoutSeconds: max(1, health.timeoutNanoseconds / 1_000_000_000)
             )
             guard !Task.isCancelled,
-                  let current = try? containerIndex(identifier),
-                  snapshot.containers[current].phase == .running,
-                  snapshot.containers[current].startedAt == startedAt else { return }
+                  let published = try? containerIndex(identifier),
+                  snapshot.containers[published].phase == .running,
+                  snapshot.containers[published].startedAt == startedAt else { return }
+            let statusBeforeResult = snapshot.containers[published].healthStatus ?? "starting"
+            let elapsedAtResult = max(
+                Int64(0),
+                Int64(Date().timeIntervalSince(startedAt) * 1_000_000_000)
+            )
             if result?.exitCode == 0 {
-                snapshot.containers[current].healthStatus = "healthy"
-                snapshot.containers[current].healthFailingStreak = 0
+                snapshot.containers[published].healthStatus = "healthy"
+                snapshot.containers[published].healthFailingStreak = 0
+            } else if statusBeforeResult == "starting"
+                        && health.startPeriodNanoseconds > elapsedAtResult {
+                snapshot.containers[published].healthStatus = "starting"
             } else {
-                let failures = (snapshot.containers[current].healthFailingStreak ?? 0) + 1
-                snapshot.containers[current].healthFailingStreak = failures
-                snapshot.containers[current].healthStatus = failures >= max(health.retries, 1) ? "unhealthy" : "starting"
+                let failures = (snapshot.containers[published].healthFailingStreak ?? 0) + 1
+                snapshot.containers[published].healthFailingStreak = failures
+                snapshot.containers[published].healthStatus = failures >= max(health.retries, 1)
+                    ? "unhealthy" : "starting"
             }
-            let status = snapshot.containers[current].healthStatus ?? "starting"
-            emit(containerEvent("health_status: \(status)", snapshot.containers[current]))
+            let status = snapshot.containers[published].healthStatus ?? "starting"
+            emit(containerEvent("health_status: \(status)", snapshot.containers[published]))
             try? await persist()
-            let delay = max(health.intervalNanoseconds, 100_000_000)
-            do {
-                try await Task.sleep(for: .nanoseconds(delay))
-            } catch {
-                return
-            }
         }
+    }
+
+    static func healthProbeDelay(
+        _ health: HealthcheckRecord, status: String, elapsedNanoseconds: Int64
+    ) -> Int64 {
+        let usesStartInterval = health.startPeriodNanoseconds > elapsedNanoseconds
+            && status != "healthy"
+        return usesStartInterval
+            ? max(health.startIntervalNanoseconds, 1_000_000)
+            : max(health.intervalNanoseconds, 1_000_000)
+    }
+
+    private static func resolvedHealthcheck(
+        container: HealthcheckRecord?, image: HealthcheckRecord?
+    ) -> HealthcheckRecord? {
+        guard var resolved = container ?? image else { return nil }
+        if resolved.test.isEmpty { resolved.test = image?.test ?? [] }
+        guard !resolved.test.isEmpty else { return nil }
+        if resolved.test.first == "NONE" { return resolved }
+        if resolved.intervalNanoseconds == 0 {
+            resolved.intervalNanoseconds = image?.intervalNanoseconds ?? 0
+        }
+        if resolved.timeoutNanoseconds == 0 {
+            resolved.timeoutNanoseconds = image?.timeoutNanoseconds ?? 0
+        }
+        if resolved.retries == 0 { resolved.retries = image?.retries ?? 0 }
+        if resolved.startPeriodNanoseconds == 0 {
+            resolved.startPeriodNanoseconds = image?.startPeriodNanoseconds ?? 0
+        }
+        if resolved.startIntervalNanoseconds == 0 {
+            resolved.startIntervalNanoseconds = image?.startIntervalNanoseconds ?? 0
+        }
+        if resolved.intervalNanoseconds == 0 { resolved.intervalNanoseconds = 30_000_000_000 }
+        if resolved.timeoutNanoseconds == 0 { resolved.timeoutNanoseconds = 30_000_000_000 }
+        if resolved.retries == 0 { resolved.retries = 3 }
+        if resolved.startIntervalNanoseconds == 0 {
+            resolved.startIntervalNanoseconds = 5_000_000_000
+        }
+        return resolved
+    }
+
+    private static func healthcheckIsEnabled(_ healthcheck: HealthcheckRecord?) -> Bool {
+        guard let test = healthcheck?.test else { return false }
+        return !test.isEmpty && test.first != "NONE"
+    }
+
+    private static func resetHealthState(_ record: inout ContainerRecord) {
+        let enabled = healthcheckIsEnabled(record.healthcheck)
+        record.healthStatus = enabled ? "starting" : nil
+        record.healthFailingStreak = enabled ? 0 : nil
     }
 
     private static func imageRecords(from images: [BackendImage]) -> [ImageRecord] {
@@ -4011,6 +4087,7 @@ public actor EngineRuntime {
                 }
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let restartedAt = Date(); restarted.startedAt = restartedAt
+                Self.resetHealthState(&restarted)
                 snapshot.containers[current] = restarted
                 clearCleanupPending(identifier)
                 try await persist(); emit(containerEvent("restart", restarted)); startHealthMonitor(identifier)

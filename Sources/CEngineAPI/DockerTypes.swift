@@ -805,6 +805,7 @@ public struct ImageInspectResponse: Encodable, Sendable {
         public let Labels: [String: String]?
         public let ExposedPorts: [String: EmptyObject]?
         public let Volumes: [String: EmptyObject]?
+        public let Healthcheck: ContainerInspectResponse.HealthcheckResponse?
         init(_ configuration: ImageConfigurationRecord?, omitEmpty: Bool) {
             Env = configuration?.environment ?? (omitEmpty ? nil : [])
             Cmd = configuration?.command
@@ -816,6 +817,14 @@ public struct ImageInspectResponse: Encodable, Sendable {
                 ?? (omitEmpty ? nil : [:])
             Volumes = configuration?.volumes.map { Dictionary(uniqueKeysWithValues: $0.map { ($0, EmptyObject()) }) }
                 ?? (omitEmpty ? nil : [:])
+            Healthcheck = configuration?.healthcheck.map {
+                .init(
+                    Test: $0.test, Interval: $0.intervalNanoseconds,
+                    Timeout: $0.timeoutNanoseconds, Retries: $0.retries,
+                    StartPeriod: $0.startPeriodNanoseconds,
+                    StartInterval: $0.startIntervalNanoseconds
+                )
+            }
         }
     }
     public struct RootFSResponse: Encodable, Sendable {

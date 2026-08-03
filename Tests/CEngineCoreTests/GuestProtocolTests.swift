@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 17)
+        #expect(GuestProtocol.version == 18)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -34,7 +34,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 17)
+        #expect(GuestProtocol.version == 18)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -124,7 +124,8 @@ import Testing
             annotations: ["io.example.owner": "runtime"],
             capabilityAdd: ["CAP_NET_ADMIN"], capabilityDrop: ["CAP_CHOWN"],
             rlimits: [.init(type: "core", soft: 0, hard: UInt64.max)],
-            ipcMode: "none",
+            ipcMode: "none", shmSize: 32 * 1_024 * 1_024,
+            sysctls: ["net.ipv4.ip_forward": "1"],
             ioClaim: "container-claim"
         )
 
@@ -136,6 +137,8 @@ import Testing
         #expect(object["capabilityDrop"] as? [String] == ["CAP_CHOWN"])
         #expect((object["rlimits"] as? [[String: Any]])?.first?["type"] as? String == "core")
         #expect(object["ipcMode"] as? String == "none")
+        #expect(object["shmSize"] as? Int == 32 * 1_024 * 1_024)
+        #expect(object["sysctls"] as? [String: String] == ["net.ipv4.ip_forward": "1"])
         #expect(object["maskedPaths"] as? [String] == ["/proc/kcore"])
         #expect(object["readonlyPaths"] as? [String] == ["/proc/sys"])
         #expect(object["noNewPrivileges"] as? Bool == false)
@@ -155,7 +158,7 @@ import Testing
     }
 
     @Test func wallClockTimeRoundTripsInCurrentProtocol() throws {
-        #expect(GuestProtocol.version == 17)
+        #expect(GuestProtocol.version == 18)
         let value = GuestProtocol.WallClockTime(
             seconds: 1_784_920_000, microseconds: 123_456
         )

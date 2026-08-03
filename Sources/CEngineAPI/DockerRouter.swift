@@ -184,6 +184,8 @@ public struct DockerRouter: Sendable {
                 input.HostConfig?.CgroupnsMode
             )
             record.ipcMode = normalizedPrivateNamespaceMode(input.HostConfig?.IpcMode)
+            record.shmSizeBytes = validated.shmSize
+            record.sysctls = validated.sysctls
             record.pidMode = input.HostConfig?.PidMode ?? ""
             record.utsMode = input.HostConfig?.UTSMode ?? ""
             record.userNamespaceMode = input.HostConfig?.UsernsMode ?? ""
@@ -207,13 +209,13 @@ public struct DockerRouter: Sendable {
             record.stopSignal = input.StopSignal ?? "SIGTERM"
             record.stopTimeoutSeconds = input.StopTimeout ?? 10
             record.restartPolicy = .init(name: input.HostConfig?.RestartPolicy?.Name ?? "no", maximumRetryCount: input.HostConfig?.RestartPolicy?.MaximumRetryCount ?? 0)
-            if let health = input.Healthcheck, let test = health.Test, test.first != "NONE" {
+            if let health = input.Healthcheck {
                 record.healthcheck = .init(
-                    test: test, intervalNanoseconds: health.Interval ?? 30_000_000_000,
-                    timeoutNanoseconds: health.Timeout ?? 30_000_000_000, retries: health.Retries ?? 3,
-                    startPeriodNanoseconds: health.StartPeriod ?? 0
+                    test: health.Test ?? [], intervalNanoseconds: health.Interval ?? 0,
+                    timeoutNanoseconds: health.Timeout ?? 0, retries: health.Retries ?? 0,
+                    startPeriodNanoseconds: health.StartPeriod ?? 0,
+                    startIntervalNanoseconds: health.StartInterval ?? 0
                 )
-                record.healthStatus = "starting"; record.healthFailingStreak = 0
             }
             record.mounts = validated.mounts
             for destination in (input.Volumes ?? [:]).keys.sorted()
@@ -1217,7 +1219,8 @@ public struct DockerRouter: Sendable {
     private func validateRuntimeInput(_ input: ContainerCreateRequest) throws -> (
         mounts: [MountRecord], ulimits: [UlimitRecord], devices: [DeviceMappingRecord],
         deviceCgroupRules: [String], blockIO: BlockIOConfiguration,
-        security: SecurityConfiguration, consoleSize: TerminalSize
+        security: SecurityConfiguration, consoleSize: TerminalSize,
+        shmSize: Int64, sysctls: [String: String]
     ) {
         try rejectActiveRuntimeFields([
             (!(input.Domainname ?? "").isEmpty, "Domainname"),
@@ -1247,7 +1250,9 @@ public struct DockerRouter: Sendable {
                 prefix: "HostConfig"
             ),
             host.security,
-            host.consoleSize
+            host.consoleSize,
+            host.shmSize,
+            host.sysctls
         )
     }
 
@@ -1332,7 +1337,10 @@ public struct DockerRouter: Sendable {
 
     private func validateHostRuntimeInput(
         _ host: ContainerCreateRequest.HostConfig?
-    ) throws -> (security: SecurityConfiguration, consoleSize: TerminalSize) {
+    ) throws -> (
+        security: SecurityConfiguration, consoleSize: TerminalSize,
+        shmSize: Int64, sysctls: [String: String]
+    ) {
         try validateResourceValues(
             memory: host?.Memory, nanoCPUs: host?.NanoCpus,
             cpuPeriod: host?.CpuPeriod, cpuQuota: host?.CpuQuota,
@@ -1371,7 +1379,6 @@ public struct DockerRouter: Sendable {
             (host?.CpuPercent != nil && host?.CpuPercent != 0, "CpuPercent"),
             (host?.IOMaximumIOps != nil && host?.IOMaximumIOps != 0, "IOMaximumIOps"),
             (host?.IOMaximumBandwidth != nil && host?.IOMaximumBandwidth != 0, "IOMaximumBandwidth"),
-            (!(host?.Sysctls ?? [:]).isEmpty, "Sysctls"),
             (!(host?.VolumesFrom ?? []).isEmpty, "VolumesFrom"),
             (!(host?.GroupAdd ?? []).isEmpty, "GroupAdd"),
             (!(host?.StorageOpt ?? [:]).isEmpty, "StorageOpt"),
@@ -1387,7 +1394,8 @@ public struct DockerRouter: Sendable {
         )
         try validateNamespaceModes(host)
         try validateOOMScore(host?.OomScoreAdj)
-        try validateSharedMemorySize(host?.ShmSize)
+        let shmSize = try normalizedSharedMemorySize(host?.ShmSize)
+        let sysctls = try normalizedSysctls(host?.Sysctls)
         try validateIsolation(host?.Isolation)
         try validateRestartPolicy(
             name: host?.RestartPolicy?.Name,
@@ -1397,7 +1405,57 @@ public struct DockerRouter: Sendable {
         if host?.AutoRemove == true && restartName != "" && restartName != "no" {
             throw EngineError(.badRequest, "AutoRemove cannot be combined with a restart policy")
         }
-        return (security, consoleSize)
+        return (security, consoleSize, shmSize, sysctls)
+    }
+
+    private func normalizedSysctls(_ values: [String: String]?) throws -> [String: String] {
+        var result: [String: String] = [:]
+        var resolvedPaths = Set<String>()
+        for (name, value) in values ?? [:] {
+            guard !name.isEmpty, !name.contains(where: { $0 == "\0" || $0 == "\n" || $0 == "\r" }),
+                  !value.contains(where: { $0 == "\0" || $0 == "\n" || $0 == "\r" }) else {
+                throw EngineError(.badRequest, "HostConfig.Sysctls contains an invalid name or value")
+            }
+            let path = try normalizedSysctlPath(name)
+            guard resolvedPaths.insert(path).inserted else {
+                throw EngineError(.badRequest, "HostConfig.Sysctls contains duplicate setting \(name)")
+            }
+            result[name] = value
+        }
+        return result
+    }
+
+    private func normalizedSysctlPath(_ name: String) throws -> String {
+        let firstDot = name.firstIndex(of: ".")
+        let firstSlash = name.firstIndex(of: "/")
+        guard firstDot != nil || firstSlash != nil else {
+            throw EngineError(.badRequest, "HostConfig.Sysctls contains malformed name \(name)")
+        }
+        // Match runc's write path: dots and existing slashes both select a
+        // /proc/sys component. The first-separator conversion in runc is only
+        // used to validate the namespaced allowlist.
+        let path = name.replacingOccurrences(of: ".", with: "/")
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count > 1, parts.allSatisfy({ validSysctlComponent($0, dotsAllowed: false) }) else {
+            throw EngineError(.badRequest, "HostConfig.Sysctls contains malformed name \(name)")
+        }
+        let allowedKernel = Set([
+            "kernel/msgmax", "kernel/msgmnb", "kernel/msgmni", "kernel/sem",
+            "kernel/shmall", "kernel/shmmax", "kernel/shmmni",
+            "kernel/shm_rmid_forced", "kernel/domainname",
+        ])
+        guard path.hasPrefix("net/") || path.hasPrefix("fs/mqueue/") || allowedKernel.contains(path) else {
+            throw EngineError(.badRequest, "HostConfig.Sysctls setting \(name) is not namespaced")
+        }
+        return path
+    }
+
+    private func validSysctlComponent(_ value: String, dotsAllowed: Bool) -> Bool {
+        guard !value.isEmpty, value != ".", value != "..",
+              !value.hasPrefix("."), !value.hasSuffix("."), !value.contains("..") else { return false }
+        return value.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || (dotsAllowed && $0 == "."))
+        }
     }
 
     private func normalizedUlimits(
@@ -1755,12 +1813,12 @@ public struct DockerRouter: Sendable {
         if value != 0 { throw EngineError(.unsupported, "HostConfig.OomScoreAdj is not supported") }
     }
 
-    private func validateSharedMemorySize(_ value: Int64?) throws {
-        guard let value else { return }
-        guard value >= 0 else { throw EngineError(.badRequest, "HostConfig.ShmSize must not be negative") }
-        if value != 0 && value != 64 * 1_024 * 1_024 {
-            throw EngineError(.unsupported, "HostConfig.ShmSize values other than 64 MiB are not supported")
+    private func normalizedSharedMemorySize(_ value: Int64?) throws -> Int64 {
+        guard let value else { return ContainerRecord.defaultShmSizeBytes }
+        guard value >= 0 else {
+            throw EngineError(.badRequest, "HostConfig.ShmSize must not be negative")
         }
+        return value == 0 ? ContainerRecord.defaultShmSizeBytes : value
     }
 
     private func validateIsolation(_ value: String?) throws {
@@ -1818,13 +1876,8 @@ public struct DockerRouter: Sendable {
         if let retries = health.Retries, retries < 0 {
             throw EngineError(.badRequest, "Healthcheck.Retries must not be negative")
         }
-        if let startInterval = health.StartInterval, startInterval != 0 {
-            throw EngineError(.unsupported, "Healthcheck.StartInterval is not supported")
-        }
         guard let test = health.Test else { return }
-        guard let kind = test.first else {
-            throw EngineError(.unsupported, "inheriting an image healthcheck is not supported")
-        }
+        guard let kind = test.first else { return }
         switch kind {
         case "NONE":
             guard test.count == 1 else {
@@ -2231,7 +2284,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Healthcheck: HealthcheckResponse?
     }
     public struct HealthcheckResponse: Codable, Sendable {
-        let Test: [String]; let Interval: Int64; let Timeout: Int64; let Retries: Int; let StartPeriod: Int64
+        let Test: [String]; let Interval: Int64; let Timeout: Int64; let Retries: Int
+        let StartPeriod: Int64; let StartInterval: Int64
     }
     public struct HostConfigResponse: Codable, Sendable {
         let Memory: UInt64; let NanoCpus: Int64; let PidsLimit: Int64
@@ -2253,6 +2307,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let Init: Bool; let RestartPolicy: RestartPolicy
         let CgroupnsMode: String; let IpcMode: String; let PidMode: String
         let UTSMode: String; let UsernsMode: String
+        let ShmSize: Int64; let Sysctls: [String: String]?
         let Annotations: [String: String]?
         let Binds: [String]; let Mounts: [MountResponse]
         let PortBindings: [String: [PortBindingResponse]]
@@ -2273,7 +2328,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
             case Devices, DeviceCgroupRules, DeviceRequests
             case Ulimits, AutoRemove, Privileged, CapAdd, CapDrop, SecurityOpt, ReadonlyRootfs
             case MaskedPaths, ReadonlyPaths, Init, RestartPolicy
-            case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode
+            case CgroupnsMode, IpcMode, PidMode, UTSMode, UsernsMode, ShmSize, Sysctls
             case Annotations, Binds, Mounts, PortBindings, NetworkMode, LogConfig
         }
 
@@ -2308,6 +2363,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
             try container.encode(PidMode, forKey: .PidMode)
             try container.encode(UTSMode, forKey: .UTSMode)
             try container.encode(UsernsMode, forKey: .UsernsMode)
+            try container.encode(ShmSize, forKey: .ShmSize)
+            try container.encodeIfPresent(Sysctls, forKey: .Sysctls)
             try container.encodeIfPresent(Annotations, forKey: .Annotations)
             try container.encode(Binds, forKey: .Binds)
             try container.encode(Mounts, forKey: .Mounts)
@@ -2347,7 +2404,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         Image = record.imageID.isEmpty ? record.image : record.imageID
         ImageManifestDescriptor = version >= .init(major: 1, minor: 48) ? record.imageManifestDescriptor : nil
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
-        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, AttachStdin: record.attachStdin, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds) })
+        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, AttachStdin: record.attachStdin, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds, StartInterval: $0.startIntervalNanoseconds) })
         RestartCount = record.restartCount
         let mounts = record.mounts.map { mount in
             MountResponse(
@@ -2396,6 +2453,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
             CgroupnsMode: record.cgroupNamespaceMode, IpcMode: record.ipcMode,
             PidMode: record.pidMode, UTSMode: record.utsMode,
             UsernsMode: record.userNamespaceMode,
+            ShmSize: record.effectiveShmSizeBytes,
+            Sysctls: record.effectiveSysctls.isEmpty ? nil : record.effectiveSysctls,
             Annotations: record.annotations.isEmpty ? nil : record.annotations,
             Binds: record.mounts.filter { $0.kind != .tmpfs }.map {
                 var options = $0.readOnly ? ["ro"] : []

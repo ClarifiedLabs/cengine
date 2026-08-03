@@ -72,6 +72,24 @@ public struct OCIImageConfiguration: Codable, Sendable {
     }
 
     public struct Configuration: Codable, Sendable {
+        public struct Healthcheck: Codable, Sendable {
+            public var test: [String]?
+            public var interval: Int64?
+            public var timeout: Int64?
+            public var retries: Int?
+            public var startPeriod: Int64?
+            public var startInterval: Int64?
+
+            enum CodingKeys: String, CodingKey {
+                case test = "Test"
+                case interval = "Interval"
+                case timeout = "Timeout"
+                case retries = "Retries"
+                case startPeriod = "StartPeriod"
+                case startInterval = "StartInterval"
+            }
+        }
+
         public var user: String?
         public var exposedPorts: [String: [String: String]]?
         public var environment: [String]?
@@ -81,6 +99,7 @@ public struct OCIImageConfiguration: Codable, Sendable {
         public var workingDirectory: String?
         public var labels: [String: String]?
         public var stopSignal: String?
+        public var healthcheck: Healthcheck?
 
         enum CodingKeys: String, CodingKey {
             case user = "User"
@@ -92,6 +111,7 @@ public struct OCIImageConfiguration: Codable, Sendable {
             case workingDirectory = "WorkingDir"
             case labels = "Labels"
             case stopSignal = "StopSignal"
+            case healthcheck = "Healthcheck"
         }
     }
 
@@ -819,6 +839,17 @@ public actor OCIContentStore {
                 labels: configuration.config?.labels,
                 exposedPorts: configuration.config?.exposedPorts.map { Array($0.keys).sorted() },
                 volumes: configuration.config?.volumes.map { Array($0.keys).sorted() },
+                healthcheck: configuration.config?.healthcheck.flatMap { health in
+                    guard let test = health.test else { return nil }
+                    return HealthcheckRecord(
+                        test: test,
+                        intervalNanoseconds: health.interval ?? 0,
+                        timeoutNanoseconds: health.timeout ?? 0,
+                        retries: health.retries ?? 0,
+                        startPeriodNanoseconds: health.startPeriod ?? 0,
+                        startIntervalNanoseconds: health.startInterval ?? 0
+                    )
+                },
                 rootFSDiffIDs: configuration.rootfs.diffIDs
             ),
             history: history

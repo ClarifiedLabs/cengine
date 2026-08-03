@@ -147,7 +147,7 @@ func (state *controlServer) handlePortProxy(connection net.Conn) {
 	if err != nil {
 		return
 	}
-	response := protocol.Envelope{ID: request.ID, Operation: request.Operation}
+	response := protocol.ResponseEnvelope(request)
 	if request.Operation != "start-port-stream" {
 		response.Error = &protocol.Error{Code: "unsupported", Message: "unsupported port proxy operation"}
 		_ = protocol.WriteEnvelope(connection, response)
@@ -287,7 +287,7 @@ func (state *controlServer) handleExecIO(connection net.Conn) {
 	if err != nil {
 		return
 	}
-	response := protocol.Envelope{ID: request.ID, Operation: request.Operation}
+	response := protocol.ResponseEnvelope(request)
 	if request.Operation != "start-exec-stream" {
 		response.Error = &protocol.Error{Code: "unsupported", Message: "unsupported exec I/O operation"}
 		_ = protocol.WriteEnvelope(connection, response)
@@ -330,7 +330,8 @@ func serveRootFS(listener net.Listener) {
 		go func() {
 			defer connection.Close()
 			envelope, err := protocol.ReadEnvelope(connection)
-			response := protocol.Envelope{ID: envelope.ID, Operation: "prepare-rootfs"}
+			response := protocol.ResponseEnvelope(envelope)
+			response.Operation = "prepare-rootfs"
 			if err == nil {
 				var request protocol.RootFSRequest
 				err = json.Unmarshal(envelope.Payload, &request)
@@ -355,7 +356,7 @@ func (state *controlServer) serve(connection net.Conn) {
 		if err != nil {
 			return
 		}
-		response := protocol.Envelope{ID: request.ID, Operation: request.Operation}
+		response := protocol.ResponseEnvelope(request)
 		payload, operationError := state.handle(request)
 		if operationError != nil {
 			code := "internal"
@@ -401,6 +402,7 @@ func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, 
 		if err := json.Unmarshal(request.Payload, &spec); err != nil {
 			return nil, fmt.Errorf("decode workload: %w", err)
 		}
+		spec.ApplyCompatibilityDefaults(request.Version)
 		if err := state.process.Prepare(spec); err != nil {
 			return nil, err
 		}

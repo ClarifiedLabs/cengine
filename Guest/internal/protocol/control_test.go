@@ -1,13 +1,16 @@
 package protocol
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 17 {
-		t.Fatalf("Version = %d, want 17", Version)
+	if Version != 18 {
+		t.Fatalf("Version = %d, want 18", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -17,6 +20,8 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 		"noNewPrivileges":true,
 		"seccompDefault":true,
 		"ipcMode":"none",
+		"shmSize":33554432,
+		"sysctls":{"net.ipv4.ip_forward":"1"},
 		"maskedPaths":["/proc/kcore"],
 		"readonlyPaths":["/proc/sys"],
 		"mounts":[{"kind":"bind","nonRecursive":true,"readOnlyNonRecursive":true}],
@@ -39,6 +44,9 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 	if spec.IPCMode != "none" {
 		t.Fatalf("IPCMode = %q, want none", spec.IPCMode)
 	}
+	if spec.ShmSize != 33554432 || spec.Sysctls["net.ipv4.ip_forward"] != "1" {
+		t.Fatalf("ShmSize/Sysctls did not decode: %#v", spec)
+	}
 	if len(spec.MaskedPaths) != 1 || spec.MaskedPaths[0] != "/proc/kcore" {
 		t.Fatalf("MaskedPaths did not decode: %#v", spec.MaskedPaths)
 	}
@@ -52,6 +60,58 @@ func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.
 	if len(spec.Rlimits) != 1 || spec.Rlimits[0].Type != "nofile" ||
 		spec.Rlimits[0].Soft != 1024 || spec.Rlimits[0].Hard != ^uint64(0) {
 		t.Fatalf("Rlimits did not decode: %#v", spec.Rlimits)
+	}
+}
+
+func TestEnvelopeVersionCompatibility(t *testing.T) {
+	frame := func(version uint32) *bytes.Buffer {
+		t.Helper()
+		data, err := json.Marshal(Envelope{Version: version, ID: "request-1", Operation: "ping"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buffer bytes.Buffer
+		if err := binary.Write(&buffer, binary.BigEndian, uint32(len(data))); err != nil {
+			t.Fatal(err)
+		}
+		buffer.Write(data)
+		return &buffer
+	}
+	for _, version := range []uint32{PreviousVersion, Version} {
+		envelope, err := ReadEnvelope(frame(version))
+		if err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if envelope.Version != version {
+			t.Fatalf("version = %d, want %d", envelope.Version, version)
+		}
+		response := ResponseEnvelope(envelope)
+		if response.Version != version || response.ID != envelope.ID || response.Operation != envelope.Operation {
+			t.Fatalf("response did not echo version %d: %#v", version, response)
+		}
+	}
+	for _, version := range []uint32{0, PreviousVersion - 1, Version + 1} {
+		_, err := ReadEnvelope(frame(version))
+		if err == nil || !strings.Contains(err.Error(), "unsupported protocol version") {
+			t.Fatalf("version %d error = %v", version, err)
+		}
+	}
+}
+
+func TestPreviousVersionWorkloadDefaultsSharedMemory(t *testing.T) {
+	var previous WorkloadSpec
+	if err := json.Unmarshal([]byte(`{"id":"container-1","ipcMode":"private"}`), &previous); err != nil {
+		t.Fatal(err)
+	}
+	previous.ApplyCompatibilityDefaults(PreviousVersion)
+	if previous.ShmSize != DefaultSharedMemorySize || len(previous.Sysctls) != 0 {
+		t.Fatalf("previous-version defaults = %#v", previous)
+	}
+
+	var current WorkloadSpec
+	current.ApplyCompatibilityDefaults(Version)
+	if current.ShmSize != 0 {
+		t.Fatalf("current-version missing shared memory size defaulted to %d", current.ShmSize)
 	}
 }
 
@@ -69,8 +129,8 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 17 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 17, got %d", Version)
+	if Version != 18 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 18, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {

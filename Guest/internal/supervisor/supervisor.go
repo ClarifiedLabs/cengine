@@ -124,6 +124,12 @@ func (s *Supervisor) Prepare(spec protocol.WorkloadSpec) error {
 	if err := validateVolumeMounts(spec); err != nil {
 		return err
 	}
+	if spec.ShmSize <= 0 {
+		return errors.New("workload shared memory size must be positive")
+	}
+	if err := validateWorkloadSysctls(spec.Sysctls); err != nil {
+		return err
+	}
 	if _, err := configuredDeviceRulesForHost(spec.Resources); err != nil {
 		return err
 	}
@@ -1242,7 +1248,15 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err := os.MkdirAll(filepath.Join(root, filepath.Clean("/"+workingDirectory)), 0755); err != nil {
 		return err
 	}
+	var sharedMemoryMounts []protocol.Mount
+	hasSharedMemoryOverride := false
 	for _, mount := range spec.Mounts {
+		targetsSharedMemory, overridesSharedMemory := classifySharedMemoryMount(mount.Destination)
+		if targetsSharedMemory {
+			sharedMemoryMounts = append(sharedMemoryMounts, mount)
+			hasSharedMemoryOverride = hasSharedMemoryOverride || overridesSharedMemory
+			continue
+		}
 		if err := applyMount(root, mount); err != nil {
 			return fmt.Errorf("mount %s: %w", mount.Destination, err)
 		}
@@ -1296,8 +1310,19 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	if err := configureContainerConsole(root, spec.Terminal); err != nil {
 		return err
 	}
-	if err := mountWorkloadSharedMemory(root, spec.IPCMode, os.MkdirAll, unix.Mount); err != nil {
-		return err
+	if !hasSharedMemoryOverride {
+		if err := mountWorkloadSharedMemory(root, spec.IPCMode, spec.ShmSize, os.MkdirAll, unix.Mount); err != nil {
+			return err
+		}
+	}
+	// Mount /dev first so an explicit /dev/shm mount is not hidden by the
+	// generated device filesystem. Apply parents before descendants so a later
+	// parent cannot hide an already-mounted nested target.
+	sortSharedMemoryMounts(sharedMemoryMounts)
+	for _, mount := range sharedMemoryMounts {
+		if err := applyMount(root, mount); err != nil {
+			return fmt.Errorf("mount %s: %w", mount.Destination, err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Join(root, "dev/mqueue"), 0755); err != nil {
 		return err
@@ -1325,6 +1350,12 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 		if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {
 			return err
 		}
+	}
+	// Endpoint IFNAME sysctls are applied by the parent before the stage-2 gate is
+	// released. Apply HostConfig sysctls afterward in the workload namespaces so
+	// explicit container settings win, but before root switching and /proc policy.
+	if err := applyWorkloadSysctls("/proc/sys", spec.Sysctls, os.Lstat, os.WriteFile); err != nil {
+		return err
 	}
 	if pathPolicyMasksUserDatabase(spec.MaskedPaths) {
 		if err := snapshotUserDatabase(root, workloadUserDatabaseSnapshotPath); err != nil {
@@ -1419,8 +1450,24 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 	return unix.Exec(path, spec.Arguments, environment)
 }
 
+func classifySharedMemoryMount(destination string) (targetsSharedMemory, overridesSharedMemory bool) {
+	cleaned := filepath.Clean("/" + destination)
+	if cleaned == "/dev/shm" {
+		return true, true
+	}
+	return strings.HasPrefix(cleaned, "/dev/shm/"), false
+}
+
+func sortSharedMemoryMounts(mounts []protocol.Mount) {
+	sort.SliceStable(mounts, func(left, right int) bool {
+		leftDepth := strings.Count(filepath.Clean("/"+mounts[left].Destination), "/")
+		rightDepth := strings.Count(filepath.Clean("/"+mounts[right].Destination), "/")
+		return leftDepth < rightDepth
+	})
+}
+
 func mountWorkloadSharedMemory(
-	root, mode string,
+	root, mode string, size int64,
 	mkdirAll func(string, os.FileMode) error,
 	mount func(string, string, string, uintptr, string) error,
 ) error {
@@ -1428,13 +1475,16 @@ func mountWorkloadSharedMemory(
 	case "none":
 		return nil
 	case "", "private":
+		if size <= 0 {
+			return errors.New("workload shared memory size must be positive")
+		}
 		path := filepath.Join(root, "dev/shm")
 		if err := mkdirAll(path, 01777); err != nil {
 			return err
 		}
 		if err := mount(
-			"tmpfs", path, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV,
-			"mode=1777,size=67108864",
+			"tmpfs", path, "tmpfs", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV,
+			fmt.Sprintf("mode=1777,size=%d", size),
 		); err != nil {
 			return fmt.Errorf("mount private shared memory: %w", err)
 		}

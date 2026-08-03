@@ -99,6 +99,9 @@ private actor CompletionBackend: ContainerBackend {
     private let completionEnabled: Bool
     private let containedStartExitCode: Int32?
     private let quarantinedStartExitCode: Int32?
+    private let images: [BackendImage]?
+    private let healthcheckExitCode: Int32
+    private var healthcheckCalls = 0
     private var execBridges: [String: ContainerIOBridge] = [:]
     private var retiredExecIDs = Set<String>()
     private var execRetirementCalls = 0
@@ -108,12 +111,16 @@ private actor CompletionBackend: ContainerBackend {
         log: Data = Data(),
         completionEnabled: Bool = true,
         containedStartExitCode: Int32? = nil,
-        quarantinedStartExitCode: Int32? = nil
+        quarantinedStartExitCode: Int32? = nil,
+        images: [BackendImage]? = nil,
+        healthcheckExitCode: Int32 = 0
     ) {
         self.log = log
         self.completionEnabled = completionEnabled
         self.containedStartExitCode = containedStartExitCode
         self.quarantinedStartExitCode = quarantinedStartExitCode
+        self.images = images
+        self.healthcheckExitCode = healthcheckExitCode
     }
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
@@ -121,6 +128,7 @@ private actor CompletionBackend: ContainerBackend {
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
     func delete(_: ContainerRecord) async throws {}
+    func listImages() async throws -> [BackendImage]? { images }
     func completion(_ container: ContainerRecord) async -> Int32? {
         guard completionEnabled else { return nil }
         return await withCheckedContinuation { continuations[container.id] = $0 }
@@ -180,8 +188,10 @@ private actor CompletionBackend: ContainerBackend {
         (["PID", "CMD"], [["1", "sleep 10"]])
     }
     func runHealthcheck(_: ContainerRecord, arguments _: [String], timeoutSeconds _: Int64) async throws -> (exitCode: Int32, output: String) {
-        (0, "ok")
+        healthcheckCalls += 1
+        return (healthcheckExitCode, "healthcheck")
     }
+    func healthcheckCount() -> Int { healthcheckCalls }
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
         [
             BackendImage(
@@ -1074,6 +1084,36 @@ private actor ImageStoreBackend: ContainerBackend {
     }
     func deletedReferences() -> [String] { deleted }
     func exportedReferences() -> [String] { exported }
+}
+
+private func healthcheckBackendImage(_ healthcheck: HealthcheckRecord) -> BackendImage {
+    let descriptor = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        digest: "sha256:" + String(repeating: "7", count: 64),
+        size: 200,
+        platform: .init(architecture: "arm64", os: "linux")
+    )
+    let imageID = "sha256:" + String(repeating: "8", count: 64)
+    return BackendImage(
+        id: imageID,
+        reference: "docker.io/library/debian:latest",
+        size: 200,
+        architecture: "arm64",
+        os: "linux",
+        targetDescriptor: descriptor,
+        manifests: [
+            .init(
+                descriptor: descriptor,
+                imageID: imageID,
+                available: true,
+                kind: .image,
+                platform: descriptor.platform,
+                contentSize: 200,
+                configuration: .init(healthcheck: healthcheck)
+            ),
+        ],
+        preferredManifestDigest: descriptor.digest
+    )
 }
 
 private func multiPlatformBackendImage() -> BackendImage {
@@ -2692,7 +2732,6 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(invalid.status == .badRequest)
 
         let unsupportedFields = [
-            #""Sysctls":{"net.ipv4.ip_forward":"1"}"#,
             #""DeviceRequests":[{"Driver":"cdi","DeviceIDs":["example.com/device=one"]}]"#,
         ]
         for (index, field) in unsupportedFields.enumerated() {
@@ -3001,12 +3040,10 @@ private actor AuthImageBackend: ContainerBackend {
             #""HostConfig":{"PidMode":"host"}"#,
             #""HostConfig":{"GroupAdd":["1234"]}"#,
             #""HostConfig":{"OomScoreAdj":100}"#,
-            #""HostConfig":{"ShmSize":33554432}"#,
             #""HostConfig":{"Isolation":"process"}"#,
             #""Mounts":[{"Type":"image","Source":"alpine","Target":"/image"}]"#,
             #""Mounts":[{"Type":"volume","Source":"data","Target":"/data","VolumeOptions":{"Labels":{"owner":"test"}}}]"#,
             #""Mounts":[{"Type":"bind","Source":"/tmp","Target":"/data","Consistency":"cached"}]"#,
-            #""Healthcheck":{"Test":["CMD","true"],"StartInterval":1000000}"#,
         ]
         for (index, field) in fields.enumerated() {
             let response = await router.route(.init(
@@ -3145,6 +3182,79 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(record.cgroupNamespaceMode == "private")
         #expect(record.ipcMode == "none")
         #expect(record.userNamespaceMode == "host")
+    }
+
+    @Test func sharedMemoryAndNamespacedSysctlsPersistInspectAndRejectBeforeMutation() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let create = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=shm-sysctls",
+            body: Data(#"{"Image":"alpine","HostConfig":{"IpcMode":"none","ShmSize":33554432,"Sysctls":{"net.ipv4.ip_forward":"1","net/ipv4/conf/eth0.100/rp_filter":"2","net.ipv4.conf.eth0/200.rp_filter":"1","fs.mqueue.msg_max":"128","kernel.domainname":"example.test"}}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let defaultCreate = try await #require(router).route(.init(
+            method: .POST, uri: "/v1.55/containers/create?name=shm-default",
+            body: Data(#"{"Image":"alpine","HostConfig":{"ShmSize":0}}"#.utf8)
+        ))
+        #expect(defaultCreate.status == .created)
+
+        func hostConfig(_ name: String, router: DockerRouter) async throws -> [String: Any] {
+            let response = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/\(name)/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            )
+            return try #require(object["HostConfig"] as? [String: Any])
+        }
+
+        var host = try await hostConfig("shm-sysctls", router: try #require(router))
+        #expect(host["ShmSize"] as? Int == 33_554_432)
+        #expect(host["IpcMode"] as? String == "none")
+        let inspectedSysctls = try #require(host["Sysctls"] as? [String: String])
+        #expect(inspectedSysctls["kernel.domainname"] == "example.test")
+        #expect(inspectedSysctls["net.ipv4.conf.eth0/200.rp_filter"] == "1")
+        let defaults = try await hostConfig("shm-default", router: try #require(router))
+        #expect(defaults["ShmSize"] as? Int == 67_108_864)
+
+        let invalidHostConfigs = [
+            #"{"ShmSize":-1}"#,
+            #"{"Sysctls":{"kernel.hostname":"bad"}}"#,
+            #"{"Sysctls":{"user.max_user_namespaces":"1"}}"#,
+            #"{"Sysctls":{"vm.swappiness":"1"}}"#,
+            #"{"Sysctls":{"fs.file-max":"1"}}"#,
+            #"{"Sysctls":{"kernel.randomize_va_space":"1"}}"#,
+            #"{"Sysctls":{"net..ipv4":"1"}}"#,
+            #"{"Sysctls":{"net/../ipv4/ip_forward":"1"}}"#,
+            #"{"Sysctls":{"net/ipv4/conf/eth0.100/rp_filter":"1","net.ipv4.conf.eth0/100.rp_filter":"2"}}"#,
+            #"{"Sysctls":{"net.ipv4.ip_forward":"bad\nvalue"}}"#,
+        ]
+        for (index, config) in invalidHostConfigs.enumerated() {
+            let response = try await #require(router).route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=invalid-sysctl-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"Volumes\":{\"/data\":{}},\"HostConfig\":\(config)}".utf8)
+            ))
+            #expect(response.status == .badRequest)
+        }
+        let volumes = try await #require(router).route(.init(method: .GET, uri: "/v1.55/volumes"))
+        let envelope = try #require(
+            JSONSerialization.jsonObject(with: volumes.body) as? [String: Any]
+        )
+        #expect((envelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+
+        router = nil
+        runtime = nil
+        let recoveredRuntime = try await EngineRuntime(root: root)
+        let recoveredRouter = DockerRouter(runtime: recoveredRuntime, root: root)
+        host = try await hostConfig("shm-sysctls", router: recoveredRouter)
+        #expect(host["ShmSize"] as? Int == 33_554_432)
+        #expect((host["Sysctls"] as? [String: String])?["net.ipv4.ip_forward"] == "1")
+        let recoveredRecord = try await recoveredRuntime.container("shm-sysctls")
+        #expect(recoveredRecord.effectiveShmSizeBytes == 33_554_432)
+        #expect(recoveredRecord.effectiveSysctls["fs.mqueue.msg_max"] == "128")
+        #expect(recoveredRecord.effectiveSysctls["net.ipv4.conf.eth0/200.rp_filter"] == "1")
     }
 
     @Test func sameKernelNamespaceSharingFailsBeforeContainerOrVolumeMutation() async throws {
@@ -3393,6 +3503,7 @@ private actor AuthImageBackend: ContainerBackend {
             #""HostConfig":{"Memory":1024}"#,
             #""HostConfig":{"AutoRemove":true,"RestartPolicy":{"Name":"always"}}"#,
             #""Healthcheck":{"Test":["CMD","true"],"Interval":1}"#,
+            #""Healthcheck":{"Test":["CMD","true"],"StartInterval":1}"#,
             #""StopSignal":"SIGSIDEWAYS""#,
             #""Mounts":[{"Type":"sideways","Target":"/data"}]"#,
             #""Mounts":[{"Type":"bind","Source":"relative","Target":"/data"}]"#,
@@ -7524,7 +7635,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(sentinel.networks.first?.ipv4Address != "192.168.64.202")
     }
 
-    @Test func restartPreservesHealthAndRejectsAStaleHealthcheckAcrossItsGeneration() async throws {
+    @Test func restartFencesAStaleHealthcheckAndResetsItsNewGeneration() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = BlockingEndpointAddressBackend()
@@ -7568,7 +7679,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(restarted.phase == .running)
         #expect(restarted.startedAt != originalStartedAt)
         #expect(restarted.restartCount == 1)
-        #expect(restarted.healthStatus == "healthy")
+        #expect(restarted.healthStatus == "starting")
         #expect(restarted.healthFailingStreak == 0)
     }
 
@@ -9871,7 +9982,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(Set(remaining.map(\.id)) == Set([wrongLabel.id, tooNew.id]))
     }
 
-    @Test func createPreservesAttachStdinAndRejectsUnsupportedHealthStartInterval() async throws {
+    @Test func createPreservesAttachStdinAndHealthStartInterval() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let create = await router.route(.init(
@@ -9889,7 +10000,16 @@ private actor AuthImageBackend: ContainerBackend {
             method: .POST, uri: "/v1.44/containers/create?name=start-interval",
             body: Data(#"{"Image":"debian","Healthcheck":{"Test":["CMD","true"],"StartInterval":1000000000}}"#.utf8)
         ))
-        #expect(health.status == .notImplemented)
+        #expect(health.status == .created)
+        let healthInspect = await router.route(.init(
+            method: .GET, uri: "/v1.44/containers/start-interval/json"
+        ))
+        let healthPayload = try #require(
+            JSONSerialization.jsonObject(with: healthInspect.body) as? [String: Any]
+        )
+        let healthConfig = try #require(healthPayload["Config"] as? [String: Any])
+        let healthcheck = try #require(healthConfig["Healthcheck"] as? [String: Any])
+        #expect(healthcheck["StartInterval"] as? Int == 1_000_000_000)
     }
 
     @Test func restartPolicyUpdateDoesNotRecreateRunningContainer() async throws {
@@ -9976,6 +10096,183 @@ private actor AuthImageBackend: ContainerBackend {
         let json = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
         let state = try #require(json["State"] as? [String: Any])
         #expect((state["Health"] as? [String: Any])?["Status"] as? String == "healthy")
+    }
+
+    @Test func healthcheckInheritsImageConfigurationAndPersistsEffectiveValues() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let imageHealthcheck = HealthcheckRecord(
+            test: ["CMD", "image-probe"],
+            intervalNanoseconds: 9_000_000_000,
+            timeoutNanoseconds: 8_000_000_000,
+            retries: 4,
+            startPeriodNanoseconds: 7_000_000_000,
+            startIntervalNanoseconds: 6_000_000_000
+        )
+        let image = healthcheckBackendImage(imageHealthcheck)
+        let backend = CompletionBackend(images: [image])
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        func create(_ name: String, healthcheck: String? = nil) async throws -> String {
+            let health = healthcheck.map { ",\"Healthcheck\":\($0)" } ?? ""
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v1.44/containers/create?name=\(name)",
+                body: Data("{\"Image\":\"debian\"\(health)}".utf8)
+            ))
+            #expect(response.status == .created)
+            let payload = try #require(
+                JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            )
+            return try #require(payload["Id"] as? String)
+        }
+
+        let inheritedID = try await create("health-inherited")
+        let partialID = try await create(
+            "health-partial",
+            healthcheck: #"{"Test":[],"Interval":1000000000}"#
+        )
+        let explicitID = try await create(
+            "health-explicit", healthcheck: #"{"Test":["CMD","container-probe"]}"#
+        )
+        let disabledID = try await create(
+            "health-disabled", healthcheck: #"{"Test":["NONE"]}"#
+        )
+
+        let inherited = try await runtime.container(inheritedID)
+        #expect(inherited.healthcheck == imageHealthcheck)
+        let partial = try #require(try await runtime.container(partialID).healthcheck)
+        #expect(partial.test == imageHealthcheck.test)
+        #expect(partial.intervalNanoseconds == 1_000_000_000)
+        #expect(partial.timeoutNanoseconds == imageHealthcheck.timeoutNanoseconds)
+        #expect(partial.retries == imageHealthcheck.retries)
+        #expect(partial.startPeriodNanoseconds == imageHealthcheck.startPeriodNanoseconds)
+        #expect(partial.startIntervalNanoseconds == imageHealthcheck.startIntervalNanoseconds)
+        let explicit = try #require(try await runtime.container(explicitID).healthcheck)
+        #expect(explicit.test == ["CMD", "container-probe"])
+        #expect(explicit.intervalNanoseconds == imageHealthcheck.intervalNanoseconds)
+        #expect(explicit.startIntervalNanoseconds == imageHealthcheck.startIntervalNanoseconds)
+        let disabled = try await runtime.container(disabledID)
+        #expect(disabled.healthcheck?.test == ["NONE"])
+        #expect(disabled.healthStatus == nil)
+        #expect(disabled.healthFailingStreak == nil)
+
+        let disabledInspect = await router.route(.init(
+            method: .GET, uri: "/v1.44/containers/health-disabled/json"
+        ))
+        let disabledPayload = try #require(
+            JSONSerialization.jsonObject(with: disabledInspect.body) as? [String: Any]
+        )
+        let disabledConfig = try #require(disabledPayload["Config"] as? [String: Any])
+        let disabledHealth = try #require(disabledConfig["Healthcheck"] as? [String: Any])
+        #expect(disabledHealth["Test"] as? [String] == ["NONE"])
+        try await runtime.startContainer(disabledID)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await backend.healthcheckCount() == 0)
+        #expect(try await runtime.container(disabledID).healthStatus == nil)
+
+        let containerInspect = await router.route(.init(
+            method: .GET, uri: "/v1.44/containers/health-inherited/json"
+        ))
+        let containerPayload = try #require(
+            JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any]
+        )
+        let containerConfig = try #require(containerPayload["Config"] as? [String: Any])
+        let inheritedInspect = try #require(
+            containerConfig["Healthcheck"] as? [String: Any]
+        )
+        #expect(inheritedInspect["Test"] as? [String] == imageHealthcheck.test)
+        #expect(inheritedInspect["StartInterval"] as? Int == 6_000_000_000)
+
+        let imageInspect = await router.route(.init(
+            method: .GET, uri: "/v1.44/images/debian/json"
+        ))
+        let imagePayload = try #require(
+            JSONSerialization.jsonObject(with: imageInspect.body) as? [String: Any]
+        )
+        let imageConfig = try #require(imagePayload["Config"] as? [String: Any])
+        let imageHealth = try #require(imageConfig["Healthcheck"] as? [String: Any])
+        #expect(imageHealth["Test"] as? [String] == imageHealthcheck.test)
+        #expect(imageHealth["StartInterval"] as? Int == 6_000_000_000)
+
+        let recovered = try await EngineRuntime(
+            root: root, backend: CompletionBackend(images: [image])
+        )
+        #expect(try await recovered.container(inheritedID).healthcheck == imageHealthcheck)
+        #expect(
+            try await recovered.container(partialID).healthcheck?.startIntervalNanoseconds
+                == 6_000_000_000
+        )
+        #expect(try await recovered.container(disabledID).healthcheck?.test == ["NONE"])
+        #expect(try await recovered.container(disabledID).healthStatus == nil)
+    }
+
+    @Test func healthProbeDelayUsesStartIntervalOnlyDuringStartingGrace() {
+        let healthcheck = HealthcheckRecord(
+            test: ["CMD", "true"],
+            intervalNanoseconds: 30_000_000_000,
+            timeoutNanoseconds: 1_000_000_000,
+            retries: 1,
+            startPeriodNanoseconds: 10_000_000_000,
+            startIntervalNanoseconds: 25_000_000
+        )
+        #expect(
+            EngineRuntime.healthProbeDelay(
+                healthcheck, status: "starting", elapsedNanoseconds: 1_000_000_000
+            ) == 25_000_000
+        )
+        #expect(
+            EngineRuntime.healthProbeDelay(
+                healthcheck, status: "healthy", elapsedNanoseconds: 1_000_000_000
+            ) == 30_000_000_000
+        )
+        #expect(
+            EngineRuntime.healthProbeDelay(
+                healthcheck, status: "starting", elapsedNanoseconds: 10_000_000_000
+            ) == 30_000_000_000
+        )
+    }
+
+    @Test func healthStartIntervalProbesDuringGraceAndResetsOnRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = CompletionBackend(
+            completionEnabled: false, healthcheckExitCode: 1
+        )
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let create = await router.route(.init(
+            method: .POST, uri: "/v1.44/containers/create?name=health-start-interval",
+            body: Data(#"{"Image":"debian","Healthcheck":{"Test":["CMD","false"],"Interval":30000000000,"Timeout":1000000000,"Retries":1,"StartPeriod":10000000000,"StartInterval":25000000}}"#.utf8)
+        ))
+        #expect(create.status == .created)
+        let payload = try #require(
+            JSONSerialization.jsonObject(with: create.body) as? [String: Any]
+        )
+        let id = try #require(payload["Id"] as? String)
+
+        try await runtime.startContainer(id)
+        for _ in 0..<2_000 {
+            if await backend.healthcheckCount() >= 2 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await backend.healthcheckCount() >= 2)
+        let duringGrace = try await runtime.container(id)
+        #expect(duringGrace.healthStatus == "starting")
+        #expect(duringGrace.healthFailingStreak == 0)
+
+        let countBeforeRestart = await backend.healthcheckCount()
+        try await runtime.restartContainer(id, timeoutSeconds: 1)
+        let restarted = try await runtime.container(id)
+        #expect(restarted.healthStatus == "starting")
+        #expect(restarted.healthFailingStreak == 0)
+        for _ in 0..<2_000 {
+            if await backend.healthcheckCount() >= countBeforeRestart + 2 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await backend.healthcheckCount() >= countBeforeRestart + 2)
+        #expect(try await runtime.container(id).healthStatus == "starting")
     }
 
     @Test func anonymousVolumeIsCreatedAndRemovedWithContainer() async throws {

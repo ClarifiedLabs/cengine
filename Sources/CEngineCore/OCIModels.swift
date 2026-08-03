@@ -100,6 +100,7 @@ public struct ImageConfigurationRecord: Codable, Sendable {
     public var labels: [String: String]?
     public var exposedPorts: [String]?
     public var volumes: [String]?
+    public var healthcheck: HealthcheckRecord?
     public var rootFSDiffIDs: [String]
 
     public init(
@@ -111,6 +112,7 @@ public struct ImageConfigurationRecord: Codable, Sendable {
         labels: [String: String]? = nil,
         exposedPorts: [String]? = nil,
         volumes: [String]? = nil,
+        healthcheck: HealthcheckRecord? = nil,
         rootFSDiffIDs: [String] = []
     ) {
         self.environment = environment
@@ -121,6 +123,7 @@ public struct ImageConfigurationRecord: Codable, Sendable {
         self.labels = labels
         self.exposedPorts = exposedPorts
         self.volumes = volumes
+        self.healthcheck = healthcheck
         self.rootFSDiffIDs = rootFSDiffIDs
     }
 }

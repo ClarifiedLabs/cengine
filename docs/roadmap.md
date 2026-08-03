@@ -39,13 +39,13 @@ master mount. Unprivileged containers use Docker's default Linux capability set 
 fails closed on unknown inputs instead of widening deletion scope. Focused
 `RTM-004`–`RTM-008` contracts cover enforcement and recovery, explicit
 propagation gaps, capability masks, prune selection, and exec stage signal and
-status behavior. Remaining security profiles, container sysctls, health start intervals, and
+status behavior. Remaining security profiles, nonnamespaced sysctls, health start intervals, and
 custom exec detach keys are decoded and rejected explicitly instead of being
 silently ignored.
 
 Docker's `SecurityOpt` no-new-privileges selection now persists, inspects, and
 applies to container init, default and privileged exec, and healthchecks through
-guest protocol v13 and is carried by current v17. Omitted policy retains cengine's
+guest protocol v13 and is carried by current v18. Omitted policy retains cengine's
 existing process-privilege defaults, while explicit true or false selections
 persist and survive container restart and daemon recovery (`RTM-021`). Seccomp
 selection remains independent: a staging process installs the filter while still
@@ -55,7 +55,7 @@ Unprivileged containers now receive an arm64 adaptation of Moby's built-in
 seccomp profile by default. `seccomp=builtin` and `seccomp=unconfined` select the
 profile explicitly, while privileged containers remain unconfined unless the
 built-in profile is requested. The selection persists and applies to init, exec, and healthchecks across container
-restart and daemon recovery through guest protocol v16, carried by current v17 (`RTM-028`). Filters are
+restart and daemon recovery through guest protocol v16, carried by current v18 (`RTM-028`). Filters are
 installed after root, mount, and rlimit setup but before the staging process drops
 its administrative capability, preserving Docker's independent no-new-privileges
 semantics. The filter rejects every non-AArch64 audit architecture; AArch32
@@ -71,7 +71,7 @@ enforcement remains active across container restart and daemon recovery
 
 Docker `Devices` mappings and additive `DeviceCgroupRules` now persist, inspect,
 apply, and update live through functionality introduced in guest protocol v14
-and carried by current v17 (`RTM-025`). A mapping's
+and carried by current v18 (`RTM-025`). A mapping's
 `PathOnHost` names a real device in the per-container Linux VM—standard guest
 devices and attached virtio block disks are supported—and the guest recreates
 that device at a descriptor-resolved `/dev` destination with the submitted
@@ -83,7 +83,7 @@ gaps and fail explicitly.
 
 Docker create-time ulimits now persist and apply to container init, exec, and
 healthcheck processes through capability introduced in guest protocol v7 and
-carried by the current guest protocol v17. The final exec command receives
+carried by the current guest protocol v18. The final exec command receives
 limits after namespace and root setup without constraining the guest supervisor
 or its signal/status proxies. `RTM-014` covers inspect, validation without
 side effects, daemon recovery, and container stop/start. Live ulimit updates
@@ -93,7 +93,29 @@ Supported namespace selections now persist, inspect, and survive daemon
 recovery. Docker IPC `none` uses a private IPC namespace without mounting
 `/dev/shm`; the default/private cgroup and IPC selections plus the host userns
 selection introduced in guest protocol v11 reflect guest behavior through the
-current guest protocol v17 (`RTM-016`).
+current guest protocol v18 (`RTM-016`). Docker `ShmSize` now persists, inspects,
+and sizes a `nosuid,nodev,noexec` private/default IPC `/dev/shm`, using Docker's
+64 MiB default when omitted or zero and preserving an explicit mount at that
+target even under IPC `none` (`RTM-033`). Docker/runc's namespaced network, message-queue,
+IPC, and UTS sysctl allowlist also persists and applies through guest protocol
+v18 after endpoint settings, across stop/start and daemon recovery (`RTM-034`).
+Nonnamespaced sysctls remain an explicit gap because they would mutate the
+guest-wide kernel rather than only the workload namespaces. The v18 guest
+accepts v17 request envelopes during live upgrades, responds at the request's
+version, and supplies the 64 MiB shared-memory default absent from v17 workload
+payloads; v18 shims continue to emit v18 so new sysctl inputs cannot be silently
+ignored.
+
+Image configuration ingestion now preserves Docker/OCI healthcheck metadata.
+Container-create healthchecks merge with image values field-by-field, an empty
+or omitted test inherits the image command, and `Test=["NONE"]` disables it.
+The effective command, interval, timeout, retries, start period, and
+`StartInterval` persist and inspect. During a new execution's start period,
+probes use `StartInterval` and failures are ignored while status remains
+`starting`; success or grace expiry switches to the regular interval. Explicit
+restart resets health state, while daemon recovery resumes monitoring the
+adopted generation (`RTM-035`).
+
 Docker-host and cross-container cgroup, IPC, PID, UTS, and network sharing are
 explicit architecture gaps: separate per-container VM kernels cannot join one
 Linux namespace. OCI namespace paths are likewise not exposed through the
@@ -101,7 +123,7 @@ Docker API or an OCI runtime CLI. These requests fail before container or volume
 mutation (`RTM-017`).
 
 Docker masked and read-only paths now persist, inspect, and enter the guest
-protocol (introduced in v11 and carried by current v17). Omitted lists select
+protocol (introduced in v11 and carried by current v18). Omitted lists select
 Docker's defaults, explicit empty lists disable them,
 and privileged workloads clear them. The guest applies the policy after its
 filesystems and workload root are in place: missing targets are ignored,
@@ -111,7 +133,7 @@ flags. `RTM-018` covers file and directory masks, read-only enforcement,
 restart, and daemon recovery.
 
 Docker's structured bind recursion and read-only controls now persist and enter
-guest protocol v12 and are carried by the current v17 protocol. `NonRecursive`
+guest protocol v12 and are carried by the current v18 protocol. `NonRecursive`
 selects a single bind instead of a recursive bind; read-only binds default to
 recursive `mount_setattr`,
 `ReadOnlyNonRecursive` limits the remount to the bind root, and
@@ -190,9 +212,9 @@ volume, or exec state is mutated; malformed and contradictory values return a
 client error. Unknown extension keys remain forward-compatible rather than
 triggering whole-object rejection.
 
-Per-container VM realtime is synchronized from the macOS host through guest
-protocol v17 before startup returns, immediately after resume, and every 30
-seconds while running. The periodic task belongs to the durable VM shim, pauses
+Per-container VM realtime is synchronized from the macOS host through
+functionality introduced in guest protocol v17 and carried by current v18 before
+startup returns, immediately after resume, and every 30 seconds while running. The periodic task belongs to the durable VM shim, pauses
 and stops with its exact generation, logs transient failures, and survives
 daemon adoption without duplication. Startup fails closed if the initial sync
 fails; a resume failure re-pauses the VM or durably quarantines it before
@@ -200,7 +222,7 @@ teardown if rollback cannot be verified. `RTM-032` brackets Linux file
 timestamps across fresh boots, pause/resume, and daemon recovery.
 
 Docker terminal sizing was introduced in guest protocol v16 and is carried by
-current v17.
+current v18.
 Container-create and exec-create `ConsoleSize` values initialize Linux PTYs,
 exec-start may override the create value, and container/exec resize applies
 `TIOCSWINSZ` to a retained PTY master so foreground processes receive
@@ -304,7 +326,7 @@ configure, and inspect endpoints is complete:
   connect accept the current request DTO for older negotiated APIs, while the
   field round-trips only through v1.46+ inspect and remains omitted from older
   responses. Recovery support shipped in guest protocol v7 and is carried by
-  the current guest protocol v17 (`NET-019`).
+  the current guest protocol v18 (`NET-019`).
 - API v1.52+ network inspect reports per-subnet IPAM allocation status while
   older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
   semantics through privileged-helper gateway validation and subnet-derived

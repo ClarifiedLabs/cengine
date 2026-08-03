@@ -9,16 +9,18 @@ import (
 )
 
 const (
-	Version                         = 17
-	ControlPort                     = 4100
-	FileSystemPort                  = 4101
-	RootFSContentPort               = 4102
-	ExecIOPort                      = 4103
-	PortProxyPort                   = 4104
-	SocketProxyPortBase             = 4200
-	MaxControlFrame                 = 16 << 20
-	MaxFileSystemIO                 = 4 << 20
-	ErrorResourceRollbackIncomplete = "resource_rollback_incomplete"
+	Version                               = 18
+	PreviousVersion                       = 17
+	DefaultSharedMemorySize         int64 = 64 * 1024 * 1024
+	ControlPort                           = 4100
+	FileSystemPort                        = 4101
+	RootFSContentPort                     = 4102
+	ExecIOPort                            = 4103
+	PortProxyPort                         = 4104
+	SocketProxyPortBase                   = 4200
+	MaxControlFrame                       = 16 << 20
+	MaxFileSystemIO                       = 4 << 20
+	ErrorResourceRollbackIncomplete       = "resource_rollback_incomplete"
 )
 
 type Envelope struct {
@@ -32,6 +34,14 @@ type Envelope struct {
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+func ResponseEnvelope(request Envelope) Envelope {
+	return Envelope{
+		Version:   request.Version,
+		ID:        request.ID,
+		Operation: request.Operation,
+	}
 }
 
 type WallClockTime struct {
@@ -82,7 +92,15 @@ type WorkloadSpec struct {
 	CapabilityDrop   []string          `json:"capabilityDrop,omitempty"`
 	Rlimits          []Rlimit          `json:"rlimits,omitempty"`
 	IPCMode          string            `json:"ipcMode"`
+	ShmSize          int64             `json:"shmSize"`
+	Sysctls          map[string]string `json:"sysctls,omitempty"`
 	IOClaim          string            `json:"ioClaim"`
+}
+
+func (spec *WorkloadSpec) ApplyCompatibilityDefaults(version uint32) {
+	if version == PreviousVersion && spec.ShmSize == 0 {
+		spec.ShmSize = DefaultSharedMemorySize
+	}
 }
 
 type TerminalSize struct {
@@ -232,7 +250,7 @@ func ReadEnvelope(reader io.Reader) (Envelope, error) {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return Envelope{}, err
 	}
-	if envelope.Version != Version {
+	if envelope.Version != PreviousVersion && envelope.Version != Version {
 		return Envelope{}, fmt.Errorf("unsupported protocol version %d", envelope.Version)
 	}
 	if envelope.ID == "" || envelope.Operation == "" {

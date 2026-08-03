@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import pathlib
@@ -19,6 +20,94 @@ from harness import compatibility_fixture_ipv6, persisted_container_record
 DIND_IMAGE = "docker:29.6.2-dind"
 ALPINE_IMAGE = "alpine:latest"
 RYUK_IMAGE = "testcontainers/ryuk:0.13.0"
+
+
+def load_healthcheck_image(
+    client: docker.DockerClient, tag: str, healthcheck: dict,
+) -> docker.models.images.Image:
+    source_archive = io.BytesIO(b"".join(client.images.get(ALPINE_IMAGE).save(named=True)))
+    output_archive = io.BytesIO()
+    with tarfile.open(fileobj=source_archive, mode="r:*") as source:
+        members = source.getmembers()
+        files = {
+            member.name: source.extractfile(member).read()
+            for member in members if member.isfile()
+        }
+        index = json.loads(files["index.json"])
+        archive_manifest = json.loads(files["manifest.json"])
+        generated: dict[str, bytes] = {}
+        config_digests: dict[str, str] = {}
+
+        def blob_name(digest: str) -> str:
+            return f"blobs/sha256/{digest.removeprefix('sha256:')}"
+
+        def store_json(value: dict) -> tuple[str, int]:
+            data = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
+            generated[blob_name(digest)] = data
+            return digest, len(data)
+
+        def rewrite(descriptor: dict) -> dict:
+            value = json.loads(files[blob_name(descriptor["digest"])])
+            if "manifests" in value:
+                value["manifests"] = [rewrite(child) for child in value["manifests"]]
+            elif value.get("config", {}).get("mediaType") in {
+                "application/vnd.oci.image.config.v1+json",
+                "application/vnd.docker.container.image.v1+json",
+            } and not value.get("artifactType") and not descriptor.get("artifactType") \
+                    and descriptor.get("annotations", {}).get(
+                        "vnd.docker.reference.type",
+                    ) != "attestation-manifest":
+                old_config = value["config"]["digest"]
+                configuration = json.loads(files[blob_name(old_config)])
+                configuration.setdefault("config", {})["Healthcheck"] = healthcheck
+                new_config, config_size = store_json(configuration)
+                value["config"]["digest"] = new_config
+                value["config"]["size"] = config_size
+                config_digests[old_config] = new_config
+            else:
+                return dict(descriptor)
+            new_digest, new_size = store_json(value)
+            rewritten = dict(descriptor)
+            rewritten["digest"] = new_digest
+            rewritten["size"] = new_size
+            return rewritten
+
+        index["manifests"] = [rewrite(descriptor) for descriptor in index["manifests"]]
+        assert index["manifests"]
+        annotations = index["manifests"][0].setdefault("annotations", {})
+        annotations["org.opencontainers.image.ref.name"] = tag
+        annotations["io.containerd.image.name"] = tag
+        for entry in archive_manifest:
+            old_config = "sha256:" + pathlib.PurePosixPath(entry["Config"]).name
+            if old_config in config_digests:
+                entry["Config"] = blob_name(config_digests[old_config])
+                entry["RepoTags"] = [tag]
+
+        generated["index.json"] = json.dumps(
+            index, separators=(",", ":"), sort_keys=True,
+        ).encode()
+        generated["manifest.json"] = json.dumps(
+            archive_manifest, separators=(",", ":"), sort_keys=True,
+        ).encode()
+        with tarfile.open(fileobj=output_archive, mode="w") as output:
+            for member in members:
+                if member.name in generated:
+                    continue
+                output.addfile(
+                    member, io.BytesIO(files[member.name]) if member.isfile() else None,
+                )
+            for name, data in generated.items():
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                member.mtime = int(time.time())
+                member.size = len(data)
+                output.addfile(member, io.BytesIO(data))
+    output_archive.seek(0)
+    client.images.load(output_archive.getvalue())
+    return client.images.get(tag)
+
+
 SNAPSHOT_SCRIPT = r"""
 snapshot() {
     for namespace in mnt pid uts ipc net cgroup; do
@@ -215,13 +304,6 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
             "HostConfig": {"CpuShares": 1024},
         },
         {"Image": ALPINE_IMAGE, "HostConfig": {"PidMode": "host"}},
-        {
-            "Image": ALPINE_IMAGE,
-            "Healthcheck": {
-                "Test": ["CMD", "true"],
-                "StartInterval": 1_000_000,
-            },
-        },
     ]
     for index, body in enumerate(cases):
         name = f"runtime-input-{suffix}-{index}"
@@ -491,6 +573,325 @@ def test_guest_wall_clock_is_synchronized_across_vm_lifecycle(
                 cleanup_client.containers.get(value.id).remove(force=True)
             except docker.errors.NotFound:
                 pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-033")
+def test_shared_memory_size_applies_restart_and_survives_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    recovered = None
+    default = None
+    override = None
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"runtime-shm-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["top"],
+            "HostConfig": {"IpcMode": "private", "ShmSize": 32 * 1024 * 1024},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+
+    def assert_generated_shared_memory(
+        value: docker.models.containers.Container, size: int, blocks: bytes,
+    ) -> None:
+        value.reload()
+        assert value.attrs["HostConfig"]["ShmSize"] == size
+        result = value.exec_run([
+            "sh", "-ec", "df -kP /dev/shm | awk 'NR == 2 { print $2 }'",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output.strip() == blocks
+        result = value.exec_run([
+            "sh", "-ec", "awk '$2 == \"/dev/shm\" { print $4 }' /proc/mounts",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        options = result.output.strip().split(b",")
+        assert {b"nosuid", b"nodev", b"noexec"}.issubset(options)
+
+    def assert_override_shared_memory(
+        value: docker.models.containers.Container,
+    ) -> None:
+        value.reload()
+        assert value.attrs["HostConfig"]["ShmSize"] == 32 * 1024 * 1024
+        for target, blocks in (("/dev/shm", b"16384"), ("/dev/shm/cache", b"1024")):
+            result = value.exec_run([
+                "sh", "-ec", f"df -kP {target} | awk 'NR == 2 {{ print $2 }}'",
+            ])
+            assert result.exit_code == 0, result.output.decode(errors="replace")
+            assert result.output.strip() == blocks
+
+    try:
+        container.start()
+        assert_generated_shared_memory(container, 32 * 1024 * 1024, b"32768")
+
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            params={"name": f"runtime-shm-default-{suffix}"},
+            data={"Image": ALPINE_IMAGE, "Cmd": ["top"]},
+        )
+        client.api._raise_for_status(response)
+        default = client.containers.get(response.json()["Id"])
+        default.start()
+        assert_generated_shared_memory(default, 64 * 1024 * 1024, b"65536")
+
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            params={"name": f"runtime-shm-override-{suffix}"},
+            data={
+                "Image": ALPINE_IMAGE,
+                "Cmd": ["top"],
+                "HostConfig": {
+                    "IpcMode": "none",
+                    "ShmSize": 32 * 1024 * 1024,
+                    "Mounts": [{
+                        "Type": "tmpfs",
+                        "Target": "/dev/shm/cache",
+                        "TmpfsOptions": {"SizeBytes": 1024 * 1024},
+                    }],
+                    "Tmpfs": {"/dev/shm": "size=16777216"},
+                },
+            },
+        )
+        client.api._raise_for_status(response)
+        override = client.containers.get(response.json()["Id"])
+        override.start()
+        assert_override_shared_memory(override)
+
+        container.stop()
+        container.start()
+        assert_generated_shared_memory(container, 32 * 1024 * 1024, b"32768")
+        override.stop()
+        override.start()
+        assert_override_shared_memory(override)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_generated_shared_memory(
+            recovered.containers.get(container.id), 32 * 1024 * 1024, b"32768",
+        )
+        assert_generated_shared_memory(
+            recovered.containers.get(default.id), 64 * 1024 * 1024, b"65536",
+        )
+        assert_override_shared_memory(recovered.containers.get(override.id))
+    finally:
+        cleanup = recovered or client
+        for value in (override, default, container):
+            if value is None:
+                continue
+            try:
+                cleanup.containers.get(value.id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-034")
+def test_namespaced_sysctls_apply_after_endpoint_settings_and_survive_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    name = f"runtime-sysctls-{suffix}"
+    endpoint_sysctls = "com.docker.network.endpoint.sysctls"
+    network = client.networks.create(f"runtime-sysctls-{suffix}")
+    recovered = None
+    sysctls = {
+        "net.ipv4.conf.eth0.forwarding": "1",
+        "fs/mqueue/msg_max": "64",
+        "kernel.shm_rmid_forced": "1",
+        "kernel.domainname": f"rtm-{suffix}.test",
+    }
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": name},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["top"],
+            "HostConfig": {"Sysctls": sysctls},
+            "NetworkingConfig": {"EndpointsConfig": {network.name: {
+                "DriverOpts": {
+                    endpoint_sysctls: "net.ipv4.conf.IFNAME.forwarding=0",
+                },
+            }}},
+        },
+    )
+    client.api._raise_for_status(response)
+    container = client.containers.get(response.json()["Id"])
+
+    def assert_sysctls(value: docker.models.containers.Container) -> None:
+        value.reload()
+        assert value.attrs["HostConfig"]["Sysctls"] == sysctls
+        result = value.exec_run([
+            "sh", "-ec",
+            "cat /proc/sys/net/ipv4/conf/eth0/forwarding "
+            "/proc/sys/fs/mqueue/msg_max /proc/sys/kernel/shm_rmid_forced "
+            "/proc/sys/kernel/domainname",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output.splitlines() == [
+            b"1", b"64", b"1", f"rtm-{suffix}.test".encode(),
+        ]
+
+    try:
+        container.start()
+        assert_sysctls(container)
+        container.stop()
+        container.start()
+        assert_sysctls(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        assert_sysctls(recovered.containers.get(container.id))
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        try:
+            cleanup.networks.get(network.id).remove()
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-035")
+def test_health_start_interval_image_inheritance_restart_and_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    tag = f"cengine-health-{suffix}:latest"
+    healthcheck = {
+        "Test": ["CMD-SHELL", "echo probe >> /tmp/health-probes; exit 1"],
+        "Interval": 1_000_000_000,
+        "Timeout": 1_000_000_000,
+        "Retries": 1,
+        "StartPeriod": 2_000_000_000,
+        "StartInterval": 200_000_000,
+    }
+    image = load_healthcheck_image(client, tag, healthcheck)
+    recovered = None
+    inherited = None
+    partial = None
+    disabled = None
+
+    def create(name: str, override: dict | None = None):
+        data = {"Image": tag, "Cmd": ["top"]}
+        if override is not None:
+            data["Healthcheck"] = override
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            params={"name": name},
+            data=data,
+        )
+        client.api._raise_for_status(response)
+        return client.containers.get(response.json()["Id"])
+
+    def probe_count(value: docker.models.containers.Container) -> int:
+        result = value.exec_run([
+            "sh", "-ec",
+            "if test -f /tmp/health-probes; then wc -l < /tmp/health-probes; else echo 0; fi",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        return int(result.output.strip())
+
+    def wait_for_probes(
+        value: docker.models.containers.Container, minimum: int, timeout: float = 5,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if probe_count(value) >= minimum:
+                return
+            time.sleep(0.05)
+        assert probe_count(value) >= minimum
+
+    try:
+        image.reload()
+        assert image.attrs["Config"]["Healthcheck"] == healthcheck
+        inherited = create(f"runtime-health-inherited-{suffix}")
+        partial = create(
+            f"runtime-health-partial-{suffix}",
+            {"Test": [], "Interval": 750_000_000},
+        )
+        disabled = create(
+            f"runtime-health-disabled-{suffix}", {"Test": ["NONE"]},
+        )
+
+        inherited.reload()
+        assert inherited.attrs["Config"]["Healthcheck"] == healthcheck
+        partial.reload()
+        partial_health = partial.attrs["Config"]["Healthcheck"]
+        assert partial_health["Test"] == healthcheck["Test"]
+        assert partial_health["Interval"] == 750_000_000
+        assert partial_health["StartInterval"] == healthcheck["StartInterval"]
+        disabled.reload()
+        assert disabled.attrs["Config"]["Healthcheck"]["Test"] == ["NONE"]
+        assert "Health" not in disabled.attrs["State"]
+        disabled.start()
+        time.sleep(0.5)
+        disabled.reload()
+        assert "Health" not in disabled.attrs["State"]
+        disabled.stop()
+
+        inherited.start()
+        wait_for_probes(inherited, 2)
+        inherited.reload()
+        assert inherited.attrs["State"]["Health"]["Status"] == "starting"
+        assert inherited.attrs["State"]["Health"]["FailingStreak"] == 0
+
+        count_before_restart = probe_count(inherited)
+        inherited.restart(timeout=1)
+        wait_for_probes(inherited, count_before_restart + 2)
+        inherited.reload()
+        assert inherited.attrs["State"]["Health"]["Status"] == "starting"
+        assert inherited.attrs["State"]["Health"]["FailingStreak"] == 0
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            inherited.reload()
+            if inherited.attrs["State"]["Health"]["Status"] == "unhealthy":
+                break
+            time.sleep(0.05)
+        inherited.reload()
+        assert inherited.attrs["State"]["Health"]["Status"] == "unhealthy"
+        assert inherited.attrs["State"]["Health"]["FailingStreak"] >= 1
+
+        count_before_recovery = probe_count(inherited)
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        recovered_inherited = recovered.containers.get(inherited.id)
+        wait_for_probes(recovered_inherited, count_before_recovery + 2)
+        recovered_inherited.reload()
+        recovered_health = recovered_inherited.attrs["Config"]["Healthcheck"]
+        assert recovered_health == healthcheck
+        assert recovered_inherited.attrs["State"]["Health"]["Status"] == "unhealthy"
+        assert recovered_inherited.attrs["State"]["Health"]["FailingStreak"] >= 1
+    finally:
+        cleanup = recovered or client
+        for value in (disabled, partial, inherited):
+            if value is None:
+                continue
+            try:
+                cleanup.containers.get(value.id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+        try:
+            cleanup.images.get(tag).remove(force=True)
+        except docker.errors.ImageNotFound:
+            pass
         if recovered is not None:
             recovered.close()
 

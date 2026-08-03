@@ -6556,6 +6556,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             processArguments: ["true"]
         )
         container.ipcMode = "none"
+        container.shmSizeBytes = 32 * 1_024 * 1_024
+        container.sysctls = ["net.ipv4.ip_forward": "1"]
 
         let workload = try RawVirtualizationBackend.workloadSpecification(
             container: container, imageConfiguration: nil, mounts: [], networks: [],
@@ -6563,6 +6565,15 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         )
 
         #expect(workload.ipcMode == "none")
+        #expect(workload.shmSize == 32 * 1_024 * 1_024)
+        #expect(workload.sysctls == ["net.ipv4.ip_forward": "1"])
+
+        let defaults = try RawVirtualizationBackend.workloadSpecification(
+            container: ContainerRecord(name: "defaults", image: "alpine", processArguments: ["true"]),
+            imageConfiguration: nil, mounts: [], networks: [], hosts: [:], volumeServer: nil
+        )
+        #expect(defaults.shmSize == ContainerRecord.defaultShmSizeBytes)
+        #expect(defaults.sysctls.isEmpty)
     }
 
     @Test func containerPathPoliciesReachGuestWorkloadSpecification() throws {

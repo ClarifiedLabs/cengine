@@ -119,11 +119,34 @@ public struct HealthcheckRecord: Codable, Hashable, Sendable {
     public var timeoutNanoseconds: Int64
     public var retries: Int
     public var startPeriodNanoseconds: Int64
-    public init(test: [String], intervalNanoseconds: Int64, timeoutNanoseconds: Int64,
-                retries: Int, startPeriodNanoseconds: Int64) {
+    public var startIntervalNanoseconds: Int64
+
+    public init(
+        test: [String], intervalNanoseconds: Int64, timeoutNanoseconds: Int64,
+        retries: Int, startPeriodNanoseconds: Int64,
+        startIntervalNanoseconds: Int64 = 5_000_000_000
+    ) {
         self.test = test; self.intervalNanoseconds = intervalNanoseconds
         self.timeoutNanoseconds = timeoutNanoseconds; self.retries = retries
         self.startPeriodNanoseconds = startPeriodNanoseconds
+        self.startIntervalNanoseconds = startIntervalNanoseconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case test, intervalNanoseconds, timeoutNanoseconds, retries
+        case startPeriodNanoseconds, startIntervalNanoseconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        test = try values.decode([String].self, forKey: .test)
+        intervalNanoseconds = try values.decode(Int64.self, forKey: .intervalNanoseconds)
+        timeoutNanoseconds = try values.decode(Int64.self, forKey: .timeoutNanoseconds)
+        retries = try values.decode(Int.self, forKey: .retries)
+        startPeriodNanoseconds = try values.decode(Int64.self, forKey: .startPeriodNanoseconds)
+        startIntervalNanoseconds = try values.decodeIfPresent(
+            Int64.self, forKey: .startIntervalNanoseconds
+        ) ?? 5_000_000_000
     }
 }
 
@@ -231,6 +254,12 @@ public struct ContainerRecord: Codable, Sendable {
     /// rejected before a record is persisted.
     public var cgroupNamespaceMode: String
     public var ipcMode: String
+    /// Requested Docker shared-memory size. Optional so snapshots written before
+    /// HostConfig.ShmSize support continue to decode.
+    public var shmSizeBytes: Int64?
+    /// Namespaced Linux sysctls requested through Docker HostConfig. Optional for
+    /// migration-safe decoding of older snapshots.
+    public var sysctls: [String: String]?
     public var pidMode: String
     public var utsMode: String
     public var userNamespaceMode: String
@@ -300,6 +329,8 @@ public struct ContainerRecord: Codable, Sendable {
         self.useInit = false
         self.cgroupNamespaceMode = "private"
         self.ipcMode = "private"
+        self.shmSizeBytes = nil
+        self.sysctls = nil
         self.pidMode = ""
         self.utsMode = ""
         self.userNamespaceMode = ""
@@ -324,6 +355,15 @@ public struct ContainerRecord: Codable, Sendable {
         self.restartCount = 0
         self.networkDisabled = false
     }
+
+    public static let defaultShmSizeBytes: Int64 = 64 * 1_024 * 1_024
+
+    public var effectiveShmSizeBytes: Int64 {
+        guard let shmSizeBytes, shmSizeBytes > 0 else { return Self.defaultShmSizeBytes }
+        return shmSizeBytes
+    }
+
+    public var effectiveSysctls: [String: String] { sysctls ?? [:] }
 
     /// Returns the same requested container configuration with a new internal
     /// incarnation identity. Runtime admission uses this copy so caller-owned

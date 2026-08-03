@@ -212,6 +212,39 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
 }
 
 @Suite struct CoreTests {
+    @Test func legacyHealthcheckRecordDefaultsStartInterval() throws {
+        let data = Data(#"{"test":["CMD","true"],"intervalNanoseconds":30000000000,"timeoutNanoseconds":30000000000,"retries":3,"startPeriodNanoseconds":0}"#.utf8)
+        let healthcheck = try JSONDecoder().decode(HealthcheckRecord.self, from: data)
+        #expect(healthcheck.startIntervalNanoseconds == 5_000_000_000)
+    }
+
+    @Test func containerRecordShmAndSysctlsDecodeFromOldSnapshotsAndRoundTrip() throws {
+        let original = ContainerRecord(
+            id: "migration-container", name: "migration", image: "alpine",
+            processArguments: ["true"]
+        )
+        let encoded = try JSONEncoder().encode(original)
+        var object = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "shmSizeBytes")
+        object.removeValue(forKey: "sysctls")
+        let oldSnapshot = try JSONSerialization.data(withJSONObject: object)
+
+        let migrated = try JSONDecoder().decode(ContainerRecord.self, from: oldSnapshot)
+        #expect(migrated.shmSizeBytes == nil)
+        #expect(migrated.effectiveShmSizeBytes == ContainerRecord.defaultShmSizeBytes)
+        #expect(migrated.effectiveSysctls.isEmpty)
+
+        var configured = migrated
+        configured.shmSizeBytes = 32 * 1_024 * 1_024
+        configured.sysctls = ["kernel.domainname": "example.test"]
+        let restored = try JSONDecoder().decode(
+            ContainerRecord.self, from: JSONEncoder().encode(configured)
+        )
+        #expect(restored.effectiveShmSizeBytes == 32 * 1_024 * 1_024)
+        #expect(restored.effectiveSysctls == ["kernel.domainname": "example.test"])
+    }
     @Test func versionReadsBundleMetadataAndFallsBack() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

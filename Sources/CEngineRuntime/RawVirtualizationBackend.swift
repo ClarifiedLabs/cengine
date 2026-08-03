@@ -6213,6 +6213,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             annotations: container.annotations,
             capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
             rlimits: try Self.rlimits(container.ulimits), ipcMode: container.ipcMode,
+            shmSize: container.effectiveShmSizeBytes, sysctls: container.effectiveSysctls,
             ioClaim: ioClaim
         )
     }
