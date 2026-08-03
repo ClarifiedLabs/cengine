@@ -238,6 +238,11 @@ private final class DaemonLock {
         case "shutdown":
             let count = try await VMShimTeardown.terminateAll(in: EnginePaths().data)
             print("stopped \(count) cengine VM shim\(count == 1 ? "" : "s")")
+        case "configure-docker":
+            let options = try dockerConfigurationOptions(Array(arguments.dropFirst()))
+            let paths = EnginePaths(home: options.home)
+            try SystemManager.configureDocker(paths: paths, socket: options.socket ?? paths.socket)
+            print("configured Docker context and Buildx builder for cengine")
         case "install": try await SystemManager.install(paths: EnginePaths())
         case "uninstall": try SystemManager.uninstall(paths: EnginePaths())
         default: throw EngineError(.badRequest, "system command is not implemented yet")
@@ -278,7 +283,7 @@ private final class DaemonLock {
         try settings.save(to: paths.builderSettings)
         if await socketIsReachable(paths.socket.path) {
             do {
-                try DockerIntegration.configureBuilder(settings)
+                try DockerIntegration.configureBuilder(settings, socket: paths.socket)
                 print("Builder resources updated to \(settings.cpus) CPUs and \(settings.memoryGiB) GiB memory.")
             } catch {
                 throw EngineError(
@@ -393,6 +398,34 @@ private final class DaemonLock {
         }
     }
 
+    private static func dockerConfigurationOptions(
+        _ arguments: [String]
+    ) throws -> (home: URL, socket: URL?) {
+        var home = FileManager.default.homeDirectoryForCurrentUser
+        var socket: URL?
+        var index = 0
+        while index < arguments.count {
+            let name = arguments[index]
+            guard ["--home", "--socket"].contains(name), index + 1 < arguments.count else {
+                throw EngineError(
+                    .badRequest,
+                    "configure-docker accepts only --home PATH and --socket PATH"
+                )
+            }
+            let value = arguments[index + 1]
+            guard !value.isEmpty else {
+                throw EngineError(.badRequest, "\(name) requires a path")
+            }
+            if name == "--home" {
+                home = URL(filePath: value, directoryHint: .isDirectory)
+            } else {
+                socket = URL(filePath: value, directoryHint: .notDirectory)
+            }
+            index += 2
+        }
+        return (home, socket)
+    }
+
     private static func memoryGiB(_ value: String) throws -> Int {
         let normalized = value.lowercased()
         let suffixes = ["gib", "gb", "g"]
@@ -429,6 +462,7 @@ private final class DaemonLock {
           network-helper status|restart
           service run
           system status|doctor|shutdown|install|uninstall
+          system configure-docker [--socket PATH] [--home PATH]
           version
         """)
     }

@@ -28,14 +28,19 @@ enum SystemManager {
             print("Installing cengine kernel and guest initramfs assets...")
             try GuestAssetInstaller.install(paths: paths)
         }
-        configureDockerContext(paths: paths)
+        configureDockerContextIfAvailable(paths: paths)
     }
 
-    static func configureBuildx() {
+    static func configureDocker(paths: EnginePaths, socket: URL) throws {
+        try paths.createDirectories()
+        try configureDockerContext(paths: paths, socket: socket)
+        try configureBuilder(paths: paths, socket: socket)
+    }
+
+    static func configureBuildx(paths: EnginePaths = EnginePaths()) {
         guard DockerIntegration.executable(named: "docker") != nil else { return }
         do {
-            let paths = EnginePaths()
-            try DockerIntegration.configureBuilder(BuilderSettings.load(from: paths.builderSettings))
+            try configureBuilder(paths: paths, socket: paths.socket)
         } catch {
             warn("could not configure Buildx: \(error.localizedDescription)")
         }
@@ -86,19 +91,30 @@ enum SystemManager {
         }
     }
 
-    private static func configureDockerContext(paths: EnginePaths) {
+    private static func configureDockerContextIfAvailable(paths: EnginePaths) {
         guard DockerIntegration.executable(named: "docker") != nil else {
             print("Docker CLI not found; skipping context and Buildx configuration")
             return
         }
         do {
-            try DockerIntegration.configureContext(
-                socket: paths.socket,
-                restoringActiveContextFrom: paths.activeContextMarker
-            )
+            try configureDockerContext(paths: paths, socket: paths.socket)
         } catch {
             warn("could not configure Docker context: \(error.localizedDescription)")
         }
+    }
+
+    private static func configureDockerContext(paths: EnginePaths, socket: URL) throws {
+        try DockerIntegration.configureContext(
+            socket: socket,
+            restoringActiveContextFrom: paths.activeContextMarker
+        )
+    }
+
+    private static func configureBuilder(paths: EnginePaths, socket: URL) throws {
+        try DockerIntegration.configureBuilder(
+            BuilderSettings.load(from: paths.builderSettings),
+            socket: socket
+        )
     }
 
     private static func warn(_ message: String) {

@@ -32,12 +32,14 @@ import Testing
         let environment = DockerIntegration.persistedContextEnvironment([
             "PATH": "/opt/homebrew/bin",
             "DOCKER_CONFIG": "/tmp/docker-config",
+            "BUILDX_CONFIG": "/tmp/buildx-config",
             "DOCKER_CONTEXT": "temporary",
             "DOCKER_HOST": "unix:///tmp/docker.sock",
         ])
 
         #expect(environment["PATH"] == "/opt/homebrew/bin")
         #expect(environment["DOCKER_CONFIG"] == "/tmp/docker-config")
+        #expect(environment["BUILDX_CONFIG"] == "/tmp/buildx-config")
         #expect(environment["DOCKER_CONTEXT"] == nil)
         #expect(environment["DOCKER_HOST"] == nil)
     }
@@ -169,6 +171,69 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: marker.path))
     }
 
+    @Test func missingContextWithoutMarkerNeverActivatesIt() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        let expected = "unix://\(socket.path)"
+        var commands: [[String]] = []
+        var inspectionCount = 0
+
+        try DockerIntegration.configureContext(
+            socket: socket,
+            restoringActiveContextFrom: marker
+        ) { arguments in
+            commands.append(arguments)
+            if arguments.starts(with: ["context", "inspect"]) {
+                inspectionCount += 1
+                if inspectionCount == 1 { throw TestError.commandFailed }
+                return expected
+            }
+            return ""
+        }
+
+        #expect(commands == [
+            ["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"],
+            ["context", "rm", "-f", "cengine"],
+            [
+                "context", "create", "cengine", "--docker", "host=\(expected)",
+                "--description", "cengine (one container per VM)",
+            ],
+            ["context", "inspect", "cengine", "--format", "{{.Endpoints.docker.Host}}"],
+        ])
+        #expect(!commands.contains(["context", "use", "cengine"]))
+    }
+
+    @Test func staleContextWithoutMarkerIsRepairedWithoutActivation() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appending(path: "active-context")
+        let socket = root.appending(path: "docker.sock")
+        let expected = "unix://\(socket.path)"
+        var commands: [[String]] = []
+        var inspectionCount = 0
+
+        try DockerIntegration.configureContext(
+            socket: socket,
+            restoringActiveContextFrom: marker
+        ) { arguments in
+            commands.append(arguments)
+            if arguments.starts(with: ["context", "inspect"]) {
+                inspectionCount += 1
+                return inspectionCount == 1 ? "unix:///tmp/stale.sock" : expected
+            }
+            return ""
+        }
+
+        #expect(commands.contains(["context", "rm", "-f", "cengine"]))
+        #expect(commands.contains([
+            "context", "create", "cengine", "--docker", "host=\(expected)",
+            "--description", "cengine (one container per VM)",
+        ]))
+        #expect(!commands.contains(["context", "use", "cengine"]))
+    }
+
     @Test func contextCreationFailureRetainsMarkerWithoutActivating() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -292,9 +357,12 @@ import Testing
 
     @Test func configuringMatchingBuilderSelectsIt() throws {
         let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []
 
-        try DockerIntegration.configureBuilder(.init(cpus: 4, memoryGiB: 4)) { arguments in
+        try DockerIntegration.configureBuilder(
+            .init(cpus: 4, memoryGiB: 4), socket: socket
+        ) { arguments in
             commands.append(arguments)
             return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
         }
@@ -306,14 +374,19 @@ import Testing
                 "--context", DockerIntegration.contextName,
                 "buildx", "use", "--default", DockerIntegration.builderName,
             ],
+            [
+                "--host", "unix://\(socket.path)",
+                "buildx", "use", "--default", DockerIntegration.builderName,
+            ],
         ])
     }
 
     @Test func configuringNativeBuilderReplacesItsState() throws {
         let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=native"#
+        let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []
 
-        try DockerIntegration.configureBuilder(.default) { arguments in
+        try DockerIntegration.configureBuilder(.default, socket: socket) { arguments in
             commands.append(arguments)
             return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
         }
@@ -327,15 +400,20 @@ import Testing
                 "--context", DockerIntegration.contextName,
                 "buildx", "use", "--default", DockerIntegration.builderName,
             ],
+            [
+                "--host", "unix://\(socket.path)",
+                "buildx", "use", "--default", DockerIntegration.builderName,
+            ],
         ])
     }
 
     @Test func configuringNewResourcesPreservesOverlayState() throws {
         let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
         let settings = BuilderSettings(cpus: 2, memoryGiB: 4)
+        let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []
 
-        try DockerIntegration.configureBuilder(settings) { arguments in
+        try DockerIntegration.configureBuilder(settings, socket: socket) { arguments in
             commands.append(arguments)
             return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
         }
@@ -347,6 +425,10 @@ import Testing
             DockerIntegration.createBuilderArguments(settings),
             [
                 "--context", DockerIntegration.contextName,
+                "buildx", "use", "--default", DockerIntegration.builderName,
+            ],
+            [
+                "--host", "unix://\(socket.path)",
                 "buildx", "use", "--default", DockerIntegration.builderName,
             ],
         ])

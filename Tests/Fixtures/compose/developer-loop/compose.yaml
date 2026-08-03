@@ -1,0 +1,19 @@
+services:
+  developer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${DEVELOPER_IMAGE}
+    platform: linux/arm64
+    init: true
+    ports:
+      - "8000"
+    volumes:
+      - type: bind
+        source: ./source
+        target: /workspace
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 1s
+      timeout: 3s
+      retries: 20

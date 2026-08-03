@@ -45,18 +45,48 @@ acquire_lock() {
 
 cleanup() {
     status=$?
+    cleanup_status=0
     trap - EXIT HUP INT TERM
     stage "cleanup"
-    $RESET || status=$?
-    rm -rf "$LOCK"
+    $RESET || cleanup_status=$?
+    if [ -n "${CENGINE_COMPAT_CLIENT_STATE_ROOT:-}" ]; then
+        rm -rf "$CENGINE_COMPAT_CLIENT_STATE_ROOT" || cleanup_status=$?
+        if [ -e "$CENGINE_COMPAT_CLIENT_STATE_ROOT" ]; then
+            echo "compatibility client state leaked at $CENGINE_COMPAT_CLIENT_STATE_ROOT" >&2
+            cleanup_status=1
+        fi
+    fi
+    rm -rf "$LOCK" || cleanup_status=$?
+    if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+        status=$cleanup_status
+    fi
     exit "$status"
 }
 
 acquire_lock
 trap cleanup EXIT HUP INT TERM
 
-unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY
-unset BUILDX_BUILDER CONTAINER_HOST
+AMBIENT_DOCKER_CONFIG=${DOCKER_CONFIG:-"$HOME/.docker"}
+CENGINE_COMPAT_CLIENT_STATE_ROOT="$LOCK/client-state"
+CENGINE_COMPAT_RUN_ID=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+CENGINE_COMPAT_OWNER_PID=$$
+DOCKER_CONFIG="$CENGINE_COMPAT_CLIENT_STATE_ROOT/docker"
+BUILDX_CONFIG="$CENGINE_COMPAT_CLIENT_STATE_ROOT/buildx"
+mkdir -p "$DOCKER_CONFIG/cli-plugins" "$BUILDX_CONFIG"
+for plugin in buildx compose; do
+    if plugin_path=$(
+        "$ROOT/Scripts/find-docker-plugin.sh" "$plugin" "$AMBIENT_DOCKER_CONFIG"
+    ); then
+        ln -s "$plugin_path" "$DOCKER_CONFIG/cli-plugins/docker-$plugin"
+    fi
+done
+printf '%s %s\n' "$CENGINE_COMPAT_RUN_ID" "$CENGINE_COMPAT_OWNER_PID" \
+    > "$CENGINE_COMPAT_CLIENT_STATE_ROOT/.owner-pid"
+export CENGINE_COMPAT_CLIENT_STATE_ROOT CENGINE_COMPAT_RUN_ID CENGINE_COMPAT_OWNER_PID
+export DOCKER_CONFIG BUILDX_CONFIG
+
+unset DOCKER_API_VERSION DOCKER_AUTH_CONFIG DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST
+unset DOCKER_TLS DOCKER_TLS_VERIFY BUILDX_BUILDER CONTAINER_HOST
 
 CENGINE_COMPAT_IPV4_AUTO_POOL=${CENGINE_COMPAT_IPV4_AUTO_POOL:-10.192.0.0/12}
 CENGINE_COMPAT_IPV6_AUTO_PREFIX=${CENGINE_COMPAT_IPV6_AUTO_PREFIX:-fdcc::/16}

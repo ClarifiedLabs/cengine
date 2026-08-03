@@ -312,8 +312,9 @@ extension SMAppService: AppService {}
             return
         }
         do {
+            let socket = URL(fileURLWithPath: socketPath)
             try await Task.detached {
-                try DockerIntegration.configureBuilder(settings)
+                try DockerIntegration.configureBuilder(settings, socket: socket)
             }.value
             builderSettingsStatus = "Applied"
         } catch {

@@ -13,14 +13,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "Tests" / "Compatibility"))
 
 from harness import (  # noqa: E402
+    DOCKER_AMBIENT_CONFIG_VARIABLES,
     DOCKER_ENDPOINT_VARIABLES,
     COMPATIBILITY_OWNER_FILE,
     VMNET_TEARDOWN_SETTLE_SECONDS,
+    compatibility_environment,
     compatibility_image_cache_key,
     compatibility_root_owned_by,
     compatibility_runtime_processes,
     control_plane_status_is_ready,
     docker_environment,
+    managed_docker_environment,
     persisted_container_record,
 )
 
@@ -28,15 +31,29 @@ from harness import (  # noqa: E402
 def main() -> None:
     ambient = {
         "PATH": "/test/bin",
-        "DOCKER_HOST": "tcp://ambient.example:2376",
+        "DOCKER_CONFIG": "/isolated/docker",
+        "BUILDX_CONFIG": "/isolated/buildx",
         **{key: f"ambient-{key.lower()}" for key in DOCKER_ENDPOINT_VARIABLES},
+        **{key: f"ambient-{key.lower()}" for key in DOCKER_AMBIENT_CONFIG_VARIABLES},
     }
+    compatible = compatibility_environment(base=ambient)
+    managed = managed_docker_environment(base=ambient)
     environment = docker_environment(pathlib.Path("/tmp/cengine/docker.sock"), base=ambient)
 
-    assert environment["PATH"] == ambient["PATH"]
+    for value in (compatible, managed, environment):
+        assert value["PATH"] == ambient["PATH"]
+        assert value["DOCKER_CONFIG"] == ambient["DOCKER_CONFIG"]
+        assert value["BUILDX_CONFIG"] == ambient["BUILDX_CONFIG"]
+        for key in DOCKER_AMBIENT_CONFIG_VARIABLES:
+            assert key not in value
+    assert "DOCKER_HOST" not in compatible
+    assert "DOCKER_HOST" not in managed
     assert environment["DOCKER_HOST"] == "unix:///tmp/cengine/docker.sock"
     for key in DOCKER_ENDPOINT_VARIABLES:
-        assert key not in environment
+        assert key not in compatible
+        assert key not in managed
+        if key != "DOCKER_HOST":
+            assert key not in environment
 
     explicit = docker_environment("tcp://127.0.0.1:2375", base={})
     assert explicit == {"DOCKER_HOST": "tcp://127.0.0.1:2375"}
@@ -90,6 +107,23 @@ def main() -> None:
         (owned_root / COMPATIBILITY_OWNER_FILE).write_text(f"{binary.resolve()}\n")
         assert compatibility_root_owned_by(owned_root, binary)
         assert not compatibility_root_owned_by(owned_root, pathlib.Path("/other/cengine"))
+
+        fake_home_config = owned_root / "home" / ".docker" / "config.json"
+        fake_home_config.parent.mkdir(parents=True)
+        sentinel = '{"credsStore":"do-not-read-or-change"}\n'
+        fake_home_config.write_text(sentinel)
+        isolated = managed_docker_environment(base={
+            "HOME": str(fake_home_config.parents[1]),
+            "DOCKER_CONFIG": str(owned_root / "client" / "docker"),
+            "BUILDX_CONFIG": str(owned_root / "client" / "buildx"),
+            "DOCKER_HOST": "unix:///developer.sock",
+            "DOCKER_CONTEXT": "developer",
+            "BUILDX_BUILDER": "developer-builder",
+            "DOCKER_AUTH_CONFIG": "developer-credentials",
+        })
+        assert isolated["DOCKER_CONFIG"].endswith("/client/docker")
+        assert isolated["BUILDX_CONFIG"].endswith("/client/buildx")
+        assert fake_home_config.read_text() == sentinel
 
     makefile = (REPO_ROOT / "Makefile").read_text()
     assert 'XCODE_COMPAT_SCHEME ?= test-compat' in makefile
@@ -158,7 +192,42 @@ def main() -> None:
     assert "rm -rf \"$ROOT/.build/compat-venv\"" in runner
     assert '"$ROOT/Scripts/check-guest-kernel.sh"' in runner
     assert 'LOCK=${CENGINE_COMPAT_LOCK:-"${TMPDIR:-/tmp}/cengine-compat-run.lock"}' in runner
-    assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY" in runner
+    assert "unset DOCKER_API_VERSION DOCKER_AUTH_CONFIG DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST" in runner
+    assert 'CENGINE_COMPAT_CLIENT_STATE_ROOT="$LOCK/client-state"' in runner
+    assert 'DOCKER_CONFIG="$CENGINE_COMPAT_CLIENT_STATE_ROOT/docker"' in runner
+    assert 'BUILDX_CONFIG="$CENGINE_COMPAT_CLIENT_STATE_ROOT/buildx"' in runner
+    assert 'AMBIENT_DOCKER_CONFIG=${DOCKER_CONFIG:-"$HOME/.docker"}' in runner
+    assert 'mkdir -p "$DOCKER_CONFIG/cli-plugins" "$BUILDX_CONFIG"' in runner
+    assert '"$ROOT/Scripts/find-docker-plugin.sh" "$plugin" "$AMBIENT_DOCKER_CONFIG"' in runner
+    assert 'ln -s "$plugin_path" "$DOCKER_CONFIG/cli-plugins/docker-$plugin"' in runner
+    plugin_finder = REPO_ROOT / "Scripts" / "find-docker-plugin.sh"
+    with tempfile.TemporaryDirectory() as directory:
+        plugin_root = pathlib.Path(directory)
+        plugin = plugin_root / ".docker-ci/cli-plugins/docker-buildx"
+        plugin.parent.mkdir(parents=True)
+        plugin.write_text("#!/bin/sh\nexit 0\n")
+        plugin.chmod(0o755)
+        discovered = subprocess.run(
+            ["/bin/sh", str(plugin_finder), "buildx", ".docker-ci"],
+            cwd=plugin_root, env={"HOME": str(plugin_root), "PATH": "/usr/bin:/bin"},
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
+        ).stdout.strip()
+        assert discovered == str(plugin.resolve())
+    assert "secrets.token_hex(32)" in runner
+    assert 'CENGINE_COMPAT_OWNER_PID=$$' in runner
+    assert 'printf \'%s %s\\n\' "$CENGINE_COMPAT_RUN_ID" "$CENGINE_COMPAT_OWNER_PID"' in runner
+    assert 'export CENGINE_COMPAT_CLIENT_STATE_ROOT CENGINE_COMPAT_RUN_ID CENGINE_COMPAT_OWNER_PID' in runner
+    conftest = (REPO_ROOT / "Tests" / "Compatibility" / "conftest.py").read_text()
+    assert 'docker_config != root / "docker"' in conftest
+    assert 'buildx_config != root / "buildx"' in conftest
+    assert 'owner_file.stat(follow_symlinks=False)' in conftest
+    assert 'owner_file.read_text() == expected_owner' in conftest
+    assert 'os.kill(int(owner_pid), 0)' in conftest
+    assert 'rm -rf "$CENGINE_COMPAT_CLIENT_STATE_ROOT"' in runner
+    plugin_finder_source = plugin_finder.read_text()
+    assert 'command -v "docker-$plugin"' in plugin_finder_source
+    assert '"/Applications/Docker.app/Contents/Resources/cli-plugins"' in plugin_finder_source
+    assert 'candidate_directory=$(CDPATH= cd -- "$(dirname -- "$candidate")" && pwd)' in plugin_finder_source
     assert 'stage "preflight reset"' in runner
     assert 'BUILD_STAGE="build and validate compatibility runtime"' in runner
     assert 'BUILD_STAGE="build and provision compatibility runtime"' in runner

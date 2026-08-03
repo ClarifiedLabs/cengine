@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import pathlib
 import tarfile
 import threading
@@ -19,7 +20,27 @@ from harness import compatibility_fixture_ipv6, persisted_container_record
 
 DIND_IMAGE = "docker:29.6.2-dind"
 ALPINE_IMAGE = "alpine:latest"
+PINNED_ALPINE_IMAGE = (
+    "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+)
 RYUK_IMAGE = "testcontainers/ryuk:0.13.0"
+
+
+def wait_for_compat_value(
+    probe, expected, description: str, *, timeout: float = 10, interval: float = 0.1,
+):
+    deadline = time.monotonic() + timeout
+    observed = probe()
+    while observed != expected:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(
+                f"timed out waiting for {description}: "
+                f"observed {observed!r}, want {expected!r}"
+            )
+        time.sleep(min(interval, remaining))
+        observed = probe()
+    return observed
 
 
 def load_healthcheck_image(
@@ -891,6 +912,444 @@ def test_health_start_interval_image_inheritance_restart_and_recovery(
         try:
             cleanup.images.get(tag).remove(force=True)
         except docker.errors.ImageNotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-036")
+def test_bind_directory_mutations_stay_coherent_across_restart_and_recovery(
+    daemon, client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    suffix = uuid.uuid4().hex[:8]
+    host_directory = tmp_path / f"bind-coherence-{suffix}"
+    writable = host_directory / "writable"
+    readonly = host_directory / "readonly"
+    writable.mkdir(parents=True)
+    readonly.mkdir()
+    guest_seed = writable / "guest-file"
+    guest_seed.write_bytes(b"guest-seed")
+    readonly_file = readonly / "value"
+    readonly_file.write_bytes(b"readonly-seed")
+
+    container = client.containers.create(
+        PINNED_ALPINE_IMAGE,
+        ["tail", "-f", "/dev/null"],
+        name=f"bind-coherence-{suffix}",
+        mounts=[
+            Mount(target="/shared", source=str(writable), type="bind"),
+            Mount(
+                target="/readonly", source=str(readonly), type="bind", read_only=True,
+            ),
+        ],
+    )
+    recovered = None
+    host_atomic_payload = b"host-atomic:" + b"h" * (4 * 1024)
+    guest_atomic_payload = b"g" * (4 * 1024)
+    readonly_atomic_payload = b"readonly-host-atomic:" + b"o" * (4 * 1024)
+    recovered_host_payload = b"after-daemon-recovery-host:" + b"d" * (4 * 1024)
+    recovered_guest_payload = b"r" * (4 * 1024)
+
+    def host_contents(path: pathlib.Path) -> bytes | None:
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def guest_contents(
+        value: docker.models.containers.Container, path: str,
+    ) -> bytes | None:
+        result = value.exec_run([
+            "sh", "-c", 'cat "$1" 2>/dev/null || exit 44', "sh", path,
+        ])
+        if result.exit_code == 44:
+            return None
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        return result.output
+
+    def wait_for_guest(
+        value: docker.models.containers.Container, path: str,
+        expected: bytes | None, phase: str,
+    ) -> None:
+        wait_for_compat_value(
+            lambda: guest_contents(value, path), expected,
+            f"{phase} to become visible at {path}",
+        )
+
+    def wait_for_host(path: pathlib.Path, expected: bytes | None, phase: str) -> None:
+        wait_for_compat_value(
+            lambda: host_contents(path), expected,
+            f"{phase} to become visible at {path}",
+        )
+
+    def run_guest(value: docker.models.containers.Container, script: str) -> None:
+        result = value.exec_run(["sh", "-ec", script])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+
+    def atomic_host_write(path: pathlib.Path, contents: bytes) -> None:
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        with temporary.open("wb") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def assert_atomic_transition(
+        probe, old: bytes, new: bytes, action, phase: str,
+    ) -> None:
+        ready = threading.Event()
+        seen_new = threading.Event()
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def observe() -> None:
+            deadline = time.monotonic() + 10
+            try:
+                while not stop.is_set() and time.monotonic() < deadline:
+                    contents = probe()
+                    if contents not in (old, new):
+                        raise AssertionError(
+                            f"{phase} exposed torn payload of "
+                            f"{None if contents is None else len(contents)} bytes"
+                        )
+                    ready.set()
+                    if contents == new:
+                        seen_new.set()
+                        return
+                    time.sleep(0.01)
+                if not stop.is_set():
+                    raise AssertionError(f"timed out waiting for {phase}")
+            except BaseException as error:
+                errors.append(error)
+                ready.set()
+
+        observer = threading.Thread(target=observe, name=f"atomic-observer-{phase}")
+        observer.start()
+        assert ready.wait(timeout=5), f"atomic observer did not start for {phase}"
+        if errors:
+            raise errors[0]
+        try:
+            action()
+        except BaseException:
+            stop.set()
+            observer.join(timeout=5)
+            raise
+        observer.join(timeout=10)
+        if observer.is_alive():
+            stop.set()
+            observer.join(timeout=5)
+        assert not observer.is_alive(), f"atomic observer did not stop for {phase}"
+        if errors:
+            raise errors[0]
+        assert seen_new.is_set(), f"atomic observer did not see the new value for {phase}"
+
+    def assert_readonly_rejection(
+        value: docker.models.containers.Container, phase: str,
+    ) -> None:
+        result = value.exec_run([
+            "sh", "-c",
+            "if printf changed 2>/dev/null >/readonly/value; then exit 40; fi; "
+            "if touch /readonly/created 2>/dev/null; then exit 41; fi; "
+            "if mv /readonly/value /readonly/renamed 2>/dev/null; then exit 42; fi; "
+            "if rm /readonly/value 2>/dev/null; then exit 43; fi; "
+            "printf readonly-rejected",
+        ])
+        assert result.exit_code == 0, (
+            f"{phase}: {result.output.decode(errors='replace')}"
+        )
+        assert result.output == b"readonly-rejected"
+        assert readonly_file.read_bytes().startswith(b"readonly-host-")
+        assert not (readonly / "created").exists()
+        assert not (readonly / "renamed").exists()
+
+    try:
+        container.start()
+
+        host_created = writable / "host-created"
+        host_created.write_bytes(b"host-create")
+        wait_for_guest(container, "/shared/host-created", b"host-create", "host create")
+        host_created.write_bytes(b"host-in-place")
+        wait_for_guest(
+            container, "/shared/host-created", b"host-in-place", "host in-place update",
+        )
+        atomic_host_write(host_created, host_atomic_payload)
+        wait_for_guest(
+            container, "/shared/host-created", host_atomic_payload,
+            "complete host atomic replacement",
+        )
+        host_renamed = writable / "host-renamed"
+        host_created.rename(host_renamed)
+        wait_for_guest(container, "/shared/host-created", None, "host rename source removal")
+        wait_for_guest(
+            container, "/shared/host-renamed", host_atomic_payload,
+            "host rename destination",
+        )
+        host_renamed.unlink()
+        wait_for_guest(container, "/shared/host-renamed", None, "host delete")
+
+        run_guest(container, "printf guest-in-place >/shared/guest-file")
+        wait_for_host(guest_seed, b"guest-in-place", "guest in-place update")
+        assert_atomic_transition(
+            lambda: host_contents(guest_seed), b"guest-in-place", guest_atomic_payload,
+            lambda: run_guest(
+                container,
+                "head -c 4096 /dev/zero | tr '\\000' g >/shared/.guest-file.tmp; "
+                "sync /shared/.guest-file.tmp; "
+                "mv /shared/.guest-file.tmp /shared/guest-file",
+            ),
+            "guest atomic replacement",
+        )
+        guest_created = writable / "guest-created"
+        run_guest(container, "printf guest-create >/shared/guest-created")
+        wait_for_host(guest_created, b"guest-create", "guest create")
+        run_guest(container, "mv /shared/guest-created /shared/guest-renamed")
+        guest_renamed = writable / "guest-renamed"
+        wait_for_host(guest_created, None, "guest rename source removal")
+        wait_for_host(guest_renamed, b"guest-create", "guest rename destination")
+        run_guest(container, "rm /shared/guest-renamed")
+        wait_for_host(guest_renamed, None, "guest delete")
+
+        wait_for_guest(container, "/readonly/value", b"readonly-seed", "read-only seed")
+        readonly_file.write_bytes(b"readonly-host-in-place")
+        wait_for_guest(
+            container, "/readonly/value", b"readonly-host-in-place",
+            "read-only host in-place update",
+        )
+        atomic_host_write(readonly_file, readonly_atomic_payload)
+        wait_for_guest(
+            container, "/readonly/value", readonly_atomic_payload,
+            "complete read-only host atomic replacement",
+        )
+        assert_readonly_rejection(container, "initial execution")
+
+        lifecycle_file = writable / "lifecycle"
+        lifecycle_file.write_bytes(b"before-container-restart")
+        wait_for_guest(
+            container, "/shared/lifecycle", b"before-container-restart",
+            "pre-restart host update",
+        )
+        container.restart(timeout=5)
+        wait_for_guest(
+            container, "/shared/lifecycle", b"before-container-restart",
+            "bind contents after container restart",
+        )
+        lifecycle_file.write_bytes(b"after-container-restart-host")
+        wait_for_guest(
+            container, "/shared/lifecycle", b"after-container-restart-host",
+            "post-restart host update",
+        )
+        run_guest(container, "printf after-container-restart-guest >/shared/lifecycle")
+        wait_for_host(
+            lifecycle_file, b"after-container-restart-guest", "post-restart guest update",
+        )
+        readonly_file.write_bytes(b"readonly-host-restart")
+        wait_for_guest(
+            container, "/readonly/value", b"readonly-host-restart",
+            "read-only host update after container restart",
+        )
+        assert_readonly_rejection(container, "container restart")
+        boot_id_before_recovery = guest_contents(
+            container, "/proc/sys/kernel/random/boot_id",
+        )
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        value = recovered.containers.get(container.id)
+
+        def recovered_status() -> str:
+            value.reload()
+            return value.status
+
+        wait_for_compat_value(recovered_status, "running", "container daemon recovery")
+        assert guest_contents(value, "/proc/sys/kernel/random/boot_id") == (
+            boot_id_before_recovery
+        )
+        wait_for_guest(
+            value, "/shared/lifecycle", b"after-container-restart-guest",
+            "bind contents after abrupt daemon recovery",
+        )
+        atomic_host_write(lifecycle_file, recovered_host_payload)
+        wait_for_guest(
+            value, "/shared/lifecycle", recovered_host_payload,
+            "complete post-recovery host atomic update",
+        )
+        assert_atomic_transition(
+            lambda: host_contents(lifecycle_file),
+            recovered_host_payload, recovered_guest_payload,
+            lambda: run_guest(
+                value,
+                "head -c 4096 /dev/zero | tr '\\000' r >/shared/.lifecycle.tmp; "
+                "sync /shared/.lifecycle.tmp; "
+                "mv /shared/.lifecycle.tmp /shared/lifecycle",
+            ),
+            "post-recovery guest atomic update",
+        )
+        atomic_host_write(readonly_file, b"readonly-host-recovery")
+        wait_for_guest(
+            value, "/readonly/value", b"readonly-host-recovery",
+            "read-only host update after daemon recovery",
+        )
+        assert_readonly_rejection(value, "daemon recovery")
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        if recovered is not None:
+            recovered.close()
+
+
+@pytest.mark.compat("RTM-037")
+def test_bind_content_polling_watcher_observes_edits_across_recovery(
+    daemon, client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    suffix = uuid.uuid4().hex[:8]
+    host_directory = tmp_path / f"bind-watcher-{suffix}"
+    host_directory.mkdir()
+    watched = host_directory / "value"
+    watched.write_bytes(b"initial-generation")
+    watcher_script = r"""
+set -eu
+watched=/watched/value
+hashes=/tmp/watcher-hashes
+ready=/tmp/watcher-ready
+printf 'ready\n' >>"$ready"
+last=
+candidate=
+while :; do
+    current=$(sha256sum "$watched" | awk '{print $1}')
+    if test "$current" = "$candidate" && test "$current" != "$last"; then
+        printf '%s\n' "$current" >>"$hashes"
+        last=$current
+    fi
+    candidate=$current
+    sleep 0.2
+done
+"""
+    container = client.containers.create(
+        PINNED_ALPINE_IMAGE,
+        ["sh", "-ec", watcher_script],
+        name=f"bind-watcher-{suffix}",
+        mounts=[Mount(target="/watched", source=str(host_directory), type="bind")],
+    )
+    recovered = None
+
+    def ready_count(value: docker.models.containers.Container) -> int:
+        result = value.exec_run([
+            "sh", "-c",
+            "if test -f /tmp/watcher-ready; then wc -l </tmp/watcher-ready; else echo 0; fi",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        return int(result.output.strip())
+
+    def boot_id(value: docker.models.containers.Container) -> str:
+        result = value.exec_run(["cat", "/proc/sys/kernel/random/boot_id"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        return result.output.decode().strip()
+
+    def observed_hashes(value: docker.models.containers.Container) -> set[str]:
+        result = value.exec_run([
+            "sh", "-c", "cat /tmp/watcher-hashes 2>/dev/null || true",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        return set(result.output.decode().splitlines())
+
+    def wait_for_generation(
+        value: docker.models.containers.Container, contents: bytes, phase: str,
+    ) -> None:
+        expected = hashlib.sha256(contents).hexdigest()
+        wait_for_compat_value(
+            lambda: expected in observed_hashes(value), True,
+            f"watcher hash for {phase}", timeout=10, interval=0.1,
+        )
+
+    def publish_in_place(
+        value: docker.models.containers.Container, contents: bytes, phase: str,
+    ) -> None:
+        watched.write_bytes(contents)
+        wait_for_generation(value, contents, phase)
+
+    def publish_atomically(
+        value: docker.models.containers.Container, contents: bytes, phase: str,
+    ) -> None:
+        observed_before = observed_hashes(value)
+        temporary = watched.with_name(f".{watched.name}.{uuid.uuid4().hex}.tmp")
+        with temporary.open("wb") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(watched)
+        directory = os.open(watched.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        wait_for_generation(value, contents, phase)
+        newly_observed = observed_hashes(value) - observed_before
+        partial_hashes = {
+            hashlib.sha256(contents[:length]).hexdigest()
+            for length in range(len(contents))
+        }
+        assert not newly_observed & partial_hashes, (
+            f"polling watcher published a partial atomic generation during {phase}"
+        )
+
+    try:
+        container.start()
+        wait_for_compat_value(
+            lambda: ready_count(container), 1, "initial watcher readiness", timeout=10,
+        )
+        wait_for_generation(container, b"initial-generation", "initial contents")
+        publish_in_place(container, b"initial-in-place-generation", "initial in-place edit")
+        publish_atomically(container, b"initial-atomic-generation", "initial atomic edit")
+
+        container.restart(timeout=5)
+        wait_for_compat_value(
+            lambda: ready_count(container), 2, "watcher readiness after container restart",
+            timeout=10,
+        )
+        publish_in_place(
+            container, b"restart-in-place-generation", "post-restart in-place edit",
+        )
+        publish_atomically(
+            container, b"restart-atomic-generation", "post-restart atomic edit",
+        )
+        boot_id_before_recovery = boot_id(container)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        value = recovered.containers.get(container.id)
+
+        def recovered_status() -> str:
+            value.reload()
+            return value.status
+
+        wait_for_compat_value(
+            recovered_status, "running", "watcher daemon recovery", timeout=10,
+        )
+        assert ready_count(value) == 2
+        assert boot_id(value) == boot_id_before_recovery
+        publish_in_place(
+            value, b"recovery-in-place-generation", "post-recovery in-place edit",
+        )
+        publish_atomically(
+            value, b"recovery-atomic-generation", "post-recovery atomic edit",
+        )
+    finally:
+        cleanup = recovered or client
+        try:
+            cleanup.containers.get(container.id).remove(force=True)
+        except docker.errors.NotFound:
             pass
         if recovered is not None:
             recovered.close()

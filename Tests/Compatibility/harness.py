@@ -8,17 +8,23 @@ import pathlib
 import signal
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import TypeVar
 
 
 DOCKER_ENDPOINT_VARIABLES = (
     "DOCKER_API_VERSION",
     "DOCKER_CERT_PATH",
     "DOCKER_CONTEXT",
+    "DOCKER_HOST",
     "DOCKER_TLS",
     "DOCKER_TLS_VERIFY",
+    "BUILDX_BUILDER",
+    "CONTAINER_HOST",
 )
+DOCKER_AMBIENT_CONFIG_VARIABLES = ("DOCKER_AUTH_CONFIG",)
+T = TypeVar("T")
 
 
 def compatibility_fixture_ipv4(
@@ -50,6 +56,32 @@ def compatibility_fixture_ipv6(
 def compatibility_image_cache_key(seeds: list[tuple[str, str]]) -> str:
     encoded = json.dumps(seeds, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def wait_for_value(
+    probe: Callable[[], T],
+    predicate: Callable[[T], bool],
+    *,
+    timeout: float,
+    interval: float = 0.2,
+    description: str = "condition",
+) -> T:
+    deadline = time.monotonic() + timeout
+    last_value: T | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            last_value = probe()
+            last_error = None
+            if predicate(last_value):
+                return last_value
+        except Exception as error:  # The caller receives the last bounded diagnostic.
+            last_error = error
+        time.sleep(interval)
+    detail = f"last value: {last_value!r}"
+    if last_error is not None:
+        detail = f"last exception: {last_error!r}"
+    raise TimeoutError(f"timed out waiting for {description} ({detail})")
 
 
 def control_plane_status_is_ready(exit_code: int, output: bytes | str) -> bool:
@@ -173,9 +205,16 @@ def terminate_compatibility_runtime(
 
 def compatibility_environment(*, base: Mapping[str, str] | None = None) -> dict[str, str]:
     environment = dict(os.environ if base is None else base)
-    for key in DOCKER_ENDPOINT_VARIABLES:
+    for key in DOCKER_ENDPOINT_VARIABLES + DOCKER_AMBIENT_CONFIG_VARIABLES:
         environment.pop(key, None)
     return environment
+
+
+def managed_docker_environment(
+    *, base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return isolated client state without selecting a Docker endpoint or builder."""
+    return compatibility_environment(base=base)
 
 
 def docker_environment(

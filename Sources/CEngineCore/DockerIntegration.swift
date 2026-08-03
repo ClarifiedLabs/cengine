@@ -146,16 +146,17 @@ public enum DockerIntegration {
 
     /// Creates the managed Buildx builder or reconciles its configuration,
     /// retaining the cache only when its snapshotter remains compatible.
-    public static func configureBuilder(_ settings: BuilderSettings) throws {
+    public static func configureBuilder(_ settings: BuilderSettings, socket: URL) throws {
         try settings.validate()
         guard executable(named: "docker") != nil else {
             throw EngineError(.notFound, "docker CLI not found")
         }
-        try configureBuilder(settings, runDocker: runDocker)
+        try configureBuilder(settings, socket: socket, runDocker: runDocker)
     }
 
     static func configureBuilder(
         _ settings: BuilderSettings,
+        socket: URL,
         runDocker: ([String]) throws -> String
     ) throws {
         _ = try runDocker(["buildx", "version"])
@@ -173,6 +174,11 @@ public enum DockerIntegration {
         }
         _ = try runDocker([
             "--context", contextName, "buildx", "use", "--default", builderName,
+        ])
+        // Compose passes both the context name and its resolved host to its
+        // Buildx child. Standalone Buildx then scopes its default by the host.
+        _ = try runDocker([
+            "--host", "unix://\(socket.path)", "buildx", "use", "--default", builderName,
         ])
     }
 

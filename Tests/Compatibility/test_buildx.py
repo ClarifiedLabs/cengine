@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BUILD_CONTEXT = REPO_ROOT / "Tests/Fixtures/buildx"
 BUILDKIT_CONFIG = BUILD_CONTEXT / "buildkitd.toml"
 BUILDKIT_IMAGE = "moby/buildkit:v0.27.1"
+MANAGED_BUILDER = "cengine-builder"
 
 
 def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -31,6 +33,16 @@ def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.
     )
     assert result.returncode == 0, f"docker buildx {' '.join(arguments)} failed:\n{result.stdout}"
     return result
+
+
+def managed_buildkit_resources(client: docker.DockerClient) -> tuple[str, str]:
+    container = client.containers.get(f"buildx_buildkit_{MANAGED_BUILDER}0")
+    volumes = [
+        mount["Name"] for mount in container.attrs["Mounts"]
+        if mount.get("Type") == "volume" and mount.get("Destination") == "/var/lib/buildkit"
+    ]
+    assert len(volumes) == 1, container.attrs["Mounts"]
+    return container.id, volumes[0]
 
 
 def restart_compatibility_network_helper() -> None:
@@ -44,6 +56,82 @@ def restart_compatibility_network_helper() -> None:
     status = json.loads(result.stdout)
     assert status["serviceName"] == "dev.cengine.network-helper.test-compat"
     assert status["buildFingerprint"] == os.environ["CENGINE_COMPAT_NETWORK_HELPER_FINGERPRINT"]
+
+
+@pytest.mark.compat("BLD-006")
+def test_managed_docker_context_and_default_builder(
+    daemon, client: docker.DockerClient, managed_docker_integration,
+):
+    managed = managed_docker_integration
+    tag = f"compat-managed-buildx:{uuid.uuid4().hex[:8]}"
+    managed.register_image(tag)
+
+    try:
+        assert managed.run("context", "show").stdout.strip() == "default"
+        context = json.loads(managed.run("context", "inspect", "cengine").stdout)[0]
+        assert context["Name"] == "cengine"
+        assert context["Endpoints"]["docker"]["Host"] == f"unix://{daemon.socket}"
+
+        named = managed.run(
+            "buildx", "inspect", MANAGED_BUILDER, "--bootstrap", timeout=300,
+        ).stdout
+        for expected in (
+            f"Name:          {MANAGED_BUILDER}",
+            "Driver:        docker-container",
+            BUILDKIT_IMAGE,
+            'memory="2147483648"',
+            'cpu-period="100000"',
+            'cpu-quota="200000"',
+            "--oci-worker-snapshotter=overlayfs",
+        ):
+            assert expected in named, f"missing {expected!r} from:\n{named}"
+
+        selected = managed.run("--context", "cengine", "buildx", "inspect").stdout
+        assert f"Name:          {MANAGED_BUILDER}" in selected
+        defaults = pathlib.Path(managed.environment["BUILDX_CONFIG"]) / "defaults"
+        expected_default_keys = {
+            hashlib.sha256("cengine".encode()).hexdigest()[:20],
+            hashlib.sha256(f"unix://{daemon.socket}".encode()).hexdigest()[:20],
+        }
+        persisted_defaults = {
+            path.name: path.read_text() for path in defaults.iterdir() if path.is_file()
+        }
+        assert persisted_defaults == {
+            key: MANAGED_BUILDER for key in expected_default_keys
+        }
+
+        first_container, first_volume = managed_buildkit_resources(client)
+        build = managed.run(
+            "--context", "cengine", "buildx", "build", "--load", "--tag", tag,
+            str(BUILD_CONTEXT), timeout=300,
+        )
+        assert "ERROR" not in build.stdout
+        assert client.images.get(tag).attrs["Os"] == "linux"
+        assert client.images.get(tag).attrs["Architecture"] == "arm64"
+        run = managed.run("--context", "cengine", "run", "--rm", tag)
+        assert run.stdout.strip() == "cengine-buildx-ok"
+
+        configured = managed.configure()
+        assert configured.returncode == 0, configured.stdout
+        assert managed.run("context", "show").stdout.strip() == "default"
+        context_after = json.loads(managed.run("context", "inspect", "cengine").stdout)[0]
+        assert context_after["Endpoints"]["docker"]["Host"] == f"unix://{daemon.socket}"
+        assert managed_buildkit_resources(client) == (first_container, first_volume)
+        assert f"Name:          {MANAGED_BUILDER}" in managed.run(
+            "--context", "cengine", "buildx", "inspect",
+        ).stdout
+
+        buildkit_containers = [
+            container.name for container in client.containers.list(all=True)
+            if container.name.startswith("buildx_buildkit_")
+        ]
+        assert buildkit_containers == [f"buildx_buildkit_{MANAGED_BUILDER}0"]
+        builders = managed.run("buildx", "ls").stdout
+        assert MANAGED_BUILDER in builders
+        assert "compat-builder-" not in builders
+    except Exception:
+        print("\nmanaged Buildx diagnostics:\n" + managed.diagnostics())
+        raise
 
 
 @pytest.mark.compat("BLD-001")
