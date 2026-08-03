@@ -10,8 +10,9 @@ Development requires Apple silicon and macOS 26 or newer.
 
 - `make build` builds the shared `cengine` Xcode scheme in debug mode.
 - `make test` checks the compatibility harness and runs the Swift/Xcode test suite.
-- `make test-compat` builds the daemon and runs isolated pytest-based Docker compatibility tests.
-- `make test-compat-soak` repeats compatibility tests with shuffled seeds.
+- `make test-compat-helper-install` performs the attended one-time install/update of the dedicated test helper.
+- `make test-compat` builds the daemon and runs isolated pytest-based Docker compatibility tests without elevation.
+- `make test-compat-soak` repeats compatibility tests with shuffled seeds without replacing the helper.
 - `make dist-cli` tests and stages the signed CLI in `dist/`.
 - `make test-release` runs release-tooling regression checks.
 - `make clean` removes `.build/` and `dist/` artifacts.

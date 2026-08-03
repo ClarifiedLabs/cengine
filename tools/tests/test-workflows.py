@@ -57,7 +57,10 @@ def main() -> None:
         'CENGINE_BINARY="$(XCODE_DERIVED_DATA)/Build/Products/$(XCODE_COMPAT_CONFIGURATION)/cengine"',
     ):
         require_contains(makefile, needle, "Makefile")
-    for target in ("test-compat", "test-compat-soak", "test-compat-oracle"):
+    for target in (
+        "test-compat", "test-compat-soak", "test-compat-oracle",
+        "test-compat-helper-install",
+    ):
         require_contains(makefile, f"{target}:", "Makefile")
     for needle in (
         "COMPONENT ?= cengine",
@@ -67,8 +70,8 @@ def main() -> None:
         'if [ -n "$(VERSION)" ]; then args+=(--version "$(VERSION)"); fi',
     ):
         require_contains(makefile, needle, "Makefile")
-    if makefile.count("$(CENGINE_COMPAT_ENV)") != 4:
-        raise AssertionError("all compatibility test targets must pass isolated runtime assets")
+    if makefile.count("$(CENGINE_COMPAT_ENV)") != 5:
+        raise AssertionError("all compatibility test and helper targets must pass isolated runtime assets")
     guest_builder = read(REPO_ROOT / "Scripts/build-guest-assets.sh")
     require_absent(guest_builder, "docker buildx build", "build-guest-assets.sh")
     for needle in ("CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64", "-buildvcs=false"):
@@ -91,7 +94,9 @@ def main() -> None:
         "dev.cengine.network-helper.test-compat",
         "CENGINE_NETWORK_HELPER_SERVICE_NAME",
         "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE",
-        "compat_network_helper_ensure",
+        "compat_network_helper_validate_installation",
+        "compat_network_helper_require",
+        "compat_network_helper_provision",
         "launchctl bootstrap system",
         "compat_network_helper_uninstall",
         "/usr/bin/osascript -",

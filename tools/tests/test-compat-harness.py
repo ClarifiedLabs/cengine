@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import pathlib
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -97,9 +99,10 @@ def main() -> None:
     assert 'CENGINE_KERNEL="$(CENGINE_GUEST_OUTPUT)/vmlinux"' in makefile
     assert 'CENGINE_CONTAINER_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/container-initramfs.cpio.gz"' in makefile
     assert 'CENGINE_STORAGE_INITRAMFS="$(CENGINE_GUEST_OUTPUT)/storage-initramfs.cpio.gz"' in makefile
-    assert makefile.count("$(CENGINE_COMPAT_ENV)") == 4
+    assert makefile.count("$(CENGINE_COMPAT_ENV)") == 5
     assert "test-compat-reset-system:" in makefile
     assert "test-compat-doctor:" in makefile
+    assert "test-compat-helper-install:" in makefile
     assert "test-compat-helper-uninstall:" in makefile
     assert "Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)" in makefile
     assert "CENGINE_HOST_OS ?= $(shell uname -s)" in makefile
@@ -157,18 +160,28 @@ def main() -> None:
     assert 'LOCK=${CENGINE_COMPAT_LOCK:-"${TMPDIR:-/tmp}/cengine-compat-run.lock"}' in runner
     assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS DOCKER_TLS_VERIFY" in runner
     assert 'stage "preflight reset"' in runner
-    assert 'stage "build and authorize compatibility runtime"' in runner
+    assert 'BUILD_STAGE="build and validate compatibility runtime"' in runner
+    assert 'BUILD_STAGE="build and provision compatibility runtime"' in runner
     assert 'XCODE_COMPAT_SCHEME=${XCODE_COMPAT_SCHEME:-test-compat}' in runner
     assert '-scheme "$XCODE_COMPAT_SCHEME"' in runner
     assert '-configuration "$XCODE_COMPAT_CONFIGURATION"' in runner
     assert 'stage "recreate test environment"' in runner
     assert 'HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")' in runner
-    assert 'compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"' in runner
+    assert 'if [ "$MODE" = helper-install ]; then' in runner
+    assert 'compat_network_helper_provision "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"' in runner
+    assert 'compat_network_helper_require "$BINARY" "$HELPER_FINGERPRINT"' in runner
+    assert runner.count("compat_network_helper_provision") == 1
+    assert "compat_network_helper_ensure" not in runner
+    assert "compat_network_helper_install" not in runner
+    assert "/usr/bin/osascript" not in runner
+    assert "/usr/bin/sudo" not in runner
     assert 'compat_network_helper_cleanup_local' not in runner
     assert 'CENGINE_COMPAT_IPV4_AUTO_POOL' in runner
     assert '"$ROOT/Scripts/check-compat-network-pools.py"' in runner
 
     helper_lifecycle = (REPO_ROOT / "Scripts" / "compat-network-helper.sh").read_text()
+    assert 'compat_network_helper_support_root="/Library/Application Support/cengine"' in helper_lifecycle
+    assert 'compat_network_helper_parent="$compat_network_helper_support_root/compat"' in helper_lifecycle
     assert 'compat_network_helper_root="/Library/Application Support/cengine/compat/' in helper_lifecycle
     assert 'compat_network_helper_token_path=' in helper_lifecycle
     assert 'compat_network_helper_manifest_path=' in helper_lifecycle
@@ -176,7 +189,10 @@ def main() -> None:
     assert 'cengine-network-helper\\n' in helper_lifecycle
     assert 'CENGINE_NETWORK_HELPER_SERVICE_NAME' in helper_lifecycle
     assert 'CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE' in helper_lifecycle
-    assert 'compat_network_helper_ensure()' in helper_lifecycle
+    assert 'compat_network_helper_validate_installation()' in helper_lifecycle
+    assert 'compat_network_helper_require()' in helper_lifecycle
+    assert 'compat_network_helper_provision()' in helper_lifecycle
+    assert 'compat_network_helper_ensure' not in helper_lifecycle
     assert 'compat_network_helper_uninstall()' in helper_lifecycle
     assert 'launchctl bootstrap system' in helper_lifecycle
     assert 'launchctl bootout "system/$label"' in helper_lifecycle
@@ -186,6 +202,114 @@ def main() -> None:
     assert helper_lifecycle.count("with administrator privileges") == 1
     assert "/Applications/cengine.app" not in helper_lifecycle
     assert "/usr/bin/sudo" not in helper_lifecycle
+    assert helper_lifecycle.count("compat_network_helper_run_as_administrator") == 3
+    assert '[ ! -L "$_cnh_controlled_path" ]' in helper_lifecycle
+    assert '[ ! -L "$compat_network_helper_token_path" ]' in helper_lifecycle
+    install_body = helper_lifecycle.split("compat_network_helper_install() {", 1)[1].split(
+        "compat_network_helper_print_install_instruction() {", 1
+    )[0]
+    assert 'validate_controlled_directory "$support_parent"' in install_body
+    assert 'refusing to overwrite stale helper backup' in install_body
+    assert 'binary=${12}' not in install_body
+    assert 'network-helper status' not in install_body
+    swift_protocol = (REPO_ROOT / "Sources/CEngineCore/PrivilegedPortProtocol.swift").read_text()
+    shell_version = re.search(r"^compat_network_helper_protocol_version=(\d+)$", helper_lifecycle, re.MULTILINE)
+    swift_version = re.search(r"public static let version: Int64 = (\d+)", swift_protocol)
+    assert shell_version is not None
+    assert swift_version is not None
+    assert shell_version.group(1) == swift_version.group(1)
+    require_body = helper_lifecycle.split("compat_network_helper_require() {", 1)[1].split(
+        "compat_network_helper_provision() {", 1
+    )[0]
+    for forbidden in (
+        "compat_network_helper_install \\",
+        "compat_network_helper_provision ",
+        "compat_network_helper_run_as_administrator ",
+        "/usr/bin/osascript",
+        "/usr/bin/sudo",
+    ):
+        assert forbidden not in require_body
+    assert 'compat_network_helper_export_environment "$_cnh_installed_fingerprint"' in require_body
+    assert "protocolVersion" in require_body
+    assert "make test-compat-helper-install" in require_body
+    provision_body = helper_lifecycle.split("compat_network_helper_provision() {", 1)[1].split(
+        "compat_network_helper_uninstall() {", 1
+    )[0]
+    assert provision_body.index("compat_network_helper_require") < provision_body.index(
+        "compat_network_helper_install"
+    )
+    assert provision_body.index("compat_network_helper_install") < provision_body.rindex(
+        "compat_network_helper_require"
+    )
+    assert "reinstalling the matching local helper because its health check failed" in provision_body
+
+    with tempfile.TemporaryDirectory() as temporary:
+        fake_binary = pathlib.Path(temporary) / "cengine"
+        installed_fingerprint = "a" * 64
+        local_fingerprint = "b" * 64
+        fake_binary.write_text(
+            "#!/bin/sh\n"
+            "cat <<EOF\n"
+            f'{{"buildFingerprint":"{installed_fingerprint}",'
+            '"serviceName":"dev.cengine.network-helper.test-compat",'
+            '"ownerUID":$(id -u),"processIdentifier":1,"protocolVersion":5}\n'
+            "EOF\n"
+        )
+        fake_binary.chmod(0o755)
+        mismatch = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                f'. {shlex.quote(str(REPO_ROOT / "Scripts/compat-network-helper.sh"))}; '
+                "compat_network_helper_validate_installation() { :; }; "
+                f"compat_network_helper_installed_fingerprint() {{ echo {installed_fingerprint}; }}; "
+                f'compat_network_helper_require {shlex.quote(str(fake_binary))} {local_fingerprint}; '
+                'printf "%s\\n" "$CENGINE_COMPAT_NETWORK_HELPER_FINGERPRINT"',
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert mismatch.returncode == 0, mismatch.stderr
+        assert mismatch.stdout.strip() == installed_fingerprint
+        assert "compatible provisioned helper differs from the local build" in mismatch.stderr
+
+        fake_binary.write_text(fake_binary.read_text().replace('"protocolVersion":5', '"protocolVersion":4'))
+        incompatible = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                f'. {shlex.quote(str(REPO_ROOT / "Scripts/compat-network-helper.sh"))}; '
+                "compat_network_helper_validate_installation() { :; }; "
+                f"compat_network_helper_installed_fingerprint() {{ echo {installed_fingerprint}; }}; "
+                f'compat_network_helper_require {shlex.quote(str(fake_binary))} {local_fingerprint}; '
+                'status=$?; printf "%s\\n" "$CENGINE_COMPAT_NETWORK_HELPER_FINGERPRINT"; exit "$status"',
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert incompatible.returncode != 0
+        assert incompatible.stdout.strip() == installed_fingerprint
+        assert "make test-compat-helper-install" in incompatible.stderr
+
+        target = pathlib.Path(temporary) / "target"
+        link = pathlib.Path(temporary) / "link"
+        target.write_text("target")
+        link.symlink_to(target)
+        symlink_check = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                f'. {shlex.quote(str(REPO_ROOT / "Scripts/compat-network-helper.sh"))}; '
+                f'compat_network_helper_validate_root_controlled {shlex.quote(str(link))}',
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert symlink_check.returncode != 0
+        assert "must not be a symbolic link" in symlink_check.stderr
 
     buildx_test = (REPO_ROOT / "Tests" / "Compatibility" / "test_buildx.py").read_text()
     assert '"network-helper", "restart"' in buildx_test
@@ -207,12 +331,27 @@ def main() -> None:
     assert 'mktemp -d "${TMPDIR:-/tmp}/cengine-compat-tool.XXXXXX"' in isolated
     assert "unset DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY" in isolated
     assert 'trap cleanup EXIT' in isolated
-    assert 'compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"' in isolated
+    assert 'compat_network_helper_require "$BINARY" "$HELPER_FINGERPRINT"' in isolated
+    assert "compat_network_helper_ensure" not in isolated
+    assert "compat_network_helper_provision" not in isolated
+    assert "compat_network_helper_install" not in isolated
+    assert "/usr/bin/osascript" not in isolated
+    assert "/usr/bin/sudo" not in isolated
     assert 'compat_network_helper_cleanup_local' not in isolated
     assert '--binary "$BINARY" --root "$ENGINE_ROOT"' in isolated
     assert isolated.index('--binary "$BINARY" --root "$ENGINE_ROOT"') < isolated.index('> "$WORK/.cengine-compat-owner"')
     assert 'CENGINE_ISOLATED_IMAGE_CACHE' in isolated
     assert '/bin/cp -cR "$IMAGE_CACHE/content" "$ENGINE_ROOT/content"' in isolated
+
+    doctor = (REPO_ROOT / "Scripts" / "compat-doctor.sh").read_text()
+    assert "local fingerprint:" in doctor
+    assert "installed fingerprint:" in doctor
+    assert 'compat_network_helper_require "$BINARY" "$LOCAL_FINGERPRINT"' in doctor
+    assert "compat_network_helper_provision" not in doctor
+    assert 'compat_network_helper_install "' not in doctor
+    assert "compat_network_helper_run_as_administrator" not in doctor
+    assert "/usr/bin/osascript" not in doctor
+    assert "/usr/bin/sudo" not in doctor
 
     kernel_fetcher = (REPO_ROOT / "Scripts" / "fetch-kernel.sh").read_text()
     kernel_builder = (REPO_ROOT / "Scripts" / "build-kernel.sh").read_text()

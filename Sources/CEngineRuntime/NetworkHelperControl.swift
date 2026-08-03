@@ -20,8 +20,15 @@ public enum NetworkHelperControl {
               let ownerUID = UInt32(exactly: xpc_dictionary_get_uint64(reply, "owner-uid")) else {
             throw EngineError(.internalError, "privileged networking helper returned malformed status")
         }
+        let protocolVersion = xpc_dictionary_get_int64(reply, "protocol-version")
+        guard PrivilegedPortProtocol.isCompatible(version: protocolVersion) else {
+            throw EngineError(
+                .unsupported,
+                "privileged networking helper protocol version \(protocolVersion) is incompatible with client version \(PrivilegedPortProtocol.version); update the networking helper"
+            )
+        }
         return NetworkHelperStatus(
-            protocolVersion: xpc_dictionary_get_int64(reply, "protocol-version"),
+            protocolVersion: protocolVersion,
             buildFingerprint: String(cString: fingerprint),
             serviceName: String(cString: serviceName),
             ownerUID: ownerUID,

@@ -12,6 +12,8 @@ make test-guest
 make test-compat
 make test-compat-soak
 make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/docker.sock
+make test-compat-helper-install
+make test-compat-doctor
 make test-compat-reset
 make dist-cli
 make package
@@ -62,12 +64,19 @@ sharing mutable engine metadata. Pytest stops all VM shims owned by that root be
 including when a test fails; it does not reuse a daemon or repair resources
 left by a preceding test. The command builds the `test-compat` Xcode scheme and
 uses a dedicated persistent `dev.cengine.network-helper.test-compat` LaunchDaemon.
-The first run, or a run after helper inputs change, requests administrator
-authorization near the start and updates the helper transactionally. Unchanged later
-runs reuse it without prompting. The test daemon, helper, authentication token, vmnet
-resource namespace, and automatic address pools are isolated from an installed
-cengine instance, which may remain running. Use `make test-compat-doctor` to verify
-the setup and `make test-compat-helper-uninstall` to remove only the test helper. See
+Provision that machine-level helper once with `make test-compat-helper-install`, an
+attended administrator action, then verify it with `make test-compat-doctor`. Normal
+suite, soak, oracle, and isolated-tool runs never request administrator authorization
+and never repair or replace the helper; a missing, damaged, wrong-owner, or
+protocol-incompatible installation fails with the explicit install instruction.
+Fingerprint drift from daemon/API/test changes, compatible helper edits, or Swift,
+Xcode, and SDK changes is diagnostic and does not require reinstalling. The test daemon,
+helper, authentication token, vmnet resource namespace, and automatic address pools are
+isolated from an installed cengine instance, which may remain running. Use
+`make test-compat-helper-install` deliberately when live VM-backed tests must exercise a
+change under `Sources/CEngineNetworkHelper` or after an incompatible protocol change;
+otherwise they continue to use the installed helper while local builds still compile
+its source. Use `make test-compat-helper-uninstall` to remove only the test helper. See
 [Compatibility testing](compatibility-testing.md) for lifecycle and pool overrides.
 The command uses the guest assets built under `.build/guest`; override
 them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and

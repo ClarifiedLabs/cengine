@@ -45,6 +45,12 @@ import Testing
         )
     }
 
+    @Test func helperProtocolCompatibilityRequiresAnExactVersionMatch() {
+        #expect(PrivilegedPortProtocol.isCompatible(version: PrivilegedPortProtocol.version))
+        #expect(!PrivilegedPortProtocol.isCompatible(version: PrivilegedPortProtocol.version - 1))
+        #expect(!PrivilegedPortProtocol.isCompatible(version: PrivilegedPortProtocol.version + 1))
+    }
+
     @Test func authenticationTokenIsReadFromOwnerOnlyFile() throws {
         let directory = FileManager.default.temporaryDirectory.appending(
             path: "cengine-helper-token-\(UUID().uuidString)", directoryHint: .isDirectory

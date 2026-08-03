@@ -14,11 +14,10 @@ runner owns the complete lifecycle so every run begins from a known state.
 3. Stop compatibility daemons and VM shims owned by this cengine binary, remove their
    temporary engine roots, and assert that both processes and roots are gone.
 4. Fingerprint the helper's sources and toolchain, build and ad-hoc sign the isolated
-   `test-compat` daemon and helper identities, and check the dedicated persistent
-   `dev.cengine.network-helper.test-compat` LaunchDaemon. If it is missing or stale,
-   replace it in one administrator-authorized transaction and perform an authenticated
-   health check. This happens before guest assets are built, so any authorization
-   prompt appears near the beginning of the run.
+   `test-compat` daemon and helper identities, then authenticate to the preprovisioned
+   `dev.cengine.network-helper.test-compat` LaunchDaemon. Validate its owner, files,
+   manifest checksum, signature, launchd state, identity, and protocol without changing
+   the installation or requesting administrator authorization.
 5. Rebuild the Linux guest initramfs, validate the exact pinned guest kernel, and reject
    compatibility address pools that overlap an active host interface or specific route.
 6. Delete and recreate the Python virtual environment from the pinned requirements.
@@ -35,10 +34,27 @@ unapproved kernel from entering a VM.
 
 ## Managed compatibility helper
 
-The first compatibility run requests administrator authorization to install the test
-helper under `/Library/Application Support/cengine/compat/`. Later runs do not prompt
-unless the helper fingerprint changes, the helper is damaged, or a different macOS
-user takes ownership of the test service. No installed cengine app is required.
+Provision the dedicated test helper once before running compatibility tests:
+
+```sh
+make test-compat-helper-install   # attended administrator action
+make test-compat-doctor
+make test-compat                  # unattended thereafter
+```
+
+The install target acquires the compatibility lock, performs the worktree-scoped reset,
+builds and signs the local `test-compat` products, and installs or updates the helper
+under `/Library/Application Support/cengine/compat/` in one administrator transaction.
+It exits before building guest assets or running pytest. No installed cengine app is
+required.
+
+Normal suite, soak, oracle, and isolated-tool runs never request administrator
+authorization and never repair or replace the helper. They fail with the install command
+when the service is missing, damaged, unloaded, provisioned for another macOS UID, or
+protocol-incompatible. The helper fingerprint is provenance rather than a compatibility
+gate: daemon/API/test changes and Swift, Xcode, SDK, or compatible helper-source drift do
+not require reinstalling it. Such runs report the drift and export the installed
+fingerprint to the tests.
 
 The test helper has a distinct service name, executable identity, client identity,
 authentication token, and per-engine-root vmnet resource namespace. Its automatic
@@ -46,10 +62,17 @@ IPv4 and IPv6 pools also differ from the production defaults. An installed cengi
 daemon and its `dev.cengine.network-helper` service may remain running while the suite
 executes.
 
-Inspect the setup before a long run, or remove it explicitly:
+Run `make test-compat-helper-install` deliberately after changing helper behavior that
+must be exercised by live VM-backed tests or after an incompatible protocol change.
+Until then, VM-backed tests continue to exercise the installed helper even though normal
+build and unit checks compile the local `Sources/CEngineNetworkHelper` source. Incompatible
+wire or required semantic changes must bump `PrivilegedPortProtocol.version`.
+
+Inspect the setup before a long run, update it deliberately, or remove it explicitly:
 
 ```sh
 make test-compat-doctor
+make test-compat-helper-install
 make test-compat-helper-uninstall
 ```
 

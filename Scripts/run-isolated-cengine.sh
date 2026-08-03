@@ -56,8 +56,7 @@ trap 'exit 143' TERM
 
 HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")
 "$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
-HELPER=$(compat_network_helper_local_for_binary "$BINARY")
-compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"
+compat_network_helper_require "$BINARY" "$HELPER_FINGERPRINT"
 
 CENGINE_COMPAT_IPV4_AUTO_POOL=${CENGINE_COMPAT_IPV4_AUTO_POOL:-10.192.0.0/12}
 CENGINE_COMPAT_IPV6_AUTO_PREFIX=${CENGINE_COMPAT_IPV6_AUTO_PREFIX:-fdcc::/16}

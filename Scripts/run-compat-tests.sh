@@ -65,10 +65,23 @@ CENGINE_COMPAT_IPV6_FIXTURE_PREFIX=${CENGINE_COMPAT_IPV6_FIXTURE_PREFIX:-fdcd::/
 export CENGINE_COMPAT_IPV4_AUTO_POOL CENGINE_COMPAT_IPV6_AUTO_PREFIX
 export CENGINE_COMPAT_IPV4_FIXTURE_POOL CENGINE_COMPAT_IPV6_FIXTURE_PREFIX
 
+case "$MODE" in
+    helper-install)
+        BUILD_STAGE="build and provision compatibility runtime"
+        ;;
+    suite|soak|oracle)
+        BUILD_STAGE="build and validate compatibility runtime"
+        ;;
+    *)
+        echo "unknown compatibility test mode: $MODE" >&2
+        exit 2
+        ;;
+esac
+
 stage "preflight reset"
 $RESET
 
-stage "build and authorize compatibility runtime"
+stage "$BUILD_STAGE"
 HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")
 "$XCODEBUILD" -project "$ROOT/$XCODE_PROJECT" -scheme "$XCODE_COMPAT_SCHEME" \
     -configuration "$XCODE_COMPAT_CONFIGURATION" -derivedDataPath "$ROOT/$XCODE_DERIVED_DATA" \
@@ -78,7 +91,11 @@ HELPER_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")
     CENGINE_NETWORK_HELPER_BUILD_FINGERPRINT="$HELPER_FINGERPRINT" build
 "$ROOT/Scripts/sign-compat-binary.sh" "$BINARY"
 HELPER=$(compat_network_helper_local_for_binary "$BINARY")
-compat_network_helper_ensure "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"
+if [ "$MODE" = helper-install ]; then
+    compat_network_helper_provision "$HELPER" "$BINARY" "$HELPER_FINGERPRINT"
+    exit 0
+fi
+compat_network_helper_require "$BINARY" "$HELPER_FINGERPRINT"
 
 stage "rebuild and validate guest assets"
 make -C "$ROOT" --no-print-directory guest-initramfs
@@ -120,9 +137,5 @@ case "$MODE" in
         fi
         stage "run Docker oracle suite"
         run_pytest -m oracle "$@"
-        ;;
-    *)
-        echo "unknown compatibility test mode: $MODE" >&2
-        exit 2
         ;;
 esac

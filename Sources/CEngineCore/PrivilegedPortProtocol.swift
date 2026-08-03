@@ -21,7 +21,14 @@ public enum PrivilegedPortProtocol {
             environment: ProcessInfo.processInfo.environment
         )
     }
+    // Stable installed helpers rely on version discipline: bump this for incompatible
+    // wire or required semantic changes. Build fingerprints are diagnostic only.
     public static let version: Int64 = 5
+
+    public static func isCompatible(version: Int64) -> Bool {
+        version == self.version
+    }
+
     public static let defaultEngineIdentifier = "dev.cengine.engine"
     public static let defaultHelperIdentifier = "dev.cengine.network-helper"
     public static let testCompatEngineIdentifier = "dev.cengine.engine.test-compat"
