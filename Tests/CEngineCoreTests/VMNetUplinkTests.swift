@@ -103,6 +103,15 @@ import Testing
         return predicate()
     }
 
+    private static func expectDatagramPeerIsClosed(_ peer: CInt) {
+        var byte: UInt8 = 0
+        errno = 0
+        let result = Darwin.send(peer, &byte, 1, 0)
+        let sendError = errno
+        #expect(result == -1)
+        #expect(sendError == ECONNRESET)
+    }
+
     @Test func vlanTagRoundTripsWithoutChangingEthernetFrame() {
         let frame = Data([0,1,2,3,4,5,6,7,8,9,10,11,0x08,0x00,0x45,0,0,20])
         let tagged = VMNetUplink.tag(frame, vlan: 4094)
@@ -277,9 +286,7 @@ import Testing
 
         let reply = try #require(replyBox.load())
         reply.finish(.success(late.transport))
-        errno = 0
-        #expect(fcntl(late.transport.descriptor, F_GETFD) == -1)
-        #expect(errno == EBADF)
+        Self.expectDatagramPeerIsClosed(late.peer)
         #expect(cancellationCount.count == 1)
         #expect(completionCount.count == 1)
     }
@@ -374,9 +381,7 @@ import Testing
 
         let reply = try #require(replyBox.load())
         reply.finish(.success(late.transport))
-        errno = 0
-        #expect(fcntl(late.transport.descriptor, F_GETFD) == -1)
-        #expect(errno == EBADF)
+        Self.expectDatagramPeerIsClosed(late.peer)
         #expect(cancellationCount.count == 1)
         #expect(completionCount.count == 1)
     }
