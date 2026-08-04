@@ -218,7 +218,7 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(healthcheck.startIntervalNanoseconds == 5_000_000_000)
     }
 
-    @Test func containerRecordShmAndSysctlsDecodeFromOldSnapshotsAndRoundTrip() throws {
+    @Test func containerRecordDomainnameShmAndSysctlsDecodeFromOldSnapshotsAndRoundTrip() throws {
         let original = ContainerRecord(
             id: "migration-container", name: "migration", image: "alpine",
             processArguments: ["true"]
@@ -227,21 +227,27 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         var object = try #require(
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         )
+        object.removeValue(forKey: "domainname")
         object.removeValue(forKey: "shmSizeBytes")
         object.removeValue(forKey: "sysctls")
         let oldSnapshot = try JSONSerialization.data(withJSONObject: object)
 
         let migrated = try JSONDecoder().decode(ContainerRecord.self, from: oldSnapshot)
+        #expect(migrated.domainname == nil)
+        #expect(migrated.effectiveDomainname == "")
         #expect(migrated.shmSizeBytes == nil)
         #expect(migrated.effectiveShmSizeBytes == ContainerRecord.defaultShmSizeBytes)
         #expect(migrated.effectiveSysctls.isEmpty)
 
         var configured = migrated
+        configured.domainname = "configured domain/例"
         configured.shmSizeBytes = 32 * 1_024 * 1_024
         configured.sysctls = ["kernel.domainname": "example.test"]
         let restored = try JSONDecoder().decode(
             ContainerRecord.self, from: JSONEncoder().encode(configured)
         )
+        #expect(restored.domainname == "configured domain/例")
+        #expect(restored.effectiveDomainname == "configured domain/例")
         #expect(restored.effectiveShmSizeBytes == 32 * 1_024 * 1_024)
         #expect(restored.effectiveSysctls == ["kernel.domainname": "example.test"])
     }

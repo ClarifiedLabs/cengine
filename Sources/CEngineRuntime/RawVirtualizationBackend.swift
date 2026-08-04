@@ -6167,6 +6167,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
         )
     }
 
+    static func effectiveWorkloadSysctls(for container: ContainerRecord) -> [String: String] {
+        var result = container.effectiveSysctls
+        let domainname = container.effectiveDomainname
+        guard !domainname.isEmpty else { return result }
+        guard !result.keys.contains(where: {
+            $0.replacingOccurrences(of: ".", with: "/") == "kernel/domainname"
+        }) else { return result }
+        result["kernel.domainname"] = domainname
+        return result
+    }
+
     static func workloadSpecification(
         container: ContainerRecord,
         imageConfiguration config: OCIImageConfiguration.Configuration?,
@@ -6213,7 +6224,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             annotations: container.annotations,
             capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
             rlimits: try Self.rlimits(container.ulimits), ipcMode: container.ipcMode,
-            shmSize: container.effectiveShmSizeBytes, sysctls: container.effectiveSysctls,
+            shmSize: container.effectiveShmSizeBytes,
+            sysctls: Self.effectiveWorkloadSysctls(for: container),
             ioClaim: ioClaim
         )
     }

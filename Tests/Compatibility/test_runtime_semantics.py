@@ -435,6 +435,108 @@ def test_explicit_exec_context_overrides_and_omitted_values_inherit(
         container.remove(force=True)
 
 
+@pytest.mark.compat("RTM-044")
+def test_domainname_persists_applies_precedence_restart_and_recovery(
+    daemon, client: docker.DockerClient,
+):
+    suffix = uuid.uuid4().hex[:8]
+    hostname = f"domain-host-{suffix}"
+    domainname = f"nis/domain name_{suffix}"
+    name = f"runtime-domainname-{suffix}"
+    recovered = None
+    container_ids = []
+    container = client.containers.create(
+        ALPINE_IMAGE,
+        ["sh", "-c", "while :; do sleep 1; done"],
+        name=name,
+        hostname=hostname,
+        domainname=domainname,
+    )
+    container_ids.append(container.id)
+
+    def assert_configuration(
+        value: docker.models.containers.Container,
+        expected_domainname: str,
+        expected_hostname: str,
+        expected_sysctls: dict[str, str] | None = None,
+    ) -> None:
+        value.reload()
+        assert value.attrs["Config"]["Hostname"] == expected_hostname
+        assert value.attrs["Config"]["Domainname"] == expected_domainname
+        assert value.attrs["HostConfig"].get("Sysctls") == expected_sysctls
+
+    def assert_uts(
+        value: docker.models.containers.Container,
+        expected_hostname: str,
+        expected_domainname: str,
+    ) -> None:
+        result = value.exec_run([
+            "sh", "-ec",
+            "cat /proc/sys/kernel/hostname; cat /proc/sys/kernel/domainname",
+        ])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        assert result.output.splitlines() == [
+            expected_hostname.encode(), expected_domainname.encode(),
+        ]
+
+    try:
+        assert_configuration(container, domainname, hostname)
+        container.start()
+        assert_uts(container, hostname, domainname)
+        container.stop()
+        container.start()
+        assert_configuration(container, domainname, hostname)
+        assert_uts(container, hostname, domainname)
+
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        container = recovered.containers.get(container.id)
+        assert_configuration(container, domainname, hostname)
+        assert_uts(container, hostname, domainname)
+
+        container.stop()
+        container.start()
+        assert_configuration(container, domainname, hostname)
+        assert_uts(container, hostname, domainname)
+
+        override_hostname = f"override-host-{suffix}"
+        configured_override = f"configured-domain-{suffix}"
+        explicit_override = f"explicit-domain-{suffix}"
+        response = recovered.api._post_json(
+            recovered.api._url("/containers/create"),
+            params={"name": f"runtime-domainname-override-{suffix}"},
+            data={
+                "Image": ALPINE_IMAGE,
+                "Cmd": ["sh", "-c", "while :; do sleep 1; done"],
+                "Hostname": override_hostname,
+                "Domainname": configured_override,
+                "HostConfig": {
+                    "Sysctls": {"kernel.domainname": explicit_override},
+                },
+            },
+        )
+        recovered.api._raise_for_status(response)
+        override = recovered.containers.get(response.json()["Id"])
+        container_ids.append(override.id)
+        override.start()
+        assert_configuration(
+            override, configured_override, override_hostname,
+            {"kernel.domainname": explicit_override},
+        )
+        assert_uts(override, override_hostname, explicit_override)
+    finally:
+        cleanup = recovered or client
+        for container_id in reversed(container_ids):
+            try:
+                cleanup.containers.get(container_id).remove(force=True)
+            except docker.errors.NotFound:
+                pass
+        if recovered is not None:
+            recovered.close()
+
+
 @pytest.mark.compat("RTM-002")
 def test_read_only_root_applies_to_exec_but_tmpfs_stays_writable(
     client: docker.DockerClient,
@@ -514,7 +616,6 @@ def test_active_unsupported_runtime_inputs_fail_closed(daemon, client: docker.Do
     initial_volumes = {volume.name for volume in client.volumes.list()}
     initial_containers = {container.id for container in client.containers.list(all=True)}
     unsupported_create_cases = [
-        {"Domainname": "example.test"},
         {"ArgsEscaped": True},
         {"NetworkDisabled": True},
         {"Shell": ["/bin/sh", "-c"]},

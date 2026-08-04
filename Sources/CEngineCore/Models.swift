@@ -222,6 +222,9 @@ public struct ContainerRecord: Codable, Sendable {
     public var workingDirectory: String
     public var user: String
     public var hostname: String
+    /// Docker's configured NIS domain name. Optional only so snapshots written
+    /// before Config.Domainname support continue to decode.
+    public var domainname: String?
     public var labels: [String: String]
     public var annotations: [String: String]
     public var tty: Bool
@@ -309,6 +312,7 @@ public struct ContainerRecord: Codable, Sendable {
         self.workingDirectory = ""
         self.user = ""
         self.hostname = String(id.prefix(12))
+        self.domainname = nil
         self.labels = [:]
         self.annotations = [:]
         self.tty = false
@@ -363,6 +367,8 @@ public struct ContainerRecord: Codable, Sendable {
     }
 
     public var effectiveSysctls: [String: String] { sysctls ?? [:] }
+
+    public var effectiveDomainname: String { domainname ?? "" }
 
     /// Returns the same requested container configuration with a new internal
     /// incarnation identity. Runtime admission uses this copy so caller-owned

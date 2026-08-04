@@ -161,6 +161,7 @@ public struct DockerRouter: Sendable {
             record.workingDirectory = input.WorkingDir ?? ""
             record.user = input.User ?? ""
             if let hostname = input.Hostname, !hostname.isEmpty { record.hostname = hostname }
+            record.domainname = validated.domainname
             record.labels = input.Labels ?? [:]
             if version >= .init(major: 1, minor: 43) {
                 record.annotations = input.HostConfig?.Annotations ?? [:]
@@ -1220,10 +1221,10 @@ public struct DockerRouter: Sendable {
         mounts: [MountRecord], ulimits: [UlimitRecord], devices: [DeviceMappingRecord],
         deviceCgroupRules: [String], blockIO: BlockIOConfiguration,
         security: SecurityConfiguration, consoleSize: TerminalSize,
-        shmSize: Int64, sysctls: [String: String]
+        shmSize: Int64, sysctls: [String: String], domainname: String?
     ) {
+        let domainname = try validatedDomainname(input.Domainname)
         try rejectActiveRuntimeFields([
-            (!(input.Domainname ?? "").isEmpty, "Domainname"),
             (input.ArgsEscaped == true, "ArgsEscaped"),
             (input.NetworkDisabled == true, "NetworkDisabled"),
             (!(input.Shell ?? []).isEmpty, "Shell"),
@@ -1252,7 +1253,8 @@ public struct DockerRouter: Sendable {
             host.security,
             host.consoleSize,
             host.shmSize,
-            host.sysctls
+            host.sysctls,
+            domainname
         )
     }
 
@@ -1406,6 +1408,14 @@ public struct DockerRouter: Sendable {
             throw EngineError(.badRequest, "AutoRemove cannot be combined with a restart policy")
         }
         return (security, consoleSize, shmSize, sysctls)
+    }
+
+    private func validatedDomainname(_ value: String?) throws -> String? {
+        guard let value else { return nil }
+        guard !value.contains(where: { $0 == "\0" || $0 == "\n" || $0 == "\r" }) else {
+            throw EngineError(.badRequest, "ContainerConfig.Domainname contains an invalid control character")
+        }
+        return value
     }
 
     private func normalizedSysctls(_ values: [String: String]?) throws -> [String: String] {
@@ -2285,7 +2295,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
     }
     public struct HealthStateResponse: Codable, Sendable { let Status: String; let FailingStreak: Int; let Log: [String] }
     public struct ConfigResponse: Codable, Sendable {
-        let Hostname: String; let User: String; let Tty: Bool; let AttachStdin: Bool; let OpenStdin: Bool; let Env: [String]
+        let Hostname: String; let Domainname: String; let User: String; let Tty: Bool
+        let AttachStdin: Bool; let OpenStdin: Bool; let Env: [String]
         let Cmd: [String]; let Image: String; let WorkingDir: String; let Labels: [String: String]
         let Healthcheck: HealthcheckResponse?
     }
@@ -2410,7 +2421,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         Image = record.imageID.isEmpty ? record.image : record.imageID
         ImageManifestDescriptor = version >= .init(major: 1, minor: 48) ? record.imageManifestDescriptor : nil
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
-        Config = .init(Hostname: record.hostname, User: record.user, Tty: record.tty, AttachStdin: record.attachStdin, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds, StartInterval: $0.startIntervalNanoseconds) })
+        Config = .init(Hostname: record.hostname, Domainname: record.effectiveDomainname, User: record.user, Tty: record.tty, AttachStdin: record.attachStdin, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds, StartInterval: $0.startIntervalNanoseconds) })
         RestartCount = record.restartCount
         let mounts = record.mounts.map { mount in
             MountResponse(

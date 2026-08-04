@@ -6578,6 +6578,42 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(defaults.sysctls.isEmpty)
     }
 
+    @Test func containerDomainnameReachesGuestWorkloadSysctlsWithExplicitPrecedence() throws {
+        func workloadSysctls(_ container: ContainerRecord) throws -> [String: String] {
+            try RawVirtualizationBackend.workloadSpecification(
+                container: container, imageConfiguration: nil, mounts: [], networks: [],
+                hosts: [:], volumeServer: nil
+            ).sysctls
+        }
+
+        let defaults = ContainerRecord(
+            id: "domain-defaults", name: "domain-defaults", image: "alpine:latest",
+            processArguments: ["true"]
+        )
+        #expect(try workloadSysctls(defaults).isEmpty)
+
+        var translated = defaults
+        translated.domainname = "not a/dns domain-例"
+        translated.sysctls = ["net.ipv4.ip_forward": "1"]
+        #expect(try workloadSysctls(translated) == [
+            "kernel.domainname": "not a/dns domain-例",
+            "net.ipv4.ip_forward": "1",
+        ])
+
+        var dotOverride = translated
+        dotOverride.sysctls = ["kernel.domainname": "explicit-dot"]
+        #expect(try workloadSysctls(dotOverride) == ["kernel.domainname": "explicit-dot"])
+
+        var slashOverride = translated
+        slashOverride.sysctls = ["kernel/domainname": "explicit-slash"]
+        #expect(try workloadSysctls(slashOverride) == ["kernel/domainname": "explicit-slash"])
+
+        var explicitOnly = defaults
+        explicitOnly.domainname = ""
+        explicitOnly.sysctls = ["kernel.domainname": "explicit-only"]
+        #expect(try workloadSysctls(explicitOnly) == ["kernel.domainname": "explicit-only"])
+    }
+
     @Test func containerPathPoliciesReachGuestWorkloadSpecification() throws {
         var container = ContainerRecord(
             id: "path-policy-container", name: "path-policy", image: "alpine:latest",

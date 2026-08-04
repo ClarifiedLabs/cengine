@@ -97,10 +97,14 @@ selection introduced in guest protocol v11 reflect guest behavior through the
 current guest protocol v19 (`RTM-016`). Docker `ShmSize` now persists, inspects,
 and sizes a `nosuid,nodev,noexec` private/default IPC `/dev/shm`, using Docker's
 64 MiB default when omitted or zero and preserving an explicit mount at that
-target even under IPC `none` (`RTM-033`). Docker/runc's namespaced network, message-queue,
-IPC, and UTS sysctl allowlist also persists and applies through guest protocol
-v18, carried by current v19, after endpoint settings and across stop/start and
-daemon recovery (`RTM-034`). Nonnamespaced sysctls remain an explicit gap
+target even under IPC `none` (`RTM-033`). Docker/runc's namespaced network,
+message-queue, IPC, and UTS sysctl allowlist also persists and applies through
+guest protocol v18, carried by current v19, after endpoint settings and across
+stop/start and daemon recovery (`RTM-034`). Docker `Config.Domainname` now
+persists and inspects exactly; non-empty values translate through that existing
+`kernel.domainname` path, with an explicit `HostConfig.Sysctls` value taking
+precedence across restart and recovery (`RTM-044`). This requires no guest-protocol
+bump. Nonnamespaced sysctls remain an explicit gap
 because they would mutate the guest-wide kernel rather than only the workload
 namespaces. The v19 guest accepts v18 request envelopes during live upgrades and
 responds at the request's version. Current shims emit v19 so older guests reject

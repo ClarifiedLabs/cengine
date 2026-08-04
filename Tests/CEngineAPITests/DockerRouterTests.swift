@@ -3051,7 +3051,6 @@ private actor AuthImageBackend: ContainerBackend {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let fields = [
-            #""Domainname":"example.test","Volumes":{"/data":{}}"#,
             #""HostConfig":{"CpuShares":1024}"#,
             #""HostConfig":{"CgroupParent":"/custom"}"#,
             #""HostConfig":{"MemorySwappiness":0}"#,
@@ -3274,6 +3273,118 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(recoveredRecord.effectiveShmSizeBytes == 33_554_432)
         #expect(recoveredRecord.effectiveSysctls["fs.mqueue.msg_max"] == "128")
         #expect(recoveredRecord.effectiveSysctls["net.ipv4.conf.eth0/200.rp_filter"] == "1")
+    }
+
+    @Test func domainnamePersistsInspectsValidatesAndPreservesExplicitSysctl() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var runtime: EngineRuntime? = try await EngineRuntime(root: root)
+        var router: DockerRouter? = DockerRouter(runtime: try #require(runtime), root: root)
+        let unusualDomainname = "not a/dns_name with spaces-例"
+        let longDomainname = "long domain/" + String(repeating: "é", count: 40)
+        #expect(longDomainname.lengthOfBytes(using: .utf8) > 64)
+
+        func create(
+            name: String, version: String, domainname: String?, includeDomainname: Bool,
+            explicitSysctl: String? = nil
+        ) async throws {
+            var body: [String: Any] = ["Image": "alpine"]
+            if includeDomainname { body["Domainname"] = domainname ?? "" }
+            if let explicitSysctl {
+                body["HostConfig"] = ["Sysctls": ["kernel.domainname": explicitSysctl]]
+            }
+            let response = try await #require(router).route(.init(
+                method: .POST, uri: "/v\(version)/containers/create?name=\(name)",
+                body: try JSONSerialization.data(withJSONObject: body)
+            ))
+            #expect(response.status == .created)
+        }
+
+        try await create(
+            name: "domain-unusual", version: "1.44", domainname: unusualDomainname,
+            includeDomainname: true
+        )
+        try await create(
+            name: "domain-conflict", version: "1.55", domainname: longDomainname,
+            includeDomainname: true, explicitSysctl: "explicit.example"
+        )
+        try await create(
+            name: "domain-empty", version: "1.44", domainname: "", includeDomainname: true
+        )
+        try await create(
+            name: "domain-omitted", version: "1.55", domainname: nil, includeDomainname: false
+        )
+
+        func inspect(
+            _ name: String, using router: DockerRouter
+        ) async throws -> (config: [String: Any], host: [String: Any]) {
+            let response = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/\(name)/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            )
+            return (
+                try #require(object["Config"] as? [String: Any]),
+                try #require(object["HostConfig"] as? [String: Any])
+            )
+        }
+
+        var inspected = try await inspect("domain-unusual", using: try #require(router))
+        #expect(inspected.config["Domainname"] as? String == unusualDomainname)
+        #expect(inspected.host["Sysctls"] == nil)
+        inspected = try await inspect("domain-conflict", using: try #require(router))
+        #expect(inspected.config["Domainname"] as? String == longDomainname)
+        #expect(
+            (inspected.host["Sysctls"] as? [String: String])?["kernel.domainname"]
+                == "explicit.example"
+        )
+        for name in ["domain-empty", "domain-omitted"] {
+            inspected = try await inspect(name, using: try #require(router))
+            #expect(inspected.config["Domainname"] as? String == "")
+            #expect(inspected.host["Sysctls"] == nil)
+        }
+
+        router = nil
+        runtime = nil
+        let recoveredRuntime = try await EngineRuntime(root: root)
+        let recoveredRouter = DockerRouter(runtime: recoveredRuntime, root: root)
+        inspected = try await inspect("domain-conflict", using: recoveredRouter)
+        #expect(inspected.config["Domainname"] as? String == longDomainname)
+        #expect(
+            (inspected.host["Sysctls"] as? [String: String])?["kernel.domainname"]
+                == "explicit.example"
+        )
+        let recoveredRecord = try await recoveredRuntime.container("domain-conflict")
+        #expect(recoveredRecord.domainname == longDomainname)
+        #expect(recoveredRecord.effectiveSysctls == ["kernel.domainname": "explicit.example"])
+
+        for (index, control) in ["\0", "\n", "\r"].enumerated() {
+            let body: [String: Any] = [
+                "Image": "alpine",
+                "Domainname": "invalid\(control)value",
+                "Volumes": ["/anonymous-must-not-leak": [String: Any]()],
+            ]
+            let response = await recoveredRouter.route(.init(
+                method: .POST,
+                uri: "/v1.55/containers/create?name=invalid-domainname-\(index)",
+                body: try JSONSerialization.data(withJSONObject: body)
+            ))
+            #expect(response.status == .badRequest)
+        }
+        let containers = await recoveredRouter.route(.init(
+            method: .GET, uri: "/v1.55/containers/json?all=true"
+        ))
+        #expect(
+            (try #require(
+                JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]]
+            )).count == 4
+        )
+        let volumes = await recoveredRouter.route(.init(method: .GET, uri: "/v1.55/volumes"))
+        let volumeEnvelope = try #require(
+            JSONSerialization.jsonObject(with: volumes.body) as? [String: Any]
+        )
+        #expect((volumeEnvelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
     }
 
     @Test func sameKernelNamespaceSharingFailsBeforeContainerOrVolumeMutation() async throws {
