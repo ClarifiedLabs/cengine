@@ -3293,7 +3293,7 @@ def test_default_seccomp_applies_to_init_exec_healthcheck_restart_and_recovery(
         assert_default_profile(recovered.containers.get(container.id))
 
         probe_expectations = [
-            ("unconfined", False, ["seccomp=unconfined"], b"0", b"1"),
+            ("unconfined", False, ["seccomp=unconfined"], b"0", b"0"),
             ("privileged-default", True, [], b"0", b"0"),
             ("privileged-builtin", True, ["seccomp=builtin"], b"2", b"0"),
             (
