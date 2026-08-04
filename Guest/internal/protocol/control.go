@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	Version                               = 18
-	PreviousVersion                       = 17
+	Version                               = 19
+	PreviousVersion                       = 18
 	DefaultSharedMemorySize         int64 = 64 * 1024 * 1024
 	ControlPort                           = 4100
 	FileSystemPort                        = 4101
@@ -20,6 +20,7 @@ const (
 	SocketProxyPortBase                   = 4200
 	MaxControlFrame                       = 16 << 20
 	MaxFileSystemIO                       = 4 << 20
+	ErrorBadRequest                       = "bad_request"
 	ErrorResourceRollbackIncomplete       = "resource_rollback_incomplete"
 )
 
@@ -98,9 +99,8 @@ type WorkloadSpec struct {
 }
 
 func (spec *WorkloadSpec) ApplyCompatibilityDefaults(version uint32) {
-	if version == PreviousVersion && spec.ShmSize == 0 {
-		spec.ShmSize = DefaultSharedMemorySize
-	}
+	// Protocol v17 omitted shmSize. Current and previous protocol generations
+	// both carry it, so no compatibility default is required for accepted frames.
 }
 
 type TerminalSize struct {

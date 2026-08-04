@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct GuestProtocolTests {
     @Test func execPayloadUsesCurrentIdentitySecurityContextAndRlimits() throws {
-        #expect(GuestProtocol.version == 18)
+        #expect(GuestProtocol.version == 19)
 
         let value = GuestProtocol.Exec(
             id: "exec-1", arguments: ["id"], environment: ["A=1"],
@@ -34,7 +34,7 @@ import Testing
     }
 
     @Test func endpointSysctlsRemainAvailableInCurrentGuestProtocol() throws {
-        #expect(GuestProtocol.version == 18)
+        #expect(GuestProtocol.version == 19)
         let endpoint = GuestProtocol.NetworkEndpoint(
             networkID: "network-1",
             vlan: 42,
@@ -158,7 +158,7 @@ import Testing
     }
 
     @Test func wallClockTimeRoundTripsInCurrentProtocol() throws {
-        #expect(GuestProtocol.version == 18)
+        #expect(GuestProtocol.version == 19)
         let value = GuestProtocol.WallClockTime(
             seconds: 1_784_920_000, microseconds: 123_456
         )

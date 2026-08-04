@@ -1561,6 +1561,20 @@ func resolveUserAtRoot(user protocol.User, root string) (int, int, []int, error)
 	return resolveUserFromData(user, passwd, groupData)
 }
 
+type identityNotFoundError struct {
+	kind string
+	name string
+}
+
+func (e identityNotFoundError) Error() string {
+	return fmt.Sprintf("%s %s not found", e.kind, e.name)
+}
+
+func IsIdentityNotFound(err error) bool {
+	var missing identityNotFoundError
+	return errors.As(err, &missing)
+}
+
 func resolveUserFromData(user protocol.User, passwd, groupData []byte) (int, int, []int, error) {
 	parts := strings.SplitN(user.Username, ":", 2)
 	name := ""
@@ -1578,7 +1592,7 @@ func resolveUserFromData(user protocol.User, passwd, groupData []byte) (int, int
 			}
 		}
 		if uid < 0 {
-			return 0, 0, nil, fmt.Errorf("user %s not found", name)
+			return 0, 0, nil, identityNotFoundError{kind: "user", name: name}
 		}
 	}
 	if len(parts) == 2 && parts[1] != "" {
@@ -1595,7 +1609,7 @@ func resolveUserFromData(user protocol.User, passwd, groupData []byte) (int, int
 				}
 			}
 			if !found {
-				return 0, 0, nil, fmt.Errorf("group %s not found", parts[1])
+				return 0, 0, nil, identityNotFoundError{kind: "group", name: parts[1]}
 			}
 		}
 	}

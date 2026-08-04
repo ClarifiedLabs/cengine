@@ -1459,31 +1459,10 @@ public struct DockerRouter: Sendable {
     }
 
     private func normalizedUlimits(
-        _ values: [ContainerCreateRequest.HostConfig.UlimitRequest]?, field: String
+        _ values: [ContainerCreateRequest.HostConfig.UlimitRequest]?, field _: String
     ) throws -> [UlimitRecord] {
-        let supported: Set<String> = [
-            "core", "cpu", "data", "fsize", "locks", "memlock", "msgqueue", "nice",
-            "nofile", "nproc", "rss", "rtprio", "rttime", "sigpending", "stack",
-        ]
-        var seen = Set<String>()
-        return try (values ?? []).map { value in
-            let name = value.Name.lowercased()
-            guard supported.contains(name) else {
-                throw EngineError(.badRequest, "\(field) contains unsupported limit name \(value.Name)")
-            }
-            guard seen.insert(name).inserted else {
-                throw EngineError(.badRequest, "\(field) contains duplicate limit \(name)")
-            }
-            guard value.Soft >= -1, value.Hard >= -1 else {
-                throw EngineError(.badRequest, "\(field).\(name) values must be -1 or nonnegative")
-            }
-            if value.Soft == -1, value.Hard != -1 {
-                throw EngineError(.badRequest, "\(field).\(name) soft limit cannot exceed its hard limit")
-            }
-            if value.Soft != -1, value.Hard != -1, value.Soft > value.Hard {
-                throw EngineError(.badRequest, "\(field).\(name) soft limit cannot exceed its hard limit")
-            }
-            return UlimitRecord(name: name, soft: value.Soft, hard: value.Hard)
+        (values ?? []).map {
+            .init(name: $0.Name, soft: $0.Soft, hard: $0.Hard)
         }
     }
 
@@ -1495,21 +1474,42 @@ public struct DockerRouter: Sendable {
         var seccompProfile: String?
         for value in values {
             if value == "no-new-privileges" {
+                if noNewPrivileges == false {
+                    throw EngineError(
+                        .badRequest,
+                        "HostConfig.SecurityOpt contains conflicting no-new-privileges selections"
+                    )
+                }
                 noNewPrivileges = true
                 continue
             }
             let separator = value.firstIndex(of: "=") ?? value.firstIndex(of: ":")
             guard let separator else {
-                throw EngineError(.unsupported, "HostConfig.SecurityOpt option \(value) is not supported")
+                throw EngineError(.badRequest, "HostConfig.SecurityOpt option \(value) is malformed")
             }
             let key = String(value[..<separator])
             let option = String(value[value.index(after: separator)...])
+            guard !key.isEmpty, !option.isEmpty else {
+                throw EngineError(.badRequest, "HostConfig.SecurityOpt option \(value) is malformed")
+            }
             switch key {
             case "no-new-privileges":
                 switch option {
                 case "1", "t", "T", "TRUE", "true", "True":
+                    if noNewPrivileges == false {
+                        throw EngineError(
+                            .badRequest,
+                            "HostConfig.SecurityOpt contains conflicting no-new-privileges selections"
+                        )
+                    }
                     noNewPrivileges = true
                 case "0", "f", "F", "FALSE", "false", "False":
+                    if noNewPrivileges == true {
+                        throw EngineError(
+                            .badRequest,
+                            "HostConfig.SecurityOpt contains conflicting no-new-privileges selections"
+                        )
+                    }
                     noNewPrivileges = false
                 default:
                     throw EngineError(
@@ -1521,6 +1521,12 @@ public struct DockerRouter: Sendable {
                 guard option == "builtin" || option == "unconfined" else {
                     throw EngineError(
                         .unsupported, "HostConfig.SecurityOpt option \(value) is not supported"
+                    )
+                }
+                if let seccompProfile, seccompProfile != option {
+                    throw EngineError(
+                        .badRequest,
+                        "HostConfig.SecurityOpt contains conflicting seccomp selections"
                     )
                 }
                 seccompProfile = option

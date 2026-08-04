@@ -37,9 +37,10 @@ the workload root plus mount and PID namespaces through close-on-exec descriptor
 and starts a second stage. The second stage joins the mount namespace, selects
 the workload PID namespace, and starts a third stage in a dedicated leaf beneath
 the workload cgroup. The third stage enters the captured root, applies the
-resolved cwd and configured process rlimits, drops to the requested user and
-supplementary groups, applies capabilities and `no_new_privs`, then replaces
-itself with the requested command. Keeping rlimits in the final stage prevents
+resolved cwd and configured process rlimits, installs the selected built-in
+seccomp filter while retaining the administrative capability required to do so,
+drops to the requested user and supplementary groups, applies capabilities and
+`no_new_privs`, then replaces itself with the requested command. Keeping rlimits in the final stage prevents
 application limits from constraining the guest supervisor or signal/status
 proxies. This preserves workload-level resource accounting while allowing
 nested runtimes to create their own child cgroups. The first two stage
@@ -54,10 +55,18 @@ the user. Environment values merge image, container, then exec entries. When
 neither the container nor exec request is privileged, cengine sets
 `PR_SET_NO_NEW_PRIVS`; an explicitly privileged exec or an exec inheriting a
 privileged container omits it and receives the effective privileged capability
-set.
+set. Seccomp is independent of exec privilege and `no_new_privs`: unprivileged
+containers use the built-in arm64 profile by default, privileged containers
+remain unconfined unless `seccomp=builtin` is selected, and
+`seccomp=unconfined` disables the filter. The selected container policy applies
+to init, exec, and healthcheck processes.
 
 These are observable Docker/OCI semantics, not an OCI runtime-CLI implementation.
-The normative coverage and remaining runtime gaps are tracked in
+Any future OCI-runtime adapter is test-only unless a separate product and
+architecture decision creates a public OCI surface. It must classify and exercise
+already adopted Docker-facing semantics without being installed or advertised as
+a production runtime. The normative coverage and remaining runtime gaps are
+tracked in
 [Docker compatibility](docker-compatibility.md#runtime-semantics-and-oci-applicability).
 
 ## CPU and memory

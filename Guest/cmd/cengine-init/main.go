@@ -363,6 +363,9 @@ func (state *controlServer) serve(connection net.Conn) {
 			var rollbackIncomplete *supervisor.ResourceRollbackIncompleteError
 			if errors.As(operationError, &rollbackIncomplete) {
 				code = protocol.ErrorResourceRollbackIncomplete
+			} else if request.Operation == "prepare-exec" &&
+				supervisor.IsIdentityNotFound(operationError) {
+				code = protocol.ErrorBadRequest
 			}
 			response.Error = &protocol.Error{Code: code, Message: operationError.Error()}
 		} else {

@@ -4949,7 +4949,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(context.environment == ["IMAGE=1", "SHARED=container", "CONTAINER=1"])
         #expect(context.workingDirectory == "/image-work")
         #expect(context.user == .init(username: "image-user"))
-        #expect(context.noNewPrivileges)
+        #expect(!context.noNewPrivileges)
         #expect(!context.privileged)
     }
 
@@ -6535,8 +6535,9 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             processArguments: ["true"]
         )
         container.ulimits = [
-            .init(name: "nofile", soft: 1_024, hard: 2_048),
+            .init(name: "NOFILE", soft: 1_024, hard: 2_048),
             .init(name: "core", soft: -1, hard: -1),
+            .init(name: "unknown", soft: -2, hard: 1),
         ]
 
         let workload = try RawVirtualizationBackend.workloadSpecification(
@@ -6545,8 +6546,9 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         )
 
         #expect(workload.rlimits == [
-            .init(type: "nofile", soft: 1_024, hard: 2_048),
+            .init(type: "NOFILE", soft: 1_024, hard: 2_048),
             .init(type: "core", soft: UInt64.max, hard: UInt64.max),
+            .init(type: "unknown", soft: UInt64.max - 1, hard: 1),
         ])
     }
 

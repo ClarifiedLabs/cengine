@@ -325,9 +325,15 @@ enum VMShimAttachmentResolver {
                 Darwin.exit(0)
             }
         } catch {
-            let code = error is BackendResourceRollbackIncompleteError
-                ? GuestProtocol.resourceRollbackIncompleteErrorCode
-                : "shim_error"
+            let code: String
+            if error is BackendResourceRollbackIncompleteError {
+                code = GuestProtocol.resourceRollbackIncompleteErrorCode
+            } else if let engineError = error as? EngineError,
+                      case .badRequest = engineError.code {
+                code = GuestProtocol.badRequestErrorCode
+            } else {
+                code = "shim_error"
+            }
             let failure = GuestProtocol.Failure(code: code, message: error.localizedDescription)
             try? file.write(contentsOf: VMShimProtocol.encode(.init(
                 id: request?.id ?? UUID().uuidString,

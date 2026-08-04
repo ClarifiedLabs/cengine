@@ -2559,11 +2559,16 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(binds.contains("/tmp:/typed:ro,private"))
 
         for (index, propagation) in ["shared", "rshared", "slave", "rslave"].enumerated() {
-            let unsupported = await router.route(.init(
-                method: .POST, uri: "/v1.44/containers/create?name=unsupported-propagation-\(index)",
+            let legacy = await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/create?name=unsupported-legacy-propagation-\(index)",
                 body: Data("{\"Image\":\"alpine\",\"HostConfig\":{\"Binds\":[\"/tmp:/data:\(propagation)\"]}}".utf8)
             ))
-            #expect(unsupported.status == .notImplemented)
+            #expect(legacy.status == .notImplemented)
+            let structured = await router.route(.init(
+                method: .POST, uri: "/v1.44/containers/create?name=unsupported-structured-propagation-\(index)",
+                body: Data("{\"Image\":\"alpine\",\"Mounts\":[{\"Type\":\"bind\",\"Source\":\"/tmp\",\"Target\":\"/data\",\"BindOptions\":{\"Propagation\":\"\(propagation)\"}}]}".utf8)
+            ))
+            #expect(structured.status == .notImplemented)
         }
 
         let invalid = await router.route(.init(
@@ -2923,7 +2928,7 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
-    @Test func ulimitsNormalizePersistAndInspectInRequestOrder() async throws {
+    @Test func ulimitsPersistAndInspectSubmittedValuesInRequestOrder() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         var runtime: EngineRuntime? = try await EngineRuntime(root: root)
@@ -2951,7 +2956,7 @@ private actor AuthImageBackend: ContainerBackend {
             return try #require(host["Ulimits"] as? [[String: Any]])
         }
         var inspected = try await inspectedLimits(try #require(router))
-        #expect(inspected.map { $0["Name"] as? String } == names.map { $0.lowercased() })
+        #expect(inspected.map { $0["Name"] as? String } == names)
         #expect(inspected[0]["Soft"] as? Int == 0)
         #expect(inspected.last?["Hard"] as? Int == -1)
 
@@ -2960,13 +2965,13 @@ private actor AuthImageBackend: ContainerBackend {
         let restoredRuntime = try await EngineRuntime(root: root)
         let restoredRouter = DockerRouter(runtime: restoredRuntime, root: root)
         inspected = try await inspectedLimits(restoredRouter)
-        #expect(inspected.map { $0["Name"] as? String } == names.map { $0.lowercased() })
+        #expect(inspected.map { $0["Name"] as? String } == names)
 
         let unlimited = try await restoredRuntime.container("limited")
         #expect(unlimited.ulimits.last == .init(name: "stack", soft: 14, hard: -1))
     }
 
-    @Test func invalidUlimitsFailBeforeContainerOrAnonymousVolumeMutation() async throws {
+    @Test func unusualUlimitsCreateContainerAndAnonymousVolumeWithoutNormalization() async throws {
         let cases: [[[String: Any]]] = [
             [["Name": "as", "Soft": 1, "Hard": 1]],
             [["Name": "unknown", "Soft": 1, "Hard": 1]],
@@ -2984,14 +2989,28 @@ private actor AuthImageBackend: ContainerBackend {
                 "HostConfig": ["Ulimits": limits],
             ])
             let response = await router.route(.init(
-                method: .POST, uri: "/v1.55/containers/create?name=bad-ulimit-\(index)", body: body
+                method: .POST, uri: "/v1.55/containers/create?name=unusual-ulimit-\(index)", body: body
             ))
-            #expect(response.status == .badRequest)
+            #expect(response.status == .created)
+            let inspect = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/unusual-ulimit-\(index)/json"
+            ))
+            let object = try #require(
+                JSONSerialization.jsonObject(with: inspect.body) as? [String: Any]
+            )
+            let host = try #require(object["HostConfig"] as? [String: Any])
+            let inspected = try #require(host["Ulimits"] as? [[String: Any]])
+            #expect(inspected.count == limits.count)
+            for (actual, expected) in zip(inspected, limits) {
+                #expect(actual["Name"] as? String == expected["Name"] as? String)
+                #expect(actual["Soft"] as? Int == expected["Soft"] as? Int)
+                #expect(actual["Hard"] as? Int == expected["Hard"] as? Int)
+            }
             let containers = await router.route(.init(method: .GET, uri: "/v1.55/containers/json?all=true"))
-            #expect((try #require(JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]])).isEmpty)
+            #expect((try #require(JSONSerialization.jsonObject(with: containers.body) as? [[String: Any]])).count == 1)
             let volumes = await router.route(.init(method: .GET, uri: "/v1.55/volumes"))
             let envelope = try #require(JSONSerialization.jsonObject(with: volumes.body) as? [String: Any])
-            #expect((envelope["Volumes"] as? [[String: Any]])?.isEmpty == true)
+            #expect((envelope["Volumes"] as? [[String: Any]])?.count == 1)
         }
     }
 
@@ -3008,7 +3027,7 @@ private actor AuthImageBackend: ContainerBackend {
             method: .POST, uri: "/v1.55/containers/update-ulimit/update",
             body: Data(#"{"Ulimits":[{"Name":"nofile","Soft":300,"Hard":200}]}"#.utf8)
         ))
-        #expect(invalid.status == .badRequest)
+        #expect(invalid.status == .notImplemented)
         let unsupported = await router.route(.init(
             method: .POST, uri: "/v1.55/containers/update-ulimit/update",
             body: Data(#"{"Ulimits":[{"Name":"nofile","Soft":150,"Hard":200}]}"#.utf8)
@@ -3422,7 +3441,7 @@ private actor AuthImageBackend: ContainerBackend {
         }
         """#.utf8)
 
-        for version in ["1.44", "1.55"] {
+        for version in (44...55).map({ "1.\($0)" }) {
             let accepted = await router.route(.init(
                 method: .POST,
                 uri: "/v\(version)/containers/create?name=docker-cli-console-\(version)",
@@ -3463,26 +3482,50 @@ private actor AuthImageBackend: ContainerBackend {
     @Test func builtInAndUnconfinedSeccompSelectionsAreAccepted() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        for (index, hostConfig) in [
-            #"{"SecurityOpt":["seccomp=unconfined"]}"#,
-            #"{"Privileged":true,"SecurityOpt":["seccomp=builtin"]}"#,
-            #"{"Privileged":true,"SecurityOpt":["seccomp=unconfined","apparmor=unconfined"]}"#,
-        ].enumerated() {
-            let accepted = await router.route(.init(
-                method: .POST, uri: "/v1.55/containers/create?name=accepted-security-\(index)",
-                body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
-            ))
-            #expect(accepted.status == .created)
-        }
+        for version in ["1.44", "1.55"] {
+            let versionTag = version.replacingOccurrences(of: ".", with: "")
+            for (index, hostConfig) in [
+                #"{"SecurityOpt":["seccomp=unconfined"]}"#,
+                #"{"Privileged":true,"SecurityOpt":["seccomp=builtin"]}"#,
+                #"{"Privileged":true,"SecurityOpt":["seccomp=unconfined","apparmor=unconfined"]}"#,
+            ].enumerated() {
+                let accepted = await router.route(.init(
+                    method: .POST,
+                    uri: "/v\(version)/containers/create?name=accepted-security-\(versionTag)-\(index)",
+                    body: Data("{\"Image\":\"alpine\",\"HostConfig\":\(hostConfig)}".utf8)
+                ))
+                #expect(accepted.status == .created)
+            }
 
-        for (index, option) in ["seccomp=default", "seccomp={}", "apparmor=unconfined"].enumerated() {
-            let rejected = await router.route(.init(
-                method: .POST, uri: "/v1.55/containers/create?name=rejected-security-\(index)",
-                body: try JSONSerialization.data(withJSONObject: [
-                    "Image": "alpine", "HostConfig": ["SecurityOpt": [option]],
-                ])
-            ))
-            #expect(rejected.status == .notImplemented)
+            for (index, option) in ["seccomp=default", "seccomp={}", "apparmor=unconfined"].enumerated() {
+                let rejected = await router.route(.init(
+                    method: .POST,
+                    uri: "/v\(version)/containers/create?name=rejected-security-\(versionTag)-\(index)",
+                    body: try JSONSerialization.data(withJSONObject: [
+                        "Image": "alpine", "HostConfig": ["SecurityOpt": [option]],
+                    ])
+                ))
+                #expect(rejected.status == .notImplemented)
+            }
+            let malformedOptions = [
+                ["seccomp"], ["seccomp="], ["=unconfined"],
+                ["seccomp=builtin", "seccomp=unconfined"],
+                ["no-new-privileges=false", "no-new-privileges"],
+            ]
+            for (index, options) in malformedOptions.enumerated() {
+                let name = "malformed-security-\(versionTag)-\(index)"
+                let rejected = await router.route(.init(
+                    method: .POST, uri: "/v\(version)/containers/create?name=\(name)",
+                    body: try JSONSerialization.data(withJSONObject: [
+                        "Image": "alpine", "HostConfig": ["SecurityOpt": options],
+                    ])
+                ))
+                #expect(rejected.status == .badRequest)
+                let inspect = await router.route(.init(
+                    method: .GET, uri: "/v\(version)/containers/\(name)/json"
+                ))
+                #expect(inspect.status == .notFound)
+            }
         }
     }
 
@@ -3525,7 +3568,7 @@ private actor AuthImageBackend: ContainerBackend {
         }
     }
 
-    @Test func unsupportedUpdateFailsBeforeMutationAndValidExecConsoleSizesReachLookup() async throws {
+    @Test func unsupportedUpdateAndMalformedExecInputsFailBeforeMutation() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let create = await router.route(.init(
@@ -3560,6 +3603,18 @@ private actor AuthImageBackend: ContainerBackend {
             body: Data(#"{"Detach":true,"ConsoleSize":[24,80]}"#.utf8)
         ))
         #expect(execStart.status == .notFound)
+        for (index, consoleSize) in ["[24]", "[-1,80]", "[24,65536]", "[24,80,0]"].enumerated() {
+            let invalidCreate = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/missing/exec",
+                body: Data("{\"Cmd\":[\"true\"],\"ConsoleSize\":\(consoleSize)}".utf8)
+            ))
+            #expect(invalidCreate.status == .badRequest)
+            let invalidStart = await router.route(.init(
+                method: .POST, uri: "/v1.55/exec/missing/start",
+                body: Data("{\"Detach\":true,\"ConsoleSize\":\(consoleSize)}".utf8)
+            ))
+            #expect(invalidStart.status == .badRequest, "invalid console-size case \(index)")
+        }
     }
 
     @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
@@ -7380,6 +7435,14 @@ private actor AuthImageBackend: ContainerBackend {
                 socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
             )
             #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
+            let invalidConsoleSize = try await upgradedExecStart(
+                socketPath: socket, execID: exec.id,
+                body: #"{"Detach":false,"Tty":false,"ConsoleSize":[24]}"#
+            )
+            #expect(
+                invalidConsoleSize.contains("400 Bad Request"),
+                "curl output: \(invalidConsoleSize)"
+            )
             #expect(try await runtime.exec(exec.id).running == false)
             #expect(try await runtime.exec(exec.id).exitCode == nil)
         }
@@ -7429,6 +7492,14 @@ private actor AuthImageBackend: ContainerBackend {
                 socketPath: socket, execID: exec.id, body: #"{"Detach":false,"Tty":true}"#
             )
             #expect(mismatchedTTY.contains("400 Bad Request"), "curl output: \(mismatchedTTY)")
+            let invalidConsoleSize = try await upgradedExecStart(
+                socketPath: socket, execID: exec.id,
+                body: #"{"Detach":false,"Tty":false,"ConsoleSize":[24]}"#
+            )
+            #expect(
+                invalidConsoleSize.contains("400 Bad Request"),
+                "curl output: \(invalidConsoleSize)"
+            )
             #expect(try await runtime.exec(exec.id).running == false)
             #expect(try await runtime.exec(exec.id).exitCode == nil)
             try await manager.shutdown()

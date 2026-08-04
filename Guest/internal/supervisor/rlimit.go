@@ -4,12 +4,14 @@ package supervisor
 
 import (
 	"fmt"
+	"strings"
 
 	"dev.cengine/guest/internal/protocol"
 	"golang.org/x/sys/unix"
 )
 
 var linuxRlimitResources = map[string]int{
+	"as":         unix.RLIMIT_AS,
 	"core":       unix.RLIMIT_CORE,
 	"cpu":        unix.RLIMIT_CPU,
 	"data":       unix.RLIMIT_DATA,
@@ -31,20 +33,16 @@ func applyRlimits(
 	limits []protocol.Rlimit,
 	setrlimit func(resource int, limit *unix.Rlimit) error,
 ) error {
-	seen := make(map[string]struct{}, len(limits))
+	seen := make(map[int]struct{}, len(limits))
 	for _, value := range limits {
-		resource, ok := linuxRlimitResources[value.Type]
+		resource, ok := linuxRlimitResources[strings.ToLower(value.Type)]
 		if !ok {
 			return fmt.Errorf("unknown rlimit %q", value.Type)
 		}
-		if _, duplicate := seen[value.Type]; duplicate {
+		if _, duplicate := seen[resource]; duplicate {
 			return fmt.Errorf("duplicate rlimit %q", value.Type)
 		}
-		seen[value.Type] = struct{}{}
-		if value.Hard != unix.RLIM_INFINITY &&
-			(value.Soft == unix.RLIM_INFINITY || value.Soft > value.Hard) {
-			return fmt.Errorf("rlimit %q soft value exceeds hard value", value.Type)
-		}
+		seen[resource] = struct{}{}
 		limit := unix.Rlimit{Cur: value.Soft, Max: value.Hard}
 		if err := setrlimit(resource, &limit); err != nil {
 			return fmt.Errorf("set rlimit %s: %w", value.Type, err)

@@ -1,7 +1,7 @@
 import Foundation
 
 public enum GuestProtocol {
-    public static let version: UInt32 = 18
+    public static let version: UInt32 = 19
     public static let controlPort: UInt32 = 4_100
     public static let fileSystemPort: UInt32 = 4_101
     public static let rootFSContentPort: UInt32 = 4_102
@@ -9,6 +9,7 @@ public enum GuestProtocol {
     public static let portProxyPort: UInt32 = 4_104
     public static let socketProxyPortBase: UInt32 = 4_200
     public static let maximumControlFrameSize = 16 * 1_024 * 1_024
+    public static let badRequestErrorCode = "bad_request"
     public static let resourceRollbackIncompleteErrorCode = "resource_rollback_incomplete"
 
     public struct Envelope: Sendable, Equatable {
@@ -84,7 +85,7 @@ public enum GuestProtocol {
         public var sysctls: [String: String]
         public var ioClaim: String
 
-        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, consoleSize: TerminalSize? = nil, readOnlyRoot: Bool, maskedPaths: [String] = [], readonlyPaths: [String] = [], stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, noNewPrivileges: Bool = true, seccompDefault: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", shmSize: Int64 = 64 * 1_024 * 1_024, sysctls: [String: String] = [:], ioClaim: String = "") {
+        public init(id: String, rootDevice: String, arguments: [String], environment: [String], workingDirectory: String, hostname: String, user: User, terminal: Bool, consoleSize: TerminalSize? = nil, readOnlyRoot: Bool, maskedPaths: [String] = [], readonlyPaths: [String] = [], stopSignal: String, volumeServer: String? = nil, mounts: [Mount], networks: [NetworkEndpoint], hosts: [String: String] = [:], resources: Resources, privileged: Bool = false, noNewPrivileges: Bool = false, seccompDefault: Bool = false, annotations: [String: String] = [:], capabilityAdd: [String] = [], capabilityDrop: [String] = [], rlimits: [Rlimit] = [], ipcMode: String = "private", shmSize: Int64 = 64 * 1_024 * 1_024, sysctls: [String: String] = [:], ioClaim: String = "") {
             self.id = id; self.rootDevice = rootDevice; self.arguments = arguments; self.environment = environment
             self.workingDirectory = workingDirectory; self.hostname = hostname; self.user = user; self.terminal = terminal
             self.consoleSize = consoleSize

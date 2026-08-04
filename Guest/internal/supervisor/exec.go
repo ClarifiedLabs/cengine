@@ -434,13 +434,19 @@ func (s *Supervisor) PrepareExec(spec protocol.ExecSpec) error {
 		processIO.close()
 		return errors.New("workload is not running")
 	}
-	if s.spec != nil && pathPolicyMasksUserDatabase(s.spec.MaskedPaths) {
-		spec.User, err = normalizeExecUserFromSnapshot(
-			spec.User, workloadUserDatabaseSnapshotPath,
-		)
+	if spec.User.Username != "" {
+		if s.spec != nil && pathPolicyMasksUserDatabase(s.spec.MaskedPaths) {
+			spec.User, err = normalizeExecUserFromSnapshot(
+				spec.User, workloadUserDatabaseSnapshotPath,
+			)
+		} else {
+			spec.User, err = normalizeExecUserAtRoot(
+				spec.User, fmt.Sprintf("/proc/%d/root", s.command.Process.Pid),
+			)
+		}
 		if err != nil {
 			processIO.close()
-			return fmt.Errorf("resolve exec user before masked identity files: %w", err)
+			return fmt.Errorf("resolve exec user: %w", err)
 		}
 	}
 	if _, exists := s.execStatus[spec.ID]; exists {
@@ -471,6 +477,23 @@ func normalizeExecUserFromSnapshot(
 	if err != nil {
 		return protocol.User{}, err
 	}
+	return normalizedExecUser(user, uid, gid, namedGroups)
+}
+
+func normalizeExecUserAtRoot(user protocol.User, root string) (protocol.User, error) {
+	if user.Username == "" {
+		return user, nil
+	}
+	uid, gid, namedGroups, err := resolveUserAtRoot(user, root)
+	if err != nil {
+		return protocol.User{}, err
+	}
+	return normalizedExecUser(user, uid, gid, namedGroups)
+}
+
+func normalizedExecUser(
+	user protocol.User, uid, gid int, namedGroups []int,
+) (protocol.User, error) {
 	if uid < 0 || uint64(uid) > uint64(^uint32(0)) || gid < 0 || uint64(gid) > uint64(^uint32(0)) {
 		return protocol.User{}, errors.New("resolved exec user is outside the Linux ID range")
 	}

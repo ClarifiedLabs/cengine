@@ -64,6 +64,9 @@ public actor GuestControlConnection {
             if failure.code == GuestProtocol.resourceRollbackIncompleteErrorCode {
                 throw BackendResourceRollbackIncompleteError(failure.message)
             }
+            if failure.code == GuestProtocol.badRequestErrorCode {
+                throw EngineError(.badRequest, failure.message)
+            }
             throw EngineError(.internalError, "guest \(failure.code): \(failure.message)")
         }
         guard let data = reply.payload else {

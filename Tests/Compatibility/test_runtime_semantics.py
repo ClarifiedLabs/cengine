@@ -214,7 +214,8 @@ def test_init_and_default_exec_share_runtime_context(
         assert exec_context["uid"] == "65534"
         assert exec_context["gid"] == "65534"
         assert "2345" in exec_context["groups"].split(",")
-        assert exec_context["status_NoNewPrivs"] == "1"
+        assert init_context["status_NoNewPrivs"] == "0"
+        assert exec_context["status_NoNewPrivs"] == "0"
         assert all(exec_context[f"fd_{descriptor}"] == "closed" for descriptor in (3, 4, 5))
 
         privileged = container.exec_run(
@@ -239,6 +240,199 @@ def test_init_and_default_exec_share_runtime_context(
         container.remove(force=True)
         if privileged_container is not None:
             privileged_container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-038")
+def test_invalid_init_and_exec_identities_fail_without_leaking_stages(
+    daemon, client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    suffix = uuid.uuid4().hex[:8]
+    passwd_file = tmp_path / "passwd"
+    group_file = tmp_path / "group"
+    passwd_file.write_text(
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "app:x:1000:1000:app:/home/app:/bin/sh\n"
+    )
+    group_file.write_text(
+        "root:x:0:\napp:x:1000:\nstaff:x:3000:\nextra:x:4000:app\n"
+    )
+    invalid_inits = []
+    container = None
+    try:
+        for index, user in enumerate(("missing-init-user:staff", "app:missing-init-group")):
+            invalid_response = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": f"invalid-init-identity-{suffix}-{index}"},
+                data={
+                    "Image": ALPINE_IMAGE, "Cmd": ["true"], "User": user,
+                    "HostConfig": {
+                        "Mounts": [
+                            {
+                                "Type": "bind", "Source": str(passwd_file),
+                                "Target": "/etc/passwd", "ReadOnly": True,
+                            },
+                            {
+                                "Type": "bind", "Source": str(group_file),
+                                "Target": "/etc/group", "ReadOnly": True,
+                            },
+                        ],
+                        "MaskedPaths": ["/etc/passwd", "/etc/group"],
+                    },
+                },
+            )
+            client.api._raise_for_status(invalid_response)
+            invalid_init = client.containers.get(invalid_response.json()["Id"])
+            invalid_inits.append(invalid_init)
+            with pytest.raises(docker.errors.APIError) as error:
+                invalid_init.start()
+            assert error.value.status_code == 500
+            invalid_init.reload()
+            assert invalid_init.status == "created"
+            assert invalid_init.attrs["State"]["Running"] is False
+
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            params={"name": f"identity-runtime-{suffix}"},
+            data={
+                "Image": ALPINE_IMAGE,
+                "Cmd": ["top"],
+                "User": "app:staff",
+                "HostConfig": {
+                    "Mounts": [
+                        {
+                            "Type": "bind", "Source": str(passwd_file),
+                            "Target": "/etc/passwd", "ReadOnly": True,
+                        },
+                        {
+                            "Type": "bind", "Source": str(group_file),
+                            "Target": "/etc/group", "ReadOnly": True,
+                        },
+                    ],
+                    "MaskedPaths": ["/etc/passwd", "/etc/group"],
+                },
+            },
+        )
+        client.api._raise_for_status(response)
+        container = client.containers.get(response.json()["Id"])
+        container.start()
+
+        for user, expected in (("app:staff", b"1000 3000 3000,4000"), ("1000:3000", b"1000 3000 3000")):
+            result = container.exec_run([
+                "sh", "-ec",
+                "printf '%s %s ' \"$(id -u)\" \"$(id -g)\"; id -G | tr ' ' ','",
+            ], user=user)
+            assert result.exit_code == 0, result.output.decode(errors="replace")
+            assert result.output.strip() == expected
+
+        for user in ("missing-exec-user", "app:missing-exec-group"):
+            artifacts_before = sorted(daemon.root.rglob("exec-*"))
+            with pytest.raises(docker.errors.APIError) as error:
+                client.api.exec_create(container.id, ["true"], user=user)
+            assert error.value.status_code == 400
+            assert sorted(daemon.root.rglob("exec-*")) == artifacts_before
+    finally:
+        if container is not None:
+            container.remove(force=True)
+        for invalid_init in invalid_inits:
+            invalid_init.remove(force=True)
+
+
+@pytest.mark.compat("RTM-039")
+def test_explicit_exec_context_overrides_and_omitted_values_inherit(
+    client: docker.DockerClient, tmp_path: pathlib.Path,
+):
+    suffix = uuid.uuid4().hex[:8]
+    passwd_file = tmp_path / "passwd"
+    group_file = tmp_path / "group"
+    passwd_file.write_text(
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "app:x:1000:1000:app:/home/app:/bin/sh\n"
+    )
+    group_file.write_text(
+        "root:x:0:\napp:x:1000:\nstaff:x:3000:\nextra:x:4000:app\n"
+    )
+    container = client.containers.create(
+        ALPINE_IMAGE,
+        ["sh", "-ec", SNAPSHOT_SCRIPT + "while :; do sleep 1; done"],
+        name=f"exec-context-{suffix}",
+        user="app:staff",
+        working_dir="/tmp",
+        environment={"CONTEXT": "container", "INHERITED": "yes"},
+        mounts=[
+            Mount("/etc/passwd", str(passwd_file), type="bind", read_only=True),
+            Mount("/etc/group", str(group_file), type="bind", read_only=True),
+        ],
+    )
+    try:
+        container.start()
+        init_context = wait_for_init_snapshot(container)
+        inherited = container.exec_run(["sh", "-ec", SNAPSHOT_SCRIPT])
+        assert inherited.exit_code == 0, inherited.output.decode(errors="replace")
+        inherited_context = parse_snapshot(inherited.output)
+        for key in (
+            "namespace_mnt", "namespace_pid", "namespace_uts", "namespace_ipc",
+            "namespace_net", "namespace_cgroup", "root_stat", "root_mount",
+            "working_directory", "uid", "gid", "groups", "environment",
+            "status_CapInh", "status_CapPrm", "status_CapEff", "status_CapBnd",
+            "status_CapAmb", "status_NoNewPrivs",
+        ):
+            assert inherited_context[key] == init_context[key]
+        assert all(inherited_context[f"fd_{descriptor}"] == "closed" for descriptor in (3, 4, 5))
+
+        explicit_contexts = []
+        explicit_script = (
+            "if test -t 1; then terminal=1; else terminal=0; fi; "
+            "printf 'terminal=%s\\n' \"$terminal\"; "
+            + SNAPSHOT_SCRIPT
+        )
+        for tty in (False, True):
+            result = container.exec_run(
+                ["sh", "-ec", explicit_script],
+                user="root:staff", workdir="/",
+                environment={"CONTEXT": "exec", "EXPLICIT": "yes"},
+                tty=tty, privileged=True,
+            )
+            assert result.exit_code == 0, result.output.decode(errors="replace")
+            context = parse_snapshot(result.output)
+            explicit_contexts.append(context)
+            assert context["terminal"] == ("1" if tty else "0")
+            assert context["working_directory"] == "/"
+            assert context["uid"] == "0" and context["gid"] == "3000"
+            assert "3000" in context["groups"].split(",")
+            assert context["environment"] == "exec"
+            assert context["status_NoNewPrivs"] == "0"
+            assert int(context["status_CapEff"], 16) & (1 << 21)
+            assert all(context[f"fd_{descriptor}"] == "closed" for descriptor in (3, 4, 5))
+            for key in (
+                "namespace_mnt", "namespace_pid", "namespace_uts", "namespace_ipc",
+                "namespace_net", "namespace_cgroup", "root_stat", "root_mount",
+            ):
+                assert context[key] == init_context[key]
+        for key in set(explicit_contexts[0]) - {"terminal"}:
+            assert explicit_contexts[0][key] == explicit_contexts[1][key]
+
+        exec_id = client.api.exec_create(
+            container.id,
+            ["sh", "-ec", "echo $$ >/tmp/authoritative-exec-pid; sleep 1; exit 23"],
+        )["Id"]
+        client.api.exec_start(exec_id, detach=True)
+        running = wait_for_compat_value(
+            lambda: client.api.exec_inspect(exec_id)["Running"], True,
+            "explicit-context exec to become running",
+        )
+        assert running is True
+        inspected = client.api.exec_inspect(exec_id)
+        pid = int(container.exec_run(["cat", "/tmp/authoritative-exec-pid"]).output.strip())
+        assert inspected["Pid"] == pid
+        wait_for_compat_value(
+            lambda: client.api.exec_inspect(exec_id)["ExitCode"], 23,
+            "explicit-context exec terminal status",
+        )
+        completed = client.api.exec_inspect(exec_id)
+        assert completed["Running"] is False
+        assert completed["Pid"] == pid
+    finally:
+        container.remove(force=True)
 
 
 @pytest.mark.compat("RTM-002")
@@ -315,48 +509,98 @@ def test_default_routes_are_selected_per_address_family(client: docker.DockerCli
 
 
 @pytest.mark.compat("RTM-013")
-def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClient):
+def test_active_unsupported_runtime_inputs_fail_closed(daemon, client: docker.DockerClient):
     suffix = uuid.uuid4().hex[:8]
     initial_volumes = {volume.name for volume in client.volumes.list()}
-    cases = [
-        {
-            "Image": ALPINE_IMAGE,
-            "Volumes": {"/data": {}},
-            "HostConfig": {"CpuShares": 1024},
-        },
-        {"Image": ALPINE_IMAGE, "HostConfig": {"PidMode": "host"}},
+    initial_containers = {container.id for container in client.containers.list(all=True)}
+    unsupported_create_cases = [
+        {"Domainname": "example.test"},
+        {"ArgsEscaped": True},
+        {"NetworkDisabled": True},
+        {"Shell": ["/bin/sh", "-c"]},
+        {"HostConfig": {"CpuShares": 1024}},
+        {"HostConfig": {"CpusetCpus": "0"}},
+        {"HostConfig": {"MemoryReservation": 64 * 1024 * 1024}},
+        {"HostConfig": {"GroupAdd": ["wheel"]}},
+        {"HostConfig": {"OomScoreAdj": 1}},
+        {"HostConfig": {"Isolation": "process"}},
+        {"HostConfig": {"PidMode": "host"}},
+        {"HostConfig": {"DeviceRequests": [{"Driver": "cdi", "Count": 1}]}},
+    ] + [
+        {"Mounts": [{"Type": kind, "Target": "/unsupported"}]}
+        for kind in ("image", "cluster", "npipe")
+    ] + [
+        {"Mounts": [{
+            "Type": "volume", "Source": "data", "Target": "/data",
+            "VolumeOptions": {"Labels": {"unsupported": "true"}},
+        }]},
+        {"Mounts": [{
+            "Type": "bind", "Source": "/tmp", "Target": "/data",
+            "Consistency": "cached",
+        }]},
     ]
-    for index, body in enumerate(cases):
-        name = f"runtime-input-{suffix}-{index}"
+    malformed_create_cases = [
+        {"StopTimeout": -1},
+        {"Healthcheck": {"Test": ["CMD", "true"], "Interval": 1}},
+        {"HostConfig": {"OomScoreAdj": 1001}},
+        {"HostConfig": {"Memory": -1}},
+        {"Mounts": [{"Type": "sideways", "Target": "/data"}]},
+    ]
+
+    def assert_create_rejected(body: dict, status_code: int, index: int) -> None:
+        name = f"runtime-input-{suffix}-{status_code}-{index}"
+        request = {
+            "Image": ALPINE_IMAGE,
+            "Volumes": {"/anonymous-must-not-leak": {}},
+            **body,
+        }
         with pytest.raises(docker.errors.APIError) as error:
             response = client.api._post_json(
-                client.api._url("/containers/create"), params={"name": name}, data=body,
+                client.api._url("/containers/create"), params={"name": name}, data=request,
             )
             client.api._raise_for_status(response)
-        assert error.value.status_code == 501
+        assert error.value.status_code == status_code
         with pytest.raises(docker.errors.NotFound):
             client.containers.get(name)
-    assert {volume.name for volume in client.volumes.list()} == initial_volumes
+        assert {volume.name for volume in client.volumes.list()} == initial_volumes
+        assert {value.id for value in client.containers.list(all=True)} == initial_containers
+
+    for index, body in enumerate(unsupported_create_cases):
+        assert_create_rejected(body, 501, index)
+    for index, body in enumerate(malformed_create_cases):
+        assert_create_rejected(body, 400, index)
 
     inert = client.api._post_json(
         client.api._url("/containers/create"),
         params={"name": f"runtime-inert-{suffix}"},
         data={
             "Image": ALPINE_IMAGE,
+            "Domainname": "",
+            "ArgsEscaped": False,
+            "NetworkDisabled": False,
+            "Shell": [],
             "AttachStdout": False,
             "AttachStderr": False,
             "StdinOnce": True,
+            "FutureRuntimeExtension": {"Enabled": True},
             "HostConfig": {
                 "Init": True,
                 "CpuShares": 0,
                 "CgroupParent": "/docker/buildx",
                 "BlkioWeightDevice": [],
                 "DeviceRequests": [],
+                "MemoryReservation": 0,
+                "MemorySwap": 0,
                 "MemorySwappiness": -1,
+                "OomKillDisable": False,
+                "CpusetCpus": "",
+                "CpusetMems": "",
                 "CgroupnsMode": "private",
                 "IpcMode": "private",
+                "Isolation": "default",
                 "ConsoleSize": [0, 0],
                 "ShmSize": 64 * 1024 * 1024,
+                "FutureHostExtension": {"Enabled": True},
             },
         },
     )
@@ -370,31 +614,54 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
         mem_limit=1024 * 1024 * 1024,
     )
     try:
+        unsupported_updates = [
+            {"DeviceRequests": [{
+                "Driver": "cdi", "DeviceIDs": ["example.com/device=one"],
+            }]},
+            {"CpusetCpus": "0"},
+            {"MemorySwap": 3 * 1024 * 1024 * 1024},
+            {"Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 1024}]},
+        ]
+        for update in unsupported_updates:
+            with pytest.raises(docker.errors.APIError) as error:
+                response = client.api._post_json(
+                    client.api._url("/containers/{0}/update", container.id),
+                    data={"Memory": 2 * 1024 * 1024 * 1024, **update},
+                )
+                client.api._raise_for_status(response)
+            assert error.value.status_code == 501
+            container.reload()
+            assert container.attrs["HostConfig"]["Memory"] == 1024 * 1024 * 1024
+            state = json.loads((daemon.root / "engine.json").read_text())
+            assert persisted_container_record(state, container.id)["memoryBytes"] == 1024 * 1024 * 1024
+
+        container.start()
+        exec_artifacts = lambda: sorted(
+            str(path.relative_to(daemon.root))
+            for path in daemon.root.rglob("exec-*")
+        )
+        artifacts_before = exec_artifacts()
         with pytest.raises(docker.errors.APIError) as error:
             response = client.api._post_json(
-                client.api._url("/containers/{0}/update", container.id),
-                data={
-                    "Memory": 2 * 1024 * 1024 * 1024,
-                    "DeviceRequests": [{
-                        "Driver": "cdi", "DeviceIDs": ["example.com/device=one"],
-                    }],
-                },
+                client.api._url("/containers/{0}/exec", container.id),
+                data={"Cmd": ["true"], "DetachKeys": "ctrl-x,x"},
             )
             client.api._raise_for_status(response)
         assert error.value.status_code == 501
-        container.reload()
-        assert container.attrs["HostConfig"]["Memory"] == 1024 * 1024 * 1024
+        assert exec_artifacts() == artifacts_before
 
-        container.start()
         response = client.api._post_json(
             client.api._url("/containers/{0}/exec", container.id),
-            data={"Cmd": ["true"], "ConsoleSize": [24, 80]},
+            data={"Cmd": ["true"], "ConsoleSize": [24, 80], "FutureExecExtension": True},
         )
         client.api._raise_for_status(response)
         exec_id = response.json()["Id"]
         response = client.api._post_json(
             client.api._url("/exec/{0}/start", exec_id),
-            data={"Detach": True, "Tty": False, "ConsoleSize": [24, 80]},
+            data={
+                "Detach": True, "Tty": False, "ConsoleSize": [24, 80],
+                "FutureExecStartExtension": True,
+            },
         )
         client.api._raise_for_status(response)
     finally:
@@ -403,8 +670,29 @@ def test_active_unsupported_runtime_inputs_fail_closed(client: docker.DockerClie
 
 
 @pytest.mark.compat("RTM-030")
-def test_console_size_applies_to_container_and_exec_ptys(client: docker.DockerClient):
+def test_console_size_applies_to_container_and_exec_ptys(daemon, client: docker.DockerClient):
     suffix = uuid.uuid4().hex[:8]
+    initial_containers = {container.id for container in client.containers.list(all=True)}
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    for index, console_size in enumerate(([24], [-1, 80], [24, 65536], [24, 80, 0])):
+        name = f"console-size-invalid-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": name},
+                data={
+                    "Image": ALPINE_IMAGE, "Cmd": ["true"], "Tty": True,
+                    "Volumes": {"/anonymous-must-not-leak": {}},
+                    "HostConfig": {"ConsoleSize": console_size},
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 400
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(name)
+        assert {volume.name for volume in client.volumes.list()} == initial_volumes
+        assert {container.id for container in client.containers.list(all=True)} == initial_containers
+
     create = client.api._post_json(
         client.api._url("/containers/create"),
         params={"name": f"console-size-{suffix}"},
@@ -442,6 +730,51 @@ def test_console_size_applies_to_container_and_exec_ptys(client: docker.DockerCl
 
         container.resize(height=44, width=122)
         wait_for_size("/tmp/container-size", b"44 122")
+
+        exec_artifacts = lambda: sorted(
+            str(path.relative_to(daemon.root)) for path in daemon.root.rglob("exec-*")
+        )
+        for console_size in ([24], [-1, 80], [24, 65536], [24, 80, 0]):
+            artifacts_before = exec_artifacts()
+            with pytest.raises(docker.errors.APIError) as error:
+                invalid_create = client.api._post_json(
+                    client.api._url("/containers/{0}/exec", container.id),
+                    data={"Cmd": ["true"], "Tty": True, "ConsoleSize": console_size},
+                )
+                client.api._raise_for_status(invalid_create)
+            assert error.value.status_code == 400
+            assert exec_artifacts() == artifacts_before
+
+        validation_exec = client.api._post_json(
+            client.api._url("/containers/{0}/exec", container.id),
+            data={"Cmd": ["true"], "Tty": False},
+        )
+        client.api._raise_for_status(validation_exec)
+        validation_exec_id = validation_exec.json()["Id"]
+        validation_inspect = client.api.exec_inspect(validation_exec_id)
+        assert validation_inspect["Running"] is False
+        for start_body in (
+            {"Detach": True, "Tty": False, "ConsoleSize": [24]},
+            {"Detach": True, "Tty": False, "ConsoleSize": [-1, 80]},
+            {"Detach": True, "Tty": False, "ConsoleSize": [24, 65536]},
+            {"Detach": True, "Tty": True, "ConsoleSize": [24, 80]},
+        ):
+            artifacts_before = exec_artifacts()
+            with pytest.raises(docker.errors.APIError) as error:
+                invalid_start = client.api._post_json(
+                    client.api._url("/exec/{0}/start", validation_exec_id), data=start_body,
+                )
+                client.api._raise_for_status(invalid_start)
+            assert error.value.status_code == 400
+            inspect = client.api.exec_inspect(validation_exec_id)
+            assert inspect["Running"] == validation_inspect["Running"]
+            assert inspect["ExitCode"] == validation_inspect["ExitCode"]
+            assert exec_artifacts() == artifacts_before
+        valid_start = client.api._post_json(
+            client.api._url("/exec/{0}/start", validation_exec_id),
+            data={"Detach": True, "Tty": False, "ConsoleSize": [24, 80]},
+        )
+        client.api._raise_for_status(valid_start)
 
         exec_create = client.api._post_json(
             client.api._url("/containers/{0}/exec", container.id),
@@ -720,6 +1053,34 @@ def test_namespaced_sysctls_apply_after_endpoint_settings_and_survive_recovery(
     daemon, client: docker.DockerClient,
 ):
     suffix = uuid.uuid4().hex[:8]
+    initial_containers = {container.id for container in client.containers.list(all=True)}
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    rejected_sysctls = [
+        {"kernel.core_pattern": "core"},
+        {"vm.swappiness": "10"},
+        {"net..ipv4.ip_forward": "1"},
+        {"net.ipv4/../ip_forward": "1"},
+        {"net.ipv4.ip_forward": "1", "net/ipv4/ip_forward": "0"},
+    ]
+    for index, sysctls in enumerate(rejected_sysctls):
+        rejected_name = f"runtime-sysctls-rejected-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": rejected_name},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/anonymous-must-not-leak": {}},
+                    "HostConfig": {"Sysctls": sysctls},
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == 400
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(rejected_name)
+        assert {volume.name for volume in client.volumes.list()} == initial_volumes
+        assert {container.id for container in client.containers.list(all=True)} == initial_containers
+
     name = f"runtime-sysctls-{suffix}"
     endpoint_sysctls = "com.docker.network.endpoint.sysctls"
     network = client.networks.create(f"runtime-sysctls-{suffix}")
@@ -1362,22 +1723,35 @@ def test_ulimits_apply_to_init_exec_healthchecks_and_survive_recovery(
     suffix = uuid.uuid4().hex[:8]
     initial_volumes = {volume.name for volume in client.volumes.list()}
     invalid_name = f"invalid-ulimit-{suffix}"
-    with pytest.raises(docker.errors.APIError) as error:
-        response = client.api._post_json(
-            client.api._url("/containers/create"),
-            params={"name": invalid_name},
-            data={
-                "Image": ALPINE_IMAGE,
-                "Volumes": {"/data": {}},
-                "HostConfig": {
-                    "Ulimits": [{"Name": "nofile", "Soft": 129, "Hard": 128}],
-                },
+    response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": invalid_name},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": ["true"],
+            "Volumes": {"/data": {}},
+            "HostConfig": {
+                "Ulimits": [{"Name": "nofile", "Soft": 129, "Hard": 128}],
             },
-        )
-        client.api._raise_for_status(response)
-    assert error.value.status_code == 400
-    with pytest.raises(docker.errors.NotFound):
-        client.containers.get(invalid_name)
+        },
+    )
+    client.api._raise_for_status(response)
+    invalid = client.containers.get(response.json()["Id"])
+    try:
+        invalid.reload()
+        assert invalid.status == "created"
+        assert invalid.attrs["HostConfig"]["Ulimits"] == [
+            {"Name": "nofile", "Soft": 129, "Hard": 128},
+        ]
+        assert len({volume.name for volume in client.volumes.list()} - initial_volumes) == 1
+        with pytest.raises(docker.errors.APIError) as error:
+            invalid.start()
+        assert error.value.status_code == 500
+        invalid.reload()
+        assert invalid.status == "created"
+        assert invalid.attrs["State"]["Running"] is False
+    finally:
+        invalid.remove(force=True, v=True)
     assert {volume.name for volume in client.volumes.list()} == initial_volumes
 
     name = f"ulimits-{suffix}"
@@ -1418,7 +1792,7 @@ def test_ulimits_apply_to_init_exec_healthchecks_and_survive_recovery(
         assert result.output.splitlines() == [b"64", b"128", b"64", b"128"]
         value.reload()
         assert value.attrs["HostConfig"]["Ulimits"] == [
-            {"Name": "nofile", "Soft": 64, "Hard": 128},
+            {"Name": "NOFILE", "Soft": 64, "Hard": 128},
             {"Name": "core", "Soft": -1, "Hard": -1},
         ]
 
@@ -2679,6 +3053,65 @@ def test_no_new_privileges_security_option_applies_restart_and_survives_recovery
     daemon, client: docker.DockerClient,
 ):
     suffix = uuid.uuid4().hex[:8]
+    initial_containers = {container.id for container in client.containers.list(all=True)}
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    rejected_options = [
+        (["no-new-privileges=maybe"], 400),
+        (["no-new-privileges=false", "no-new-privileges"], 400),
+        (["apparmor=loaded-profile"], 501),
+    ]
+    for index, (security_options, status_code) in enumerate(rejected_options):
+        name = f"no-new-privileges-rejected-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            response = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": name},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/anonymous-must-not-leak": {}},
+                    "HostConfig": {"SecurityOpt": security_options},
+                },
+            )
+            client.api._raise_for_status(response)
+        assert error.value.status_code == status_code
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(name)
+        assert {volume.name for volume in client.volumes.list()} == initial_volumes
+        assert {container.id for container in client.containers.list(all=True)} == initial_containers
+
+    false_options = ["no-new-privileges=false"]
+    false_response = client.api._post_json(
+        client.api._url("/containers/create"),
+        params={"name": f"no-new-privileges-false-{suffix}"},
+        data={
+            "Image": ALPINE_IMAGE,
+            "Cmd": [
+                "sh", "-ec",
+                "awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status >/tmp/init-nnp; "
+                "while :; do sleep 1; done",
+            ],
+            "HostConfig": {"SecurityOpt": false_options},
+        },
+    )
+    client.api._raise_for_status(false_response)
+    false_container = client.containers.get(false_response.json()["Id"])
+    try:
+        false_container.start()
+        explicit_false = false_container.exec_run([
+            "sh", "-ec",
+            "test \"$(cat /tmp/init-nnp)\" = 0; "
+            "awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status",
+        ])
+        assert explicit_false.exit_code == 0, explicit_false.output.decode(errors="replace")
+        assert explicit_false.output.strip() == b"0"
+        false_container.reload()
+        assert false_container.attrs["HostConfig"]["SecurityOpt"] == false_options
+        state = json.loads((daemon.root / "engine.json").read_text())
+        false_record = persisted_container_record(state, false_container.id)
+        assert false_record["noNewPrivileges"] is False
+    finally:
+        false_container.remove(force=True)
+
     options = [
         "no-new-privileges=true", "seccomp=unconfined", "apparmor=unconfined",
     ]
@@ -2767,6 +3200,34 @@ def test_default_seccomp_applies_to_init_exec_healthcheck_restart_and_recovery(
     daemon, client: docker.DockerClient,
 ):
     suffix = uuid.uuid4().hex[:8]
+    initial_containers = {container.id for container in client.containers.list(all=True)}
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    rejected_options = [
+        (["seccomp"], 400),
+        (["seccomp="], 400),
+        (["seccomp=builtin", "seccomp=unconfined"], 400),
+        (["seccomp={}"], 501),
+        (["seccomp=/tmp/profile.json"], 501),
+    ]
+    for index, (security_options, status_code) in enumerate(rejected_options):
+        name = f"seccomp-rejected-{suffix}-{index}"
+        with pytest.raises(docker.errors.APIError) as error:
+            rejected = client.api._post_json(
+                client.api._url("/containers/create"),
+                params={"name": name},
+                data={
+                    "Image": ALPINE_IMAGE,
+                    "Volumes": {"/anonymous-must-not-leak": {}},
+                    "HostConfig": {"SecurityOpt": security_options},
+                },
+            )
+            client.api._raise_for_status(rejected)
+        assert error.value.status_code == status_code
+        with pytest.raises(docker.errors.NotFound):
+            client.containers.get(name)
+        assert {volume.name for volume in client.volumes.list()} == initial_volumes
+        assert {container.id for container in client.containers.list(all=True)} == initial_containers
+
     response = client.api._post_json(
         client.api._url("/containers/create"),
         params={"name": f"default-seccomp-{suffix}"},
@@ -2945,15 +3406,54 @@ def test_pids_limit_enforces_live_updates_and_survives_recovery(
 def test_unrealizable_bind_mount_propagation_is_rejected(
     client: docker.DockerClient, tmp_path: pathlib.Path,
 ):
-    with pytest.raises(docker.errors.APIError) as error:
-        client.containers.create(
-            ALPINE_IMAGE,
-            ["tail", "-f", "/dev/null"],
-            mounts=[Mount(
-                target="/propagated", source=str(tmp_path), type="bind", propagation="rshared",
-            )],
-        )
-    assert error.value.status_code == 501
+    suffix = uuid.uuid4().hex[:8]
+    initial_containers = {container.id for container in client.containers.list(all=True)}
+    initial_volumes = {volume.name for volume in client.volumes.list()}
+    accepted = []
+    try:
+        for index, propagation in enumerate(("private", "rprivate")):
+            container = client.containers.create(
+                ALPINE_IMAGE,
+                ["tail", "-f", "/dev/null"],
+                name=f"propagation-accepted-{suffix}-{index}",
+                mounts=[Mount(
+                    target="/propagated", source=str(tmp_path), type="bind",
+                    propagation=propagation,
+                )],
+            )
+            accepted.append(container)
+
+        accepted_ids = {container.id for container in accepted}
+        for index, propagation in enumerate(("shared", "rshared", "slave", "rslave")):
+            for shape, host_config in (
+                ("legacy", {"Binds": [f"{tmp_path}:/propagated:{propagation}"]}),
+                ("structured", {"Mounts": [{
+                    "Type": "bind", "Source": str(tmp_path), "Target": "/propagated",
+                    "BindOptions": {"Propagation": propagation},
+                }]}),
+            ):
+                name = f"propagation-rejected-{suffix}-{shape}-{index}"
+                with pytest.raises(docker.errors.APIError) as error:
+                    response = client.api._post_json(
+                        client.api._url("/containers/create"),
+                        params={"name": name},
+                        data={
+                            "Image": ALPINE_IMAGE,
+                            "Volumes": {"/anonymous-must-not-leak": {}},
+                            "HostConfig": host_config,
+                        },
+                    )
+                    client.api._raise_for_status(response)
+                assert error.value.status_code == 501
+                with pytest.raises(docker.errors.NotFound):
+                    client.containers.get(name)
+                assert {volume.name for volume in client.volumes.list()} == initial_volumes
+                assert {
+                    container.id for container in client.containers.list(all=True)
+                } == initial_containers | accepted_ids
+    finally:
+        for container in accepted:
+            container.remove(force=True)
 
 
 @pytest.mark.compat("RTM-006")
@@ -3250,9 +3750,15 @@ def test_parent_stop_and_restart_terminalize_attached_and_detached_execs(
             )
             assert not attached_errors, attached_errors
             for exec_id in (detached, attached):
+                def terminal_state() -> tuple[bool, bool]:
+                    state = client.api.exec_inspect(exec_id)
+                    return state["Running"], state["ExitCode"] is not None
+
+                wait_for_compat_value(
+                    terminal_state, (False, True),
+                    f"{operation} exec {exec_id} terminal state",
+                )
                 inspected = client.api.exec_inspect(exec_id)
-                assert inspected["Running"] is False
-                assert inspected["ExitCode"] is not None
                 assert inspected["Pid"] > 0
             container.reload()
             if operation == "stop":

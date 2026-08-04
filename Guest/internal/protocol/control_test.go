@@ -9,8 +9,8 @@ import (
 )
 
 func TestWorkloadSpecDecodesRuntimeAnnotationsRlimitsAndPathPolicies(t *testing.T) {
-	if Version != 18 {
-		t.Fatalf("Version = %d, want 18", Version)
+	if Version != 19 {
+		t.Fatalf("Version = %d, want 19", Version)
 	}
 	var spec WorkloadSpec
 	if err := json.Unmarshal([]byte(`{
@@ -98,20 +98,16 @@ func TestEnvelopeVersionCompatibility(t *testing.T) {
 	}
 }
 
-func TestPreviousVersionWorkloadDefaultsSharedMemory(t *testing.T) {
-	var previous WorkloadSpec
-	if err := json.Unmarshal([]byte(`{"id":"container-1","ipcMode":"private"}`), &previous); err != nil {
-		t.Fatal(err)
-	}
-	previous.ApplyCompatibilityDefaults(PreviousVersion)
-	if previous.ShmSize != DefaultSharedMemorySize || len(previous.Sysctls) != 0 {
-		t.Fatalf("previous-version defaults = %#v", previous)
-	}
-
-	var current WorkloadSpec
-	current.ApplyCompatibilityDefaults(Version)
-	if current.ShmSize != 0 {
-		t.Fatalf("current-version missing shared memory size defaulted to %d", current.ShmSize)
+func TestAcceptedProtocolVersionsDoNotRewriteSharedMemorySize(t *testing.T) {
+	for _, version := range []uint32{PreviousVersion, Version} {
+		var spec WorkloadSpec
+		if err := json.Unmarshal([]byte(`{"id":"container-1","ipcMode":"private"}`), &spec); err != nil {
+			t.Fatal(err)
+		}
+		spec.ApplyCompatibilityDefaults(version)
+		if spec.ShmSize != 0 || len(spec.Sysctls) != 0 {
+			t.Fatalf("version %d defaults = %#v", version, spec)
+		}
 	}
 }
 
@@ -129,8 +125,8 @@ func TestExecSpecDecodesIOClaim(t *testing.T) {
 }
 
 func TestEndpointSysctlsRemainAvailableInCurrentProtocol(t *testing.T) {
-	if Version != 18 {
-		t.Fatalf("endpoint sysctls require current guest protocol version 18, got %d", Version)
+	if Version != 19 {
+		t.Fatalf("endpoint sysctls require current guest protocol version 19, got %d", Version)
 	}
 	endpoint := NetworkEndpoint{Sysctls: []string{"net.ipv4.conf.IFNAME.forwarding=1"}}
 	if len(endpoint.Sysctls) != 1 || endpoint.Sysctls[0] != "net.ipv4.conf.IFNAME.forwarding=1" {

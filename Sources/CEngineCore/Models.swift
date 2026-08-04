@@ -235,9 +235,8 @@ public struct ContainerRecord: Codable, Sendable {
     public var capabilityDrop: [String]
     /// Docker security options accepted for this workload and returned by inspect.
     public var securityOptions: [String]
-    /// An explicit Docker no-new-privileges selection. When omitted, cengine's
-    /// default remains enabled for unprivileged processes and disabled for
-    /// privileged processes.
+    /// An explicit Docker no-new-privileges selection. When omitted, Docker's
+    /// default leaves no-new-privileges disabled.
     public var noNewPrivileges: Bool?
     /// An explicit Docker seccomp profile selection. `nil` uses Docker's built-in
     /// profile for unprivileged containers and no profile for privileged containers.

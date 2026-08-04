@@ -492,6 +492,15 @@ func TestExecNormalizesNamedUserBeforeMaskedIdentityFilesTakeEffect(t *testing.T
 	if user.Username != "" {
 		t.Fatalf("normalized exec retained masked-file dependency %q", user.Username)
 	}
+
+	for _, unresolved := range []protocol.User{
+		{Username: "missing-user"},
+		{Username: "app:missing-group"},
+	} {
+		if _, err := normalizeExecUserFromSnapshot(unresolved, snapshot); !IsIdentityNotFound(err) {
+			t.Fatalf("unresolved exec identity error = %v", err)
+		}
+	}
 }
 
 func TestExecAppliesNoNewPrivilegesWhenRequested(t *testing.T) {

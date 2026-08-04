@@ -14,7 +14,7 @@ import (
 
 func TestApplyRlimitsMapsEveryDockerResourceAndPreservesOrder(t *testing.T) {
 	names := []string{
-		"core", "cpu", "data", "fsize", "locks", "memlock", "msgqueue", "nice",
+		"as", "core", "cpu", "data", "fsize", "locks", "memlock", "msgqueue", "nice",
 		"nofile", "nproc", "rss", "rtprio", "rttime", "sigpending", "stack",
 	}
 	limits := make([]protocol.Rlimit, 0, len(names))
@@ -44,16 +44,52 @@ func TestApplyRlimitsMapsEveryDockerResourceAndPreservesOrder(t *testing.T) {
 	}
 }
 
-func TestApplyRlimitsRejectsInvalidGuestPayloads(t *testing.T) {
-	cases := [][]protocol.Rlimit{
-		{{Type: "as", Soft: 1, Hard: 1}},
-		{{Type: "nofile", Soft: 2, Hard: 1}},
-		{{Type: "nofile", Soft: 1, Hard: 1}, {Type: "nofile", Soft: 1, Hard: 1}},
+func TestApplyRlimitsIsCaseInsensitiveAndPassesRelationshipsToLinux(t *testing.T) {
+	var resource int
+	var value unix.Rlimit
+	if err := applyRlimits(
+		[]protocol.Rlimit{{Type: "NOFILE", Soft: unix.RLIM_INFINITY, Hard: 1}},
+		func(actualResource int, actualValue *unix.Rlimit) error {
+			resource = actualResource
+			value = *actualValue
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
 	}
-	for _, limits := range cases {
-		if err := applyRlimits(limits, func(int, *unix.Rlimit) error { return nil }); err == nil {
-			t.Fatalf("accepted invalid limits %#v", limits)
-		}
+	if resource != unix.RLIMIT_NOFILE {
+		t.Fatalf("resource = %d, want %d", resource, unix.RLIMIT_NOFILE)
+	}
+	wantValue := unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: 1}
+	if value != wantValue {
+		t.Fatalf("value = %#v, want %#v", value, wantValue)
+	}
+
+	if err := applyRlimits(
+		[]protocol.Rlimit{{Type: "unknown", Soft: 1, Hard: 1}},
+		func(int, *unix.Rlimit) error { return nil },
+	); err == nil {
+		t.Fatal("accepted unknown rlimit")
+	}
+}
+
+func TestApplyRlimitsRejectsCaseInsensitiveDuplicateAtRuntime(t *testing.T) {
+	calls := 0
+	err := applyRlimits(
+		[]protocol.Rlimit{
+			{Type: "NOFILE", Soft: 1, Hard: 1},
+			{Type: "nofile", Soft: 1, Hard: 1},
+		},
+		func(int, *unix.Rlimit) error {
+			calls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), `duplicate rlimit "nofile"`) {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("setrlimit calls = %d, want 1", calls)
 	}
 }
 

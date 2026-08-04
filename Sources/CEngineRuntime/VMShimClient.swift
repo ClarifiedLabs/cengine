@@ -3564,6 +3564,9 @@ public final class VMShimClient: @unchecked Sendable {
             if failure.code == GuestProtocol.resourceRollbackIncompleteErrorCode {
                 throw BackendResourceRollbackIncompleteError(failure.message)
             }
+            if failure.code == GuestProtocol.badRequestErrorCode {
+                throw EngineError(.badRequest, failure.message)
+            }
             throw EngineError(.internalError, "VM shim \(failure.code): \(failure.message)")
         }
         guard let payload = reply.payload else { throw EngineError(.internalError, "VM shim response has no payload") }

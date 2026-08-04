@@ -22,7 +22,7 @@ COMPOSE_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose.yaml"
 COMPOSE_VOLUMES_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-volumes.yaml"
 COMPOSE_HEALTH_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-health.yaml"
 DEVELOPER_FIXTURE = REPO_ROOT / "Tests/Fixtures/compose/developer-loop"
-COMPOSE_VERSION = "5.3.1"
+COMPOSE_VERSION = "5.4.0"
 
 
 def compose(daemon, project: str, *arguments: str, compose_file=COMPOSE_FILE) -> subprocess.CompletedProcess[str]:
@@ -104,7 +104,7 @@ def managed_buildkit_identity(client) -> tuple[str, str]:
             if value.name.startswith("buildx_buildkit_")
         )
         raise AssertionError(
-            "Compose 5.3.1 did not use the cengine context's default "
+            f"Compose {COMPOSE_VERSION} did not use the cengine context's default "
             f"cengine-builder; observed BuildKit containers: {observed}"
         ) from None
     state_volumes = [

@@ -6208,7 +6208,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 deviceCgroupRules: try Self.deviceCgroupRules(container.deviceCgroupRules)
             ),
             privileged: container.privileged,
-            noNewPrivileges: container.noNewPrivileges ?? !container.privileged,
+            noNewPrivileges: container.noNewPrivileges ?? false,
             seccompDefault: Self.usesDefaultSeccomp(container),
             annotations: container.annotations,
             capabilityAdd: container.capabilityAdd, capabilityDrop: container.capabilityDrop,
@@ -6243,14 +6243,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private static func rlimits(_ values: [UlimitRecord]) throws -> [GuestProtocol.Rlimit] {
-        try values.map {
-            guard $0.soft >= -1, $0.hard >= -1 else {
-                throw EngineError(.internalError, "container has an invalid persisted ulimit value")
-            }
-            return .init(
+        values.map {
+            .init(
                 type: $0.name,
-                soft: $0.soft == -1 ? UInt64.max : UInt64($0.soft),
-                hard: $0.hard == -1 ? UInt64.max : UInt64($0.hard)
+                soft: UInt64(bitPattern: $0.soft),
+                hard: UInt64(bitPattern: $0.hard)
             )
         }
     }
@@ -6648,8 +6645,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     ?? containerUser.nilIfEmpty
                     ?? imageUser?.nilIfEmpty
             ),
-            noNewPrivileges: containerNoNewPrivileges
-                ?? !(containerPrivileged || configuration.privileged),
+            noNewPrivileges: containerNoNewPrivileges ?? false,
             privileged: containerPrivileged || configuration.privileged
         )
     }

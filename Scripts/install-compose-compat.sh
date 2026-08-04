@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-version="5.3.1"
-expected="32691ba1196d819fa68cbdc0aad9a5569e730a35ae40c6fdd8458110ecd69488"
+version="5.4.0"
+expected="bc3d1fd4c01e3af9b481fc5ea153ea7c006c77eb39be78e9af3e2e8ebecc0d61"
 destination="${1:-$HOME/.docker/cli-plugins/docker-compose}"
 temporary="$(mktemp)"
 trap 'rm -f "$temporary"' EXIT
