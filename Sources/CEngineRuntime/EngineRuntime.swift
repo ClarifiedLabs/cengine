@@ -706,7 +706,9 @@ public actor EngineRuntime {
         do {
             var updated = old
             if let memoryBytes, memoryBytes > 0 { updated.memoryBytes = UInt64(memoryBytes) }
-            if let nanoCPUs, nanoCPUs > 0 { updated.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000)) }
+            if let nanoCPUs, nanoCPUs > 0 {
+                updated.cpus = try DockerCPUResources.cpuCount(nanoCPUs: nanoCPUs)
+            }
             if let pidsLimit { updated.pidsLimit = pidsLimit }
             if let restartPolicy { updated.restartPolicy = restartPolicy }
             if let blockIOReadBps { updated.blockIOReadBps = blockIOReadBps }
@@ -772,7 +774,7 @@ public actor EngineRuntime {
             var merged = snapshot.containers[current]
             if let memoryBytes, memoryBytes > 0 { merged.memoryBytes = UInt64(memoryBytes) }
             if let nanoCPUs, nanoCPUs > 0 {
-                merged.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000))
+                merged.cpus = try DockerCPUResources.cpuCount(nanoCPUs: nanoCPUs)
             }
             if let pidsLimit { merged.pidsLimit = pidsLimit }
             if let restartPolicy { merged.restartPolicy = restartPolicy }
@@ -1556,6 +1558,19 @@ public actor EngineRuntime {
         return try await backend.saveImages(
             references: identifiers.map(ImageReference.normalized),
             platforms: platforms
+        )
+    }
+
+    public func saveImages(
+        _ identifiers: [String],
+        platforms: [OCIPlatform] = [],
+        to destination: URL
+    ) async throws {
+        for identifier in identifiers { _ = try image(identifier) }
+        try await backend.saveImages(
+            references: identifiers.map(ImageReference.normalized),
+            platforms: platforms,
+            to: destination
         )
     }
 

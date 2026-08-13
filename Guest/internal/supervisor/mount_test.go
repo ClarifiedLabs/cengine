@@ -4,7 +4,10 @@ package supervisor
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"dev.cengine/guest/internal/protocol"
@@ -109,6 +112,181 @@ func TestRecursiveReadOnlyFallbackAndForceBehavior(t *testing.T) {
 		ReadOnlyNonRecursive: true, ReadOnlyForceRecursive: true,
 	}, mount, unsupported); err == nil {
 		t.Fatal("conflicting read-only modes unexpectedly succeeded")
+	}
+}
+
+func TestConfinedVolumeMountPinsSourceAndDestinationThroughAttributes(t *testing.T) {
+	parent := t.TempDir()
+	sourceRoot := filepath.Join(parent, "volume")
+	destinationRoot := filepath.Join(parent, "rootfs")
+	outsideSource := filepath.Join(parent, "outside-source")
+	outsideDestination := filepath.Join(parent, "outside-destination")
+	for _, directory := range []string{
+		filepath.Join(sourceRoot, "nested"), destinationRoot, outsideSource, outsideDestination,
+	} {
+		if err := os.MkdirAll(directory, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "nested", "marker"), []byte("pinned"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := []string{}
+	mount := func(source, target, filesystem string, flags uintptr, data string) error {
+		calls = append(calls, "mount")
+		if !strings.HasPrefix(source, "/proc/self/fd/") ||
+			!strings.HasPrefix(target, "/proc/self/fd/") || !strings.HasSuffix(target, "/data") {
+			t.Fatalf("mount paths are not descriptor-confined: %q -> %q", source, target)
+		}
+		if filesystem != "" || data != "" || flags != unix.MS_BIND|unix.MS_REC {
+			t.Fatalf("mount arguments = %q %#x %q", filesystem, flags, data)
+		}
+		if err := os.Rename(sourceRoot, sourceRoot+"-moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideSource, sourceRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(destinationRoot, destinationRoot+"-moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideDestination, destinationRoot); err != nil {
+			t.Fatal(err)
+		}
+		contents, err := os.ReadFile(filepath.Join(source, "marker"))
+		if err != nil {
+			t.Fatalf("read pinned source after replacement: %v", err)
+		}
+		if string(contents) != "pinned" {
+			t.Fatalf("pinned source contents = %q", contents)
+		}
+		if info, err := os.Stat(target); err != nil || !info.IsDir() {
+			t.Fatalf("pinned destination after replacement = %v, %v", info, err)
+		}
+		return nil
+	}
+	mountSetattr := func(_ int, path string, flags uint, attr *unix.MountAttr) error {
+		calls = append(calls, "attributes")
+		if !strings.HasPrefix(path, "/proc/self/fd/") {
+			t.Fatalf("attribute path is not a pinned descriptor: %q", path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("destination descriptor closed before attributes: %v", err)
+		}
+		if flags != unix.AT_RECURSIVE || attr.Attr_set != unix.MOUNT_ATTR_RDONLY {
+			t.Fatalf("mount attributes = %#x %#x", flags, attr.Attr_set)
+		}
+		return nil
+	}
+	err := mountConfinedVolume(sourceRoot, destinationRoot, protocol.Mount{
+		Destination: "/data", Subpath: "nested", ReadOnly: true,
+	}, mount, mountSetattr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []string{"mount", "attributes"}) {
+		t.Fatalf("mount ordering = %#v", calls)
+	}
+	if _, err := os.Lstat(filepath.Join(outsideDestination, "data")); !os.IsNotExist(err) {
+		t.Fatalf("replacement destination was modified: %v", err)
+	}
+}
+
+func TestConfinedVolumeMountRejectsFinalSubpathSymlink(t *testing.T) {
+	sourceRoot := t.TempDir()
+	destinationRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(sourceRoot, "directory"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("directory", filepath.Join(sourceRoot, "link")); err != nil {
+		t.Fatal(err)
+	}
+	mountCalled := false
+	err := mountConfinedVolume(sourceRoot, destinationRoot, protocol.Mount{
+		Destination: "/data", Subpath: "link",
+	}, func(string, string, string, uintptr, string) error {
+		mountCalled = true
+		return nil
+	}, unix.MountSetattr)
+	if err == nil {
+		t.Fatal("final VolumeSubpath symlink unexpectedly accepted")
+	}
+	if mountCalled {
+		t.Fatal("mount called for rejected VolumeSubpath")
+	}
+}
+
+func TestConfinedBindMountAllowsContainedIntermediateSymlink(t *testing.T) {
+	sourceRoot := t.TempDir()
+	destinationRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(sourceRoot, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(destinationRoot, "usr", "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("usr/lib", filepath.Join(destinationRoot, "lib")); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := mountConfinedBind(sourceRoot, destinationRoot, protocol.Mount{
+		Destination: "/lib/modules", Subpath: "nested",
+	}, func(_, target, _ string, _ uintptr, _ string) error {
+		called = true
+		if info, err := os.Stat(target); err != nil || !info.IsDir() {
+			t.Fatalf("resolved mount target = %v, %v", info, err)
+		}
+		return nil
+	}, func(int, string, uint, *unix.MountAttr) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("mount was not called for contained intermediate symlink")
+	}
+	if info, err := os.Stat(filepath.Join(destinationRoot, "usr", "lib", "modules")); err != nil || !info.IsDir() {
+		t.Fatalf("contained mountpoint = %v, %v", info, err)
+	}
+}
+
+func TestConfinedBindAndTmpfsRejectSymlinkedDestinations(t *testing.T) {
+	sourceRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(sourceRoot, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"bind", "tmpfs"} {
+		t.Run(kind, func(t *testing.T) {
+			destinationRoot := t.TempDir()
+			outside := t.TempDir()
+			if err := os.Symlink(outside, filepath.Join(destinationRoot, "escape")); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			mount := func(string, string, string, uintptr, string) error {
+				called = true
+				return nil
+			}
+			var err error
+			if kind == "bind" {
+				err = mountConfinedBind(sourceRoot, destinationRoot, protocol.Mount{
+					Destination: "/escape/data", Subpath: "nested",
+				}, mount, unix.MountSetattr)
+			} else {
+				err = mountConfinedTmpfs(
+					destinationRoot, "/escape/data", 0, "", mount,
+				)
+			}
+			if err == nil {
+				t.Fatal("symlinked destination unexpectedly accepted")
+			}
+			if called {
+				t.Fatal("mount called for symlinked destination")
+			}
+			if _, err := os.Lstat(filepath.Join(outside, "data")); !os.IsNotExist(err) {
+				t.Fatalf("outside destination changed: %v", err)
+			}
+		})
 	}
 }
 

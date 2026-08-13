@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct OCIPlatform: Codable, Hashable, Sendable {
@@ -82,6 +83,56 @@ public struct OCIDescriptor: Codable, Hashable, Sendable {
         self.data = data
         self.platform = platform
         self.artifactType = artifactType
+    }
+}
+
+public struct ValidatedOCIDescriptor: Sendable {
+    public let descriptor: OCIDescriptor
+    public let size: UInt64
+
+    public init(descriptor: OCIDescriptor, size: UInt64) {
+        self.descriptor = descriptor
+        self.size = size
+    }
+}
+
+public extension OCIDescriptor {
+    func validated(
+        policy: OCITransferPolicy = .default,
+        errorCode: EngineError.Code = .upstream
+    ) throws -> ValidatedOCIDescriptor {
+        let bytes = Array(digest.utf8)
+        let isLowercaseSHA256 = bytes.count == 71
+            && bytes.starts(with: Array("sha256:".utf8))
+            && bytes.dropFirst(7).allSatisfy {
+                ($0 >= Character("0").asciiValue! && $0 <= Character("9").asciiValue!)
+                    || ($0 >= Character("a").asciiValue! && $0 <= Character("f").asciiValue!)
+            }
+        guard isLowercaseSHA256 else {
+            throw EngineError(errorCode, "unsupported OCI digest \(digest)")
+        }
+        guard size >= 0, let exactSize = UInt64(exactly: size) else {
+            throw EngineError(errorCode, "OCI descriptor \(digest) has an invalid size")
+        }
+        let isMetadata = mediaType.contains("manifest")
+            || mediaType.contains("index")
+            || mediaType.contains("config")
+        let maximum = isMetadata ? UInt64(policy.metadataBytes) : policy.maximumBlobBytes
+        guard exactSize <= maximum else {
+            throw EngineError(errorCode, "OCI descriptor \(digest) exceeds its media size limit")
+        }
+        if let data {
+            guard UInt64(data.count) == exactSize else {
+                throw EngineError(errorCode, "embedded OCI content \(digest) has the wrong size")
+            }
+            let actual = "sha256:" + SHA256.hash(data: data).map {
+                String(format: "%02x", $0)
+            }.joined()
+            guard actual == digest else {
+                throw EngineError(errorCode, "embedded OCI content \(digest) failed verification")
+            }
+        }
+        return .init(descriptor: self, size: exactSize)
     }
 }
 

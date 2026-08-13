@@ -109,6 +109,7 @@ public enum VMShimProtocol {
         public var networkNamespace: String
         public var vlans: [UInt16]
         public var rosetta: Bool
+        public var outputSpool: OutputSpool?
 
         public init(
             kind: Kind = .container,
@@ -134,7 +135,8 @@ public enum VMShimProtocol {
             networkSocketPath: String? = nil,
             networkNamespace: String = "",
             vlans: [UInt16] = [],
-            rosetta: Bool = false
+            rosetta: Bool = false,
+            outputSpool: OutputSpool? = nil
         ) {
             self.kind = kind
             self.containerID = containerID
@@ -160,6 +162,7 @@ public enum VMShimProtocol {
             self.networkNamespace = networkNamespace
             self.vlans = vlans
             self.rosetta = rosetta
+            self.outputSpool = outputSpool
         }
 
         // Persisted specifications and prepared-shim journals written before
@@ -191,6 +194,9 @@ public enum VMShimProtocol {
             networkNamespace = try container.decode(String.self, forKey: .networkNamespace)
             vlans = try container.decode([UInt16].self, forKey: .vlans)
             rosetta = try container.decodeIfPresent(Bool.self, forKey: .rosetta) ?? false
+            outputSpool = try container.decodeIfPresent(
+                OutputSpool.self, forKey: .outputSpool
+            )
         }
     }
 
@@ -220,6 +226,40 @@ public enum VMShimProtocol {
         public init(device: UInt64, inode: UInt64) {
             self.device = device
             self.inode = inode
+        }
+    }
+
+    public struct OutputSpool: Codable, Sendable, Equatable {
+        public var directoryPath: String
+        public var directoryIdentity: FileIdentity
+        public var stdoutIdentity: FileIdentity
+        public var stderrIdentity: FileIdentity
+        public var stdoutSpoolDirectoryIdentity: FileIdentity
+        public var stderrSpoolDirectoryIdentity: FileIdentity
+        public var retainedBytes: Int
+        public var segmentBytes: Int
+        public var maximumSegments: Int
+
+        public init(
+            directoryPath: String,
+            directoryIdentity: FileIdentity,
+            stdoutIdentity: FileIdentity,
+            stderrIdentity: FileIdentity,
+            stdoutSpoolDirectoryIdentity: FileIdentity,
+            stderrSpoolDirectoryIdentity: FileIdentity,
+            retainedBytes: Int,
+            segmentBytes: Int,
+            maximumSegments: Int
+        ) {
+            self.directoryPath = directoryPath
+            self.directoryIdentity = directoryIdentity
+            self.stdoutIdentity = stdoutIdentity
+            self.stderrIdentity = stderrIdentity
+            self.stdoutSpoolDirectoryIdentity = stdoutSpoolDirectoryIdentity
+            self.stderrSpoolDirectoryIdentity = stderrSpoolDirectoryIdentity
+            self.retainedBytes = retainedBytes
+            self.segmentBytes = segmentBytes
+            self.maximumSegments = maximumSegments
         }
     }
 

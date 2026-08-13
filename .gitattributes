@@ -1,0 +1,4 @@
+# Preserve upstream vendored Markdown verbatim; its release notes intentionally
+# contain trailing spaces and blank EOF lines.
+Guest/vendor/github.com/klauspost/compress/README.md whitespace=-trailing-space,-blank-at-eof
+Guest/vendor/github.com/klauspost/compress/**/README.md whitespace=-trailing-space,-blank-at-eof

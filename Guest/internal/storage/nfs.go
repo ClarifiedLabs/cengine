@@ -136,10 +136,98 @@ type volumeNFSFilesystem struct {
 }
 
 func (filesystem *volumeNFSFilesystem) Rename(from, to string) error {
-	if err := filesystem.Filesystem.Rename(from, to); err != nil {
+	var err error
+	if isExclusiveCopyupRename(from, to) {
+		err = filesystem.renameNoReplace(from, to)
+	} else {
+		err = filesystem.Filesystem.Rename(from, to)
+	}
+	if err != nil {
 		return err
 	}
 	filesystem.handles.rename(from, to)
+	return nil
+}
+
+func isExclusiveCopyupRename(from, to string) bool {
+	fromParts, fromOK := volumeNFSPathParts(from)
+	toParts, toOK := volumeNFSPathParts(to)
+	if !fromOK || !toOK || len(fromParts) < 3 || fromParts[0] != toParts[0] {
+		return false
+	}
+	if len(fromParts) == 3 && len(toParts) == 3 {
+		return fromParts[1] == ".cengine-copyup-transaction" &&
+			fromParts[2] == "manifest.tmp" &&
+			toParts[1] == ".cengine-copyup-transaction" &&
+			toParts[2] == "manifest.json"
+	}
+	return len(fromParts) == 4 && len(toParts) == 2 &&
+		fromParts[1] == ".cengine-copyup-transaction" &&
+		fromParts[2] == "staging" && fromParts[3] == toParts[1]
+}
+
+func volumeNFSPathParts(name string) ([]string, bool) {
+	clean := filepath.Clean(name)
+	clean = strings.TrimPrefix(clean, string(filepath.Separator))
+	if clean == "." || clean == "" || clean == ".." ||
+		strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, false
+	}
+	parts := strings.Split(clean, string(filepath.Separator))
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+func (filesystem *volumeNFSFilesystem) renameNoReplace(from, to string) error {
+	fromParts, fromOK := volumeNFSPathParts(from)
+	toParts, toOK := volumeNFSPathParts(to)
+	if !fromOK || !toOK {
+		return os.ErrInvalid
+	}
+	rootFD, err := unix.Open(
+		filesystem.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(rootFD)
+	openParent := func(parts []string) (int, error) {
+		parent := "."
+		if len(parts) > 1 {
+			parent = filepath.Join(parts[:len(parts)-1]...)
+		}
+		return unix.Openat2(rootFD, parent, &unix.OpenHow{
+			Flags:   uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC),
+			Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS,
+		})
+	}
+	fromParent, err := openParent(fromParts)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fromParent)
+	toParent, err := openParent(toParts)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(toParent)
+	if err := unix.Renameat2(
+		fromParent, fromParts[len(fromParts)-1],
+		toParent, toParts[len(toParts)-1],
+		unix.RENAME_NOREPLACE,
+	); err != nil {
+		return err
+	}
+	if err := unix.Fsync(fromParent); err != nil {
+		return err
+	}
+	if err := unix.Fsync(toParent); err != nil {
+		return err
+	}
 	return nil
 }
 

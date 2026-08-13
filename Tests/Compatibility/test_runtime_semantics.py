@@ -7,15 +7,24 @@ import io
 import json
 import os
 import pathlib
+import resource
+import signal
+import socket
+import subprocess
 import tarfile
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import time
 import uuid
 
 import docker
 import pytest
 from docker.types import Mount
-from harness import compatibility_fixture_ipv6, persisted_container_record
+from harness import (
+    compatibility_fixture_ipv6,
+    docker_environment,
+    persisted_container_record,
+)
 
 
 DIND_IMAGE = "docker:29.6.2-dind"
@@ -3972,3 +3981,298 @@ def test_nested_docker_exec_and_healthcheck_without_kind(client: docker.DockerCl
             )
     finally:
         container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-046")
+def test_volume_copyup_and_subpaths_reject_symlink_escape_across_recovery(
+    daemon, client: docker.DockerClient,
+):
+    volume = client.volumes.create(f"rtm-volume-{uuid.uuid4().hex[:8]}")
+    ordinary = None
+    rejected = []
+    try:
+        client.containers.run(
+            ALPINE_IMAGE,
+            ["sh", "-ec", "mkdir -p /seed/nested; printf safe >/seed/nested/marker; ln -s /etc /seed/escape"],
+            mounts=[Mount(target="/seed", source=volume.name, type="volume")],
+            remove=True,
+        )
+        ordinary = client.containers.create(
+            ALPINE_IMAGE,
+            ["cat", "/data/marker"],
+            mounts=[Mount(
+                target="/data", source=volume.name, type="volume", subpath="nested",
+            )],
+        )
+        ordinary.start()
+        assert ordinary.wait(timeout=60)["StatusCode"] == 0
+        assert ordinary.logs().strip() == b"safe"
+
+        for current in (client, None):
+            if current is None:
+                daemon.restart(kill=True)
+                current = docker.DockerClient(
+                    base_url=f"unix://{daemon.socket}", timeout=60, version="auto",
+                )
+            candidate = current.containers.create(
+                ALPINE_IMAGE,
+                ["sh", "-ec", "test ! -e /data/passwd"],
+                mounts=[Mount(
+                    target="/data", source=volume.name, type="volume", subpath="escape",
+                )],
+            )
+            rejected.append((current, candidate))
+            with pytest.raises(docker.errors.APIError):
+                candidate.start()
+    finally:
+        if ordinary is not None:
+            ordinary.remove(force=True)
+        for current, candidate in rejected:
+            try:
+                candidate.remove(force=True)
+            except docker.errors.NotFound:
+                pass
+            if current is not client:
+                current.close()
+        volume.remove(force=True)
+
+
+@pytest.mark.compat("RTM-047")
+def test_retained_logs_stay_bounded_and_recover(daemon, client: docker.DockerClient):
+    emitted = 65 * 1024 * 1024
+    container = client.containers.create(
+        ALPINE_IMAGE,
+        ["sh", "-ec", f"head -c {emitted} /dev/zero | tr '\\000' L"],
+        tty=True,
+    )
+    try:
+        container.start()
+        assert container.wait(timeout=180)["StatusCode"] == 0
+        retained = container.logs()
+        assert 0 < len(retained) <= 64 * 1024 * 1024
+        assert retained[-4096:] == b"L" * 4096
+        daemon.restart(kill=True)
+        recovered = docker.DockerClient(
+            base_url=f"unix://{daemon.socket}", timeout=180, version="auto",
+        )
+        try:
+            after = recovered.containers.get(container.id).logs()
+            assert after == retained
+        finally:
+            recovered.close()
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-048")
+def test_registry_streams_valid_blob_and_rejects_descriptor_size_mismatch(
+    client: docker.DockerClient,
+):
+    config = json.dumps({
+        "architecture": "arm64", "os": "linux", "config": {},
+        "rootfs": {"type": "layers", "diff_ids": []}, "history": [],
+    }, separators=(",", ":")).encode()
+    config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+
+    def manifest(size: int) -> bytes:
+        return json.dumps({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest, "size": size,
+            },
+            "layers": [],
+        }, separators=(",", ":")).encode()
+
+    manifests = {"valid": manifest(len(config)), "bad": manifest(len(config) - 1)}
+
+    class RegistryHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            if self.path == "/v2/":
+                self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+                return
+            if "/manifests/" in self.path:
+                selector = self.path.rsplit("/", 1)[-1]
+                body = manifests.get(selector)
+                if body is None:
+                    self.send_error(404); return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                self.send_header("Docker-Content-Digest", "sha256:" + hashlib.sha256(body).hexdigest())
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+                return
+            if self.path.endswith("/blobs/" + config_digest):
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for chunk in (config[:7], config[7:]):
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                return
+            self.send_error(404)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RegistryHandler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    reference = f"127.0.0.1:{server.server_port}/security/image"
+    try:
+        pulled = client.images.pull(reference, tag="valid")
+        assert pulled.id == config_digest
+        updates = list(client.api.pull(
+            reference, tag="bad", stream=True, decode=True,
+        ))
+        errors = [
+            update.get("errorDetail", {}).get("message", update.get("error", ""))
+            for update in updates if update.get("error") or update.get("errorDetail")
+        ]
+        assert errors, updates
+        message = "\n".join(errors).lower()
+        assert "size" in message or "descriptor" in message
+        with pytest.raises(docker.errors.ImageNotFound):
+            client.images.get(f"{reference}:bad")
+    finally:
+        server.shutdown(); server.server_close(); worker.join(timeout=5)
+
+
+@pytest.mark.compat("RTM-049")
+def test_archive_copy_roundtrip_rejects_link_traversal_and_expansion(
+    client: docker.DockerClient,
+):
+    container = client.containers.run(
+        ALPINE_IMAGE, ["sh", "-ec", "while :; do sleep 1; done"], detach=True,
+    )
+    try:
+        assert container.put_archive("/tmp", archive_file("ordinary", b"roundtrip"))
+        stream, _ = container.get_archive("/tmp/ordinary")
+        assert b"roundtrip" in b"".join(stream)
+
+        malicious = io.BytesIO()
+        with tarfile.open(fileobj=malicious, mode="w:") as archive:
+            link = tarfile.TarInfo("link"); link.type = tarfile.SYMTYPE; link.linkname = "../../etc"
+            archive.addfile(link)
+            child = tarfile.TarInfo("link/passwd"); child.size = 1
+            archive.addfile(child, io.BytesIO(b"x"))
+        with pytest.raises(docker.errors.APIError):
+            container.put_archive("/tmp", malicious.getvalue())
+
+        huge = tarfile.TarInfo("huge")
+        huge.size = 20 * 1024 * 1024 * 1024 + 1
+        oversized = huge.tobuf(format=tarfile.GNU_FORMAT) + b"\0" * 1024
+        with pytest.raises(docker.errors.APIError) as caught:
+            container.put_archive("/tmp", oversized)
+        assert caught.value.response.status_code == 413
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-050")
+def test_extreme_cpu_values_fail_without_mutation(client: docker.DockerClient):
+    before = {value.id for value in client.containers.list(all=True)}
+    for host_config in (
+        {"NanoCpus": 2**63 - 1},
+        {"CpuPeriod": 1000, "CpuQuota": 2**63 - 1},
+    ):
+        response = client.api._post_json(
+            client.api._url("/containers/create"),
+            data={"Image": ALPINE_IMAGE, "HostConfig": host_config},
+        )
+        assert response.status_code == 400, response.text
+    assert {value.id for value in client.containers.list(all=True)} == before
+
+    container = client.containers.create(ALPINE_IMAGE, ["true"], nano_cpus=1_500_000_000)
+    try:
+        assert client.api.inspect_container(container.id)["HostConfig"]["NanoCpus"] == 2_000_000_000
+        with pytest.raises(docker.errors.APIError) as caught:
+            client.api.update_container(container.id, cpu_period=1000, cpu_quota=2**63 - 1)
+        assert caught.value.response.status_code == 400
+        assert client.api.inspect_container(container.id)["HostConfig"]["NanoCpus"] == 2_000_000_000
+    finally:
+        container.remove(force=True)
+
+
+@pytest.mark.compat("RTM-051")
+def test_global_connection_admission_recovers_capacity(daemon, client: docker.DockerClient):
+    original_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    raised_soft_limit = max(original_limit[0], 1024)
+    if original_limit[1] != resource.RLIM_INFINITY:
+        raised_soft_limit = min(raised_soft_limit, original_limit[1])
+    resource.setrlimit(resource.RLIMIT_NOFILE, (raised_soft_limit, original_limit[1]))
+    held: list[socket.socket] = []
+    extra = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        for _ in range(256):
+            deadline = time.monotonic() + 5
+            while True:
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    connection.connect(str(daemon.socket))
+                    break
+                except ConnectionRefusedError:
+                    connection.close()
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            held.append(connection)
+        time.sleep(0.5)
+        extra.settimeout(5)
+        extra.connect(str(daemon.socket))
+        response = extra.recv(4096)
+        assert b"503 Service Unavailable" in response
+    finally:
+        extra.close()
+        for connection in held:
+            connection.close()
+        resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
+    wait_for_compat_value(client.ping, True, "API admission capacity recovery")
+
+
+@pytest.mark.compat("RTM-052")
+def test_scoped_socket_authenticates_owner_descendants_and_cleans_on_exit(daemon):
+    host_variable = "DOCKER" + "_HOST"
+    process = subprocess.Popen(
+        [
+            str(daemon.binary), "run", "--socket", str(daemon.socket), "--cpus", "1", "--",
+            "sh", "-ec",
+            f'printf "%s\\n" "${{{host_variable}}}"; '
+            'docker version --format "{{.Server.Version}}"; exec sleep 30',
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=docker_environment(daemon.socket),
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    docker_host = process.stdout.readline().strip()
+    version = process.stdout.readline().strip()
+    assert docker_host.startswith("unix://") and version
+    scoped_socket = pathlib.Path(docker_host.removeprefix("unix://"))
+    try:
+        unrelated = subprocess.run(
+            [
+                "curl", "--silent", "--show-error", "--output", "/dev/null",
+                "--write-out", "%{http_code}", "--unix-socket", str(scoped_socket),
+                "http://localhost/_ping",
+            ],
+            text=True, capture_output=True, timeout=10,
+        )
+        assert unrelated.stdout == "403", unrelated.stderr
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+    wait_for_compat_value(scoped_socket.exists, False, "scope cleanup after owner exit")

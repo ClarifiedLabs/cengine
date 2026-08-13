@@ -4,8 +4,13 @@ public struct EngineError: Error, LocalizedError, Sendable {
     public enum Code: Sendable {
         case badRequest
         case unauthorized
+        case forbidden
         case notFound
         case conflict
+        case payloadTooLarge
+        case tooManyRequests
+        case serviceUnavailable
+        case upstream
         case unsupported
         case internalError
     }

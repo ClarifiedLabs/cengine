@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CEngineCore
 import CEngineRuntime
@@ -5,15 +6,128 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 
+private final class DockerHandlerContextReference: @unchecked Sendable {
+    let context: ChannelHandlerContext
+
+    init(_ context: ChannelHandlerContext) {
+        self.context = context
+    }
+}
+
+final class DockerUploadFileWriter: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let stateLock = NSLock()
+    private var handle: FileHandle?
+    private var cancelled = false
+    private var failure: EngineError?
+
+    init(
+        handle: FileHandle,
+        queue: DispatchQueue = DispatchQueue(label: "dev.cengine.api-upload", qos: .utility)
+    ) {
+        self.handle = handle
+        self.queue = queue
+    }
+
+    func write(_ data: Data, completion: @escaping @Sendable (EngineError?) -> Void) {
+        queue.async { [self] in
+            if let error = currentFailure() {
+                completion(error)
+                return
+            }
+            do {
+                guard let handle else {
+                    throw EngineError(.internalError, "API upload file is closed")
+                }
+                try handle.write(contentsOf: data)
+                completion(nil)
+            } catch {
+                let failure = recordFailure(error)
+                completion(failure)
+            }
+        }
+    }
+
+    func finish(completion: @escaping @Sendable (EngineError?) -> Void) {
+        queue.async { [self] in
+            if let error = currentFailure() {
+                closeHandle()
+                completion(error)
+                return
+            }
+            do {
+                guard let handle else {
+                    throw EngineError(.internalError, "API upload file is closed")
+                }
+                try handle.synchronize()
+                try handle.close()
+                self.handle = nil
+                completion(nil)
+            } catch {
+                let failure = recordFailure(error)
+                completion(failure)
+            }
+        }
+    }
+
+    func cancel() {
+        stateLock.withLock { cancelled = true }
+        queue.async { [self] in closeHandle() }
+    }
+
+    private func currentFailure() -> EngineError? {
+        stateLock.withLock {
+            if let failure { return failure }
+            if cancelled {
+                return EngineError(.internalError, "API upload was cancelled")
+            }
+            return nil
+        }
+    }
+
+    private func recordFailure(_ error: Error) -> EngineError {
+        let value = (error as? EngineError) ?? EngineError(
+            .internalError, EngineError.message(for: error)
+        )
+        stateLock.withLock {
+            if failure == nil { failure = value }
+        }
+        closeHandle()
+        return value
+    }
+
+    private func closeHandle() {
+        try? handle?.close()
+        handle = nil
+    }
+
+}
+
 public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     public typealias InboundIn = HTTPServerRequestPart
     public typealias OutboundOut = HTTPServerResponsePart
 
     private let router: DockerRouter
+    private let peerIdentity: UnixPeerIdentity?
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
+    private var requestLease: APIAdmissionLease?
+    private var bufferedBodyLease: APIAdmissionLease?
+    private var uploadLease: APIAdmissionLease?
+    private var bodyExpectedBytes: Int?
+    private var bodyReceivedBytes = 0
+    private var uploadWriter: DockerUploadFileWriter?
+    private var uploadURL: URL?
+    private var pendingUploadWrites = 0
+    private var uploadEndPending = false
+    private var uploadReadsPaused = false
+    private var discardingRequest = false
     private var followIO: ContainerIOBridge?
     private var followSubscription: UUID?
+    private var followSetupTask: Task<Void, Never>?
+    private var followUntilTask: Task<Void, Never>?
+    private var followLease: APIAdmissionLease?
+    private var followerWriteBudget: FollowerWriteBudget?
     private var eventTask: Task<Void, Never>?
     private var statsTask: Task<Void, Never>?
     private var pullTask: Task<Void, Never>?
@@ -21,68 +135,400 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var requestTasks: [UUID: Task<Void, Never>] = [:]
     private var inputCloseHandler: DockerHTTPInputCloseHandler?
     private let maximumBodyBytes: Int
+    private let admission: APIAdmissionController
 
-    public init(router: DockerRouter, maximumBodyBytes: Int = 512 * 1024 * 1024) {
-        self.router = router; self.maximumBodyBytes = maximumBodyBytes
+    public init(
+        router: DockerRouter,
+        maximumBodyBytes: Int = 512 * 1024 * 1024,
+        admission: APIAdmissionController = APIAdmissionController(),
+        peerIdentity: UnixPeerIdentity? = nil
+    ) {
+        self.router = router
+        self.peerIdentity = peerIdentity
+        self.maximumBodyBytes = maximumBodyBytes
+        self.admission = admission
     }
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch unwrapInboundIn(data) {
-        case .head(let value): head = value; body.clear()
+        case .head(let value):
+            cleanupPendingRequest()
+            head = value
+            body.clear()
+            bodyReceivedBytes = 0
+            discardingRequest = false
+            do {
+                requestLease = try admission.acquire(.request)
+                bodyExpectedBytes = try Self.strictContentLength(value.headers)
+                let upload = Self.isFileUpload(value)
+                let effectiveMaximum = upload
+                    ? maximumBodyBytes : min(maximumBodyBytes, 8 * 1_024 * 1_024)
+                if let bodyExpectedBytes, bodyExpectedBytes > effectiveMaximum {
+                    throw EngineError(.payloadTooLarge, "request body too large")
+                }
+                if upload {
+                    uploadLease = try admission.acquire(.upload)
+                    let opened = try Self.openUploadFile()
+                    uploadURL = opened.url
+                    uploadWriter = DockerUploadFileWriter(handle: opened.handle)
+                } else {
+                    bufferedBodyLease = try admission.acquire(
+                        .bufferedRequestBytes, amount: bodyExpectedBytes ?? 0
+                    )
+                }
+            } catch let error as EngineError {
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(error)
+                )
+            } catch {
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(
+                        EngineError(.internalError, EngineError.message(for: error))
+                    )
+                )
+            }
+
         case .body(var chunk):
-            guard body.readableBytes + chunk.readableBytes <= maximumBodyBytes else {
-                Self.write(channel: context.channel, response: .init(status: .payloadTooLarge, body: Data(#"{"message":"request body too large"}"#.utf8)), keepAlive: false)
+            guard !discardingRequest else { return }
+            let chunkBytes = chunk.readableBytes
+            let effectiveMaximum = uploadWriter == nil
+                ? min(maximumBodyBytes, 8 * 1_024 * 1_024) : maximumBodyBytes
+            guard chunkBytes <= effectiveMaximum - bodyReceivedBytes else {
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(
+                        EngineError(.payloadTooLarge, "request body too large")
+                    )
+                )
                 return
             }
-            body.writeBuffer(&chunk)
+            if let bodyExpectedBytes,
+               chunkBytes > bodyExpectedBytes - bodyReceivedBytes {
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(
+                        EngineError(.badRequest, "request body exceeds Content-Length")
+                    )
+                )
+                return
+            }
+            do {
+                if bodyExpectedBytes == nil, uploadWriter == nil {
+                    try bufferedBodyLease?.increase(by: chunkBytes)
+                }
+                bodyReceivedBytes = try CheckedArithmetic.add(
+                    bodyReceivedBytes, chunkBytes
+                )
+                if let uploadWriter {
+                    let lease = try admission.acquire(
+                        .bufferedRequestBytes, amount: chunkBytes
+                    )
+                    let payload = Data(chunk.readableBytesView)
+                    pendingUploadWrites += 1
+                    pauseUploadReads(context: context)
+                    let contextReference = DockerHandlerContextReference(context)
+                    uploadWriter.write(payload) { [self, contextReference] error in
+                        lease.release()
+                        contextReference.context.eventLoop.execute { [self, contextReference] in
+                            guard self.uploadWriter === uploadWriter else { return }
+                            self.pendingUploadWrites -= 1
+                            if let error {
+                                self.rejectCurrentRequest(
+                                    context: contextReference.context,
+                                    response: dockerErrorResponse(error)
+                                )
+                            } else if self.pendingUploadWrites == 0 && !self.uploadEndPending {
+                                self.resumeUploadReads(context: contextReference.context)
+                            }
+                        }
+                    }
+                } else {
+                    body.writeBuffer(&chunk)
+                }
+            } catch let error as EngineError {
+                rejectCurrentRequest(context: context, response: dockerErrorResponse(error))
+            } catch {
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(
+                        EngineError(.internalError, EngineError.message(for: error))
+                    )
+                )
+            }
+
         case .end:
-            guard let head else { return }
-            let target: DockerRequestTarget
+            guard !discardingRequest, head != nil else {
+                cleanupPendingRequest()
+                return
+            }
+            if let bodyExpectedBytes, bodyReceivedBytes != bodyExpectedBytes {
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(
+                        EngineError(.badRequest, "request body does not match Content-Length")
+                    )
+                )
+                return
+            }
+            if let uploadWriter {
+                uploadEndPending = true
+                pauseUploadReads(context: context)
+                let contextReference = DockerHandlerContextReference(context)
+                uploadWriter.finish { [self, contextReference] error in
+                    contextReference.context.eventLoop.execute { [self, contextReference] in
+                        guard self.uploadWriter === uploadWriter else { return }
+                        self.uploadWriter = nil
+                        self.pendingUploadWrites = 0
+                        self.uploadEndPending = false
+                        self.resumeUploadReads(context: contextReference.context)
+                        if let error {
+                            self.rejectCurrentRequest(
+                                context: contextReference.context,
+                                response: dockerErrorResponse(error)
+                            )
+                        } else {
+                            self.completeCurrentRequest(context: contextReference.context)
+                        }
+                    }
+                }
+                return
+            }
+            completeCurrentRequest(context: context)
+        }
+    }
+
+    private func completeCurrentRequest(context: ChannelHandlerContext) {
+        guard let head else {
+            cleanupPendingRequest()
+            return
+        }
+        let target: DockerRequestTarget
             do { target = try DockerRequestTarget.parse(head.uri) }
             catch let error as EngineError {
-                Self.write(channel: context.channel, response: dockerErrorResponse(error), keepAlive: head.isKeepAlive)
+                rejectCurrentRequest(
+                    context: context,
+                    response: dockerErrorResponse(error),
+                    keepAlive: head.isKeepAlive
+                )
                 return
             } catch {
-                Self.write(channel: context.channel, response: .init(status: .badRequest), keepAlive: head.isKeepAlive)
+                rejectCurrentRequest(
+                    context: context,
+                    response: .init(status: .badRequest),
+                    keepAlive: head.isKeepAlive
+                )
                 return
             }
+            let request = APIRequest(
+                method: head.method,
+                uri: head.uri,
+                headers: head.headers,
+                body: Data(body.readableBytesView),
+                uploadURL: uploadURL,
+                peerIdentity: peerIdentity
+            )
+            let resources = takePendingRequestResources()
             if Self.isImagePull(head, target: target) {
-                startImagePull(request: .init(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView)), channel: context.channel)
+                resources.release(removeUpload: true)
+                startImagePull(request: request, channel: context.channel)
                 return
             }
             if Self.isStreamingStats(target), let id = Self.statsContainerID(target) {
+                resources.release(removeUpload: true)
                 startStats(identifier: id, version: target.version, channel: context.channel)
                 return
             }
             if target.path == "/events" {
-                startEvents(target: target, requestHeaders: head.headers, channel: context.channel)
+                resources.release(removeUpload: true)
+                startEvents(
+                    target: target,
+                    requestHeaders: head.headers,
+                    channel: context.channel
+                )
                 return
             }
             if Self.isFollowingLogs(target), let id = Self.logContainerID(target) {
-                startFollowingLogs(identifier: id, target: target, channel: context.channel)
+                resources.release(removeUpload: true)
+                startFollowingLogs(
+                    identifier: id, target: target, channel: context.channel
+                )
                 return
             }
             if head.method == .POST, let id = Self.waitContainerID(target) {
-                let condition = target.components.queryItems?.first(where: { $0.name == "condition" })?.value
-                startContainerWait(identifier: id, condition: condition, channel: context.channel, keepAlive: head.isKeepAlive)
+                resources.release(removeUpload: true)
+                let condition = target.components.queryItems?.first(where: {
+                    $0.name == "condition"
+                })?.value
+                startContainerWait(
+                    identifier: id,
+                    condition: condition,
+                    channel: context.channel,
+                    keepAlive: head.isKeepAlive
+                )
                 return
             }
-            let request = APIRequest(method: head.method, uri: head.uri, headers: head.headers, body: Data(body.readableBytesView))
             let keepAlive = head.isKeepAlive
             let channel = context.channel
             let requestID = UUID()
             let task = Task { [router] in
+                defer { resources.release(removeUpload: true) }
                 let response = await router.route(request)
                 channel.eventLoop.execute {
-                    guard self.requestTasks.removeValue(forKey: requestID) != nil else { return }
-                    guard channel.isActive else { return }
-                    Self.write(channel: channel, response: response, keepAlive: keepAlive)
-                    if self.requestTasks.isEmpty { self.inputCloseHandler?.stopWatchingWhenDrained() }
+                    guard self.requestTasks.removeValue(forKey: requestID) != nil else {
+                        response.file?.cleanup()
+                        return
+                    }
+                    guard channel.isActive else {
+                        response.file?.cleanup()
+                        return
+                    }
+                    let downloadLease: APIAdmissionLease?
+                    if response.file != nil {
+                        do {
+                            downloadLease = try self.admission.acquire(.download)
+                        } catch let error as EngineError {
+                            response.file?.cleanup()
+                            Self.write(
+                                channel: channel,
+                                response: dockerErrorResponse(error),
+                                keepAlive: false
+                            )
+                            return
+                        } catch {
+                            response.file?.cleanup()
+                            return
+                        }
+                    } else {
+                        downloadLease = nil
+                    }
+                    Self.write(
+                        channel: channel,
+                        response: response,
+                        keepAlive: keepAlive,
+                        completion: { downloadLease?.release() }
+                    )
+                    if self.requestTasks.isEmpty {
+                        self.inputCloseHandler?.stopWatchingWhenDrained()
+                    }
                 }
             }
-            requestTasks[requestID] = task
-            inputCloseHandler?.watchForDisconnect()
+        requestTasks[requestID] = task
+        inputCloseHandler?.watchForDisconnect()
+    }
+
+    private struct RequestResources: @unchecked Sendable {
+        let request: APIAdmissionLease?
+        let bufferedBody: APIAdmissionLease?
+        let upload: APIAdmissionLease?
+        let uploadURL: URL?
+
+        func release(removeUpload: Bool) {
+            request?.release()
+            bufferedBody?.release()
+            upload?.release()
+            if removeUpload, let uploadURL {
+                try? FileManager.default.removeItem(at: uploadURL)
+            }
         }
+    }
+
+    private func takePendingRequestResources() -> RequestResources {
+        let result = RequestResources(
+            request: requestLease,
+            bufferedBody: bufferedBodyLease,
+            upload: uploadLease,
+            uploadURL: uploadURL
+        )
+        requestLease = nil
+        bufferedBodyLease = nil
+        uploadLease = nil
+        uploadURL = nil
+        uploadWriter = nil
+        pendingUploadWrites = 0
+        uploadEndPending = false
+        bodyExpectedBytes = nil
+        bodyReceivedBytes = 0
+        head = nil
+        body.clear()
+        return result
+    }
+
+    private func cleanupPendingRequest() {
+        uploadWriter?.cancel()
+        uploadWriter = nil
+        pendingUploadWrites = 0
+        uploadEndPending = false
+        takePendingRequestResources().release(removeUpload: true)
+        discardingRequest = false
+    }
+
+    private func rejectCurrentRequest(
+        context: ChannelHandlerContext,
+        response: APIResponse,
+        keepAlive: Bool = false
+    ) {
+        cleanupPendingRequest()
+        discardingRequest = true
+        resumeUploadReads(context: context)
+        Self.write(channel: context.channel, response: response, keepAlive: keepAlive)
+    }
+
+    private func pauseUploadReads(context: ChannelHandlerContext) {
+        guard !uploadReadsPaused else { return }
+        uploadReadsPaused = true
+        context.channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in
+            context.close(promise: nil)
+        }
+    }
+
+    private func resumeUploadReads(context: ChannelHandlerContext) {
+        guard uploadReadsPaused else { return }
+        uploadReadsPaused = false
+        context.channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { _ in
+            context.close(promise: nil)
+        }
+    }
+
+    private static func strictContentLength(_ headers: HTTPHeaders) throws -> Int? {
+        let rawValues = headers[canonicalForm: "content-length"].flatMap {
+            $0.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        }
+        guard !rawValues.isEmpty else { return nil }
+        guard Set(rawValues).count == 1, let raw = rawValues.first,
+              !raw.isEmpty,
+              raw.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let value = Int(raw), String(value) == raw else {
+            throw EngineError(.badRequest, "invalid or conflicting Content-Length")
+        }
+        if !headers[canonicalForm: "transfer-encoding"].isEmpty {
+            throw EngineError(.badRequest, "Content-Length conflicts with Transfer-Encoding")
+        }
+        return value
+    }
+
+    private static func isFileUpload(_ head: HTTPRequestHead) -> Bool {
+        guard let target = try? DockerRequestTarget.parse(head.uri) else { return false }
+        return (head.method == .POST && target.path == "/images/load")
+            || (head.method == .PUT
+                && target.path.hasPrefix("/containers/")
+                && target.path.hasSuffix("/archive"))
+    }
+
+    private static func openUploadFile() throws -> (url: URL, handle: FileHandle) {
+        let url = FileManager.default.temporaryDirectory.appending(
+            path: ".cengine-api-upload-\(UUID().uuidString)"
+        )
+        let descriptor = Darwin.open(
+            url.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600)
+        )
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return (url, FileHandle(fileDescriptor: descriptor, closeOnDealloc: true))
     }
 
     fileprivate func monitorDisconnects(with handler: DockerHTTPInputCloseHandler) {
@@ -104,9 +550,18 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
 
     fileprivate func cancelActiveOperations() {
         inputCloseHandler?.stopWatching()
+        cleanupPendingRequest()
         if let followSubscription { followIO?.detach(followSubscription) }
         followSubscription = nil
         followIO = nil
+        followSetupTask?.cancel()
+        followUntilTask?.cancel()
+        followSetupTask = nil
+        followUntilTask = nil
+        followerWriteBudget?.close()
+        followerWriteBudget = nil
+        followLease?.release()
+        followLease = nil
         eventTask?.cancel()
         statsTask?.cancel()
         pullTask?.cancel()
@@ -120,7 +575,14 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 
     private func startContainerWait(identifier: String, condition: String?, channel: Channel, keepAlive: Bool) {
+        let lease: APIAdmissionLease
+        do { lease = try admission.acquire(.longLivedStream) }
+        catch let error as EngineError {
+            Self.write(channel: channel, response: dockerErrorResponse(error), keepAlive: false)
+            return
+        } catch { return }
         waitTask = Task { [router] in
+            defer { lease.release() }
             do {
                 let subscription = try await router.containerWait(identifier, condition: condition)
                 channel.eventLoop.execute {
@@ -159,49 +621,155 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         return String(path.dropFirst("/containers/".count).dropLast("/wait".count))
     }
 
-    private func startFollowingLogs(identifier id: String, target: DockerRequestTarget, channel: Channel) {
+    private func startFollowingLogs(
+        identifier id: String,
+        target: DockerRequestTarget,
+        channel: Channel
+    ) {
         let options = Self.logOptions(target)
-        Task { [router] in
+        do {
+            followLease = try admission.acquire(.longLivedStream)
+        } catch let error as EngineError {
+            Self.write(
+                channel: channel,
+                response: dockerErrorResponse(error),
+                keepAlive: false
+            )
+            return
+        } catch { return }
+        let budget = FollowerWriteBudget(
+            maximumBytes: ContainerLogRetentionPolicy.default.followerQueueBytes,
+            maximumRecords: ContainerLogRetentionPolicy.default.followerQueueRecords
+        )
+        followerWriteBudget = budget
+        followSetupTask = Task { [router] in
             do {
                 let io = try await router.containerIO(id)
+                guard !Task.isCancelled else { return }
                 channel.eventLoop.execute {
+                    guard channel.isActive, self.followSetupTask != nil else {
+                        self.finishFollowingLogs(channel: channel, sendEnd: false)
+                        return
+                    }
                     self.followIO = io
                     var headers = HTTPHeaders()
-                    headers.add(name: "Content-Type", value: "application/vnd.docker.raw-stream")
+                    headers.add(
+                        name: "Content-Type",
+                        value: "application/vnd.docker.raw-stream"
+                    )
                     headers.add(name: "Transfer-Encoding", value: "chunked")
-                    channel.write(HTTPServerResponsePart.head(.init(version: .http1_1, status: .ok, headers: headers)), promise: nil)
-                    let subscription = io.attachLogs(options: options, replayExisting: true, output: { data in
-                        channel.eventLoop.execute {
-                            var buffer = channel.allocator.buffer(capacity: data.count)
-                            buffer.writeBytes(data)
-                            channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+                    channel.write(
+                        HTTPServerResponsePart.head(.init(
+                            version: .http1_1,
+                            status: .ok,
+                            headers: headers
+                        )),
+                        promise: nil
+                    )
+                    let subscription = io.attachLogs(
+                        options: options,
+                        replayExisting: true,
+                        output: { data in
+                            guard budget.reserve(bytes: data.count) else {
+                                channel.eventLoop.execute {
+                                    self.finishFollowingLogs(
+                                        channel: channel, sendEnd: false
+                                    )
+                                    channel.close(promise: nil)
+                                }
+                                return
+                            }
+                            channel.eventLoop.execute {
+                                guard channel.isActive else {
+                                    budget.complete(bytes: data.count)
+                                    return
+                                }
+                                var buffer = channel.allocator.buffer(
+                                    capacity: data.count
+                                )
+                                buffer.writeBytes(data)
+                                channel.writeAndFlush(
+                                    HTTPServerResponsePart.body(.byteBuffer(buffer))
+                                ).whenComplete { _ in
+                                    budget.complete(bytes: data.count)
+                                }
+                            }
+                        },
+                        closed: {
+                            channel.eventLoop.execute {
+                                self.finishFollowingLogs(
+                                    channel: channel, sendEnd: true
+                                )
+                            }
                         }
-                    }, closed: {
-                        channel.eventLoop.execute { channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil) }
-                    })
+                    )
                     self.followSubscription = subscription.id
                     if !subscription.initial.isEmpty {
-                        let initial = subscription.initial
-                        var buffer = channel.allocator.buffer(capacity: initial.count)
-                        buffer.writeBytes(initial)
-                        channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
-                    } else { channel.flush() }
+                        var offset = 0
+                        while offset < subscription.initial.count {
+                            let end = min(
+                                subscription.initial.count,
+                                offset + 64 * 1_024
+                            )
+                            let chunk = Data(subscription.initial[offset..<end])
+                            var buffer = channel.allocator.buffer(
+                                capacity: chunk.count
+                            )
+                            buffer.writeBytes(chunk)
+                            channel.write(
+                                HTTPServerResponsePart.body(.byteBuffer(buffer)),
+                                promise: nil
+                            )
+                            offset = end
+                        }
+                        channel.flush()
+                    } else {
+                        channel.flush()
+                    }
                     if let until = options.until {
                         let delay = max(until.timeIntervalSinceNow, 0)
-                        self.eventTask = Task {
+                        self.followUntilTask = Task {
                             try? await Task.sleep(for: .seconds(delay))
+                            guard !Task.isCancelled else { return }
                             channel.eventLoop.execute {
-                                if let subscription = self.followSubscription { io.detach(subscription) }
-                                channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
+                                self.finishFollowingLogs(
+                                    channel: channel, sendEnd: true
+                                )
                             }
                         }
                     }
+                    self.followSetupTask = nil
                 }
             } catch {
                 channel.eventLoop.execute {
-                    Self.write(channel: channel, response: .init(status: .notFound, body: Data(#"{"message":"container logs unavailable"}"#.utf8)), keepAlive: false)
+                    self.finishFollowingLogs(channel: channel, sendEnd: false)
+                    Self.write(
+                        channel: channel,
+                        response: .init(
+                            status: .notFound,
+                            body: Data(#"{"message":"container logs unavailable"}"#.utf8)
+                        ),
+                        keepAlive: false
+                    )
                 }
             }
+        }
+    }
+
+    private func finishFollowingLogs(channel: Channel, sendEnd: Bool) {
+        if let followSubscription { followIO?.detach(followSubscription) }
+        followSubscription = nil
+        followIO = nil
+        followSetupTask?.cancel()
+        followUntilTask?.cancel()
+        followSetupTask = nil
+        followUntilTask = nil
+        followerWriteBudget?.close()
+        followerWriteBudget = nil
+        followLease?.release()
+        followLease = nil
+        if sendEnd, channel.isActive {
+            channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
         }
     }
 
@@ -230,6 +798,12 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 
     private func startEvents(target: DockerRequestTarget, requestHeaders: HTTPHeaders, channel: Channel) {
+        let lease: APIAdmissionLease
+        do { lease = try admission.acquire(.longLivedStream) }
+        catch let error as EngineError {
+            Self.write(channel: channel, response: dockerErrorResponse(error), keepAlive: false)
+            return
+        } catch { return }
         let filters = Self.eventFilters(target)
         let query = Dictionary(grouping: target.components.queryItems ?? [], by: \.name)
             .compactMapValues { $0.first?.value ?? "" }
@@ -238,6 +812,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         let jsonl = target.version >= .init(major: 1, minor: 53)
             && requestHeaders["Accept"].contains(where: { $0.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == "application/jsonl" } })
         eventTask = Task { [router] in
+            defer { lease.release() }
             let stream = await router.events(since: since, until: until)
             do {
                 var headers = HTTPHeaders()
@@ -322,7 +897,14 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 
     private func startStats(identifier: String, version: DockerAPIVersion, channel: Channel) {
+        let lease: APIAdmissionLease
+        do { lease = try admission.acquire(.longLivedStream) }
+        catch let error as EngineError {
+            Self.write(channel: channel, response: dockerErrorResponse(error), keepAlive: false)
+            return
+        } catch { return }
         statsTask = Task { [router] in
+            defer { lease.release() }
             channel.eventLoop.execute {
                 var headers = HTTPHeaders(); headers.add(name: "Content-Type", value: "application/json")
                 headers.add(name: "Transfer-Encoding", value: "chunked")
@@ -358,12 +940,19 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 
     private func startImagePull(request: APIRequest, channel: Channel) {
+        let lease: APIAdmissionLease
+        do { lease = try admission.acquire(.expensiveOperation) }
+        catch let error as EngineError {
+            Self.write(channel: channel, response: dockerErrorResponse(error), keepAlive: false)
+            return
+        } catch { return }
         channel.write(HTTPServerResponsePart.head(.init(
             version: .http1_1, status: .ok,
             headers: ["Content-Type": "application/json", "Transfer-Encoding": "chunked"]
         )), promise: nil)
         channel.flush()
         pullTask = Task { [router] in
+            defer { lease.release() }
             do {
                 let image = try await router.pullImage(request, progress: { progress in
                     let line = "{\"status\":\"Downloading\",\"progressDetail\":{\"current\":\(progress.completedBytes),\"total\":\(progress.totalBytes)}}\n"
@@ -390,7 +979,73 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         head.method == .POST && target.path == "/images/create"
     }
 
-    private static func write(channel: Channel, response: APIResponse, keepAlive: Bool) {
+    private static func write(
+        channel: Channel,
+        response: APIResponse,
+        keepAlive: Bool,
+        completion: @escaping @Sendable () -> Void = {}
+    ) {
+        if let file = response.file {
+            Task {
+                defer {
+                    file.cleanup()
+                    completion()
+                }
+                do {
+                    let descriptor = Darwin.open(
+                        file.url.path,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+                    )
+                    guard descriptor >= 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                    let input = FileHandle(
+                        fileDescriptor: descriptor, closeOnDealloc: true
+                    )
+                    defer { try? input.close() }
+                    var information = stat()
+                    guard Darwin.fstat(descriptor, &information) == 0,
+                          information.st_mode & S_IFMT == S_IFREG,
+                          information.st_size >= 0 else {
+                        throw EngineError(.internalError, "response file is unsafe")
+                    }
+                    var headers = response.headers
+                    headers.replaceOrAdd(
+                        name: "Content-Length",
+                        value: String(information.st_size)
+                    )
+                    if keepAlive {
+                        headers.replaceOrAdd(name: "Connection", value: "keep-alive")
+                    }
+                    try await channel.writeAndFlush(
+                        HTTPServerResponsePart.head(.init(
+                            version: .http1_1,
+                            status: response.status,
+                            headers: headers
+                        ))
+                    ).get()
+                    while let data = try input.read(upToCount: 128 * 1_024),
+                          !data.isEmpty {
+                        guard !Task.isCancelled, channel.isActive else {
+                            throw CancellationError()
+                        }
+                        var buffer = channel.allocator.buffer(capacity: data.count)
+                        buffer.writeBytes(data)
+                        try await channel.writeAndFlush(
+                            HTTPServerResponsePart.body(.byteBuffer(buffer))
+                        ).get()
+                    }
+                    try await channel.writeAndFlush(
+                        HTTPServerResponsePart.end(nil)
+                    ).get()
+                    if !keepAlive { try? await channel.close().get() }
+                } catch {
+                    channel.close(promise: nil)
+                }
+            }
+            return
+        }
+
         var headers = response.headers
         headers.replaceOrAdd(name: "Content-Length", value: String(response.body.count))
         if keepAlive { headers.replaceOrAdd(name: "Connection", value: "keep-alive") }
@@ -400,7 +1055,52 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
             buffer.writeBytes(response.body)
             channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
         }
-        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in if !keepAlive { channel.close(promise: nil) } }
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in
+            completion()
+            if !keepAlive { channel.close(promise: nil) }
+        }
+    }
+}
+
+fileprivate final class FollowerWriteBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maximumBytes: Int
+    private let maximumRecords: Int
+    private var pendingBytes = 0
+    private var pendingRecords = 0
+    private var closed = false
+
+    init(maximumBytes: Int, maximumRecords: Int) {
+        self.maximumBytes = maximumBytes
+        self.maximumRecords = maximumRecords
+    }
+
+    func reserve(bytes: Int) -> Bool {
+        lock.withLock {
+            guard !closed,
+                  bytes >= 0,
+                  pendingRecords < maximumRecords,
+                  bytes <= maximumBytes - pendingBytes else { return false }
+            pendingBytes += bytes
+            pendingRecords += 1
+            return true
+        }
+    }
+
+    func complete(bytes: Int) {
+        lock.withLock {
+            guard pendingRecords > 0, bytes <= pendingBytes else { return }
+            pendingBytes -= bytes
+            pendingRecords -= 1
+        }
+    }
+
+    func close() {
+        lock.withLock {
+            closed = true
+            pendingBytes = 0
+            pendingRecords = 0
+        }
     }
 }
 
@@ -559,13 +1259,15 @@ public final class DockerServer: @unchecked Sendable {
     private let router: DockerRouter
     private let maximumPendingRequestBytes: Int
     private let maximumPendingRequestParts: Int
+    public let admission: APIAdmissionController
     private var channel: Channel?
 
     public init(
         socketPath: String,
         router: DockerRouter,
         maximumPendingRequestBytes: Int = 1 * 1024 * 1024,
-        maximumPendingRequestParts: Int = 1024
+        maximumPendingRequestParts: Int = 1024,
+        admission: APIAdmissionController = APIAdmissionController()
     ) {
         precondition(maximumPendingRequestBytes > 0)
         precondition(maximumPendingRequestParts > 0)
@@ -573,24 +1275,49 @@ public final class DockerServer: @unchecked Sendable {
         self.router = router
         self.maximumPendingRequestBytes = maximumPendingRequestBytes
         self.maximumPendingRequestParts = maximumPendingRequestParts
+        self.admission = admission
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: max(2, System.coreCount / 2))
     }
 
     public func start() async throws {
+        try ensureFileDescriptorCapacity()
         if FileManager.default.fileExists(atPath: socketPath) { try FileManager.default.removeItem(atPath: socketPath) }
         let bootstrap = ServerBootstrap(group: group)
-            .serverChannelOption(ChannelOptions.backlog, value: 256)
+            // Leave accept-queue headroom so connections beyond the admitted
+            // limit reach the child initializer and receive an explicit 503.
+            .serverChannelOption(
+                ChannelOptions.backlog,
+                value: Int32(clamping: max(512, admission.policy.connections))
+            )
             .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
-            .childChannelInitializer { [router, maximumPendingRequestBytes, maximumPendingRequestParts] channel in
-                configureDockerHTTPPipeline(
+            .childChannelInitializer {
+                [router, maximumPendingRequestBytes, maximumPendingRequestParts, admission] channel in
+                configureAdmittedDockerHTTPPipeline(
                     channel: channel,
                     router: router,
+                    admission: admission,
                     maximumPendingRequestBytes: maximumPendingRequestBytes,
                     maximumPendingRequestParts: maximumPendingRequestParts
                 )
             }
         channel = try await bootstrap.bind(unixDomainSocketPath: socketPath).get()
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketPath)
+    }
+
+    private func ensureFileDescriptorCapacity() throws {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else {
+            throw EngineError(.internalError, "could not read the process file descriptor limit")
+        }
+        let required = rlim_t(admission.policy.connections + 256)
+        guard limit.rlim_cur < required else { return }
+        limit.rlim_cur = min(required, limit.rlim_max)
+        guard limit.rlim_cur >= required, setrlimit(RLIMIT_NOFILE, &limit) == 0 else {
+            throw EngineError(
+                .serviceUnavailable,
+                "the process file descriptor limit is too low for the configured API connection limit"
+            )
+        }
     }
 
     public func wait() async throws { try await channel?.closeFuture.get() }
@@ -604,14 +1331,93 @@ public final class DockerServer: @unchecked Sendable {
     }
 }
 
+private final class DockerConnectionRejectionHandler: ChannelDuplexHandler {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private let response: ByteBuffer
+    private var didReject = false
+
+    init(response: ByteBuffer) {
+        self.response = response
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        if context.channel.isActive { reject(context: context) }
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        reject(context: context)
+    }
+
+    private func reject(context: ChannelHandlerContext) {
+        guard !didReject else { return }
+        didReject = true
+        let channel = context.channel
+        context.writeAndFlush(wrapOutboundOut(response)).whenComplete { _ in
+            channel.close(promise: nil)
+        }
+    }
+}
+
+func configureAdmittedDockerHTTPPipeline(
+    channel: Channel,
+    router: DockerRouter,
+    admission: APIAdmissionController,
+    maximumPendingRequestBytes: Int = 1 * 1024 * 1024,
+    maximumPendingRequestParts: Int = 1024,
+    authorizePeer: ((UnixPeerIdentity) throws -> Void)? = nil
+) -> EventLoopFuture<Void> {
+    do {
+        let peerIdentity = try UnixPeerIdentity.capture(from: channel)
+        try authorizePeer?(peerIdentity)
+        let lease = try admission.acquire(.connection)
+        channel.closeFuture.whenComplete { _ in lease.release() }
+        return configureDockerHTTPPipeline(
+            channel: channel,
+            router: router,
+            admission: admission,
+            peerIdentity: peerIdentity,
+            maximumPendingRequestBytes: maximumPendingRequestBytes,
+            maximumPendingRequestParts: maximumPendingRequestParts
+        )
+    } catch {
+        let unavailable = (error as? EngineError)?.code == .serviceUnavailable
+        let status = unavailable
+            ? "503 Service Unavailable" : "403 Forbidden"
+        let body = unavailable
+            ? #"{"message":"connection capacity exhausted"}"#
+            : #"{"message":"Unix peer is not authorized"}"#
+        var response = channel.allocator.buffer(capacity: 192)
+        response.writeString(
+            "HTTP/1.1 \(status)\r\n"
+                + "Content-Type: application/json\r\n"
+                + "Content-Length: \(body.utf8.count)\r\n"
+                + "Connection: close\r\n\r\n"
+                + body
+        )
+        // The accepted channel is not active until its initializer completes.
+        // Queue the rejection in a handler rather than waiting on a write that
+        // cannot complete before activation.
+        return channel.pipeline.addHandler(
+            DockerConnectionRejectionHandler(response: response)
+        )
+    }
+}
+
 func configureDockerHTTPPipeline(
     channel: Channel,
     router: DockerRouter,
+    admission: APIAdmissionController = APIAdmissionController(),
+    peerIdentity: UnixPeerIdentity? = nil,
     maximumPendingRequestBytes: Int = 1 * 1024 * 1024,
     maximumPendingRequestParts: Int = 1024
 ) -> EventLoopFuture<Void> {
     let responseEncoder = HTTPResponseEncoder()
-    let httpHandler = DockerHTTPHandler(router: router)
+    let httpHandler = DockerHTTPHandler(
+        router: router, admission: admission, peerIdentity: peerIdentity
+    )
     let inputCloseHandler = DockerHTTPInputCloseHandler(
         httpHandler: httpHandler,
         maximumPendingRequestBytes: maximumPendingRequestBytes,

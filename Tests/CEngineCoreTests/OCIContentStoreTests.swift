@@ -5,6 +5,74 @@ import Testing
 @testable import CEngineRuntime
 
 @Suite struct OCIContentStoreTests {
+    @Test func descriptorsRejectInvalidDigestSizeAndEmbeddedContent() throws {
+        let validData = Data("manifest".utf8)
+        let digest = "sha256:" + SHA256.hash(data: validData).map {
+            String(format: "%02x", $0)
+        }.joined()
+        let valid = OCIDescriptor(
+            mediaType: "application/vnd.oci.image.manifest.v1+json",
+            digest: digest,
+            size: Int64(validData.count),
+            data: validData
+        )
+        #expect(try valid.validated().size == UInt64(validData.count))
+
+        #expect(throws: EngineError.self) {
+            try OCIDescriptor(
+                mediaType: valid.mediaType,
+                digest: "sha256:" + String(repeating: "A", count: 64),
+                size: 1
+            ).validated()
+        }
+        #expect(throws: EngineError.self) {
+            try OCIDescriptor(
+                mediaType: valid.mediaType, digest: digest, size: -1
+            ).validated()
+        }
+        #expect(throws: EngineError.self) {
+            try OCIDescriptor(
+                mediaType: valid.mediaType,
+                digest: digest,
+                size: Int64(OCITransferPolicy.default.metadataBytes) + 1
+            ).validated()
+        }
+        let attestation = OCIDescriptor(
+            mediaType: "application/vnd.in-toto+json",
+            digest: digest,
+            size: Int64(OCITransferPolicy.default.metadataBytes) + 1
+        )
+        #expect(try attestation.validated().size == UInt64(attestation.size))
+        #expect(throws: EngineError.self) {
+            try OCIDescriptor(
+                mediaType: valid.mediaType,
+                digest: digest,
+                size: Int64(validData.count) + 1,
+                data: validData
+            ).validated()
+        }
+    }
+
+    @Test func layoutImportRejectsSymlinkedMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let layout = root.appending(path: "layout")
+        let outside = root.appending(path: "outside-index.json")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: layout, withIntermediateDirectories: true
+        )
+        try Data(#"{"schemaVersion":2,"manifests":[]}"#.utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: layout.appending(path: "index.json"),
+            withDestinationURL: outside
+        )
+        let store = try OCIContentStore(root: root.appending(path: "content"))
+
+        await #expect(throws: EngineError.self) {
+            _ = try await store.importLayout(layout)
+        }
+    }
+
     @Test func registryReferenceSeparatesTagFromDigestRepository() throws {
         let digest = "sha256:" + String(repeating: "a", count: 64)
         let reference = try OCIRegistryReference("kindest/node:v1.36.1@\(digest)")

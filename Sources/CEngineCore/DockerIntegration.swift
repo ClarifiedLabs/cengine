@@ -167,7 +167,7 @@ public enum DockerIntegration {
                 if builderUsesManagedSnapshotter(inspected) { removal.append("--keep-state") }
                 removal.append(builderName)
                 _ = try runDocker(removal)
-                _ = try runDocker(createBuilderArguments(settings))
+                _ = try runDocker(try createBuilderArguments(settings))
             }
         } else {
             _ = try runDocker(createBuilderArguments(settings))
@@ -182,23 +182,29 @@ public enum DockerIntegration {
         ])
     }
 
-    public static func createBuilderArguments(_ settings: BuilderSettings) -> [String] {
-        [
+    public static func createBuilderArguments(_ settings: BuilderSettings) throws -> [String] {
+        let quota: Int
+        do { quota = try CheckedArithmetic.multiply(settings.cpus, cpuPeriod) }
+        catch { throw EngineError(.badRequest, "Buildx CPU quota overflows") }
+        return [
             "buildx", "create", "--name", builderName, "--driver", "docker-container",
             "--driver-opt", "image=\(buildkitImage)",
             "--driver-opt", "memory=\(settings.memoryBytes)",
             "--driver-opt", "cpu-period=\(cpuPeriod)",
-            "--driver-opt", "cpu-quota=\(settings.cpus * cpuPeriod)",
+            "--driver-opt", "cpu-quota=\(quota)",
             "--buildkitd-flags", "--oci-worker-snapshotter=\(buildkitSnapshotter)", contextName,
         ]
     }
 
     public static func builder(_ inspection: String, matches settings: BuilderSettings) -> Bool {
+        guard let quota = try? CheckedArithmetic.multiply(settings.cpus, cpuPeriod) else {
+            return false
+        }
         let expected = [
             "image=\"\(buildkitImage)\"",
             "memory=\"\(settings.memoryBytes)\"",
             "cpu-period=\"\(cpuPeriod)\"",
-            "cpu-quota=\"\(settings.cpus * cpuPeriod)\"",
+            "cpu-quota=\"\(quota)\"",
             "--oci-worker-snapshotter=\(buildkitSnapshotter)",
         ]
         return expected.allSatisfy(inspection.contains)

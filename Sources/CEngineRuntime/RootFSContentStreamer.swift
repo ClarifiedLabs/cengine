@@ -32,11 +32,8 @@ public struct RootFSContentStreamer: Sendable {
         let envelope = GuestProtocol.Envelope(operation: "prepare-rootfs", payload: payload)
         try file.write(contentsOf: GuestProtocol.encode(envelope))
         for descriptor in layers {
-            let data = try await store.data(for: descriptor.digest)
-            guard data.count == descriptor.size else {
-                throw EngineError(.internalError, "OCI layer \(descriptor.digest) size mismatch")
-            }
-            try file.write(contentsOf: data)
+            _ = try descriptor.validated(errorCode: .internalError)
+            try await store.copyBlob(descriptor, to: file)
         }
         let reply = try GuestProtocol.decode(try readFrame(file))
         guard reply.id == envelope.id else { throw EngineError(.internalError, "rootfs response id does not match request") }

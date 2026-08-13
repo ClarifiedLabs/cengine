@@ -78,6 +78,32 @@ private func upgradedExecStart(socketPath: String, execID: String, body: String)
     )
 }
 
+private func dockerSocketRequest(socketPath: String, path: String) async throws -> String {
+    let process = Process()
+    let output = Pipe()
+    let errors = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+    process.arguments = [
+        "--silent", "--show-error", "--include", "--max-time", "5",
+        "--unix-socket", socketPath,
+        "http://localhost\(path)",
+    ]
+    process.standardOutput = output
+    process.standardError = errors
+    try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, Error>) in
+        process.terminationHandler = { _ in continuation.resume() }
+        do {
+            try process.run()
+        } catch {
+            process.terminationHandler = nil
+            continuation.resume(throwing: error)
+        }
+    }
+    return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        + String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+}
+
 private func withRunningDockerServer<T>(
     _ server: DockerServer,
     operation: () async throws -> T
@@ -5355,6 +5381,13 @@ private actor AuthImageBackend: ContainerBackend {
             )
             let path = String(scope.dockerHost.dropFirst("unix://".count))
             #expect(FileManager.default.fileExists(atPath: path))
+            let forbidden = try await dockerSocketRequest(
+                socketPath: path, path: "/_ping"
+            )
+            #expect(
+                forbidden.contains("403 Forbidden"),
+                "unrelated scoped-socket request did not receive a response: \(forbidden)"
+            )
 
             owner.terminate()
             let clock = ContinuousClock()
@@ -5390,12 +5423,14 @@ private actor AuthImageBackend: ContainerBackend {
         let runtime = try await EngineRuntime(root: root)
         let manager = ContainerResourceScopeManager(runtime: runtime, root: root, socketDirectory: sockets)
         let router = DockerRouter(runtime: runtime, root: root, resourceScopeManager: manager)
+        let peer = try UnixPeerIdentity.current()
 
         do {
             let invalid = await router.route(.init(
                 method: .POST,
                 uri: "/_cengine/v1/resource-scopes",
-                body: try JSONEncoder().encode(ContainerResourceScopeCreateRequest(ownerPID: getpid()))
+                body: try JSONEncoder().encode(ContainerResourceScopeCreateRequest(ownerPID: getpid())),
+                peerIdentity: peer
             ))
             #expect(invalid.status == .badRequest)
 
@@ -5404,7 +5439,8 @@ private actor AuthImageBackend: ContainerBackend {
                 uri: "/_cengine/v1/resource-scopes",
                 body: try JSONEncoder().encode(ContainerResourceScopeCreateRequest(
                     ownerPID: getpid(), cpus: 1, memoryGiB: 1
-                ))
+                )),
+                peerIdentity: peer
             ))
             #expect(created.status == .created)
             let scope = try JSONDecoder().decode(ContainerResourceScope.self, from: created.body)
@@ -5413,7 +5449,8 @@ private actor AuthImageBackend: ContainerBackend {
 
             let deleted = await router.route(.init(
                 method: .DELETE,
-                uri: "/_cengine/v1/resource-scopes/\(scope.id)"
+                uri: "/_cengine/v1/resource-scopes/\(scope.id)",
+                peerIdentity: peer
             ))
             #expect(deleted.status == .noContent)
             #expect(!FileManager.default.fileExists(atPath: path))
@@ -6804,7 +6841,9 @@ private actor AuthImageBackend: ContainerBackend {
             uri: "/v1.52/images/example:multi/get?platform=\(arm)&platform=\(amd)"
         ))
         #expect(save.status == .ok)
-        #expect(save.body == Data("archive".utf8))
+        let saveFile = try #require(save.file)
+        #expect(try Data(contentsOf: saveFile.url) == Data("archive".utf8))
+        saveFile.cleanup()
 
         let archive = OCIArchive.tar(entries: [("placeholder", Data())])
         let load = await router.route(.init(
@@ -6866,7 +6905,9 @@ private actor AuthImageBackend: ContainerBackend {
         ))
 
         #expect(response.status == .ok)
-        #expect(response.body == Data("archive".utf8))
+        let responseFile = try #require(response.file)
+        #expect(try Data(contentsOf: responseFile.url) == Data("archive".utf8))
+        responseFile.cleanup()
         #expect(await backend.exportedReferences() == [
             "docker.io/library/existing:latest",
             "docker.io/library/busybox:latest",

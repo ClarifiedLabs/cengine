@@ -4,11 +4,11 @@ go 1.25.0
 
 require (
 	github.com/go-git/go-billy/v5 v5.9.0
-	github.com/klauspost/compress v1.18.0
+	github.com/klauspost/compress v1.18.7
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
 	github.com/willscott/go-nfs v0.0.4
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.44.0
 )
 
 replace github.com/willscott/go-nfs => ./third_party/go-nfs

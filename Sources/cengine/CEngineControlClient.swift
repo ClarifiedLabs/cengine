@@ -8,11 +8,9 @@ import NIOPosix
 enum CEngineControlClient {
     static func createResourceScope(
         socketPath: String,
-        ownerPID: Int32,
         resources: ContainerResourceOverride
     ) async throws -> ContainerResourceScope {
         let body = try JSONEncoder().encode(ContainerResourceScopeCreateRequest(
-            ownerPID: ownerPID,
             cpus: resources.cpus,
             memoryGiB: resources.memoryGiB
         ))

@@ -609,6 +609,55 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(String(decoding: try bridge.logData().dropFirst(8), as: UTF8.self) == "failure\n")
     }
 
+    @Test func containerIORetentionBoundsMemoryDiskAndRecoveredHistory() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appending(path: "docker.log")
+        let policy = ContainerLogRetentionPolicy(
+            retainedBytes: 10,
+            segmentBytes: 8,
+            maximumSegments: 3,
+            maximumRetainedRecords: 4,
+            maximumRecordBytes: 8,
+            followerQueueBytes: 8,
+            followerQueueRecords: 2
+        )
+
+        do {
+            let bridge = ContainerIOBridge(
+                tty: true, logURL: log, retentionPolicy: policy
+            )
+            try bridge.writer(.stdout).write(Data("12345678".utf8))
+            try bridge.writer(.stdout).write(Data("abcdefgh".utf8))
+            try bridge.writer(.stdout).write(Data("I".utf8))
+
+            #expect(try bridge.logData() == Data("8abcdefghI".utf8))
+            #expect(bridge.retainedLogPayloadByteCount == 10)
+            #expect(bridge.retainedBufferedByteCount <= policy.followerQueueBytes)
+            let offsets = try #require(bridge.durableSourceByteOffsets())
+            #expect(offsets[.stdout] == 17)
+            #expect(offsets[.stderr] == 0)
+        }
+
+        let recovered = ContainerIOBridge(
+            tty: true, logURL: log, retentionPolicy: policy
+        )
+        #expect(try recovered.logData() == Data("8abcdefghI".utf8))
+        #expect(recovered.retainedLogPayloadByteCount == 10)
+        let offsets = try #require(recovered.durableSourceByteOffsets())
+        #expect(offsets[.stdout] == 17)
+        #expect(try #require(
+            FileManager.default.attributesOfItem(atPath: log.path)[.size] as? NSNumber
+        ).intValue <= policy.retainedBytes)
+        #expect(try #require(
+            FileManager.default.attributesOfItem(
+                atPath: log.appendingPathExtension("entries").path
+            )[.size] as? NSNumber
+        ).intValue <= policy.retainedBytes * 2 + policy.maximumRecordBytes * 2
+            + policy.maximumRetainedRecords * 256)
+    }
+
     @Test func containerIOBridgeKeepsVerifiedLogHandleAfterPathSwap() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -617,13 +666,20 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         let index = log.appendingPathExtension("entries")
         let heldLog = root.appending(path: "held-docker.log")
         let heldIndex = root.appending(path: "held-docker.log.entries")
+        let journalDirectory = root.appending(path: "docker.log.journal")
         let sentinel = root.appending(path: "sentinel")
         let sentinelData = Data("do-not-write".utf8)
         try sentinelData.write(to: sentinel)
         let bridge = ContainerIOBridge(tty: true, logURL: log)
         try bridge.writer(.stdout).write(Data("before-".utf8))
-        let firstIndexSize = try #require(
-            FileManager.default.attributesOfItem(atPath: index.path)[.size] as? NSNumber
+        let segment = try #require(
+            FileManager.default.contentsOfDirectory(atPath: journalDirectory.path)
+                .first(where: { $0.hasSuffix(".celj") })
+        )
+        let segmentURL = journalDirectory.appending(path: segment)
+        let firstSegmentSize = try #require(
+            FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size]
+                as? NSNumber
         ).uint64Value
 
         try FileManager.default.moveItem(at: log, to: heldLog)
@@ -639,8 +695,9 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(try bridge.logData() == Data("before-after".utf8))
         #expect(try Data(contentsOf: heldLog) == Data("before-after".utf8))
         #expect(try #require(
-            FileManager.default.attributesOfItem(atPath: heldIndex.path)[.size] as? NSNumber
-        ).uint64Value > firstIndexSize)
+            FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size]
+                as? NSNumber
+        ).uint64Value > firstSegmentSize)
         #expect(try Data(contentsOf: sentinel) == sentinelData)
         var indexInformation = stat()
         #expect(Darwin.lstat(index.path, &indexInformation) == 0)
@@ -1212,6 +1269,218 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(offsets[.stdout] == UInt64(Data("before-downtime".utf8).count))
     }
 
+    @Test func shimOutputSpoolBoundsDowntimeAndRecoversExactlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["stdout", "stderr", "stdin"] {
+            try Data().write(to: root.appending(path: name))
+        }
+        let directory = try PersistentStateDirectory.open(root)
+        let stdoutIdentity = try directory.regularFileIdentity(named: "stdout")
+        let stderrIdentity = try directory.regularFileIdentity(named: "stderr")
+        let stdoutSpool = try directory.createDirectory(named: "stdout.spool")
+        let stderrSpool = try directory.createDirectory(named: "stderr.spool")
+        let sourceWriter = try directory.openRegularFile(
+            named: "stdout", expectedIdentity: stdoutIdentity, access: .writeOnly
+        ).handle
+
+        var spooler: VMShimOutputSpooler? = try VMShimOutputSpooler(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            stdoutDirectory: stdoutSpool,
+            stderrDirectory: stderrSpool,
+            retainedBytes: 8,
+            segmentBytes: 4,
+            maximumSegments: 3
+        )
+        let downtime = Data("abcdefghijklmnop".utf8)
+        try sourceWriter.seekToEnd()
+        try sourceWriter.write(contentsOf: downtime)
+        try sourceWriter.synchronize()
+        try await spooler?.stop()
+        spooler = nil
+
+        let retainedNames = try stdoutSpool.entryNames().filter {
+            $0.hasPrefix("segment-") || $0.hasPrefix("active-")
+        }
+        var retainedBytes: UInt64 = 0
+        for name in retainedNames {
+            let handle = try stdoutSpool.openRegularFile(
+                named: name, access: .readOnly
+            ).handle
+            var information = stat()
+            #expect(Darwin.fstat(handle.fileDescriptor, &information) == 0)
+            retainedBytes += UInt64(max(0, information.st_size))
+        }
+        #expect(retainedNames.count <= 3)
+        #expect(retainedBytes <= 8)
+
+        let logURL = root.appending(path: "docker.log")
+        let firstBridge = ContainerIOBridge(tty: true, logURL: logURL)
+        let firstMonitor = ContainerLogMonitor(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            input: try directory.openRegularFile(named: "stdin", access: .readWrite).handle,
+            bridge: firstBridge,
+            stdoutSpoolDirectory: stdoutSpool,
+            stderrSpoolDirectory: stderrSpool,
+            spoolSegmentBytes: 4,
+            spoolMaximumSegments: 3,
+            maximumOutputChunkSize: 3
+        )
+        try firstMonitor.drain(stream: .stdout)
+        try firstMonitor.stop(finishOutput: false)
+        #expect(try firstBridge.logData() == Data(downtime.suffix(8)))
+        var offsets = try #require(firstBridge.durableSourceByteOffsets())
+        #expect(offsets[.stdout] == UInt64(downtime.count))
+
+        // Model a shim crash/restart after the daemon acknowledged all closed
+        // segments. Recovery resumes at the durable absolute cursor and never
+        // reads the punched prefix from the source inode.
+        var recoveredSpooler: VMShimOutputSpooler? = try VMShimOutputSpooler(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            stdoutDirectory: stdoutSpool,
+            stderrDirectory: stderrSpool,
+            retainedBytes: 8,
+            segmentBytes: 4,
+            maximumSegments: 3
+        )
+        let afterRestart = Data("QRST".utf8)
+        try sourceWriter.seekToEnd()
+        try sourceWriter.write(contentsOf: afterRestart)
+        try sourceWriter.synchronize()
+        try await recoveredSpooler?.stop()
+        recoveredSpooler = nil
+
+        let recoveredBridge = ContainerIOBridge(tty: true, logURL: logURL)
+        let recoveredMonitor = ContainerLogMonitor(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            input: try directory.openRegularFile(named: "stdin", access: .readWrite).handle,
+            bridge: recoveredBridge,
+            stdoutSpoolDirectory: stdoutSpool,
+            stderrSpoolDirectory: stderrSpool,
+            spoolSegmentBytes: 4,
+            spoolMaximumSegments: 3,
+            maximumOutputChunkSize: 3
+        )
+        recoveredMonitor.start(atEnd: true)
+        try recoveredMonitor.drain(stream: .stdout)
+        try recoveredMonitor.stop(finishOutput: false)
+
+        #expect(try recoveredBridge.logData() == Data(downtime.suffix(8)) + afterRestart)
+        offsets = try #require(recoveredBridge.durableSourceByteOffsets())
+        #expect(offsets[.stdout] == UInt64(downtime.count + afterRestart.count))
+        #expect(try directory.regularFileIdentity(named: "stdout") == stdoutIdentity)
+        var sourceInformation = stat()
+        #expect(Darwin.fstat(sourceWriter.fileDescriptor, &sourceInformation) == 0)
+        #expect(sourceInformation.st_size == downtime.count + afterRestart.count)
+    }
+
+    @Test func spoolSegmentsRemainUntilDockerJournalCommitSucceeds() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["stdout", "stderr", "stdin"] {
+            try Data().write(to: root.appending(path: name))
+        }
+        let directory = try PersistentStateDirectory.open(root)
+        let stdoutIdentity = try directory.regularFileIdentity(named: "stdout")
+        let stderrIdentity = try directory.regularFileIdentity(named: "stderr")
+        let stdoutSpool = try directory.createDirectory(named: "stdout.spool")
+        let stderrSpool = try directory.createDirectory(named: "stderr.spool")
+        let payload = Data("abcdefgh".utf8)
+        let sourceWriter = try directory.openRegularFile(
+            named: "stdout", expectedIdentity: stdoutIdentity, access: .writeOnly
+        ).handle
+        try sourceWriter.write(contentsOf: payload)
+        try sourceWriter.synchronize()
+        let spooler = try VMShimOutputSpooler(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            stdoutDirectory: stdoutSpool,
+            stderrDirectory: stderrSpool,
+            retainedBytes: 8,
+            segmentBytes: 4,
+            maximumSegments: 3
+        )
+        try await spooler.stop()
+        let closedBefore = try stdoutSpool.entryNames().filter {
+            $0.hasPrefix("segment-")
+        }
+        #expect(closedBefore.count == 2)
+
+        let bridge = ContainerIOBridge(
+            tty: true, logURL: root.appending(path: "docker.log")
+        )
+        let failingMonitor = ContainerLogMonitor(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            input: try directory.openRegularFile(named: "stdin", access: .readWrite).handle,
+            bridge: bridge,
+            stdoutSpoolDirectory: stdoutSpool,
+            stderrSpoolDirectory: stderrSpool,
+            spoolSegmentBytes: 4,
+            spoolMaximumSegments: 3,
+            persistOutput: { _, _ in
+                throw EngineError(.internalError, "injected journal failure")
+            }
+        )
+        #expect(throws: EngineError.self) {
+            try failingMonitor.drain(stream: .stdout)
+        }
+        #expect(try stdoutSpool.entryNames().filter {
+            $0.hasPrefix("segment-")
+        } == closedBefore)
+
+        let retryingMonitor = ContainerLogMonitor(
+            stdout: try directory.openRegularFile(
+                named: "stdout", expectedIdentity: stdoutIdentity, access: .readWrite
+            ).handle,
+            stderr: try directory.openRegularFile(
+                named: "stderr", expectedIdentity: stderrIdentity, access: .readWrite
+            ).handle,
+            input: try directory.openRegularFile(named: "stdin", access: .readWrite).handle,
+            bridge: bridge,
+            stdoutSpoolDirectory: stdoutSpool,
+            stderrSpoolDirectory: stderrSpool,
+            spoolSegmentBytes: 4,
+            spoolMaximumSegments: 3
+        )
+        try retryingMonitor.drain(stream: .stdout)
+        try retryingMonitor.stop(finishOutput: false)
+        #expect(try bridge.logData() == payload)
+        #expect(try stdoutSpool.entryNames().allSatisfy {
+            !$0.hasPrefix("segment-")
+        })
+    }
+
     @Test func recoveredMonitorUsesOnlyCurrentSourceSessionOffset() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1294,25 +1563,33 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let log = root.appending(path: "docker.log")
-        let index = log.appendingPathExtension("entries")
+        let journalDirectory = root.appending(path: "docker.log.journal")
         var firstLogSize: UInt64 = 0
-        var firstIndexSize: UInt64 = 0
+        var firstJournalSize: UInt64 = 0
+        var journalSegment: URL?
         do {
             let bridge = ContainerIOBridge(tty: false, logURL: log)
             try bridge.writer(.stdout).write(Data("first\n".utf8))
             firstLogSize = try #require(
                 FileManager.default.attributesOfItem(atPath: log.path)[.size] as? NSNumber
             ).uint64Value
-            firstIndexSize = try #require(
-                FileManager.default.attributesOfItem(atPath: index.path)[.size] as? NSNumber
+            let segmentName = try #require(
+                FileManager.default.contentsOfDirectory(atPath: journalDirectory.path)
+                    .first(where: { $0.hasSuffix(".celj") })
+            )
+            journalSegment = journalDirectory.appending(path: segmentName)
+            firstJournalSize = try #require(
+                FileManager.default.attributesOfItem(atPath: journalSegment!.path)[.size]
+                    as? NSNumber
             ).uint64Value
             try bridge.writer(.stderr).write(Data("partial\n".utf8))
         }
 
-        let indexHandle = try FileHandle(forUpdating: index)
-        try indexHandle.truncate(atOffset: firstIndexSize + 7)
-        try indexHandle.synchronize()
-        try indexHandle.close()
+        let recoveredJournalSegment = try #require(journalSegment)
+        let journalHandle = try FileHandle(forUpdating: recoveredJournalSegment)
+        try journalHandle.truncate(atOffset: firstJournalSize + 7)
+        try journalHandle.synchronize()
+        try journalHandle.close()
         let logHandle = try FileHandle(forUpdating: log)
         try logHandle.truncate(atOffset: firstLogSize)
         try logHandle.synchronize()
@@ -1335,8 +1612,9 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(rendered.contains("future\n"))
         #expect(!rendered.contains("partial\n"))
         #expect(try #require(
-            FileManager.default.attributesOfItem(atPath: index.path)[.size] as? NSNumber
-        ).uint64Value > firstIndexSize)
+            FileManager.default.attributesOfItem(atPath: recoveredJournalSegment.path)[.size]
+                as? NSNumber
+        ).uint64Value > firstJournalSize)
     }
 
     @Test func containerIOJournalRepairsRawMirrorAfterCommittedIndexCrash() throws {

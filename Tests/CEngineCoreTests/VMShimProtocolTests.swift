@@ -6810,6 +6810,31 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(RawVirtualizationBackend.mountDestinationOrder(destinations) == [2, 3, 0, 1, 4])
     }
 
+    @Test func recoveredStorageAdministrationUsesTheAdoptedShimSocket() throws {
+        let specification = VMShimProtocol.Specification(
+            kind: .storage,
+            containerID: "cengine-storage",
+            generation: 1,
+            token: "secret",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: "/storage.ext4",
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:01",
+            socketPath: "/tmp/recovered-control.sock",
+            logPath: "/tmp/recovered-shim.log",
+            fileSystemSocketPath: "/tmp/recovered-storage.sock",
+            networkSocketPath: "/tmp/recovered-network.sock"
+        )
+        let recovered = VMShimClient(specification: specification)
+
+        #expect(
+            try RawVirtualizationBackend.storageAdministrativeSocketPath(for: recovered)
+                == "/tmp/recovered-storage.sock"
+        )
+    }
+
     @MainActor @Test func containerShutdownDoesNotOwnInfrastructureTransportSockets() {
         func specification(kind: VMShimProtocol.Specification.Kind) -> VMShimProtocol.Specification {
             VMShimProtocol.Specification(

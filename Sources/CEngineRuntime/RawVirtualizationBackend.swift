@@ -591,8 +591,10 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
     let execArtifactCompactionIdentity: PersistentFileIdentity
     let ioDirectoryIdentity: PersistentFileIdentity
     let ioFileIdentities: [String: PersistentFileIdentity]
+    let outputSpoolDirectoryIdentities: [String: PersistentFileIdentity]?
     let dockerLogIdentity: PersistentFileIdentity
     let dockerLogIndexIdentity: PersistentFileIdentity
+    let dockerLogJournalDirectoryIdentity: PersistentFileIdentity?
 
     static func create(
         in directory: PersistentStateDirectory,
@@ -617,12 +619,21 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
                 named: name, size: 0
             )
         }
+        var outputSpoolDirectoryIdentities: [String: PersistentFileIdentity] = [:]
+        for name in ["stdout.spool", "stderr.spool"] {
+            outputSpoolDirectoryIdentities[name] = try ioDirectory.createDirectory(
+                named: name
+            ).identity
+        }
         let dockerLogIdentity = try ioDirectory.createSparseRegularFile(
             named: "docker.log", size: 0
         )
         let dockerLogIndexIdentity = try ioDirectory.createSparseRegularFile(
             named: "docker.log.entries", size: 0
         )
+        let dockerLogJournalDirectoryIdentity = try ioDirectory.createDirectory(
+            named: "docker.log.journal"
+        ).identity
         let artifacts = RawContainerPreparationArtifacts(
             directoryIdentity: directory.identity,
             rootDiskIdentity: rootDiskIdentity,
@@ -632,8 +643,10 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
             execArtifactCompactionIdentity: execArtifactCompactionIdentity,
             ioDirectoryIdentity: ioDirectory.identity,
             ioFileIdentities: ioFileIdentities,
+            outputSpoolDirectoryIdentities: outputSpoolDirectoryIdentities,
             dockerLogIdentity: dockerLogIdentity,
-            dockerLogIndexIdentity: dockerLogIndexIdentity
+            dockerLogIndexIdentity: dockerLogIndexIdentity,
+            dockerLogJournalDirectoryIdentity: dockerLogJournalDirectoryIdentity
         )
         try artifacts.validate(in: directory)
         return artifacts
@@ -654,8 +667,22 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
         for name in directIOFileNames {
             _ = try ioDirectory.regularFileIdentity(named: name)
         }
+        for name in ["stdout.spool", "stderr.spool"] {
+            if let spool = try ioDirectory.openDirectoryIfPresent(named: name) {
+                guard spool.pathStillNamesThisDirectory() else {
+                    throw EngineError(.conflict, "container output spool directory changed")
+                }
+            }
+        }
         _ = try ioDirectory.regularFileIdentity(named: "docker.log")
         _ = try ioDirectory.regularFileIdentity(named: "docker.log.entries")
+        if let journal = try ioDirectory.openDirectoryIfPresent(
+            named: "docker.log.journal"
+        ) {
+            guard journal.pathStillNamesThisDirectory() else {
+                throw EngineError(.conflict, "container log journal directory changed")
+            }
+        }
         guard directory.pathStillNamesThisDirectory() else {
             throw EngineError(.conflict, "container state directory changed")
         }
@@ -698,12 +725,31 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
                 expectedIdentity: expectedIdentity
             )
         }
+        if let spoolIdentities = outputSpoolDirectoryIdentities {
+            for name in ["stdout.spool", "stderr.spool"] {
+                guard let expected = spoolIdentities[name] else {
+                    throw EngineError(.internalError, "missing output spool identity")
+                }
+                let spool = try ioDirectory.openDirectory(named: name)
+                guard spool.identity == expected,
+                      spool.pathStillNamesThisDirectory() else {
+                    throw EngineError(.conflict, "container output spool directory changed")
+                }
+            }
+        }
         _ = try ioDirectory.regularFileIdentity(
             named: "docker.log", expectedIdentity: dockerLogIdentity
         )
         _ = try ioDirectory.regularFileIdentity(
             named: "docker.log.entries", expectedIdentity: dockerLogIndexIdentity
         )
+        if let expected = dockerLogJournalDirectoryIdentity {
+            let journal = try ioDirectory.openDirectory(named: "docker.log.journal")
+            guard journal.identity == expected,
+                  journal.pathStillNamesThisDirectory() else {
+                throw EngineError(.conflict, "container log journal directory changed")
+            }
+        }
         guard directory.pathStillNamesThisDirectory() else {
             throw EngineError(.conflict, "container state directory changed")
         }
@@ -2141,6 +2187,8 @@ struct RawContainerDirectIOHandles {
     let stderr: FileHandle
     let stdin: FileHandle
     let stdinClosed: FileHandle
+    let stdoutSpool: PersistentStateDirectory?
+    let stderrSpool: PersistentStateDirectory?
 
     static func open(
         in containerDirectory: PersistentStateDirectory,
@@ -2167,10 +2215,31 @@ struct RawContainerDirectIOHandles {
             stdout: try open("stdout"),
             stderr: try open("stderr"),
             stdin: try open("stdin"),
-            stdinClosed: try open("stdin.closed")
+            stdinClosed: try open("stdin.closed"),
+            stdoutSpool: try openSpool(
+                "stdout.spool", artifacts: artifacts, directory: ioDirectory
+            ),
+            stderrSpool: try openSpool(
+                "stderr.spool", artifacts: artifacts, directory: ioDirectory
+            )
         )
         try handles.validateNames(artifacts: artifacts)
         return handles
+    }
+
+    private static func openSpool(
+        _ name: String,
+        artifacts: RawContainerPreparationArtifacts,
+        directory: PersistentStateDirectory
+    ) throws -> PersistentStateDirectory? {
+        guard let expected = artifacts.outputSpoolDirectoryIdentities?[name] else {
+            return nil
+        }
+        let spool = try directory.openDirectory(named: name)
+        guard spool.identity == expected else {
+            throw EngineError(.conflict, "container output spool directory changed")
+        }
+        return spool
     }
 
     func validateNames(artifacts: RawContainerPreparationArtifacts) throws {
@@ -2186,6 +2255,14 @@ struct RawContainerDirectIOHandles {
                 named: name, expectedIdentity: identity
             )
         }
+        if let expected = artifacts.outputSpoolDirectoryIdentities {
+            for (name, identity) in expected {
+                let spool = try directory.openDirectory(named: name)
+                guard spool.identity == identity else {
+                    throw EngineError(.conflict, "container output spool directory changed")
+                }
+            }
+        }
         _ = try directory.regularFileIdentity(
             named: "docker.log", expectedIdentity: artifacts.dockerLogIdentity
         )
@@ -2196,7 +2273,11 @@ struct RawContainerDirectIOHandles {
 
     func openDockerLogs(
         artifacts: RawContainerPreparationArtifacts
-    ) throws -> (log: FileHandle, index: FileHandle) {
+    ) throws -> (
+        log: FileHandle,
+        index: FileHandle,
+        journalDirectory: PersistentStateDirectory
+    ) {
         try validateNames(artifacts: artifacts)
         let log = try directory.openRegularFile(
             named: "docker.log",
@@ -2208,11 +2289,21 @@ struct RawContainerDirectIOHandles {
             expectedIdentity: artifacts.dockerLogIndexIdentity,
             access: .readWrite
         ).handle
+        let journalDirectory = try directory.openOrCreateDirectory(
+            named: "docker.log.journal"
+        )
+        if let expected = artifacts.dockerLogJournalDirectoryIdentity,
+           journalDirectory.identity != expected {
+            throw EngineError(.conflict, "container log journal directory changed")
+        }
         try validateNames(artifacts: artifacts)
-        return (log, index)
+        return (log, index, journalDirectory)
     }
 
     func truncate(hook: RawIOSourceSessionResetHook? = nil) throws {
+        for spool in [stdoutSpool, stderrSpool].compactMap({ $0 }) {
+            try VMShimOutputSpooler.reset(spool)
+        }
         let namedHandles = zip(
             RawContainerPreparationArtifacts.directIOFileNames,
             [stdout, stderr, stdin, stdinClosed]
@@ -3078,7 +3169,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         )
         infrastructure = try await Self.recoverOrLaunch(infrastructureSpec)
         storage = StorageAdministrativeClient(
-            socketPath: infrastructureSpec.fileSystemSocketPath!,
+            socketPath: try Self.storageAdministrativeSocketPath(for: infrastructure),
             tokenIssuer: tokenIssuer
         )
         _ = try await infrastructure.boot()
@@ -3313,6 +3404,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data {
         try await store.exportLayout(references: references, platforms: platforms)
+    }
+
+    public func saveImages(
+        references: [String], platforms: [OCIPlatform], to destination: URL
+    ) async throws {
+        try await store.exportLayout(
+            references: references, platforms: platforms, to: destination
+        )
     }
 
     public func pushImage(reference: String, platform: String, credentials: RegistryCredentials?) async throws {
@@ -4761,7 +4860,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     ) async throws {
         let resources = GuestProtocol.Resources(
             memoryBytes: container.memoryBytes,
-            cpuQuota: Int64(container.cpus * 100_000),
+            cpuQuota: try DockerCPUResources.quota(cpuCount: container.cpus),
             cpuPeriod: 100_000,
             pids: container.pidsLimit,
             blockIOReadBps: Self.blockIOThrottles(container.blockIOReadBps),
@@ -5455,7 +5554,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let bridge = ContainerIOBridge(
             tty: container.tty,
             logHandle: logs.log,
-            logIndexHandle: logs.index
+            logIndexHandle: logs.index,
+            journalDirectory: logs.journalDirectory
         )
         if !preservingExistingFiles {
             try handles.resetSourceSession(
@@ -5470,6 +5570,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
             stderr: handles.stderr,
             input: handles.stdin,
             bridge: bridge,
+            stdoutSpoolDirectory: handles.stdoutSpool,
+            stderrSpoolDirectory: handles.stderrSpool,
+            spoolSegmentBytes: ContainerLogRetentionPolicy.default.segmentBytes,
+            spoolMaximumSegments: ContainerLogRetentionPolicy.default.maximumSegments,
             markInputClosed: {
                 try RawContainerDirectIOHandles.markInputClosed(stdinClosed)
             }
@@ -6070,6 +6174,36 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 forHardLimit: container.memoryBytes
             )
         }
+        let outputSpool: VMShimProtocol.OutputSpool?
+        if let directories = artifacts.outputSpoolDirectoryIdentities {
+            guard let stdout = artifacts.ioFileIdentities["stdout"],
+                  let stderr = artifacts.ioFileIdentities["stderr"],
+                  let stdoutSpool = directories["stdout.spool"],
+                  let stderrSpool = directories["stderr.spool"] else {
+                throw EngineError(.internalError, "container output spool preparation is incomplete")
+            }
+            let policy = ContainerLogRetentionPolicy.default
+            outputSpool = .init(
+                directoryPath: ioDirectory.path,
+                directoryIdentity: .init(
+                    device: artifacts.ioDirectoryIdentity.device,
+                    inode: artifacts.ioDirectoryIdentity.inode
+                ),
+                stdoutIdentity: .init(device: stdout.device, inode: stdout.inode),
+                stderrIdentity: .init(device: stderr.device, inode: stderr.inode),
+                stdoutSpoolDirectoryIdentity: .init(
+                    device: stdoutSpool.device, inode: stdoutSpool.inode
+                ),
+                stderrSpoolDirectoryIdentity: .init(
+                    device: stderrSpool.device, inode: stderrSpool.inode
+                ),
+                retainedBytes: policy.retainedBytes,
+                segmentBytes: policy.segmentBytes,
+                maximumSegments: policy.maximumSegments
+            )
+        } else {
+            outputSpool = nil
+        }
         return VMShimProtocol.Specification(
             containerID: container.id,
             generation: generation,
@@ -6118,7 +6252,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             ],
             networkSocketPath: infrastructure.specification.networkSocketPath,
             vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN],
-            rosetta: VZLinuxRosettaDirectoryShare.availability == .installed
+            rosetta: VZLinuxRosettaDirectoryShare.availability == .installed,
+            outputSpool: outputSpool
         )
     }
 
@@ -6221,7 +6356,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             mounts: mounts, networks: networks, hosts: hosts,
             resources: .init(
                 memoryBytes: container.memoryBytes,
-                cpuQuota: Int64(container.cpus * 100_000), cpuPeriod: 100_000, pids: container.pidsLimit,
+                cpuQuota: try DockerCPUResources.quota(cpuCount: container.cpus), cpuPeriod: 100_000, pids: container.pidsLimit,
                 blockIOReadBps: Self.blockIOThrottles(container.blockIOReadBps),
                 blockIOWriteBps: Self.blockIOThrottles(container.blockIOWriteBps),
                 blockIOReadIOps: Self.blockIOThrottles(container.blockIOReadIOps),
@@ -6607,6 +6742,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
             if (try? await client.status()) != nil { return client }
         }
         return try await VMShimClient.launch(specification: specification)
+    }
+
+    static func storageAdministrativeSocketPath(for infrastructure: VMShimClient) throws -> String {
+        guard infrastructure.specification.kind == .storage,
+              let path = infrastructure.specification.fileSystemSocketPath,
+              !path.isEmpty else {
+            throw EngineError(.internalError, "storage shim has no administrative socket")
+        }
+        return path
     }
 
     static func makeRuntimeSocketPath() throws -> String {

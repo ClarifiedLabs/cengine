@@ -36,19 +36,61 @@ public struct APIRequest: Sendable {
     public let uri: String
     public let headers: HTTPHeaders
     public let body: Data
+    public let uploadURL: URL?
+    public let peerIdentity: UnixPeerIdentity?
 
-    public init(method: HTTPMethod, uri: String, headers: HTTPHeaders = [:], body: Data = Data()) {
-        self.method = method; self.uri = uri; self.headers = headers; self.body = body
+    public init(
+        method: HTTPMethod,
+        uri: String,
+        headers: HTTPHeaders = [:],
+        body: Data = Data(),
+        uploadURL: URL? = nil,
+        peerIdentity: UnixPeerIdentity? = nil
+    ) {
+        self.method = method
+        self.uri = uri
+        self.headers = headers
+        self.body = body
+        self.uploadURL = uploadURL
+        self.peerIdentity = peerIdentity
     }
+}
+
+public final class APIResponseFile: @unchecked Sendable {
+    public let url: URL
+    private let lock = NSLock()
+    private var cleaned = false
+
+    public init(url: URL) { self.url = url }
+
+    public func cleanup() {
+        let shouldRemove = lock.withLock {
+            guard !cleaned else { return false }
+            cleaned = true
+            return true
+        }
+        if shouldRemove { try? FileManager.default.removeItem(at: url) }
+    }
+
+    deinit { cleanup() }
 }
 
 public struct APIResponse: Sendable {
     public var status: HTTPResponseStatus
     public var headers: HTTPHeaders
     public var body: Data
+    public var file: APIResponseFile?
 
-    public init(status: HTTPResponseStatus, headers: HTTPHeaders = [:], body: Data = Data()) {
-        self.status = status; self.headers = headers; self.body = body
+    public init(
+        status: HTTPResponseStatus,
+        headers: HTTPHeaders = [:],
+        body: Data = Data(),
+        file: APIResponseFile? = nil
+    ) {
+        self.status = status
+        self.headers = headers
+        self.body = body
+        self.file = file
     }
 }
 
@@ -62,6 +104,12 @@ public struct DockerRouter: Sendable {
 
     private func nonEmpty(_ value: String?) -> String? {
         value.flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    private static func temporaryResponseURL() -> URL {
+        FileManager.default.temporaryDirectory.appending(
+            path: ".cengine-api-response-\(UUID().uuidString)"
+        )
     }
     private func endpointDriverOptions(
         _ endpoint: ContainerCreateRequest.EndpointSettingsRequest?
@@ -106,8 +154,15 @@ public struct DockerRouter: Sendable {
         case (.POST, "/_cengine/v1/resource-scopes"):
             guard let resourceScopeManager else { throw EngineError(.notFound, "page not found") }
             let input = try decoder.decode(ContainerResourceScopeCreateRequest.self, from: request.body)
+            guard let peer = request.peerIdentity else {
+                throw EngineError(.forbidden, "resource scope peer identity is required")
+            }
+            if let legacyPID = input.ownerPID,
+               legacyPID != peer.process.processIdentifier {
+                throw EngineError(.forbidden, "resource scope ownerPID does not match the authenticated peer")
+            }
             let scope = try await resourceScopeManager.create(
-                ownerPID: input.ownerPID,
+                owner: peer.process,
                 resources: .init(cpus: input.cpus, memoryGiB: input.memoryGiB)
             )
             return json(status: .created, scope)
@@ -115,7 +170,10 @@ public struct DockerRouter: Sendable {
             guard let resourceScopeManager else { throw EngineError(.notFound, "page not found") }
             let id = String(value.dropFirst("/_cengine/v1/resource-scopes/".count))
             guard !id.isEmpty else { throw EngineError(.badRequest, "resource scope ID is required") }
-            await resourceScopeManager.remove(id)
+            guard let peer = request.peerIdentity else {
+                throw EngineError(.forbidden, "resource scope peer identity is required")
+            }
+            try await resourceScopeManager.remove(id, requestedBy: peer.process)
             return APIResponse(status: .noContent)
         case (.GET, "/_ping"), (.HEAD, "/_ping"):
             return APIResponse(status: .ok, headers: ["Api-Version": DockerAPIVersion.maximum.description, "Docker-Experimental": "true"], body: request.method == .HEAD ? Data() : Data("OK".utf8))
@@ -134,7 +192,7 @@ public struct DockerRouter: Sendable {
                 version: version
             ))
         case (.GET, "/system/df"):
-            return json(status: .ok, SystemDiskUsageResponse(
+            return json(status: .ok, try SystemDiskUsageResponse(
                 containers: await runtime.listContainers(all: true),
                 images: await runtime.listImages(),
                 volumes: await runtime.listVolumes()
@@ -199,11 +257,12 @@ public struct DockerRouter: Sendable {
             record.deviceCgroupRules = validated.deviceCgroupRules
             record.ulimits = validated.ulimits
             if let memory = input.HostConfig?.Memory, memory > 0 { record.memoryBytes = UInt64(memory) }
-            if let nano = input.HostConfig?.NanoCpus, nano > 0 {
-                record.cpus = max(1, Int((nano + 999_999_999) / 1_000_000_000))
-            } else if let quota = input.HostConfig?.CpuQuota, quota > 0 {
-                let period = max(input.HostConfig?.CpuPeriod ?? 100_000, 1)
-                record.cpus = max(1, Int((quota + period - 1) / period))
+            if let nanoCPUs = try DockerCPUResources.resolvedNanoCPUs(
+                nanoCPUs: input.HostConfig?.NanoCpus,
+                period: input.HostConfig?.CpuPeriod,
+                quota: input.HostConfig?.CpuQuota
+            ) {
+                record.cpus = try DockerCPUResources.cpuCount(nanoCPUs: nanoCPUs)
             }
             if let memoryBytes = containerResourceOverride?.memoryBytes { record.memoryBytes = memoryBytes }
             if let cpus = containerResourceOverride?.cpus { record.cpus = cpus }
@@ -275,7 +334,14 @@ public struct DockerRouter: Sendable {
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/stats"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/stats".count))
             let record = try await runtime.container(id)
-            return json(status: .ok, ContainerStatsResponse(try await runtime.containerStatistics(id), container: record, version: version))
+            return json(
+                status: .ok,
+                try ContainerStatsResponse(
+                    try await runtime.containerStatistics(id),
+                    container: record,
+                    version: version
+                )
+            )
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/top"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/top".count))
             let result = try await runtime.containerTop(id, arguments: (query["ps_args"] ?? "-ef").split(whereSeparator: \.isWhitespace).map(String.init))
@@ -283,7 +349,15 @@ public struct DockerRouter: Sendable {
         case (.PUT, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/archive"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/archive".count))
             guard let path = query["path"], !path.isEmpty else { throw EngineError(.badRequest, "path is required") }
-            try await runtime.copyArchiveIntoContainer(id, path: path, archive: request.body)
+            if let uploadURL = request.uploadURL {
+                try await runtime.copyArchiveIntoContainer(
+                    id, path: path, archiveURL: uploadURL
+                )
+            } else {
+                try await runtime.copyArchiveIntoContainer(
+                    id, path: path, archive: request.body
+                )
+            }
             return APIResponse(status: .ok)
         case (.HEAD, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/archive"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/archive".count))
@@ -302,14 +376,23 @@ public struct DockerRouter: Sendable {
                 name: URL(filePath: path).lastPathComponent, size: 0,
                 mode: 0, mtime: ISO8601DateFormatter().string(from: Date()), linkTarget: ""
             )
-            return APIResponse(
-                status: .ok,
-                headers: [
-                    "Content-Type": "application/x-tar",
-                    "X-Docker-Container-Path-Stat": try encoder.encode(stat).base64EncodedString(),
-                ],
-                body: try await runtime.copyArchiveOutOfContainer(id, path: path)
-            )
+            let file = APIResponseFile(url: Self.temporaryResponseURL())
+            do {
+                try await runtime.copyArchiveOutOfContainer(
+                    id, path: path, to: file.url
+                )
+                return APIResponse(
+                    status: .ok,
+                    headers: [
+                        "Content-Type": "application/x-tar",
+                        "X-Docker-Container-Path-Stat": try encoder.encode(stat).base64EncodedString(),
+                    ],
+                    file: file
+                )
+            } catch {
+                file.cleanup()
+                throw error
+            }
         case (.POST, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/start"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/start".count))
             try await runtime.startContainer(id); return APIResponse(status: .noContent)
@@ -354,14 +437,11 @@ public struct DockerRouter: Sendable {
             let policy = input.RestartPolicy.map {
                 RestartPolicyRecord(name: $0.Name ?? "no", maximumRetryCount: $0.MaximumRetryCount ?? 0)
             }
-            let nanoCPUs: Int64? = try {
-                if let value = input.NanoCpus, value > 0 { return value }
-                guard let quota = input.CpuQuota, quota > 0 else { return nil }
-                let period = max(input.CpuPeriod ?? 100_000, 1)
-                let (scaled, overflow) = quota.multipliedReportingOverflow(by: 1_000_000_000)
-                guard !overflow else { throw EngineError(.badRequest, "CPU quota is too large") }
-                return scaled / period + (scaled % period == 0 ? 0 : 1)
-            }()
+            let nanoCPUs = try DockerCPUResources.resolvedNanoCPUs(
+                nanoCPUs: input.NanoCpus,
+                period: input.CpuPeriod,
+                quota: input.CpuQuota
+            )
             _ = try await runtime.updateContainer(
                 id, memoryBytes: input.Memory, nanoCPUs: nanoCPUs,
                 pidsLimit: try validatedPidsLimit(input.PidsLimit), restartPolicy: policy,
@@ -503,23 +583,48 @@ public struct DockerRouter: Sendable {
             return json(status: .ok, PruneResponse(containers: try await runtime.pruneContainers(ids: candidates)))
         case (.POST, "/images/prune"):
             let scope = try imagePruneScope(filters: query["filters"])
-            return json(status: .ok, PruneResponse(images: try await runtime.pruneImages(scope: scope)))
+            return json(
+                status: .ok,
+                try PruneResponse(images: try await runtime.pruneImages(scope: scope))
+            )
         case (.POST, "/volumes/prune"):
             let scope = try volumePruneScope(filters: query["filters"], version: version)
             return json(status: .ok, PruneResponse(volumes: try await runtime.pruneVolumes(scope: scope)))
         case (.DELETE, let value) where value.hasPrefix("/networks/"):
             try await runtime.removeNetwork(String(value.dropFirst("/networks/".count))); return APIResponse(status: .noContent)
         case (.GET, "/volumes"):
-            return json(status: .ok, VolumeListEnvelope(Volumes: filteredVolumes(await runtime.listVolumes(), filters: query["filters"]).map { DockerVolumeResponse($0) }, Warnings: []))
+            return json(
+                status: .ok,
+                VolumeListEnvelope(
+                    Volumes: try filteredVolumes(
+                        await runtime.listVolumes(), filters: query["filters"]
+                    ).map { try DockerVolumeResponse($0) },
+                    Warnings: []
+                )
+            )
         case (.GET, let value) where value.hasPrefix("/volumes/"):
-            return json(status: .ok, DockerVolumeResponse(try await runtime.volume(String(value.dropFirst("/volumes/".count)))))
+            return json(
+                status: .ok,
+                try DockerVolumeResponse(
+                    try await runtime.volume(String(value.dropFirst("/volumes/".count)))
+                )
+            )
         case (.POST, "/volumes/create"):
             let input = try decoder.decode(VolumeCreateRequest.self, from: request.body)
             if let driver = input.Driver, !driver.isEmpty, driver != "local" {
                 throw EngineError(.unsupported, "volume driver \(driver) is not supported")
             }
             let name = input.Name.flatMap { $0.isEmpty ? nil : $0 } ?? Identifier.random()
-            return json(status: .created, DockerVolumeResponse(try await runtime.createVolume(name: name, labels: input.Labels ?? [:], options: input.DriverOpts ?? [:])))
+            return json(
+                status: .created,
+                try DockerVolumeResponse(
+                    try await runtime.createVolume(
+                        name: name,
+                        labels: input.Labels ?? [:],
+                        options: input.DriverOpts ?? [:]
+                    )
+                )
+            )
         case (.DELETE, let value) where value.hasPrefix("/volumes/"):
             try await runtime.removeVolume(String(value.dropFirst("/volumes/".count)), force: parseBool(query["force"]) ?? false); return APIResponse(status: .noContent)
         case (.GET, "/images/json"):
@@ -580,10 +685,16 @@ public struct DockerRouter: Sendable {
                     repeated: version >= .init(major: 1, minor: 52)
                 )
                 : []
-            let images = try await runtime.loadImages(
-                archive: request.body,
-                platforms: platforms
-            )
+            let images: [ImageRecord]
+            if let uploadURL = request.uploadURL {
+                images = try await runtime.loadImages(
+                    archiveURL: uploadURL, platforms: platforms
+                )
+            } else {
+                images = try await runtime.loadImages(
+                    archive: request.body, platforms: platforms
+                )
+            }
             let output = images.map { "{\"stream\":\"Loaded image: \($0.references.first ?? $0.id)\\n\"}\n" }.joined()
             return APIResponse(status: .ok, headers: ["Content-Type": "application/json"], body: Data(output.utf8))
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/json"):
@@ -666,14 +777,20 @@ public struct DockerRouter: Sendable {
                     repeated: version >= .init(major: 1, minor: 52)
                 )
                 : []
-            return APIResponse(
-                status: .ok,
-                headers: ["Content-Type": "application/x-tar"],
-                body: try await runtime.saveImages(
-                    queries["names"] ?? [],
-                    platforms: platforms
+            let file = APIResponseFile(url: Self.temporaryResponseURL())
+            do {
+                try await runtime.saveImages(
+                    queries["names"] ?? [], platforms: platforms, to: file.url
                 )
-            )
+                return APIResponse(
+                    status: .ok,
+                    headers: ["Content-Type": "application/x-tar"],
+                    file: file
+                )
+            } catch {
+                file.cleanup()
+                throw error
+            }
         case (.GET, let value) where value.hasPrefix("/images/") && value.hasSuffix("/get"):
             let id = String(value.dropFirst("/images/".count).dropLast("/get".count)).removingPercentEncoding ?? value
             let platforms = version >= .init(major: 1, minor: 48)
@@ -682,14 +799,20 @@ public struct DockerRouter: Sendable {
                     repeated: version >= .init(major: 1, minor: 52)
                 )
                 : []
-            return APIResponse(
-                status: .ok,
-                headers: ["Content-Type": "application/x-tar"],
-                body: try await runtime.saveImage(
-                    id,
-                    platforms: platforms
+            let file = APIResponseFile(url: Self.temporaryResponseURL())
+            do {
+                try await runtime.saveImages(
+                    [id], platforms: platforms, to: file.url
                 )
-            )
+                return APIResponse(
+                    status: .ok,
+                    headers: ["Content-Type": "application/x-tar"],
+                    file: file
+                )
+            } catch {
+                file.cleanup()
+                throw error
+            }
         case (.DELETE, let value) where value.hasPrefix("/images/"):
             let id = String(value.dropFirst("/images/".count)).removingPercentEncoding ?? value
             let force = parseBool(query["force"]) ?? false
@@ -1112,7 +1235,11 @@ public struct DockerRouter: Sendable {
     }
 
     private func inspectContainer(_ identifier: String, version: DockerAPIVersion) async throws -> ContainerInspectResponse {
-        .init(try await runtime.container(identifier), networks: await runtime.listNetworks(), version: version)
+        try .init(
+            try await runtime.container(identifier),
+            networks: await runtime.listNetworks(),
+            version: version
+        )
     }
 
     public func containerIO(_ identifier: String) async throws -> ContainerIOBridge {
@@ -1127,7 +1254,11 @@ public struct DockerRouter: Sendable {
     }
     public func statistics(_ identifier: String, version: DockerAPIVersion = .maximum) async throws -> ContainerStatsResponse {
         let record = try await runtime.container(identifier)
-        return ContainerStatsResponse(try await runtime.containerStatistics(identifier), container: record, version: version)
+        return try ContainerStatsResponse(
+            try await runtime.containerStatistics(identifier),
+            container: record,
+            version: version
+        )
     }
     public func pullImage(_ request: APIRequest, progress: @escaping ImagePullProgressHandler) async throws -> ImageRecord {
         let components = try parsedComponents(request.uri)
@@ -1572,25 +1703,9 @@ public struct DockerRouter: Sendable {
         if let memory, memory > 0, memory < 6 * 1_024 * 1_024 {
             throw EngineError(.badRequest, "Memory must be at least 6 MiB")
         }
-        if let nanoCPUs, nanoCPUs < 0 { throw EngineError(.badRequest, "NanoCpus must not be negative") }
-        if let cpuPeriod, cpuPeriod < 0 { throw EngineError(.badRequest, "CpuPeriod must not be negative") }
-        if let cpuQuota, cpuQuota < -1 { throw EngineError(.badRequest, "CpuQuota is invalid") }
-        if let cpuPeriod, cpuPeriod != 0, !(1_000...1_000_000).contains(cpuPeriod) {
-            throw EngineError(.badRequest, "CpuPeriod must be between 1000 and 1000000 microseconds")
-        }
-        if let cpuQuota, cpuQuota > 0, cpuQuota < 1_000 {
-            throw EngineError(.badRequest, "CpuQuota must be at least 1000 microseconds")
-        }
-        if cpuQuota == -1 { throw EngineError(.unsupported, "unlimited CpuQuota is not supported") }
-        if let nanoCPUs, nanoCPUs > 0, let cpuPeriod, cpuPeriod > 0 {
-            throw EngineError(.badRequest, "NanoCpus and CpuPeriod cannot both be set")
-        }
-        if let nanoCPUs, nanoCPUs > 0, let cpuQuota, cpuQuota > 0 {
-            throw EngineError(.badRequest, "NanoCpus and CpuQuota cannot both be set")
-        }
-        if let cpuPeriod, cpuPeriod > 0, !(cpuQuota.map { $0 > 0 } ?? false) {
-            throw EngineError(.unsupported, "CpuPeriod without a positive CpuQuota is not supported")
-        }
+        _ = try DockerCPUResources.resolvedNanoCPUs(
+            nanoCPUs: nanoCPUs, period: cpuPeriod, quota: cpuQuota
+        )
         _ = try validatedPidsLimit(pidsLimit)
     }
 
@@ -2414,7 +2529,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         let GwPriority: Int?; let DNSNames: [String]
     }
 
-    init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
+    init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) throws {
         let formatter = ISO8601DateFormatter()
         Id = record.id; Name = "/\(record.name)"; Created = formatter.string(from: record.createdAt)
         Path = record.processArguments.first ?? ""; Args = Array(record.processArguments.dropFirst())
@@ -2445,7 +2560,8 @@ public struct ContainerInspectResponse: Codable, Sendable {
             ? "none"
             : record.networks.first.flatMap { networkByID[$0.networkID]?.name } ?? "default"
         HostConfig = .init(
-            Memory: record.memoryBytes, NanoCpus: Int64(record.cpus) * 1_000_000_000,
+            Memory: record.memoryBytes,
+            NanoCpus: try DockerCPUResources.nanoCPUs(cpuCount: record.cpus),
             PidsLimit: record.pidsLimit,
             ConsoleSize: [record.consoleSize.height, record.consoleSize.width],
             BlkioWeight: 0, BlkioWeightDevice: nil,

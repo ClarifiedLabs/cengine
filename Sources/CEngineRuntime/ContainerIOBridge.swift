@@ -22,7 +22,6 @@ public final class ContainerIOBridge: @unchecked Sendable {
 
     private static let journalMagic = Data([0x43, 0x45, 0x4c, 0x4a]) // CELJ
     private static let journalHeaderSize = 20
-    private static let maximumJournalPayloadSize = 256 * 1_024 * 1_024
     static let defaultCompletedSnapshotByteLimit = 8 * 1_024 * 1_024
 
     private let lock = NSLock()
@@ -33,22 +32,30 @@ public final class ContainerIOBridge: @unchecked Sendable {
         let output: @Sendable (Data, OutputStream, Date) -> Void
         let closed: @Sendable () -> Void
     }
+    private struct SourceOffsets: Codable, Sendable {
+        let stdout: UInt64
+        let stderr: UInt64
+    }
+
     private struct LogEntry: Codable, Sendable {
         let date: Date
         let stream: UInt8
         let payload: Data
         let startsSourceSession: Bool?
+        let sourceOffsets: SourceOffsets?
 
         init(
             date: Date,
             stream: UInt8,
             payload: Data,
-            startsSourceSession: Bool? = nil
+            startsSourceSession: Bool? = nil,
+            sourceOffsets: SourceOffsets? = nil
         ) {
             self.date = date
             self.stream = stream
             self.payload = payload
             self.startsSourceSession = startsSourceSession
+            self.sourceOffsets = sourceOffsets
         }
     }
     private var subscribers: [UUID: Subscriber] = [:]
@@ -57,8 +64,15 @@ public final class ContainerIOBridge: @unchecked Sendable {
     private var frozen = false
     private let tty: Bool
     private var logHandle: FileHandle?
+    /// The fixed index handle is retained only long enough to migrate legacy
+    /// single-file journals. New records live in immutable generation segments.
     private var logIndexHandle: FileHandle?
+    private let journalDirectory: PersistentStateDirectory?
+    private var journalSegments: [JournalSegmentState] = []
+    private var activeJournalHandle: FileHandle?
     private var logEntries: [LogEntry] = []
+    private var sourceByteOffsets: [OutputStream: UInt64] = [.stdout: 0, .stderr: 0]
+    private let retentionPolicy: ContainerLogRetentionPolicy
     private var logPersistenceError: Error?
     private var inputFinished = false
     private var inputFinishResult: Result<Void, Error>?
@@ -67,19 +81,28 @@ public final class ContainerIOBridge: @unchecked Sendable {
         id: UUID, handler: @Sendable () throws -> Void
     )?
 
-    public convenience init(tty: Bool, logURL: URL? = nil) {
+    public convenience init(
+        tty: Bool,
+        logURL: URL? = nil,
+        retentionPolicy: ContainerLogRetentionPolicy = .default
+    ) {
         var logHandle: FileHandle?
         var logIndexHandle: FileHandle?
+        var journalDirectory: PersistentStateDirectory?
         var openingError: Error?
         if let logURL {
             do {
+                let parentURL = logURL.deletingLastPathComponent()
                 try FileManager.default.createDirectory(
-                    at: logURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
+                    at: parentURL, withIntermediateDirectories: true
                 )
                 logHandle = try Self.openOrCreateRegularFile(at: logURL)
                 logIndexHandle = try Self.openOrCreateRegularFile(
                     at: logURL.appendingPathExtension("entries")
+                )
+                let parent = try PersistentStateDirectory.open(parentURL)
+                journalDirectory = try parent.openOrCreateDirectory(
+                    named: logURL.lastPathComponent + ".journal"
                 )
             } catch {
                 openingError = error
@@ -89,7 +112,9 @@ public final class ContainerIOBridge: @unchecked Sendable {
             tty: tty,
             logHandle: logHandle,
             logIndexHandle: logIndexHandle,
-            initialPersistenceError: openingError
+            journalDirectory: journalDirectory,
+            initialPersistenceError: openingError,
+            retentionPolicy: retentionPolicy
         )
     }
 
@@ -97,19 +122,40 @@ public final class ContainerIOBridge: @unchecked Sendable {
         tty: Bool,
         logHandle: FileHandle?,
         logIndexHandle: FileHandle?,
-        initialPersistenceError: Error? = nil
+        journalDirectory: PersistentStateDirectory? = nil,
+        initialPersistenceError: Error? = nil,
+        retentionPolicy: ContainerLogRetentionPolicy = .default
     ) {
         self.tty = tty
         self.logHandle = logHandle
         self.logIndexHandle = logIndexHandle
+        self.journalDirectory = journalDirectory
+        self.retentionPolicy = retentionPolicy
         (inputStream, inputContinuation) = AsyncStream.makeStream(of: Data.self)
         logPersistenceError = initialPersistenceError
         do {
-            logEntries = try Self.recoverLogEntries(
-                tty: tty,
-                logHandle: logHandle,
-                logIndexHandle: logIndexHandle
-            )
+            if let journalDirectory {
+                let recovery = try Self.recoverSegmentedJournal(
+                    tty: tty,
+                    logHandle: logHandle,
+                    legacyIndexHandle: logIndexHandle,
+                    directory: journalDirectory,
+                    policy: retentionPolicy
+                )
+                logEntries = recovery.entries
+                journalSegments = recovery.segments
+                activeJournalHandle = recovery.activeHandle
+                try? logIndexHandle?.close()
+                self.logIndexHandle = nil
+            } else {
+                logEntries = try Self.recoverLogEntries(
+                    tty: tty,
+                    logHandle: logHandle,
+                    logIndexHandle: logIndexHandle,
+                    policy: retentionPolicy
+                )
+            }
+            sourceByteOffsets = try Self.recoveredSourceByteOffsets(logEntries)
         } catch {
             // Keep raw reads available, but never append an entry behind an
             // index state whose valid boundary could not be established.
@@ -273,20 +319,25 @@ public final class ContainerIOBridge: @unchecked Sendable {
             buffered.removeAll(keepingCapacity: false)
             logPersistenceError = nil
             frozen = true
-            let result = [logHandle, logIndexHandle].compactMap { $0 }
+            let result = [logHandle, logIndexHandle, activeJournalHandle].compactMap { $0 }
             logHandle = nil
             logIndexHandle = nil
+            activeJournalHandle = nil
             return result
         }
         for handle in handles { try? handle.close() }
     }
 
     var retainedPersistentDescriptorCount: Int {
-        lock.withLock { (logHandle == nil ? 0 : 1) + (logIndexHandle == nil ? 0 : 1) }
+        lock.withLock {
+            (logHandle == nil ? 0 : 1)
+                + (logIndexHandle == nil ? 0 : 1)
+                + (activeJournalHandle == nil ? 0 : 1)
+        }
     }
 
     var retainedLogPayloadByteCount: Int {
-        lock.withLock { logEntries.reduce(0) { $0 + $1.payload.count } }
+        lock.withLock { logEntries.reduce(0) { result, entry in result + entry.payload.count } }
     }
 
     var retainedBufferedByteCount: Int {
@@ -310,7 +361,11 @@ public final class ContainerIOBridge: @unchecked Sendable {
                 return Self.rawLogData(logEntries, tty: tty)
             }
             guard let logHandle else { return Data() }
-            return try Self.readAll(from: logHandle)
+            let maximumBytes = try CheckedArithmetic.add(
+                retentionPolicy.retainedBytes,
+                try CheckedArithmetic.multiply(retentionPolicy.maximumRetainedRecords, 8)
+            )
+            return try Self.readAll(from: logHandle, maximumBytes: maximumBytes)
         }
     }
 
@@ -318,7 +373,11 @@ public final class ContainerIOBridge: @unchecked Sendable {
         try lock.withLock {
             guard !logEntries.isEmpty else {
                 guard let logHandle else { return Data() }
-                return try Self.readAll(from: logHandle)
+                let maximumBytes = try CheckedArithmetic.add(
+                    retentionPolicy.retainedBytes,
+                    try CheckedArithmetic.multiply(retentionPolicy.maximumRetainedRecords, 8)
+                )
+                return try Self.readAll(from: logHandle, maximumBytes: maximumBytes)
             }
             return Self.render(logEntries, tty: tty, options: options)
         }
@@ -330,17 +389,45 @@ public final class ContainerIOBridge: @unchecked Sendable {
     /// monitor was stopped without replaying previously journaled output.
     func durableSourceByteOffsets() -> [OutputStream: UInt64]? {
         lock.withLock {
-            guard logIndexHandle != nil else { return nil }
-            var result: [OutputStream: UInt64] = [.stdout: 0, .stderr: 0]
-            for entry in logEntries {
-                if entry.startsSourceSession == true {
-                    result = [.stdout: 0, .stderr: 0]
-                    continue
-                }
-                guard let stream = OutputStream(rawValue: entry.stream) else { continue }
-                result[stream, default: 0] &+= UInt64(entry.payload.count)
+            guard logIndexHandle != nil || activeJournalHandle != nil else { return nil }
+            return sourceByteOffsets
+        }
+    }
+
+    /// Advances across a source-spool retention gap without manufacturing zero
+    /// bytes from the punched source inode. The checkpoint is journal-durable
+    /// before the monitor begins consuming the first retained segment.
+    func advanceDurableSourceByteOffset(
+        stream: OutputStream,
+        to offset: UInt64
+    ) throws {
+        try lock.withLock {
+            let current = sourceByteOffsets[stream] ?? 0
+            guard offset > current else { return }
+            if let logPersistenceError { throw logPersistenceError }
+            guard logIndexHandle != nil || activeJournalHandle != nil else {
+                throw EngineError(.internalError, "container log source checkpoint is unavailable")
             }
-            return result
+            do {
+                try compactIfNeededForIncomingPayload(0)
+                var next = sourceByteOffsets
+                next[stream] = offset
+                let marker = LogEntry(
+                    date: Date(),
+                    stream: 0,
+                    payload: Data(),
+                    sourceOffsets: .init(
+                        stdout: next[.stdout] ?? 0,
+                        stderr: next[.stderr] ?? 0
+                    )
+                )
+                try appendPersistentJournalEntry(marker)
+                logEntries.append(marker)
+                sourceByteOffsets = next
+            } catch {
+                logPersistenceError = error
+                throw error
+            }
         }
     }
 
@@ -354,10 +441,12 @@ public final class ContainerIOBridge: @unchecked Sendable {
                 date: Date(), stream: 0, payload: Data(), startsSourceSession: true
             )
             do {
-                if let logIndexHandle {
-                    try Self.appendJournalEntry(marker, to: logIndexHandle)
+                if logIndexHandle != nil || activeJournalHandle != nil {
+                    try appendPersistentJournalEntry(marker)
                 }
                 logEntries.append(marker)
+                sourceByteOffsets = [.stdout: 0, .stderr: 0]
+                try compactIfNeededForIncomingPayload(0)
             } catch {
                 logPersistenceError = error
                 throw error
@@ -389,13 +478,17 @@ public final class ContainerIOBridge: @unchecked Sendable {
     }
 
     fileprivate func write(_ data: Data, stream: OutputStream) throws {
+        guard data.count <= retentionPolicy.maximumRecordBytes,
+              let frameLength = UInt32(exactly: data.count) else {
+            throw EngineError(.internalError, "container log record exceeds the retention policy")
+        }
         let framed: Data
         if tty {
             framed = data
         } else {
             var header = Data([stream.rawValue, 0, 0, 0])
-            let count = UInt32(data.count).bigEndian
-            withUnsafeBytes(of: count) { header.append(contentsOf: $0) }
+            var count = frameLength.bigEndian
+            withUnsafeBytes(of: &count) { header.append(contentsOf: $0) }
             header.append(data)
             framed = header
         }
@@ -407,11 +500,15 @@ public final class ContainerIOBridge: @unchecked Sendable {
             }
             if let logPersistenceError { throw logPersistenceError }
             do {
-                if let logIndexHandle {
+                try compactIfNeededForIncomingPayload(data.count)
+                let oldOffset = sourceByteOffsets[stream] ?? 0
+                let nextOffset = try CheckedArithmetic.add(oldOffset, UInt64(data.count))
+                if logIndexHandle != nil || activeJournalHandle != nil {
                     // The self-contained journal is authoritative. Publish and
                     // synchronize it before updating the raw Docker-log mirror.
-                    try Self.appendJournalEntry(entry, to: logIndexHandle)
+                    try appendPersistentJournalEntry(entry)
                     logEntries.append(entry)
+                    sourceByteOffsets[stream] = nextOffset
                     if let logHandle {
                         try Self.appendAndSynchronize(framed, to: logHandle)
                     }
@@ -420,16 +517,483 @@ public final class ContainerIOBridge: @unchecked Sendable {
                         try Self.appendAndSynchronize(framed, to: logHandle)
                     }
                     logEntries.append(entry)
+                    sourceByteOffsets[stream] = nextOffset
                 }
             } catch {
                 logPersistenceError = error
                 throw error
             }
             let handlers = subscribers.values.map(\.output)
-            if handlers.isEmpty { buffered.append(framed) }
+            if handlers.isEmpty {
+                buffered.append(framed)
+                while buffered.count > retentionPolicy.followerQueueRecords
+                    || buffered.reduce(0, { $0 + $1.count }) > retentionPolicy.followerQueueBytes {
+                    buffered.removeFirst()
+                }
+            }
             return handlers
         }
         handlers.forEach { $0(framed, stream, date) }
+    }
+
+    private func compactIfNeededForIncomingPayload(_ incomingBytes: Int) throws {
+        let retainedBytes = try logEntries.reduce(0) {
+            try CheckedArithmetic.add($0, $1.payload.count)
+        }
+        let journalLimit = try CheckedArithmetic.add(
+            try CheckedArithmetic.add(
+                try CheckedArithmetic.multiply(retentionPolicy.retainedBytes, 2),
+                try CheckedArithmetic.multiply(retentionPolicy.maximumRecordBytes, 2)
+            ),
+            try CheckedArithmetic.multiply(retentionPolicy.maximumRetainedRecords, 256)
+        )
+        let rawLimit = try CheckedArithmetic.add(
+            retentionPolicy.retainedBytes,
+            try CheckedArithmetic.multiply(retentionPolicy.maximumRetainedRecords, 8)
+        )
+        let allowedExisting = retentionPolicy.retainedBytes - incomingBytes
+        let shouldCompact = retainedBytes > allowedExisting
+            || logEntries.count >= retentionPolicy.maximumRetainedRecords
+            || journalPhysicalSize().map { $0 >= journalLimit } == true
+            || Self.fileSize(logHandle).map { $0 >= rawLimit } == true
+        guard shouldCompact else { return }
+
+        var remainingBytes = allowedExisting
+        var remainingRecords = max(0, retentionPolicy.maximumRetainedRecords - 1)
+        var retained: [LogEntry] = []
+        for entry in logEntries.reversed() {
+            guard OutputStream(rawValue: entry.stream) != nil,
+                  remainingBytes > 0, remainingRecords > 0 else { continue }
+            if entry.payload.count <= remainingBytes {
+                retained.append(entry)
+                remainingBytes -= entry.payload.count
+            } else {
+                retained.append(.init(
+                    date: entry.date,
+                    stream: entry.stream,
+                    payload: Data(entry.payload.suffix(remainingBytes))
+                ))
+                remainingBytes = 0
+            }
+            remainingRecords -= 1
+        }
+        retained.reverse()
+        retained.append(.init(
+            date: Date(),
+            stream: 0,
+            payload: Data(),
+            sourceOffsets: .init(
+                stdout: sourceByteOffsets[.stdout] ?? 0,
+                stderr: sourceByteOffsets[.stderr] ?? 0
+            )
+        ))
+        if journalDirectory != nil {
+            try replaceSegmentedJournal(with: retained)
+        } else if let logIndexHandle {
+            try Self.rewriteJournal(
+                retained, in: logIndexHandle, policy: retentionPolicy
+            )
+        }
+        if let logHandle {
+            try Self.rewriteAndSynchronize(Self.rawLogData(retained, tty: tty), in: logHandle)
+        }
+        logEntries = retained
+    }
+
+    private struct JournalSegmentReference: Codable, Equatable, Sendable {
+        let name: String
+        let identity: PersistentFileIdentity
+    }
+
+    private struct JournalManifest: Codable, Sendable {
+        static let currentSchemaVersion = 1
+
+        let schemaVersion: Int
+        let segments: [JournalSegmentReference]
+
+        init(segments: [JournalSegmentReference]) {
+            schemaVersion = Self.currentSchemaVersion
+            self.segments = segments
+        }
+    }
+
+    private struct JournalSegmentState {
+        let name: String
+        let identity: PersistentFileIdentity
+        var payloadBytes: Int
+        var recordCount: Int
+        var encodedBytes: Int
+
+        var reference: JournalSegmentReference {
+            .init(name: name, identity: identity)
+        }
+    }
+
+    private struct SegmentedJournalRecovery {
+        let entries: [LogEntry]
+        let segments: [JournalSegmentState]
+        let activeHandle: FileHandle
+    }
+
+    private func appendPersistentJournalEntry(_ entry: LogEntry) throws {
+        if let directory = journalDirectory {
+            let frame = try Self.journalFrame(entry, policy: retentionPolicy)
+            guard var active = journalSegments.last,
+                  let activeJournalHandle else {
+                throw EngineError(.internalError, "container log journal has no active segment")
+            }
+            let payloadWouldOverflow = active.recordCount > 0
+                && active.payloadBytes > retentionPolicy.segmentBytes - entry.payload.count
+            let encodedLimit = try Self.journalSegmentEncodedLimit(retentionPolicy)
+            let encodedWouldOverflow = active.recordCount > 0
+                && active.encodedBytes > encodedLimit - frame.count
+            if payloadWouldOverflow || encodedWouldOverflow {
+                try rotateSegmentedJournal(in: directory)
+                guard let rotated = journalSegments.last,
+                      let rotatedHandle = self.activeJournalHandle else {
+                    throw EngineError(.internalError, "container log journal rotation failed")
+                }
+                active = rotated
+                try Self.appendAndSynchronize(frame, to: rotatedHandle)
+            } else {
+                try Self.appendAndSynchronize(frame, to: activeJournalHandle)
+            }
+            active.payloadBytes = try CheckedArithmetic.add(
+                active.payloadBytes, entry.payload.count
+            )
+            active.recordCount = try CheckedArithmetic.add(active.recordCount, 1)
+            active.encodedBytes = try CheckedArithmetic.add(active.encodedBytes, frame.count)
+            journalSegments[journalSegments.count - 1] = active
+            return
+        }
+        guard let logIndexHandle else {
+            throw EngineError(.internalError, "container log journal is unavailable")
+        }
+        try Self.appendJournalEntry(entry, to: logIndexHandle, policy: retentionPolicy)
+    }
+
+    private func rotateSegmentedJournal(
+        in directory: PersistentStateDirectory
+    ) throws {
+        if journalSegments.count >= retentionPolicy.maximumSegments {
+            try replaceSegmentedJournal(with: logEntries)
+        }
+        guard journalSegments.count < retentionPolicy.maximumSegments else {
+            throw EngineError(.internalError, "container log journal segment limit exhausted")
+        }
+        let created = try Self.createJournalSegment(in: directory)
+        do {
+            let references = journalSegments.map(\.reference) + [created.state.reference]
+            try Self.publishJournalManifest(references, in: directory)
+        } catch {
+            try? created.handle.close()
+            try? directory.removeRegularFileIfPresent(named: created.state.name)
+            throw error
+        }
+        try? activeJournalHandle?.close()
+        activeJournalHandle = created.handle
+        journalSegments.append(created.state)
+    }
+
+    private func replaceSegmentedJournal(with entries: [LogEntry]) throws {
+        guard let directory = journalDirectory else {
+            throw EngineError(.internalError, "container log journal directory is unavailable")
+        }
+        let previous = journalSegments
+        let replacement = try Self.publishJournalGeneration(
+            entries, in: directory, policy: retentionPolicy
+        )
+        try? activeJournalHandle?.close()
+        journalSegments = replacement.segments
+        activeJournalHandle = replacement.activeHandle
+        let retainedNames = Set(replacement.segments.map(\.name))
+        for segment in previous where !retainedNames.contains(segment.name) {
+            guard let current = try directory.entryMetadata(named: segment.name),
+                  current.type == S_IFREG,
+                  current.identity == segment.identity else {
+                if try directory.entryMetadata(named: segment.name) != nil {
+                    throw EngineError(.conflict, "container log segment changed before retirement")
+                }
+                continue
+            }
+            try directory.removeRegularFileIfPresent(named: segment.name)
+        }
+    }
+
+    private func journalPhysicalSize() -> Int? {
+        if journalDirectory != nil {
+            return try? journalSegments.reduce(0) {
+                try CheckedArithmetic.add($0, $1.encodedBytes)
+            }
+        }
+        return Self.fileSize(logIndexHandle)
+    }
+
+    private static func recoverSegmentedJournal(
+        tty: Bool,
+        logHandle: FileHandle?,
+        legacyIndexHandle: FileHandle?,
+        directory: PersistentStateDirectory,
+        policy: ContainerLogRetentionPolicy
+    ) throws -> SegmentedJournalRecovery {
+        let manifestData = try directory.readRegularFile(
+            named: "manifest.json", maximumBytes: 64 * 1_024, required: false
+        )
+        guard let manifestData else {
+            let legacyEntries = try recoverLogEntries(
+                tty: tty,
+                logHandle: logHandle,
+                logIndexHandle: legacyIndexHandle,
+                policy: policy
+            )
+            let replacement = try publishJournalGeneration(
+                legacyEntries, in: directory, policy: policy
+            )
+            if let legacyIndexHandle {
+                try truncateAndSynchronize(legacyIndexHandle, to: 0)
+            }
+            try removeOrphanedJournalFiles(
+                in: directory,
+                retaining: Set(replacement.segments.map(\.name))
+            )
+            return replacement
+        }
+
+        let manifest: JournalManifest
+        do {
+            manifest = try JSONDecoder().decode(JournalManifest.self, from: manifestData)
+        } catch {
+            throw EngineError(.conflict, "container log journal manifest is invalid")
+        }
+        guard manifest.schemaVersion == JournalManifest.currentSchemaVersion,
+              !manifest.segments.isEmpty,
+              manifest.segments.count <= policy.maximumSegments,
+              Set(manifest.segments.map(\.name)).count == manifest.segments.count,
+              manifest.segments.allSatisfy({ validJournalSegmentName($0.name) }) else {
+            throw EngineError(.conflict, "container log journal manifest is invalid")
+        }
+
+        let segmentLimit = try journalSegmentEncodedLimit(policy)
+        var entries: [LogEntry] = []
+        var states: [JournalSegmentState] = []
+        var activeHandle: FileHandle?
+        do {
+            for (index, reference) in manifest.segments.enumerated() {
+                let opened = try directory.openRegularFile(
+                    named: reference.name,
+                    expectedIdentity: reference.identity,
+                    access: .readWrite
+                )
+                let handle = opened.handle
+                let data = try readAll(from: handle, maximumBytes: segmentLimit)
+                let recovery = decodeJournal(data, policy: policy)
+                guard data.isEmpty || recovery.recognized else {
+                    try? handle.close()
+                    throw EngineError(.conflict, "container log journal segment is invalid")
+                }
+                if recovery.validByteCount != data.count {
+                    try truncateAndSynchronize(handle, to: recovery.validByteCount)
+                }
+                let payloadBytes = try recovery.entries.reduce(0) {
+                    try CheckedArithmetic.add($0, $1.payload.count)
+                }
+                states.append(.init(
+                    name: reference.name,
+                    identity: reference.identity,
+                    payloadBytes: payloadBytes,
+                    recordCount: recovery.entries.count,
+                    encodedBytes: recovery.validByteCount
+                ))
+                entries.append(contentsOf: recovery.entries)
+                if index == manifest.segments.count - 1 {
+                    activeHandle = handle
+                } else {
+                    try handle.close()
+                }
+            }
+        } catch {
+            try? activeHandle?.close()
+            throw error
+        }
+        guard let recoveredActiveHandle = activeHandle else {
+            throw EngineError(.internalError, "container log journal has no active segment")
+        }
+        var selectedActiveHandle = recoveredActiveHandle
+
+        let payloadBytes = try entries.reduce(0) {
+            try CheckedArithmetic.add($0, $1.payload.count)
+        }
+        if payloadBytes > policy.retainedBytes
+            || entries.count > policy.maximumRetainedRecords {
+            let offsets = try recoveredSourceByteOffsets(entries)
+            let retained = retainedSuffix(
+                entries, policy: policy, sourceOffsets: offsets
+            )
+            try selectedActiveHandle.close()
+            let replacement = try publishJournalGeneration(
+                retained, in: directory, policy: policy
+            )
+            for state in states
+                where !replacement.segments.contains(where: { $0.name == state.name }) {
+                if let current = try directory.entryMetadata(named: state.name),
+                   current.identity == state.identity, current.type == S_IFREG {
+                    try directory.removeRegularFileIfPresent(named: state.name)
+                }
+            }
+            entries = retained
+            states = replacement.segments
+            selectedActiveHandle = replacement.activeHandle
+        }
+
+        if let logHandle {
+            let rawLimit = try CheckedArithmetic.add(
+                policy.retainedBytes,
+                try CheckedArithmetic.multiply(policy.maximumRetainedRecords, 8)
+            )
+            let raw = try readAll(from: logHandle, maximumBytes: rawLimit)
+            let repaired = rawLogData(entries, tty: tty)
+            if raw != repaired { try rewriteAndSynchronize(repaired, in: logHandle) }
+        }
+        try removeOrphanedJournalFiles(
+            in: directory, retaining: Set(states.map(\.name))
+        )
+        return .init(
+            entries: entries, segments: states, activeHandle: selectedActiveHandle
+        )
+    }
+
+    private static func publishJournalGeneration(
+        _ entries: [LogEntry],
+        in directory: PersistentStateDirectory,
+        policy: ContainerLogRetentionPolicy
+    ) throws -> SegmentedJournalRecovery {
+        var groups: [[LogEntry]] = [[]]
+        var groupPayloadBytes = 0
+        for entry in entries {
+            if !groups[groups.count - 1].isEmpty,
+               groupPayloadBytes > policy.segmentBytes - entry.payload.count {
+                groups.append([])
+                groupPayloadBytes = 0
+            }
+            groups[groups.count - 1].append(entry)
+            groupPayloadBytes = try CheckedArithmetic.add(
+                groupPayloadBytes, entry.payload.count
+            )
+        }
+        guard groups.count <= policy.maximumSegments else {
+            throw EngineError(.internalError, "container log journal requires too many segments")
+        }
+
+        var created: [(state: JournalSegmentState, handle: FileHandle)] = []
+        do {
+            for group in groups {
+                var segment = try createJournalSegment(in: directory)
+                var encoded = Data()
+                var payloadBytes = 0
+                for entry in group {
+                    let frame = try journalFrame(entry, policy: policy)
+                    encoded.append(frame)
+                    payloadBytes = try CheckedArithmetic.add(
+                        payloadBytes, entry.payload.count
+                    )
+                }
+                if !encoded.isEmpty {
+                    try appendAndSynchronize(encoded, to: segment.handle)
+                }
+                segment.state.payloadBytes = payloadBytes
+                segment.state.recordCount = group.count
+                segment.state.encodedBytes = encoded.count
+                created.append(segment)
+            }
+            try publishJournalManifest(created.map { $0.state.reference }, in: directory)
+        } catch {
+            for segment in created {
+                try? segment.handle.close()
+                try? directory.removeRegularFileIfPresent(named: segment.state.name)
+            }
+            throw error
+        }
+        for segment in created.dropLast() { try segment.handle.close() }
+        guard let active = created.last else {
+            throw EngineError(.internalError, "container log journal generation is empty")
+        }
+        return .init(
+            entries: entries,
+            segments: created.map(\.state),
+            activeHandle: active.handle
+        )
+    }
+
+    private static func createJournalSegment(
+        in directory: PersistentStateDirectory
+    ) throws -> (state: JournalSegmentState, handle: FileHandle) {
+        let name = "segment-\(UUID().uuidString.lowercased()).celj"
+        let identity = try directory.createSparseRegularFile(named: name, size: 0)
+        do {
+            let handle = try directory.openRegularFile(
+                named: name, expectedIdentity: identity, access: .readWrite
+            ).handle
+            return (
+                .init(
+                    name: name, identity: identity, payloadBytes: 0,
+                    recordCount: 0, encodedBytes: 0
+                ),
+                handle
+            )
+        } catch {
+            try? directory.removeRegularFileIfPresent(named: name)
+            throw error
+        }
+    }
+
+    private static func publishJournalManifest(
+        _ references: [JournalSegmentReference],
+        in directory: PersistentStateDirectory
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(JournalManifest(segments: references))
+        guard data.count <= 64 * 1_024 else {
+            throw EngineError(.internalError, "container log journal manifest is too large")
+        }
+        try directory.replaceRegularFile(named: "manifest.json", data: data)
+    }
+
+    private static func removeOrphanedJournalFiles(
+        in directory: PersistentStateDirectory,
+        retaining names: Set<String>
+    ) throws {
+        for name in try directory.entryNames() {
+            let isSegment = validJournalSegmentName(name)
+            let isTemporaryManifest = name.hasPrefix(".cengine-state-")
+            guard (isSegment && !names.contains(name)) || isTemporaryManifest else {
+                continue
+            }
+            guard let metadata = try directory.entryMetadata(named: name),
+                  metadata.type == S_IFREG else {
+                throw EngineError(.conflict, "container log journal contains an unsafe orphan")
+            }
+            try directory.removeRegularFileIfPresent(named: name)
+        }
+    }
+
+    private static func validJournalSegmentName(_ name: String) -> Bool {
+        guard name.hasPrefix("segment-"), name.hasSuffix(".celj") else { return false }
+        let start = name.index(name.startIndex, offsetBy: 8)
+        let end = name.index(name.endIndex, offsetBy: -5)
+        return UUID(uuidString: String(name[start..<end])) != nil
+    }
+
+    private static func journalSegmentEncodedLimit(
+        _ policy: ContainerLogRetentionPolicy
+    ) throws -> Int {
+        try CheckedArithmetic.add(
+            try CheckedArithmetic.add(
+                try CheckedArithmetic.multiply(policy.segmentBytes, 2),
+                try CheckedArithmetic.multiply(policy.maximumRecordBytes, 2)
+            ),
+            try CheckedArithmetic.multiply(policy.maximumRetainedRecords, 256)
+        )
     }
 
     private struct JournalRecovery {
@@ -445,13 +1009,32 @@ public final class ContainerIOBridge: @unchecked Sendable {
     private static func recoverLogEntries(
         tty: Bool,
         logHandle: FileHandle?,
-        logIndexHandle: FileHandle?
+        logIndexHandle: FileHandle?,
+        policy: ContainerLogRetentionPolicy
     ) throws -> [LogEntry] {
+        let journalLimit = try CheckedArithmetic.add(
+            try CheckedArithmetic.add(
+                try CheckedArithmetic.multiply(policy.retainedBytes, 2),
+                try CheckedArithmetic.multiply(policy.maximumRecordBytes, 2)
+            ),
+            try CheckedArithmetic.multiply(policy.maximumRetainedRecords, 256)
+        )
+        let rawLimit = try CheckedArithmetic.add(
+            policy.retainedBytes,
+            try CheckedArithmetic.multiply(policy.maximumRetainedRecords, 8)
+        )
+        if fileSize(logIndexHandle).map({ $0 > journalLimit }) == true
+            || fileSize(logHandle).map({ $0 > rawLimit }) == true {
+            if let logIndexHandle { try truncateAndSynchronize(logIndexHandle, to: 0) }
+            if let logHandle { try truncateAndSynchronize(logHandle, to: 0) }
+            return []
+        }
+
         var entries: [LogEntry] = []
         if let logIndexHandle {
-            let data = try readAll(from: logIndexHandle)
+            let data = try readAll(from: logIndexHandle, maximumBytes: journalLimit)
             if !data.isEmpty {
-                let recovery = decodeJournal(data)
+                let recovery = decodeJournal(data, policy: policy)
                 if recovery.recognized {
                     entries = recovery.entries
                     if recovery.validByteCount != data.count {
@@ -463,7 +1046,7 @@ public final class ContainerIOBridge: @unchecked Sendable {
                     [LogEntry].self, from: data
                 ) {
                     entries = legacy
-                    try rewriteJournal(entries, in: logIndexHandle)
+                    try rewriteJournal(entries, in: logIndexHandle, policy: policy)
                 } else {
                     try truncateAndSynchronize(logIndexHandle, to: 0)
                 }
@@ -471,17 +1054,19 @@ public final class ContainerIOBridge: @unchecked Sendable {
         }
 
         if let logHandle {
-            let raw = try readAll(from: logHandle)
+            let raw = try readAll(from: logHandle, maximumBytes: rawLimit)
             let committedRaw = rawLogData(entries, tty: tty)
             if raw.starts(with: committedRaw), raw.count > committedRaw.count {
                 let suffix = Data(raw.dropFirst(committedRaw.count))
                 let recovered = recoverRawEntries(
-                    suffix, tty: tty, date: modificationDate(of: logHandle)
+                    suffix, tty: tty, date: modificationDate(of: logHandle), policy: policy
                 )
                 if !recovered.isEmpty {
                     if let logIndexHandle {
                         for entry in recovered {
-                            try appendJournalEntry(entry, to: logIndexHandle)
+                            try appendJournalEntry(
+                                entry, to: logIndexHandle, policy: policy
+                            )
                         }
                     }
                     entries.append(contentsOf: recovered)
@@ -493,10 +1078,27 @@ public final class ContainerIOBridge: @unchecked Sendable {
                 try rewriteAndSynchronize(repairedRaw, in: logHandle)
             }
         }
+        let payloadBytes = try entries.reduce(0) {
+            try CheckedArithmetic.add($0, $1.payload.count)
+        }
+        if payloadBytes > policy.retainedBytes
+            || entries.count > policy.maximumRetainedRecords {
+            let offsets = try recoveredSourceByteOffsets(entries)
+            entries = retainedSuffix(entries, policy: policy, sourceOffsets: offsets)
+            if let logIndexHandle {
+                try rewriteJournal(entries, in: logIndexHandle, policy: policy)
+            }
+            if let logHandle {
+                try rewriteAndSynchronize(rawLogData(entries, tty: tty), in: logHandle)
+            }
+        }
         return entries
     }
 
-    private static func decodeJournal(_ data: Data) -> JournalRecovery {
+    private static func decodeJournal(
+        _ data: Data,
+        policy: ContainerLogRetentionPolicy
+    ) -> JournalRecovery {
         var entries: [LogEntry] = []
         var offset = 0
         var recognized = false
@@ -517,7 +1119,8 @@ public final class ContainerIOBridge: @unchecked Sendable {
             recognized = true
             let length = decodeUInt64(data, at: offset + 4)
             let checksum = decodeUInt64(data, at: offset + 12)
-            guard length <= UInt64(maximumJournalPayloadSize),
+            let maximumEncodedRecordBytes = UInt64(policy.maximumRecordBytes) * 2 + 64 * 1_024
+            guard length <= maximumEncodedRecordBytes,
                   length <= UInt64(Int.max) else { break }
             let payloadCount = Int(length)
             let (frameEnd, overflow) = offset.addingReportingOverflow(
@@ -527,7 +1130,8 @@ public final class ContainerIOBridge: @unchecked Sendable {
             let payload = Data(data[(offset + journalHeaderSize)..<frameEnd])
             guard journalChecksum(payload) == checksum,
                   let entry = try? JSONDecoder().decode(LogEntry.self, from: payload),
-                  entry.startsSourceSession == true
+                  entry.payload.count <= policy.maximumRecordBytes,
+                  entry.startsSourceSession == true || entry.sourceOffsets != nil
                     || OutputStream(rawValue: entry.stream) != nil else { break }
             entries.append(entry)
             offset = frameEnd
@@ -538,35 +1142,64 @@ public final class ContainerIOBridge: @unchecked Sendable {
     }
 
     private static func appendJournalEntry(
-        _ entry: LogEntry, to handle: FileHandle
+        _ entry: LogEntry,
+        to handle: FileHandle,
+        policy: ContainerLogRetentionPolicy
     ) throws {
-        let payload = try JSONEncoder().encode(entry)
-        guard payload.count <= maximumJournalPayloadSize else {
+        try appendAndSynchronize(
+            try journalFrame(entry, policy: policy), to: handle
+        )
+    }
+
+    private static func journalFrame(
+        _ entry: LogEntry,
+        policy: ContainerLogRetentionPolicy
+    ) throws -> Data {
+        guard entry.payload.count <= policy.maximumRecordBytes else {
             throw EngineError(.internalError, "container log entry is too large to index")
+        }
+        let payload = try JSONEncoder().encode(entry)
+        let maximumEncodedRecordBytes = try CheckedArithmetic.add(
+            try CheckedArithmetic.multiply(policy.maximumRecordBytes, 2),
+            64 * 1_024
+        )
+        guard payload.count <= maximumEncodedRecordBytes else {
+            throw EngineError(.internalError, "encoded container log entry is too large to index")
         }
         var frame = Data()
         frame.append(journalMagic)
         appendUInt64(UInt64(payload.count), to: &frame)
         appendUInt64(journalChecksum(payload), to: &frame)
         frame.append(payload)
-        try appendAndSynchronize(frame, to: handle)
+        return frame
     }
 
     private static func rewriteJournal(
-        _ entries: [LogEntry], in handle: FileHandle
+        _ entries: [LogEntry],
+        in handle: FileHandle,
+        policy: ContainerLogRetentionPolicy
     ) throws {
         try truncateAndSynchronize(handle, to: 0)
         for entry in entries {
-            try appendJournalEntry(entry, to: handle)
+            try appendJournalEntry(entry, to: handle, policy: policy)
         }
     }
 
     private static func recoverRawEntries(
-        _ data: Data, tty: Bool, date: Date
+        _ data: Data,
+        tty: Bool,
+        date: Date,
+        policy: ContainerLogRetentionPolicy
     ) -> [LogEntry] {
         guard !data.isEmpty else { return [] }
         if tty {
-            return [.init(date: date, stream: OutputStream.stdout.rawValue, payload: data)]
+            return stride(from: 0, to: data.count, by: policy.maximumRecordBytes).map { offset in
+                .init(
+                    date: date,
+                    stream: OutputStream.stdout.rawValue,
+                    payload: Data(data[offset..<min(data.count, offset + policy.maximumRecordBytes)])
+                )
+            }
         }
         var entries: [LogEntry] = []
         var offset = 0
@@ -576,6 +1209,7 @@ public final class ContainerIOBridge: @unchecked Sendable {
                   data[offset + 2] == 0,
                   data[offset + 3] == 0 else { break }
             let payloadCount = Int(decodeUInt32(data, at: offset + 4))
+            guard payloadCount <= policy.maximumRecordBytes else { break }
             let (frameEnd, overflow) = offset.addingReportingOverflow(8 + payloadCount)
             guard !overflow, frameEnd <= data.count else { break }
             entries.append(.init(
@@ -595,14 +1229,73 @@ public final class ContainerIOBridge: @unchecked Sendable {
             if tty {
                 result.append(entry.payload)
             } else {
+                guard let payloadCount = UInt32(exactly: entry.payload.count) else { continue }
                 var header = Data([entry.stream, 0, 0, 0])
-                var count = UInt32(entry.payload.count).bigEndian
+                var count = payloadCount.bigEndian
                 withUnsafeBytes(of: &count) { header.append(contentsOf: $0) }
                 result.append(header)
                 result.append(entry.payload)
             }
         }
         return result
+    }
+
+    private static func recoveredSourceByteOffsets(
+        _ entries: [LogEntry]
+    ) throws -> [OutputStream: UInt64] {
+        var result: [OutputStream: UInt64] = [.stdout: 0, .stderr: 0]
+        for entry in entries {
+            if entry.startsSourceSession == true {
+                result = [.stdout: 0, .stderr: 0]
+                continue
+            }
+            if let offsets = entry.sourceOffsets {
+                result = [.stdout: offsets.stdout, .stderr: offsets.stderr]
+                continue
+            }
+            guard let stream = OutputStream(rawValue: entry.stream) else { continue }
+            result[stream] = try CheckedArithmetic.add(
+                result[stream] ?? 0, UInt64(entry.payload.count)
+            )
+        }
+        return result
+    }
+
+    private static func retainedSuffix(
+        _ entries: [LogEntry],
+        policy: ContainerLogRetentionPolicy,
+        sourceOffsets: [OutputStream: UInt64]
+    ) -> [LogEntry] {
+        var remainingBytes = policy.retainedBytes
+        var remainingRecords = max(0, policy.maximumRetainedRecords - 1)
+        var retained: [LogEntry] = []
+        for entry in entries.reversed() {
+            guard OutputStream(rawValue: entry.stream) != nil,
+                  remainingBytes > 0, remainingRecords > 0 else { continue }
+            if entry.payload.count <= remainingBytes {
+                retained.append(entry)
+                remainingBytes -= entry.payload.count
+            } else {
+                retained.append(.init(
+                    date: entry.date,
+                    stream: entry.stream,
+                    payload: Data(entry.payload.suffix(remainingBytes))
+                ))
+                remainingBytes = 0
+            }
+            remainingRecords -= 1
+        }
+        retained.reverse()
+        retained.append(.init(
+            date: Date(),
+            stream: 0,
+            payload: Data(),
+            sourceOffsets: .init(
+                stdout: sourceOffsets[.stdout] ?? 0,
+                stderr: sourceOffsets[.stderr] ?? 0
+            )
+        ))
+        return retained
     }
 
     private static func appendAndSynchronize(
@@ -681,10 +1374,36 @@ public final class ContainerIOBridge: @unchecked Sendable {
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
-    private static func readAll(from handle: FileHandle) throws -> Data {
+    private static func fileSize(_ handle: FileHandle?) -> Int? {
+        guard let handle else { return nil }
+        var information = stat()
+        guard Darwin.fstat(handle.fileDescriptor, &information) == 0,
+              information.st_size >= 0,
+              let size = Int(exactly: information.st_size) else { return nil }
+        return size
+    }
+
+    private static func readAll(
+        from handle: FileHandle,
+        maximumBytes: Int
+    ) throws -> Data {
+        guard maximumBytes >= 0 else {
+            throw EngineError(.internalError, "invalid container log read limit")
+        }
         try handle.seek(toOffset: 0)
-        let data = try handle.readToEnd() ?? Data()
+        var data = Data()
+        data.reserveCapacity(min(maximumBytes, 64 * 1_024))
+        while data.count <= maximumBytes {
+            let requested = min(64 * 1_024, maximumBytes + 1 - data.count)
+            guard requested > 0,
+                  let chunk = try handle.read(upToCount: requested),
+                  !chunk.isEmpty else { break }
+            data.append(chunk)
+        }
         try handle.seekToEnd()
+        guard data.count <= maximumBytes else {
+            throw EngineError(.internalError, "container log exceeds its persisted size limit")
+        }
         return data
     }
 

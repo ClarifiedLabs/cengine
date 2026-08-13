@@ -1,4 +1,5 @@
 import CEngineCore
+import Darwin
 import Foundation
 
 public struct ArchiveOwnership: Sendable {
@@ -270,6 +271,9 @@ public protocol ContainerBackend: Sendable {
     func pushImage(reference: String, platform: OCIPlatform?, credentials: RegistryCredentials?) async throws
     func saveImages(references: [String], platform: String) async throws -> Data
     func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data
+    func saveImages(
+        references: [String], platforms: [OCIPlatform], to destination: URL
+    ) async throws
     func pause(_ container: ContainerRecord) async throws
     func resume(_ container: ContainerRecord) async throws
     /// Restart implementations may stop the old execution before throwing.
@@ -368,6 +372,29 @@ public extension ContainerBackend {
     }
     func saveImages(references: [String], platforms: [OCIPlatform]) async throws -> Data {
         try await saveImages(references: references, platform: platforms.first?.description ?? "linux/arm64")
+    }
+    func saveImages(
+        references: [String], platforms: [OCIPlatform], to destination: URL
+    ) async throws {
+        let data = try await saveImages(references: references, platforms: platforms)
+        let descriptor = Darwin.open(
+            destination.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600)
+        )
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
     }
     func pause(_: ContainerRecord) async throws { throw EngineError(.unsupported, "pause is unavailable for this backend") }
     func resume(_: ContainerRecord) async throws { throw EngineError(.unsupported, "unpause is unavailable for this backend") }

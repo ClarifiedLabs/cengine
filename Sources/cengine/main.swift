@@ -96,10 +96,18 @@ private final class DaemonLock {
             )
         }
         let runtime = try await EngineRuntime(root: root, backend: backend)
-        let resourceScopes = ContainerResourceScopeManager(runtime: runtime, root: root)
+        let admission = APIAdmissionController()
+        let resourceScopes = ContainerResourceScopeManager(
+            runtime: runtime, root: root, admission: admission
+        )
         let server = DockerServer(
             socketPath: socket,
-            router: DockerRouter(runtime: runtime, root: root, resourceScopeManager: resourceScopes)
+            router: DockerRouter(
+                runtime: runtime,
+                root: root,
+                resourceScopeManager: resourceScopes
+            ),
+            admission: admission
         )
         do {
             try await server.start()
@@ -211,8 +219,9 @@ private final class DaemonLock {
         guard let engine = error as? EngineError else { return false }
         if engine.message.localizedCaseInsensitiveContains("checksum") { return true }
         switch engine.code {
-        case .badRequest, .conflict, .unsupported, .unauthorized: return true
-        case .notFound, .internalError: return false
+        case .badRequest, .conflict, .unsupported, .unauthorized, .forbidden,
+             .payloadTooLarge: return true
+        case .notFound, .tooManyRequests, .serviceUnavailable, .upstream, .internalError: return false
         }
     }
 
@@ -347,7 +356,6 @@ private final class DaemonLock {
 
         let scope = try await CEngineControlClient.createResourceScope(
             socketPath: socket,
-            ownerPID: getpid(),
             resources: resources
         )
         guard setenv("DOCKER_HOST", scope.dockerHost, 1) == 0 else {

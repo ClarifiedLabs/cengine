@@ -194,7 +194,8 @@ func validateVolumeMounts(spec protocol.WorkloadSpec) error {
 }
 
 func prepareVolume(mount protocol.Mount) error {
-	if mount.Source == "" || mount.Source == "." || mount.Source == ".." || strings.ContainsRune(mount.Source, '/') {
+	components, err := validateConfinedRelativePath(mount.Source)
+	if err != nil || len(components) != 1 {
 		return fmt.Errorf("invalid volume name %q", mount.Source)
 	}
 	if mount.Device == "" {
@@ -1635,99 +1636,73 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func initializeVolume(spec protocol.WorkloadSpec, mount protocol.Mount) error {
-	destination := filepath.Join("/run/cengine/volumes", mount.Source)
-	empty, err := dockerVolumeIsEmpty(destination)
+func initializeVolume(_ protocol.WorkloadSpec, mount protocol.Mount) error {
+	return initializeVolumeAt(
+		"/run/cengine/rootfs",
+		filepath.Join("/run/cengine/volumes", mount.Source),
+		mount,
+	)
+}
+
+func initializeVolumeAt(rootfsPath string, volumePath string, mount protocol.Mount) error {
+	destination, err := openConfinedRoot(volumePath)
+	if err != nil {
+		return err
+	}
+	defer destination.close()
+	lockFD, err := unix.Openat(
+		destination.fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(lockFD)
+	if err := unix.Flock(lockFD, unix.LOCK_EX); err != nil {
+		return fmt.Errorf("serialize volume copy-up: %w", err)
+	}
+	defer unix.Flock(lockFD, unix.LOCK_UN)
+	if err := recoverConfinedCopyTransaction(destination); err != nil {
+		return fmt.Errorf("recover volume copy-up: %w", err)
+	}
+	empty, err := confinedDirectoryIsEmpty(destination, "lost+found", confinedCopyTransactionName)
 	if err != nil {
 		return err
 	}
 	if !empty {
 		return nil
 	}
-	source := filepath.Join("/run/cengine/rootfs", filepath.Clean("/"+mount.Destination))
-	info, err := os.Stat(source)
-	if errors.Is(err, os.ErrNotExist) {
+
+	sourceRelative, err := absoluteMountDestinationRelative(mount.Destination)
+	if err != nil {
+		return err
+	}
+	sourceRoot, err := openConfinedRoot(rootfsPath)
+	if err != nil {
+		return err
+	}
+	defer sourceRoot.close()
+	sourceFD, sourceStat, err := pinConfinedSubpath(sourceRoot, sourceRelative)
+	if errors.Is(err, unix.ENOENT) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
+	source := &confinedRoot{fd: sourceFD}
+	defer source.close()
+	if sourceStat.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return nil
 	}
-	sourceEntries, err := os.ReadDir(source)
-	if err != nil {
-		return err
-	}
-	for _, entry := range sourceEntries {
-		if err := copyVolumeEntry(filepath.Join(source, entry.Name()), filepath.Join(destination, entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
+	return copyConfinedDirectory(source, destination)
 }
 
 func dockerVolumeIsEmpty(destination string) (bool, error) {
-	entries, err := os.ReadDir(destination)
+	root, err := openConfinedRoot(destination)
 	if err != nil {
 		return false, err
 	}
-	for _, entry := range entries {
-		if entry.Name() != "lost+found" {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-func copyVolumeEntry(source, destination string) error {
-	info, err := os.Lstat(source)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		if err := os.MkdirAll(destination, info.Mode().Perm()); err != nil {
-			return err
-		}
-		entries, err := os.ReadDir(source)
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			if err := copyVolumeEntry(filepath.Join(source, entry.Name()), filepath.Join(destination, entry.Name())); err != nil {
-				return err
-			}
-		}
-	} else if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(source)
-		if err != nil {
-			return err
-		}
-		if err := os.Symlink(target, destination); err != nil {
-			return err
-		}
-	} else if info.Mode().IsRegular() {
-		input, err := os.Open(source)
-		if err != nil {
-			return err
-		}
-		defer input.Close()
-		output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(output, input)
-		closeErr := output.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		_ = os.Lchown(destination, int(stat.Uid), int(stat.Gid))
-	}
-	return nil
+	defer root.close()
+	return confinedDirectoryIsEmpty(root, "lost+found", confinedCopyTransactionName)
 }
 
 func writeNetworkFiles(root string, spec protocol.WorkloadSpec) error {
@@ -1783,9 +1758,8 @@ func writeNetworkFiles(root string, spec protocol.WorkloadSpec) error {
 }
 
 func applyMount(root string, mount protocol.Mount) error {
-	destination := filepath.Join(root, filepath.Clean("/"+mount.Destination))
-	if !filepath.IsAbs(mount.Destination) || destination == root {
-		return errors.New("mount destination must be an absolute non-root path")
+	if _, err := absoluteMountDestinationRelative(mount.Destination); err != nil {
+		return err
 	}
 	flags := uintptr(0)
 	if mount.ReadOnly {
@@ -1793,14 +1767,11 @@ func applyMount(root string, mount protocol.Mount) error {
 	}
 	switch mount.Kind {
 	case "tmpfs":
-		if err := os.MkdirAll(destination, 0755); err != nil {
-			return err
-		}
 		tmpfsFlags, data, err := tmpfsMountConfiguration(mount.Options)
 		if err != nil {
 			return err
 		}
-		return unix.Mount("tmpfs", destination, "tmpfs", flags|tmpfsFlags, data)
+		return mountConfinedTmpfs(root, mount.Destination, flags|tmpfsFlags, data, unix.Mount)
 	case "bind":
 		staging := filepath.Join("/run/cengine/binds", mount.Source)
 		if err := os.MkdirAll(staging, 0755); err != nil {
@@ -1809,32 +1780,12 @@ func applyMount(root string, mount protocol.Mount) error {
 		if err := unix.Mount(mount.Source, staging, "virtiofs", 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
 			return err
 		}
-		source, err := mountSubpath(staging, mount.Subpath)
-		if err != nil {
-			return err
-		}
-		if err := prepareMountpoint(source, destination); err != nil {
-			return err
-		}
-		if err := unix.Mount(source, destination, "", bindMountFlags(mount), ""); err != nil {
-			return err
-		}
-		return applyBindMountAttributes(destination, mount, unix.Mount, unix.MountSetattr)
+		return mountConfinedBind(staging, root, mount, unix.Mount, unix.MountSetattr)
 	case "socket":
 		return nil
 	case "volume":
 		staging := filepath.Join("/run/cengine/volumes", mount.Source)
-		source, err := mountSubpath(staging, mount.Subpath)
-		if err != nil {
-			return err
-		}
-		if err := prepareMountpoint(source, destination); err != nil {
-			return err
-		}
-		if err := unix.Mount(source, destination, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-			return err
-		}
-		return applyVolumeMountAttributes(destination, mount, unix.MountSetattr)
+		return mountConfinedVolume(staging, root, mount, unix.Mount, unix.MountSetattr)
 	default:
 		return fmt.Errorf("unsupported mount kind %q", mount.Kind)
 	}

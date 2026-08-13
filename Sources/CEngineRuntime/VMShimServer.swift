@@ -182,6 +182,7 @@ enum VMShimAttachmentResolver {
     private let launchIntentURL: URL?
     private var runtimeArtifactPublication: VMShimClient.PersistentRuntimeArtifactPublication?
     private var machine: RawContainerVirtualMachine?
+    private var outputSpooler: VMShimOutputSpooler?
     private var state: VMShimProtocol.State = .created
     private var exitCode: Int32?
     private var failure: String?
@@ -439,10 +440,12 @@ enum VMShimAttachmentResolver {
             state = .running; failure = nil; try persist(); return try JSONEncoder().encode(status())
         case .stop:
             if let machine { try await machine.forceStop() }
+            try await outputSpooler?.stop(); outputSpooler = nil
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             machine = nil; hostSocketRelays.removeAll(); state = .stopped; try persist(); return try JSONEncoder().encode(status())
         case .shutdown:
             if let machine { try? await machine.forceStop() }
+            try? await outputSpooler?.stop(); outputSpooler = nil
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             machine = nil; hostSocketRelays.removeAll(); state = .stopped; try persist(); return try JSONEncoder().encode(status())
         }
@@ -478,6 +481,15 @@ enum VMShimAttachmentResolver {
                 try value.install(listener: relay.listener, port: specification.port)
                 return relay
             }
+            if specification.kind == .container {
+                step = "start output spool"
+                outputSpooler = try makeOutputSpooler()
+                outputSpooler?.start { [weak self] error in
+                    Task { @MainActor in
+                        await self?.outputSpoolFailed(error)
+                    }
+                }
+            }
             step = "start virtual machine"
             if specification.kind == .storage {
                 try await value.startInfrastructure(servicePort: GuestProtocol.fileSystemPort)
@@ -491,6 +503,8 @@ enum VMShimAttachmentResolver {
             }
             machine = value; state = .running; failure = nil; try persist()
         } catch {
+            try? await outputSpooler?.stop()
+            outputSpooler = nil
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             hostSocketRelays.removeAll()
             state = .failed; failure = error.localizedDescription; try? persist()
@@ -500,6 +514,78 @@ enum VMShimAttachmentResolver {
                 "boot step '\(step)' failed: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]"
             )
         }
+    }
+
+    private func makeOutputSpooler() throws -> VMShimOutputSpooler? {
+        guard let spool = specification.outputSpool else { return nil }
+        guard spool.retainedBytes > 0,
+              spool.segmentBytes > 0,
+              spool.maximumSegments > 0 else {
+            throw EngineError(.badRequest, "invalid output spool policy")
+        }
+        let directory = try PersistentStateDirectory.open(
+            URL(filePath: spool.directoryPath, directoryHint: .isDirectory)
+        )
+        guard directory.identity == PersistentFileIdentity(
+            device: spool.directoryIdentity.device,
+            inode: spool.directoryIdentity.inode
+        ), directory.pathStillNamesThisDirectory() else {
+            throw EngineError(.conflict, "container I/O directory changed")
+        }
+        let stdout = try directory.openRegularFile(
+            named: "stdout",
+            expectedIdentity: PersistentFileIdentity(
+                device: spool.stdoutIdentity.device,
+                inode: spool.stdoutIdentity.inode
+            ),
+            access: .readWrite
+        ).handle
+        let stderr = try directory.openRegularFile(
+            named: "stderr",
+            expectedIdentity: PersistentFileIdentity(
+                device: spool.stderrIdentity.device,
+                inode: spool.stderrIdentity.inode
+            ),
+            access: .readWrite
+        ).handle
+        do {
+            let stdoutDirectory = try directory.openDirectory(named: "stdout.spool")
+            let stderrDirectory = try directory.openDirectory(named: "stderr.spool")
+            guard stdoutDirectory.identity == PersistentFileIdentity(
+                device: spool.stdoutSpoolDirectoryIdentity.device,
+                inode: spool.stdoutSpoolDirectoryIdentity.inode
+            ), stderrDirectory.identity == PersistentFileIdentity(
+                device: spool.stderrSpoolDirectoryIdentity.device,
+                inode: spool.stderrSpoolDirectoryIdentity.inode
+            ), stdoutDirectory.pathStillNamesThisDirectory(),
+               stderrDirectory.pathStillNamesThisDirectory() else {
+                throw EngineError(.conflict, "container output spool directory changed")
+            }
+            return try VMShimOutputSpooler(
+                stdout: stdout,
+                stderr: stderr,
+                stdoutDirectory: stdoutDirectory,
+                stderrDirectory: stderrDirectory,
+                retainedBytes: spool.retainedBytes,
+                segmentBytes: spool.segmentBytes,
+                maximumSegments: spool.maximumSegments
+            )
+        } catch {
+            try? stdout.close()
+            try? stderr.close()
+            throw error
+        }
+    }
+
+    private func outputSpoolFailed(_ error: Error) async {
+        guard outputSpooler != nil else { return }
+        try? await machine?.forceStop()
+        try? await outputSpooler?.stop()
+        outputSpooler = nil
+        machine = nil
+        state = .failed
+        failure = "output spool failed: \(error.localizedDescription)"
+        try? persist()
     }
 
     private func status() -> VMShimProtocol.Status {

@@ -72,8 +72,13 @@ func dockerErrorResponse(_ error: EngineError) -> APIResponse {
     let status: HTTPResponseStatus = switch error.code {
     case .badRequest: .badRequest
     case .unauthorized: .unauthorized
+    case .forbidden: .forbidden
     case .notFound: .notFound
     case .conflict: .conflict
+    case .payloadTooLarge: .payloadTooLarge
+    case .tooManyRequests: .tooManyRequests
+    case .serviceUnavailable: .serviceUnavailable
+    case .upstream: .badGateway
     case .unsupported: .notImplemented
     case .internalError: .internalServerError
     }

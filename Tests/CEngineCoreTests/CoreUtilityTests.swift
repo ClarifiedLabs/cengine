@@ -334,8 +334,8 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: marker.path))
     }
 
-    @Test func builderArgumentsProvisionRecommendedResources() {
-        let arguments = DockerIntegration.createBuilderArguments(.init(cpus: 4, memoryGiB: 4))
+    @Test func builderArgumentsProvisionRecommendedResources() throws {
+        let arguments = try DockerIntegration.createBuilderArguments(.init(cpus: 4, memoryGiB: 4))
 
         #expect(arguments.contains("memory=4294967296"))
         #expect(arguments.contains("cpu-period=100000"))
@@ -395,7 +395,7 @@ import Testing
             ["buildx", "version"],
             ["buildx", "inspect", DockerIntegration.builderName],
             ["buildx", "rm", "--force", DockerIntegration.builderName],
-            DockerIntegration.createBuilderArguments(.default),
+            try DockerIntegration.createBuilderArguments(.default),
             [
                 "--context", DockerIntegration.contextName,
                 "buildx", "use", "--default", DockerIntegration.builderName,
@@ -422,7 +422,7 @@ import Testing
             ["buildx", "version"],
             ["buildx", "inspect", DockerIntegration.builderName],
             ["buildx", "rm", "--force", "--keep-state", DockerIntegration.builderName],
-            DockerIntegration.createBuilderArguments(settings),
+            try DockerIntegration.createBuilderArguments(settings),
             [
                 "--context", DockerIntegration.contextName,
                 "buildx", "use", "--default", DockerIntegration.builderName,

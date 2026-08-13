@@ -5,11 +5,11 @@ import Foundation
 
 public struct DockerErrorBody: Codable, Sendable { public let message: String }
 public struct ContainerResourceScopeCreateRequest: Codable, Sendable {
-    public let ownerPID: Int32
+    public let ownerPID: Int32?
     public let cpus: Int?
     public let memoryGiB: Int?
 
-    public init(ownerPID: Int32, cpus: Int? = nil, memoryGiB: Int? = nil) {
+    public init(ownerPID: Int32? = nil, cpus: Int? = nil, memoryGiB: Int? = nil) {
         self.ownerPID = ownerPID
         self.cpus = cpus
         self.memoryGiB = memoryGiB
@@ -396,7 +396,7 @@ public struct ContainerStatsResponse: Encodable, Sendable {
         let rx_bytes: UInt64; let rx_packets: UInt64; let rx_errors: UInt64; let rx_dropped: UInt64 = 0
         let tx_bytes: UInt64; let tx_packets: UInt64; let tx_errors: UInt64; let tx_dropped: UInt64 = 0
     }
-    public init(_ value: BackendStatistics, container: ContainerRecord, version: DockerAPIVersion = .maximum) {
+    public init(_ value: BackendStatistics, container: ContainerRecord, version: DockerAPIVersion = .maximum) throws {
         id = container.id; name = container.name
         os_type = version >= .init(major: 1, minor: 52) ? "linux" : nil
         let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -416,7 +416,24 @@ public struct ContainerStatsResponse: Encodable, Sendable {
         ] : blockIOEntries)
         let usage = Usage(total_usage: value.cpuTotalNanoseconds, usage_in_kernelmode: value.cpuSystemNanoseconds,
                           usage_in_usermode: value.cpuUserNanoseconds, percpu_usage: [value.cpuTotalNanoseconds])
-        let system = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000_000) * UInt64(max(container.cpus, 1))
+        let uptimeNanoseconds = ProcessInfo.processInfo.systemUptime * 1_000_000_000
+        guard uptimeNanoseconds.isFinite,
+              uptimeNanoseconds >= 0,
+              uptimeNanoseconds < Double(UInt64.max) else {
+            throw EngineError(.internalError, "container stats time is not representable")
+        }
+        let uptime = UInt64(uptimeNanoseconds.rounded(.down))
+        let cpuCount: UInt64
+        do {
+            cpuCount = try CheckedArithmetic.exact(
+                max(container.cpus, 1), as: UInt64.self
+            )
+        } catch {
+            throw EngineError(.internalError, "container stats CPU count is invalid")
+        }
+        let system: UInt64
+        do { system = try CheckedArithmetic.multiply(uptime, cpuCount) }
+        catch { throw EngineError(.internalError, "container stats CPU time overflows") }
         let throttling = Throttling(
             periods: value.cpuPeriods, throttled_periods: value.cpuThrottledPeriods,
             throttled_time: value.cpuThrottledNanoseconds
@@ -560,9 +577,20 @@ public struct PruneResponse: Encodable, Sendable {
     public init(containers: [String]) {
         ContainersDeleted = containers; ImagesDeleted = nil; NetworksDeleted = nil; VolumesDeleted = nil; SpaceReclaimed = 0
     }
-    public init(images: [ImageRecord]) {
-        ContainersDeleted = nil; ImagesDeleted = images.map { .init(Deleted: $0.id) }
-        NetworksDeleted = nil; VolumesDeleted = nil; SpaceReclaimed = UInt64(images.reduce(0) { $0 + $1.size })
+    public init(images: [ImageRecord]) throws {
+        ContainersDeleted = nil
+        ImagesDeleted = images.map { .init(Deleted: $0.id) }
+        NetworksDeleted = nil
+        VolumesDeleted = nil
+        var reclaimed: UInt64 = 0
+        for image in images {
+            guard let size = UInt64(exactly: image.size) else {
+                throw EngineError(.internalError, "image reclaimed size is invalid")
+            }
+            do { reclaimed = try CheckedArithmetic.add(reclaimed, size) }
+            catch { throw EngineError(.internalError, "image reclaimed size overflows") }
+        }
+        SpaceReclaimed = reclaimed
     }
     public init(volumes: [String]) {
         ContainersDeleted = nil; ImagesDeleted = nil; NetworksDeleted = nil; VolumesDeleted = volumes; SpaceReclaimed = 0
@@ -576,10 +604,17 @@ public struct DockerVolumeResponse: Encodable, Sendable {
     public let Labels: [String: String]; public let Scope = "local"; public let Options: [String: String]
     public let UsageData: Usage?
     public struct Usage: Encodable, Sendable { public let RefCount: Int; public let Size: Int64 }
-    public init(_ volume: VolumeRecord, refCount: Int? = nil) {
+    public init(_ volume: VolumeRecord, refCount: Int? = nil) throws {
         Name = volume.name; Mountpoint = "cengine://volumes/\(volume.name)"
         CreatedAt = ISO8601DateFormatter().string(from: volume.createdAt); Labels = volume.labels; Options = volume.options
-        UsageData = refCount.map { .init(RefCount: $0, Size: Int64(volume.sizeBytes)) }
+        if let refCount {
+            guard let size = Int64(exactly: volume.sizeBytes) else {
+                throw EngineError(.internalError, "volume size is not representable")
+            }
+            UsageData = .init(RefCount: refCount, Size: size)
+        } else {
+            UsageData = nil
+        }
     }
 }
 
@@ -604,16 +639,24 @@ public struct SystemDiskUsageResponse: Encodable, Sendable {
 
     public struct BuildCacheRecord: Encodable, Sendable {}
 
-    public init(containers: [ContainerRecord], images: [ImageRecord], volumes: [VolumeRecord]) {
-        LayersSize = images.reduce(0) { $0 + max($1.size, 0) }
+    public init(containers: [ContainerRecord], images: [ImageRecord], volumes: [VolumeRecord]) throws {
+        var layersSize: Int64 = 0
+        for image in images {
+            guard image.size >= 0 else {
+                throw EngineError(.internalError, "image layer size is invalid")
+            }
+            do { layersSize = try CheckedArithmetic.add(layersSize, image.size) }
+            catch { throw EngineError(.internalError, "image layer size overflows") }
+        }
+        LayersSize = layersSize
         Images = images.map { image in
             ImageSummaryResponse(image, containers: containers.filter { $0.image == image.id || image.references.contains($0.image) }.count)
         }
         Containers = containers.map { container in
             Container(container, image: images.first { $0.id == container.image || $0.references.contains(container.image) })
         }
-        Volumes = volumes.map { volume in
-            DockerVolumeResponse(volume, refCount: containers.filter { container in
+        Volumes = try volumes.map { volume in
+            try DockerVolumeResponse(volume, refCount: containers.filter { container in
                 container.mounts.contains { $0.kind == .volume && $0.source == volume.name }
             }.count)
         }
