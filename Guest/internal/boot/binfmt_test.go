@@ -80,6 +80,10 @@ func TestRosettaRegistrationEntryIsByteExact(t *testing.T) {
 
 func TestRegisterBinfmtHandlerWritesExactEntry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "register")
+	// The binfmt_misc register endpoint is an existing procfs node.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	entry := RosettaRegistrationEntry("/run/cengine/rosetta/rosetta")
 	if err := registerBinfmtHandler(path, entry); err != nil {
 		t.Fatal(err)
