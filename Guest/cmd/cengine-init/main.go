@@ -78,6 +78,16 @@ func main() {
 	if err := boot.MountKernelFilesystems(); err != nil {
 		log.Fatalf("mount kernel filesystems: %v", err)
 	}
+	if err := boot.MountBinfmtMisc(); err != nil {
+		log.Printf("mount binfmt_misc: %v", err)
+	}
+	// Container VMs carry a Rosetta for Linux virtiofs share; the storage VM
+	// and hosts without Rosetta do not, so an absent share is not an error.
+	if err := boot.MountVirtioFS("rosetta", "/run/cengine/rosetta"); err != nil {
+		log.Printf("rosetta share unavailable: %v", err)
+	} else if err := boot.RegisterRosetta("/run/cengine/rosetta/rosetta"); err != nil {
+		log.Printf("register rosetta binfmt handler: %v", err)
+	}
 	if err := boot.MountVirtioFS("cengine-io", "/run/cengine/io"); err != nil {
 		log.Fatalf("mount I/O share: %v", err)
 	}

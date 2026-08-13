@@ -99,12 +99,13 @@ def main() -> None:
         "compat_network_helper_provision",
         "launchctl bootstrap system",
         "compat_network_helper_uninstall",
-        "/usr/bin/osascript -",
-        "with administrator privileges",
+        "/usr/bin/sudo",
     ):
         require_contains(compat_helper, needle, "compat-network-helper.sh")
-    if compat_helper.count("with administrator privileges") != 1:
+    if compat_helper.count("/usr/bin/sudo") != 1:
         raise AssertionError("compatibility helper lifecycle must use one administrator session")
+    if "/usr/bin/osascript" in compat_helper or "with administrator privileges" in compat_helper:
+        raise AssertionError("compatibility helper lifecycle must elevate with sudo, not osascript")
     for needle in (
         '<Scheme',
         'buildConfiguration = "test-compat"',

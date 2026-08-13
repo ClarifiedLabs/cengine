@@ -108,6 +108,7 @@ public enum VMShimProtocol {
         public var networkSocketPath: String?
         public var networkNamespace: String
         public var vlans: [UInt16]
+        public var rosetta: Bool
 
         public init(
             kind: Kind = .container,
@@ -132,7 +133,8 @@ public enum VMShimProtocol {
             fileSystemSocketPath: String? = nil,
             networkSocketPath: String? = nil,
             networkNamespace: String = "",
-            vlans: [UInt16] = []
+            vlans: [UInt16] = [],
+            rosetta: Bool = false
         ) {
             self.kind = kind
             self.containerID = containerID
@@ -157,6 +159,38 @@ public enum VMShimProtocol {
             self.networkSocketPath = networkSocketPath
             self.networkNamespace = networkNamespace
             self.vlans = vlans
+            self.rosetta = rosetta
+        }
+
+        // Persisted specifications and prepared-shim journals written before
+        // the Rosetta share existed carry no `rosetta` key; decode them as
+        // disabled instead of failing daemon recovery.
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            kind = try container.decode(Kind.self, forKey: .kind)
+            containerID = try container.decode(String.self, forKey: .containerID)
+            generation = try container.decode(UInt64.self, forKey: .generation)
+            token = try container.decode(String.self, forKey: .token)
+            kernelPath = try container.decode(String.self, forKey: .kernelPath)
+            initialRamdiskPath = try container.decode(String.self, forKey: .initialRamdiskPath)
+            rootDiskPath = try container.decode(String.self, forKey: .rootDiskPath)
+            rootDiskIdentity = try container.decodeIfPresent(FileIdentity.self, forKey: .rootDiskIdentity)
+            rootDiskSize = try container.decodeIfPresent(UInt64.self, forKey: .rootDiskSize)
+            rootDiskReadOnly = try container.decode(Bool.self, forKey: .rootDiskReadOnly)
+            volumeDisks = try container.decode([VolumeDisk].self, forKey: .volumeDisks)
+            cpus = try container.decode(Int.self, forKey: .cpus)
+            memoryBytes = try container.decode(UInt64.self, forKey: .memoryBytes)
+            macAddress = try container.decode(String.self, forKey: .macAddress)
+            bindShares = try container.decode([BindShare].self, forKey: .bindShares)
+            socketRelays = try container.decode([SocketRelay].self, forKey: .socketRelays)
+            socketPath = try container.decode(String.self, forKey: .socketPath)
+            logPath = try container.decode(String.self, forKey: .logPath)
+            kernelArguments = try container.decode([String].self, forKey: .kernelArguments)
+            fileSystemSocketPath = try container.decodeIfPresent(String.self, forKey: .fileSystemSocketPath)
+            networkSocketPath = try container.decodeIfPresent(String.self, forKey: .networkSocketPath)
+            networkNamespace = try container.decode(String.self, forKey: .networkNamespace)
+            vlans = try container.decode([UInt16].self, forKey: .vlans)
+            rosetta = try container.decodeIfPresent(Bool.self, forKey: .rosetta) ?? false
         }
     }
 

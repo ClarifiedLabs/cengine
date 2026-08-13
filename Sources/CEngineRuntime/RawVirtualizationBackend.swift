@@ -3,6 +3,7 @@ import CEngineCore
 import CryptoKit
 import Darwin
 import Foundation
+import Virtualization
 
 struct RawBackendExecutionFence: Sendable {
     struct Token: Equatable, Sendable {
@@ -6052,6 +6053,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
         capacitySpecification: VMShimProtocol.Specification? = nil
     ) throws -> VMShimProtocol.Specification {
         let ioDirectory = directory.appending(path: "io", directoryHint: .isDirectory)
+        if let platform = try? OCIPlatform(container.platform),
+           platform.architecture != "arm64",
+           VZLinuxRosettaDirectoryShare.availability != .installed {
+            throw EngineError(
+                .unsupported,
+                "running \(container.platform) containers requires Rosetta; "
+                    + "install it with: softwareupdate --install-rosetta --agree-to-license"
+            )
+        }
         let memoryCapacity: UInt64
         if let capacitySpecification {
             memoryCapacity = capacitySpecification.memoryBytes
@@ -6107,7 +6117,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
             ],
             networkSocketPath: infrastructure.specification.networkSocketPath,
-            vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN]
+            vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN],
+            rosetta: VZLinuxRosettaDirectoryShare.availability == .installed
         )
     }
 

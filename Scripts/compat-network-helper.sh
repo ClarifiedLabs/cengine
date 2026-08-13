@@ -31,21 +31,13 @@ compat_network_helper_validate_fingerprint() {
     }
 }
 
+# Elevation uses terminal sudo: the previous osascript GUI administrator
+# prompt fails outright in sessions without window-server access (SSH,
+# detached tmux), while sudo prompts on any terminal.
 compat_network_helper_run_as_administrator() {
     _cnh_script=$1
     shift
-    /usr/bin/osascript - "$_cnh_script" "$@" <<'APPLESCRIPT'
-on run argv
-    if (count of argv) < 1 then error "missing administrator session command"
-    set shellCommand to "/bin/sh -c " & quoted form of (item 1 of argv) & " cengine-compat-helper"
-    if (count of argv) > 1 then
-        repeat with argumentIndex from 2 to count of argv
-            set shellCommand to shellCommand & " " & quoted form of (item argumentIndex of argv)
-        end repeat
-    end if
-    do shell script shellCommand with administrator privileges
-end run
-APPLESCRIPT
+    /usr/bin/sudo /bin/sh -c "$_cnh_script" cengine-compat-helper "$@"
 }
 
 compat_network_helper_export_environment() {

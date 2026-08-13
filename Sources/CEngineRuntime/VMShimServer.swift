@@ -334,7 +334,11 @@ enum VMShimAttachmentResolver {
             } else {
                 code = "shim_error"
             }
-            let failure = GuestProtocol.Failure(code: code, message: error.localizedDescription)
+            let nsError = error as NSError
+            let failure = GuestProtocol.Failure(
+                code: code,
+                message: "\(error.localizedDescription) [\(nsError.domain) \(nsError.code)]"
+            )
             try? file.write(contentsOf: VMShimProtocol.encode(.init(
                 id: request?.id ?? UUID().uuidString,
                 token: specification.token,
@@ -447,8 +451,10 @@ enum VMShimAttachmentResolver {
     private func boot() async throws {
         guard machine == nil else { return }
         state = .starting; try persist()
+        var step = "resolve attachments"
         do {
             let attachments = try VMShimAttachmentResolver.resolve(specification)
+            step = "build configuration (rosetta=\(specification.rosetta))"
             let config = RawVirtualMachineConfiguration(
                 id: specification.containerID,
                 kernel: URL(filePath: specification.kernelPath),
@@ -461,14 +467,18 @@ enum VMShimAttachmentResolver {
                 macAddress: specification.macAddress,
                 bindShares: attachments.bindShares,
                 retainedAttachmentHandles: attachments.retainedHandles,
-                kernelArguments: specification.kernelArguments
+                kernelArguments: specification.kernelArguments,
+                rosetta: specification.rosetta
             )
+            step = "create virtual machine"
             let value = try RawContainerVirtualMachine(configuration: config)
+            step = "install socket relays"
             hostSocketRelays = try specification.socketRelays.map { specification in
                 let relay = UnixVirtioSocketRelay(socketPath: specification.path)
                 try value.install(listener: relay.listener, port: specification.port)
                 return relay
             }
+            step = "start virtual machine"
             if specification.kind == .storage {
                 try await value.startInfrastructure(servicePort: GuestProtocol.fileSystemPort)
                 await fabric.register(.init("storage-service"), file: value.trunk.fabricFileHandle, vlans: Set(activeVLANs))
@@ -483,7 +493,12 @@ enum VMShimAttachmentResolver {
         } catch {
             if specification.kind == .storage { await fabric.unregister(.init("storage-service")) }
             hostSocketRelays.removeAll()
-            state = .failed; failure = error.localizedDescription; try? persist(); throw error
+            state = .failed; failure = error.localizedDescription; try? persist()
+            let nsError = error as NSError
+            throw EngineError(
+                .internalError,
+                "boot step '\(step)' failed: \(error.localizedDescription) [\(nsError.domain) \(nsError.code)]"
+            )
         }
     }
 

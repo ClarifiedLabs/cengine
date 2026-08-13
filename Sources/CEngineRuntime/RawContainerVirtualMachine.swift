@@ -30,21 +30,7 @@ import Foundation
     public init(configuration: RawVirtualMachineConfiguration) throws {
         identifier = configuration.id
         trunk = try RawPacketTrunk()
-        let value = RawVirtualMachineConfiguration(
-            id: configuration.id,
-            kernel: configuration.kernel,
-            initialRamdisk: configuration.initialRamdisk,
-            rootDisk: configuration.rootDisk,
-            rootDiskReadOnly: configuration.rootDiskReadOnly,
-            additionalDisks: configuration.additionalDisks,
-            cpus: configuration.cpus,
-            memoryBytes: configuration.memoryBytes,
-            networkFileHandle: trunk.virtualMachineFileHandle,
-            macAddress: configuration.macAddress,
-            bindShares: configuration.bindShares,
-            retainedAttachmentHandles: configuration.retainedAttachmentHandles,
-            kernelArguments: configuration.kernelArguments
-        )
+        let value = configuration.replacingNetworkFileHandle(trunk.virtualMachineFileHandle)
         let virtualizationConfiguration = try value.makeVirtualizationConfiguration()
         maximumMemoryBytes = virtualizationConfiguration.memorySize
         retainedAttachmentHandles = configuration.retainedAttachmentHandles

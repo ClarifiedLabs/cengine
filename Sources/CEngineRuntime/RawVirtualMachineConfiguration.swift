@@ -41,6 +41,7 @@ public struct RawVirtualMachineConfiguration: Sendable {
     public let bindShares: [BindShare]
     public let retainedAttachmentHandles: [FileHandle]
     public let kernelArguments: [String]
+    public let rosetta: Bool
 
     public init(
         id: String,
@@ -55,7 +56,8 @@ public struct RawVirtualMachineConfiguration: Sendable {
         macAddress: String,
         bindShares: [BindShare] = [],
         retainedAttachmentHandles: [FileHandle] = [],
-        kernelArguments: [String] = []
+        kernelArguments: [String] = [],
+        rosetta: Bool = false
     ) {
         self.id = id
         self.kernel = kernel
@@ -70,6 +72,29 @@ public struct RawVirtualMachineConfiguration: Sendable {
         self.bindShares = bindShares
         self.retainedAttachmentHandles = retainedAttachmentHandles
         self.kernelArguments = kernelArguments
+        self.rosetta = rosetta
+    }
+
+    /// Returns a copy with the network file handle substituted, preserving
+    /// every other field. `RawContainerVirtualMachine` uses this to inject
+    /// its packet trunk without dropping configuration flags.
+    public func replacingNetworkFileHandle(_ handle: FileHandle?) -> RawVirtualMachineConfiguration {
+        RawVirtualMachineConfiguration(
+            id: id,
+            kernel: kernel,
+            initialRamdisk: initialRamdisk,
+            rootDisk: rootDisk,
+            rootDiskReadOnly: rootDiskReadOnly,
+            additionalDisks: additionalDisks,
+            cpus: cpus,
+            memoryBytes: memoryBytes,
+            networkFileHandle: handle,
+            macAddress: macAddress,
+            bindShares: bindShares,
+            retainedAttachmentHandles: retainedAttachmentHandles,
+            kernelArguments: kernelArguments,
+            rosetta: rosetta
+        )
     }
 
     @MainActor public func makeVirtualizationConfiguration() throws -> VZVirtualMachineConfiguration {
@@ -126,12 +151,18 @@ public struct RawVirtualMachineConfiguration: Sendable {
         network.macAddress = address
         configuration.networkDevices = [network]
 
-        configuration.directorySharingDevices = bindShares.map { share in
+        var directorySharingDevices: [VZVirtioFileSystemDeviceConfiguration] = bindShares.map { share in
             let directory = VZSharedDirectory(url: share.source, readOnly: share.readOnly)
             let device = VZVirtioFileSystemDeviceConfiguration(tag: share.tag)
             device.share = VZSingleDirectoryShare(directory: directory)
             return device
         }
+        if rosetta {
+            let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+            device.share = try VZLinuxRosettaDirectoryShare()
+            directorySharingDevices.append(device)
+        }
+        configuration.directorySharingDevices = directorySharingDevices
         try configuration.validate()
         return configuration
     }

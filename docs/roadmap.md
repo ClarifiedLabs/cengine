@@ -250,6 +250,14 @@ selection, multi-platform archive round trips, multi-repository Docker CLI
 exports used by kind image loading, selective deletion, identity, attestations,
 and optional differential response-shape comparison.
 
+Containers created with `--platform linux/amd64` now execute through Rosetta
+for Linux: container VMs attach a `VZLinuxRosettaDirectoryShare` virtiofs
+device and guest init registers an x86-64 binfmt_misc handler with the
+mandatory `OCF` flags, so `docker run` and `docker exec` report `x86_64` on
+hosts with Rosetta installed (`RTM-045`). Hosts without Rosetta fail amd64
+container start with an actionable install error instead of `exec format
+error`; `linux/arm64` remains the default platform.
+
 ### Client-visible metadata and image events
 
 Container annotations now persist from create through inspect and daemon

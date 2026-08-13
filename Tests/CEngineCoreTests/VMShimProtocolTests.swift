@@ -416,6 +416,68 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(decoded.networkNamespace == "engine-root-namespace")
     }
 
+    private static func makeRosettaSpecification(rosetta: Bool) -> VMShimProtocol.Specification {
+        VMShimProtocol.Specification(
+            containerID: "rosetta-container",
+            generation: 1,
+            token: "secret",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: "/root.ext4",
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:05",
+            socketPath: "/tmp/control.sock",
+            logPath: "/tmp/shim.log",
+            rosetta: rosetta
+        )
+    }
+
+    @Test func shimSpecificationRoundTripsRosetta() throws {
+        let specification = Self.makeRosettaSpecification(rosetta: true)
+
+        let decoded = try JSONDecoder().decode(
+            VMShimProtocol.Specification.self,
+            from: JSONEncoder().encode(specification)
+        )
+        #expect(decoded == specification)
+        #expect(decoded.rosetta)
+    }
+
+    @Test func shimSpecificationDefaultsRosettaOffForLegacyJSON() throws {
+        let specification = Self.makeRosettaSpecification(rosetta: true)
+        #expect(!Self.makeRosettaSpecification(rosetta: false).rosetta)
+
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(specification))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "rosetta")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(VMShimProtocol.Specification.self, from: legacy)
+        #expect(!decoded.rosetta)
+    }
+
+    #if os(macOS)
+    @Test func rosettaSpecificationBuildsRosettaVMConfiguration() throws {
+        let specification = Self.makeRosettaSpecification(rosetta: true)
+
+        let configuration = RawVirtualMachineConfiguration(
+            id: specification.containerID,
+            kernel: URL(filePath: specification.kernelPath),
+            initialRamdisk: URL(filePath: specification.initialRamdiskPath),
+            rootDisk: URL(filePath: specification.rootDiskPath),
+            cpus: specification.cpus,
+            memoryBytes: specification.memoryBytes,
+            macAddress: specification.macAddress,
+            kernelArguments: specification.kernelArguments,
+            rosetta: specification.rosetta
+        )
+        #expect(configuration.rosetta)
+        #expect(configuration.replacingNetworkFileHandle(nil).rosetta)
+    }
+    #endif
+
     @Test func managementVLANIsReservedFromDockerNetworks() {
         #expect(VMShimProtocol.managementVLAN == 4_094)
         #if os(macOS)

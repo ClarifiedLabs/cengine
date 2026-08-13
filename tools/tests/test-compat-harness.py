@@ -267,10 +267,10 @@ def main() -> None:
     assert 'launchctl bootout "system/$label"' in helper_lifecycle
     assert 'launchctl kickstart "system/$label"' in helper_lifecycle
     assert 'launchctl kickstart -k "system/$label"' not in helper_lifecycle
-    assert helper_lifecycle.count("/usr/bin/osascript -") == 1
-    assert helper_lifecycle.count("with administrator privileges") == 1
+    assert "/usr/bin/osascript" not in helper_lifecycle
+    assert "with administrator privileges" not in helper_lifecycle
     assert "/Applications/cengine.app" not in helper_lifecycle
-    assert "/usr/bin/sudo" not in helper_lifecycle
+    assert helper_lifecycle.count("/usr/bin/sudo") == 1
     assert helper_lifecycle.count("compat_network_helper_run_as_administrator") == 3
     assert '[ ! -L "$_cnh_controlled_path" ]' in helper_lifecycle
     assert '[ ! -L "$compat_network_helper_token_path" ]' in helper_lifecycle
