@@ -107,7 +107,10 @@ struct ImageSummary: Decodable, Identifiable, Hashable, Sendable {
     var id: String { Id }
     var primaryReference: String { RepoTags.first ?? RepoDigests.first ?? shortID }
     var shortID: String { String(Id.replacingOccurrences(of: "sha256:", with: "").prefix(12)) }
-    var createdAt: Date { Date(timeIntervalSince1970: TimeInterval(Created)) }
+    var createdAt: Date? {
+        guard Created > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(Created))
+    }
     var referencesDisplay: String {
         let count = RepoTags.count + RepoDigests.count
         return count > 1 ? "\(primaryReference) +\(count - 1)" : primaryReference

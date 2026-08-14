@@ -600,7 +600,7 @@ public actor OCIContentStore {
     public func history(reference: String, platform: OCIPlatform?) throws -> [ImageHistoryEntry] {
         let value = try image(reference: reference, platform: platform)
         return (value.configuration.history ?? []).map {
-            let date = $0.created.flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date(timeIntervalSince1970: 0)
+            let date = $0.created.flatMap(Self.parseISO8601Date) ?? Date(timeIntervalSince1970: 0)
             return .init(created: Int64(date.timeIntervalSince1970), createdBy: $0.createdBy ?? "", comment: $0.comment ?? "", emptyLayer: $0.emptyLayer ?? false)
         }
     }
@@ -1086,9 +1086,12 @@ public actor OCIContentStore {
             variant: configuration.variant,
             osVersion: configuration.osVersion
         )
-        let created = configuration.created.flatMap { ISO8601DateFormatter().date(from: $0) }
+        let annotatedCreated = manifest.annotations?["org.opencontainers.image.created"]
+            ?? descriptor.annotations?["org.opencontainers.image.created"]
+        let created = configuration.created.flatMap(Self.parseISO8601Date)
+            ?? annotatedCreated.flatMap(Self.parseISO8601Date)
         let history = (configuration.history ?? []).map { entry in
-            let date = entry.created.flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date(timeIntervalSince1970: 0)
+            let date = entry.created.flatMap(Self.parseISO8601Date) ?? Date(timeIntervalSince1970: 0)
             return ImageHistoryEntry(
                 created: Int64(date.timeIntervalSince1970),
                 createdBy: entry.createdBy ?? "",
@@ -1547,6 +1550,12 @@ public actor OCIContentStore {
             throw EngineError(.badRequest, "unsupported OCI digest \(digest)")
         }
         return blobRoot.appending(path: String(digest.dropFirst(7)))
+    }
+
+    private static func parseISO8601Date(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
 
     private static func readRegularFile(

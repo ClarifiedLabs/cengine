@@ -45,8 +45,9 @@ enum AppFormat {
         return value.formatted(date: .abbreviated, time: .shortened)
     }
 
-    static func relative(_ value: Date) -> String {
-        value.formatted(.relative(presentation: .named))
+    static func relative(_ value: Date?) -> String {
+        guard let value else { return "—" }
+        return value.formatted(.relative(presentation: .named))
     }
 
     static func dockerDate(_ value: String) -> String {

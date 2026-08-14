@@ -95,6 +95,56 @@ import Testing
         #expect(try await store.data(for: descriptor.digest) == data)
     }
 
+    @Test func imageCreationDatesAcceptFractionalSecondsAndManifestAnnotations() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try OCIContentStore(root: root)
+        let encoder = JSONEncoder()
+
+        func addImage(reference: String, configCreated: String?, annotationCreated: String?) async throws {
+            var configObject: [String: Any] = [
+                "architecture": "arm64",
+                "os": "linux",
+                "rootfs": ["type": "layers", "diff_ids": [String]()] as [String: Any],
+                "history": [["created": "2026-01-28T01:18:09.724934761Z"]],
+            ]
+            if let configCreated { configObject["created"] = configCreated }
+            let configData = try JSONSerialization.data(withJSONObject: configObject)
+            let config = try await store.put(
+                configData, mediaType: "application/vnd.oci.image.config.v1+json"
+            )
+            let manifestData = try encoder.encode(OCIManifest(
+                schemaVersion: 2,
+                mediaType: "application/vnd.oci.image.manifest.v1+json",
+                config: config,
+                layers: [],
+                annotations: annotationCreated.map { ["org.opencontainers.image.created": $0] }
+            ))
+            let manifest = try await store.put(
+                manifestData, mediaType: "application/vnd.oci.image.manifest.v1+json"
+            )
+            try await store.tag(manifest, as: reference)
+        }
+
+        try await addImage(
+            reference: "example:config-date",
+            configCreated: "2026-01-29T11:03:47.54684059Z",
+            annotationCreated: "2026-01-29T11:01:35.546Z"
+        )
+        try await addImage(
+            reference: "example:annotation-date",
+            configCreated: nil,
+            annotationCreated: "2026-01-29T11:01:35.546Z"
+        )
+
+        let summaries = try await store.summaries()
+        let configDate = try #require(summaries.first { $0.reference.hasSuffix("example:config-date") })
+        let annotationDate = try #require(summaries.first { $0.reference.hasSuffix("example:annotation-date") })
+        #expect(abs(configDate.createdAt.timeIntervalSince1970 - 1_769_684_627.54684059) < 0.001)
+        #expect(abs(annotationDate.createdAt.timeIntervalSince1970 - 1_769_684_495.546) < 0.001)
+        #expect(configDate.manifests.first?.history.first?.created == 1_769_563_089)
+    }
+
     @Test func updatedReferencesPersistAcrossStoreInstances() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

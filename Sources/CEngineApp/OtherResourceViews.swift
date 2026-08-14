@@ -4,7 +4,7 @@ struct ImagesView: View {
     @EnvironmentObject private var model: AppModel
     @Binding var selection: String?
     @State private var searchText = ""
-    @State private var sortOrder = [KeyPathComparator(\ImageSummary.createdAt, order: .reverse)]
+    @State private var sortOrder = [KeyPathComparator(\ImageSummary.Created, order: .reverse)]
 
     private var rows: [ImageSummary] {
         model.images.filter { image in
@@ -38,7 +38,7 @@ struct ImagesView: View {
                         TableColumn("Containers", value: \ImageSummary.Containers) { image in
                             Text(image.Containers < 0 ? "—" : String(image.Containers))
                         }
-                        TableColumn("Created", value: \ImageSummary.createdAt) { image in
+                        TableColumn("Created", value: \ImageSummary.Created) { image in
                             Text(AppFormat.relative(image.createdAt))
                         }
                     }

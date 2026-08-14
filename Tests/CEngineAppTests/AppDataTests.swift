@@ -69,6 +69,15 @@ import Testing
         #expect(telemetry.networkTransmitBytes == 440)
     }
 
+    @Test func treatsEpochImageCreationTimeAsUnknown() throws {
+        let image = try JSONDecoder().decode(ImageSummary.self, from: Data("""
+        {"Id":"sha256:unknown-date","RepoTags":["moby/buildkit:v0.27.1"],"RepoDigests":[],"Containers":1,"Created":0,"Size":100700000,"Labels":{}}
+        """.utf8))
+
+        #expect(image.createdAt == nil)
+        #expect(AppFormat.relative(image.createdAt) == "—")
+    }
+
     @Test func validatesTypedResourceSettings() {
         #expect(AppModel.validationMessage(
             cpus: 4,
