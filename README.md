@@ -9,7 +9,7 @@ container.
 
 - Apple silicon
 - macOS 26 or newer
-- Docker CLI with the Buildx plugin
+- Docker CLI with the Buildx plugin (the Homebrew Cask installs the Docker CLI)
 - Docker Compose plugin when using Compose
 
 ## Install

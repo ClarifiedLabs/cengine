@@ -23,6 +23,7 @@ cask "cengine" do
 
   depends_on arch: :arm64
   depends_on macos: :tahoe
+  depends_on formula: "docker"
 
   pkg "cengine-${version}.pkg"
 

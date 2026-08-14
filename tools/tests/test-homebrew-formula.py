@@ -26,6 +26,7 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn("cengine-1.2.3.pkg", cask)
             self.assertIn('depends_on arch: :arm64', cask)
             self.assertIn("depends_on macos: :tahoe", cask)
+            self.assertIn('depends_on formula: "docker"', cask)
             self.assertNotIn('depends_on macos: ">= :tahoe"', cask)
             self.assertIn('pkg "cengine-1.2.3.pkg"', cask)
             self.assertIn("postflight do", cask)
