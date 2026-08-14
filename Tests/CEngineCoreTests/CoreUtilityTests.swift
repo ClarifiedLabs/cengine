@@ -344,7 +344,7 @@ import Testing
     }
 
     @Test func builderInspectionMustMatchEveryManagedResource() {
-        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
 
         #expect(DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 6, memoryGiB: 4)))
@@ -356,7 +356,7 @@ import Testing
     }
 
     @Test func configuringMatchingBuilderSelectsIt() throws {
-        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
         let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []
 
@@ -382,7 +382,7 @@ import Testing
     }
 
     @Test func configuringNativeBuilderReplacesItsState() throws {
-        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=native"#
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=native"#
         let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []
 
@@ -408,7 +408,7 @@ import Testing
     }
 
     @Test func configuringNewResourcesPreservesOverlayState() throws {
-        let inspection = #"Driver Options: image="moby/buildkit:v0.27.1" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
         let settings = BuilderSettings(cpus: 2, memoryGiB: 4)
         let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []

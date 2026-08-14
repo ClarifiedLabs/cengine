@@ -24,7 +24,9 @@ public enum DockerRemovalOutcome: Sendable, Equatable {
 public enum DockerIntegration {
     public static let contextName = "cengine"
     public static let builderName = "cengine-builder"
-    public static let buildkitImage = "moby/buildkit:v0.27.1"
+    // moby/buildkit v0.32.2
+    public static let buildkitImage =
+        "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
     public static let buildkitSnapshotter = "overlayfs"
     private static let cpuPeriod = 100_000
 

@@ -21,7 +21,10 @@ from harness import compatibility_environment, docker_environment
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BUILD_CONTEXT = REPO_ROOT / "Tests/Fixtures/buildx"
 BUILDKIT_CONFIG = BUILD_CONTEXT / "buildkitd.toml"
-BUILDKIT_IMAGE = "moby/buildkit:v0.27.1"
+# moby/buildkit v0.32.2
+BUILDKIT_IMAGE = (
+    "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+)
 MANAGED_BUILDER = "cengine-builder"
 
 

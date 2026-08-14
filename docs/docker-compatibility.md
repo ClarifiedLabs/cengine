@@ -388,11 +388,12 @@ These candidate decisions are docs-first and do not change accepted API behavior
 | `CMP-009` | `test_developer_compose_source_edits_hot_reload_without_replacement` | ✅ Pass | Support | **cengine-owned.** Repeated host in-place and atomic-save edits plus a guest-originated atomic edit are observed through a 150 ms Python stable-content polling reloader without changing the service container or server process. The line-oriented reloader requires a complete newline-terminated payload and two consecutive matching reads before publication, matching and strengthening the `RTM-037` baseline. Compose Watch and event-only watchers remain out of scope. |
 | `CMP-010` | `test_developer_compose_rebuild_restart_recovery_and_teardown` | ✅ Pass | Support | **cengine-owned.** A changed image input rebuilds and recreates the service, an unchanged rebuild is idempotent, Compose restart preserves container identity, abrupt daemon recovery adopts the same service and builder, post-recovery source reload remains usable, and final teardown removes project resources. Recovery means adoption, not VM migration or cross-VM namespace sharing. |
 
-## Docker Buildx and BuildKit 0.27.1
+## Docker Buildx and BuildKit 0.32.2
 
 The Buildx plugin is supplied by the host Docker CLI and its version is recorded
 in compatibility-test output rather than pinned by this repository. The managed
-builder and compatibility fixtures pin `moby/buildkit:v0.27.1`.
+builder and compatibility fixtures pin `moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8`
+(`v0.32.2`).
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
