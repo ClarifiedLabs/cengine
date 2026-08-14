@@ -75,10 +75,7 @@ def test_managed_docker_context_and_default_builder(
         assert context["Name"] == "cengine"
         assert context["Endpoints"]["docker"]["Host"] == f"unix://{daemon.socket}"
 
-        named = managed.run(
-            "buildx", "inspect", MANAGED_BUILDER, "--bootstrap", timeout=300,
-        ).stdout
-        for expected in (
+        expected_builder_details = (
             f"Name:          {MANAGED_BUILDER}",
             "Driver:        docker-container",
             BUILDKIT_IMAGE,
@@ -86,7 +83,19 @@ def test_managed_docker_context_and_default_builder(
             'cpu-period="100000"',
             'cpu-quota="200000"',
             "--oci-worker-snapshotter=overlayfs",
-        ):
+        )
+        named = managed.run(
+            "buildx", "inspect", MANAGED_BUILDER, "--bootstrap", timeout=300,
+        ).stdout
+        # A cold image pull can outlive Buildx's first worker probe while the
+        # newly created BuildKit VM continues starting in the background.
+        deadline = time.monotonic() + 30
+        while not all(expected in named for expected in expected_builder_details):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+            named = managed.run("buildx", "inspect", MANAGED_BUILDER).stdout
+        for expected in expected_builder_details:
             assert expected in named, f"missing {expected!r} from:\n{named}"
 
         selected = managed.run("--context", "cengine", "buildx", "inspect").stdout
