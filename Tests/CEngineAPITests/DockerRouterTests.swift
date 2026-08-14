@@ -3757,10 +3757,17 @@ private actor AuthImageBackend: ContainerBackend {
     @Test func createUsesCPUQuotaWhenNanoCPUsAreAbsent() async throws {
         let (router, root) = try await fixture()
         defer { try? FileManager.default.removeItem(at: root) }
+        let requestedCPUs = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+        let cpuQuota = requestedCPUs * 100_000
         let response = await router.route(.init(
             method: .POST, uri: "/v1.44/containers/create?name=quota-limited",
-            body: Data(#"{"Image":"alpine","HostConfig":{"Memory":4294967296,"CpuPeriod":100000,"CpuQuota":400000}}"#.utf8)
+            body: Data(
+                """
+                {"Image":"alpine","HostConfig":{"Memory":4294967296,"CpuPeriod":100000,"CpuQuota":\(cpuQuota)}}
+                """.utf8
+            )
         ))
+        #expect(response.status == .created)
         let created = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
         let id = try #require(created["Id"] as? String)
         let inspect = await router.route(.init(method: .GET, uri: "/v1.44/containers/\(id)/json"))
@@ -3768,7 +3775,7 @@ private actor AuthImageBackend: ContainerBackend {
         let host = try #require(object["HostConfig"] as? [String: Any])
 
         #expect(host["Memory"] as? Int == 4 * 1_024 * 1_024 * 1_024)
-        #expect(host["NanoCpus"] as? Int == 4_000_000_000)
+        #expect(host["NanoCpus"] as? Int == requestedCPUs * 1_000_000_000)
     }
 
     @Test func pidsLimitRoundTripsAndRejectsInvalidValues() async throws {
