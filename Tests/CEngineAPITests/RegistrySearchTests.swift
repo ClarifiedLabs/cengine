@@ -530,6 +530,304 @@ private func queryEncodedJSON(_ value: String) -> String {
     }
 }
 
+private actor RegistryAuthenticatorSpy: RegistryAuthenticating {
+    struct Call: Sendable {
+        let serverAddress: String
+        let credentials: RegistryCredentials
+    }
+
+    private(set) var calls: [Call] = []
+    private let result: RegistryAuthenticationResult
+
+    init(result: RegistryAuthenticationResult = .init(
+        status: "Login Succeeded",
+        identityToken: "identity-token"
+    )) {
+        self.result = result
+    }
+
+    func authenticate(
+        serverAddress: String,
+        credentials: RegistryCredentials
+    ) async throws -> RegistryAuthenticationResult {
+        calls.append(.init(serverAddress: serverAddress, credentials: credentials))
+        return result
+    }
+
+    func lastCall() -> Call? { calls.last }
+    func count() -> Int { calls.count }
+}
+
+@Suite struct RegistryAuthenticationClientTests {
+    @Test func basicChallengeValidatesCredentialsAgainstRegistryV2() async throws {
+        let recorder = RegistrySearchRequestRecorder(stubs: [
+            .init(statusCode: 401, headers: ["WWW-Authenticate": #"Basic realm="Bearer login""#]),
+            .init(responseBody: #"{}"#),
+        ])
+        let client = RegistryAuthenticationClient(execute: {
+            try await recorder.execute($0, maximumBytes: $1)
+        })
+
+        let result = try await client.authenticate(
+            serverAddress: "registry.example.test",
+            credentials: .init(username: "push", password: "secret")
+        )
+
+        #expect(result.status == "Login Succeeded")
+        #expect(result.identityToken.isEmpty)
+        let requests = await recorder.allRequests()
+        #expect(requests.count == 2)
+        #expect(requests[0].url?.absoluteString == "https://registry.example.test/v2/")
+        #expect(requests[0].value(forHTTPHeaderField: "Authorization") == nil)
+        #expect(requests[1].url == requests[0].url)
+        #expect(requests[1].value(forHTTPHeaderField: "Authorization") == "Basic cHVzaDpzZWNyZXQ=")
+    }
+
+    @Test func challengeParserHonorsSchemeBoundariesAndOptionalWhitespace() {
+        let challenges = RegistrySearchClient.authenticationChallenges(
+            #"Basic realm="Bearer login", Bearer realm = "https://auth.example.test/token", service = "registry.example.test", note = "use \"token\", now""#
+        )
+
+        #expect(challenges.map(\.scheme) == ["basic", "bearer"])
+        #expect(challenges[0].parameters["realm"] == "Bearer login")
+        #expect(challenges[1].parameters["realm"] == "https://auth.example.test/token")
+        #expect(challenges[1].parameters["service"] == "registry.example.test")
+        #expect(challenges[1].parameters["note"] == #"use "token", now"#)
+    }
+
+    @Test func bearerChallengeReturnsRefreshTokenAfterCredentialValidation() async throws {
+        let recorder = RegistrySearchRequestRecorder(stubs: [
+            .init(
+                statusCode: 401,
+                headers: [
+                    "WWW-Authenticate": #"Basic realm="legacy", Bearer realm="https://auth.example.test/token",service="registry.example.test""#,
+                ]
+            ),
+            .init(responseBody: #"{"access_token":"scoped-access","refresh_token":"refresh-secret"}"#),
+            .init(responseBody: #"{}"#),
+        ])
+        let client = RegistryAuthenticationClient(execute: {
+            try await recorder.execute($0, maximumBytes: $1)
+        })
+
+        let result = try await client.authenticate(
+            serverAddress: "registry.example.test",
+            credentials: .init(username: "push", password: "secret")
+        )
+
+        #expect(result.status == "Login Succeeded")
+        #expect(result.identityToken == "refresh-secret")
+        let requests = await recorder.allRequests()
+        #expect(requests.count == 3)
+        let tokenRequest = requests[1]
+        #expect(tokenRequest.url?.host == "auth.example.test")
+        #expect(tokenRequest.httpMethod == "GET")
+        #expect(tokenRequest.value(forHTTPHeaderField: "Authorization") == "Basic cHVzaDpzZWNyZXQ=")
+        let query = try #require(tokenRequest.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems
+        })
+        #expect(query.first(where: { $0.name == "service" })?.value == "registry.example.test")
+        #expect(query.first(where: { $0.name == "offline_token" })?.value == "true")
+        #expect(query.first(where: { $0.name == "client_id" })?.value == "docker")
+        #expect(query.first(where: { $0.name == "account" })?.value == "push")
+        #expect(requests[2].url?.absoluteString == "https://registry.example.test/v2/")
+        #expect(requests[2].value(forHTTPHeaderField: "Authorization") == "Bearer scoped-access")
+    }
+
+    @Test func identityTokenIsOnlyPostedToHTTPSAuthenticationRealm() async throws {
+        let recorder = RegistrySearchRequestRecorder(stubs: [
+            .init(
+                statusCode: 401,
+                headers: [
+                    "WWW-Authenticate": #"Bearer realm="https://auth.example.test/token",service="registry.example.test""#,
+                ]
+            ),
+            .init(responseBody: #"{"token":"scoped-access"}"#),
+            .init(responseBody: #"{}"#),
+        ])
+        let client = RegistryAuthenticationClient(execute: {
+            try await recorder.execute($0, maximumBytes: $1)
+        })
+
+        let result = try await client.authenticate(
+            serverAddress: "registry.example.test",
+            credentials: .init(username: "push", identityToken: "refresh-secret")
+        )
+
+        #expect(result.identityToken == "refresh-secret")
+        let requests = await recorder.allRequests()
+        #expect(requests.count == 3)
+        #expect(requests[0].value(forHTTPHeaderField: "Authorization") == nil)
+        #expect(requests[1].httpMethod == "POST")
+        #expect(requests[1].value(forHTTPHeaderField: "Authorization") == nil)
+        let formBody = String(decoding: try #require(requests[1].httpBody), as: UTF8.self)
+        let form = URLComponents(string: "?\(formBody)")?.queryItems ?? []
+        #expect(form.first(where: { $0.name == "grant_type" })?.value == "refresh_token")
+        #expect(form.first(where: { $0.name == "refresh_token" })?.value == "refresh-secret")
+        #expect(requests[2].value(forHTTPHeaderField: "Authorization") == "Bearer scoped-access")
+    }
+
+    @Test func anonymousBearerLoginOmitsCredentialsFromTokenRequest() async throws {
+        let recorder = RegistrySearchRequestRecorder(stubs: [
+            .init(
+                statusCode: 401,
+                headers: [
+                    "WWW-Authenticate": #"Bearer realm="https://auth.example.test/token",service="registry.example.test""#,
+                ]
+            ),
+            .init(responseBody: #"{"token":"anonymous-access"}"#),
+            .init(responseBody: #"{}"#),
+        ])
+        let client = RegistryAuthenticationClient(execute: {
+            try await recorder.execute($0, maximumBytes: $1)
+        })
+
+        let result = try await client.authenticate(
+            serverAddress: "registry.example.test",
+            credentials: .init()
+        )
+
+        #expect(result.status == "Login Succeeded")
+        let requests = await recorder.allRequests()
+        #expect(requests[1].value(forHTTPHeaderField: "Authorization") == nil)
+        let query = URLComponents(
+            url: try #require(requests[1].url), resolvingAgainstBaseURL: false
+        )?.queryItems ?? []
+        #expect(!query.contains(where: { $0.name == "account" }))
+        #expect(requests[2].value(forHTTPHeaderField: "Authorization") == "Bearer anonymous-access")
+    }
+
+    @Test func schemeLessLoopbackTriesHTTPSBeforeFallingBackToHTTP() async throws {
+        let recorder = RegistrySearchRequestRecorder(stubs: [
+            .init(error: .cannotConnectToHost),
+            .init(statusCode: 401, headers: ["WWW-Authenticate": #"Basic realm="registry""#]),
+            .init(responseBody: #"{}"#),
+        ])
+        let client = RegistryAuthenticationClient(execute: {
+            try await recorder.execute($0, maximumBytes: $1)
+        })
+
+        _ = try await client.authenticate(
+            serverAddress: "127.0.0.1:5000",
+            credentials: .init(username: "push", password: "secret")
+        )
+
+        let requests = await recorder.allRequests()
+        #expect(requests.count == 3)
+        #expect(requests[0].url?.absoluteString == "https://127.0.0.1:5000/v2/")
+        #expect(requests[1].url?.absoluteString == "http://127.0.0.1:5000/v2/")
+        #expect(requests[2].url == requests[1].url)
+    }
+
+    @Test func loginRedirectsStayOnOriginAndNeverReplayTokenPosts() throws {
+        var original = URLRequest(url: try #require(URL(string: "https://registry.example.test/v2/")))
+        original.setValue("Bearer scoped-access", forHTTPHeaderField: "Authorization")
+        let sameOrigin = URLRequest(url: try #require(URL(string: "https://registry.example.test:443/v2/")))
+        let preserved = try #require(RegistryAuthenticationSessionDelegate.redirectedRequest(
+            from: original, to: sameOrigin
+        ))
+        #expect(preserved.value(forHTTPHeaderField: "Authorization") == "Bearer scoped-access")
+
+        let crossOrigin = URLRequest(url: try #require(URL(string: "https://other.example.test/v2/")))
+        #expect(RegistryAuthenticationSessionDelegate.redirectedRequest(
+            from: original, to: crossOrigin
+        ) == nil)
+        let downgrade = URLRequest(url: try #require(URL(string: "http://registry.example.test/v2/")))
+        #expect(RegistryAuthenticationSessionDelegate.redirectedRequest(
+            from: original, to: downgrade
+        ) == nil)
+
+        var token = URLRequest(url: try #require(URL(string: "https://auth.example.test/token")))
+        token.httpMethod = "POST"
+        token.httpBody = Data("refresh_token=refresh-secret".utf8)
+        #expect(RegistryAuthenticationSessionDelegate.redirectedRequest(
+            from: token, to: token
+        ) == nil)
+    }
+
+    @Test func rejectsBadCredentialsAndCleartextRemoteRegistries() async throws {
+        let recorder = RegistrySearchRequestRecorder(stubs: [
+            .init(statusCode: 401, headers: ["WWW-Authenticate": #"Basic realm="registry""#]),
+            .init(statusCode: 401),
+        ])
+        let client = RegistryAuthenticationClient(execute: {
+            try await recorder.execute($0, maximumBytes: $1)
+        })
+
+        do {
+            _ = try await client.authenticate(
+                serverAddress: "registry.example.test",
+                credentials: .init(username: "push", password: "wrong")
+            )
+            Issue.record("bad registry credentials succeeded")
+        } catch let error as EngineError {
+            #expect(error.code == .unauthorized)
+        }
+
+        await #expect(throws: EngineError.self) {
+            try await client.authenticate(
+                serverAddress: "http://registry.example.test",
+                credentials: .init(username: "push", password: "secret")
+            )
+        }
+        #expect(await recorder.count() == 2)
+    }
+}
+
+@Suite struct DockerRegistryAuthRouteTests {
+    @Test func authIsAvailableAcrossSupportedVersionsWithDockerWireShape() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let authenticator = RegistryAuthenticatorSpy()
+        let router = DockerRouter(
+            runtime: try await EngineRuntime(root: root),
+            root: root,
+            registryAuthenticator: authenticator
+        )
+        let body = Data(#"{"username":"push","password":"secret","serveraddress":"registry.orb17.com"}"#.utf8)
+
+        for version in ["1.44", "1.55"] {
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v\(version)/auth",
+                body: body
+            ))
+            #expect(response.status == .ok)
+            let decoded = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: String])
+            #expect(decoded == [
+                "Status": "Login Succeeded",
+                "IdentityToken": "identity-token",
+            ])
+        }
+
+        let call = try #require(await authenticator.lastCall())
+        #expect(call.serverAddress == "registry.orb17.com")
+        #expect(call.credentials.username == "push")
+        #expect(call.credentials.password == "secret")
+        #expect(await authenticator.count() == 2)
+    }
+
+    @Test func malformedAuthBodyIsRejectedBeforeRegistryAccess() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let authenticator = RegistryAuthenticatorSpy()
+        let router = DockerRouter(
+            runtime: try await EngineRuntime(root: root),
+            root: root,
+            registryAuthenticator: authenticator
+        )
+
+        let response = await router.route(.init(
+            method: .POST,
+            uri: "/v1.55/auth",
+            body: Data(#"{"username":42}"#.utf8)
+        ))
+
+        #expect(response.status == .badRequest)
+        #expect(await authenticator.count() == 0)
+    }
+}
+
 @Suite struct DockerRegistrySearchRouteTests {
     private func router(searcher: any RegistrySearching) async throws -> (DockerRouter, URL) {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)

@@ -83,6 +83,44 @@ import Testing
         #expect(reference.normalized == "docker.io/kindest/node:v1.36.1@\(digest)")
     }
 
+    @Test func identityTokenForImageOperationsIsExchangedOnlyAtBearerRealm() throws {
+        let reference = try OCIRegistryReference("registry.example.test/team/app:latest")
+        let request = try OCIRegistryClient.bearerTokenRequest(
+            challenge: #"Basic realm="legacy", Bearer realm="https://auth.example.test/token",service="registry.example.test",scope="repository:team/app:pull""#,
+            reference: reference,
+            credentials: .init(username: "push", identityToken: "refresh-secret")
+        )
+
+        #expect(request.url?.absoluteString == "https://auth.example.test/token")
+        #expect(request.httpMethod == "POST")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
+        let formBody = String(decoding: try #require(request.httpBody), as: UTF8.self)
+        let form = URLComponents(string: "?\(formBody)")?.queryItems ?? []
+        #expect(form.first(where: { $0.name == "grant_type" })?.value == "refresh_token")
+        #expect(form.first(where: { $0.name == "refresh_token" })?.value == "refresh-secret")
+        #expect(form.first(where: { $0.name == "scope" })?.value == "repository:team/app:pull")
+        #expect(form.first(where: { $0.name == "service" })?.value == "registry.example.test")
+    }
+
+    @Test func registryRedirectsStripAccessTokensAndRejectSecretDowngrades() throws {
+        var registry = URLRequest(url: try #require(URL(string: "https://registry.example.test/v2/team/app/blobs/value")))
+        registry.setValue("Bearer scoped-access", forHTTPHeaderField: "Authorization")
+        let external = URLRequest(url: try #require(URL(string: "https://cdn.example.test/blob")))
+        let stripped = try #require(OCIRegistrySessionDelegate.redirectedRequest(
+            from: registry, to: external
+        ))
+        #expect(stripped.value(forHTTPHeaderField: "Authorization") == nil)
+
+        let downgrade = URLRequest(url: try #require(URL(string: "http://registry.example.test/blob")))
+        #expect(OCIRegistrySessionDelegate.redirectedRequest(from: registry, to: downgrade) == nil)
+
+        var token = URLRequest(url: try #require(URL(string: "https://auth.example.test/token")))
+        token.httpMethod = "POST"
+        token.httpBody = Data("refresh_token=refresh-secret".utf8)
+        token.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        #expect(OCIRegistrySessionDelegate.redirectedRequest(from: token, to: external) == nil)
+    }
+
     @Test func contentIsAddressedAndVerifiedByDigest() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

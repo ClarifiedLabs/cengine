@@ -100,6 +100,7 @@ public struct DockerRouter: Sendable {
     private let containerResourceOverride: ContainerResourceOverride?
     private let resourceScopeManager: ContainerResourceScopeManager?
     private let registrySearcher: any RegistrySearching
+    private let registryAuthenticator: any RegistryAuthenticating
     private let decoder = JSONDecoder()
 
     private func nonEmpty(_ value: String?) -> String? {
@@ -124,13 +125,15 @@ public struct DockerRouter: Sendable {
         root: URL,
         containerResourceOverride: ContainerResourceOverride? = nil,
         resourceScopeManager: ContainerResourceScopeManager? = nil,
-        registrySearcher: any RegistrySearching = RegistrySearchClient()
+        registrySearcher: any RegistrySearching = RegistrySearchClient(),
+        registryAuthenticator: any RegistryAuthenticating = RegistryAuthenticationClient()
     ) {
         self.runtime = runtime
         self.root = root
         self.containerResourceOverride = containerResourceOverride
         self.resourceScopeManager = resourceScopeManager
         self.registrySearcher = registrySearcher
+        self.registryAuthenticator = registryAuthenticator
     }
 
     public func route(_ request: APIRequest) async -> APIResponse {
@@ -179,6 +182,20 @@ public struct DockerRouter: Sendable {
             return APIResponse(status: .ok, headers: ["Api-Version": DockerAPIVersion.maximum.description, "Docker-Experimental": "true"], body: request.method == .HEAD ? Data() : Data("OK".utf8))
         case (.GET, "/version"):
             return json(status: .ok, DockerVersionResponse())
+        case (.POST, "/auth"):
+            let input = try decoder.decode(RegistryAuthRequest.self, from: request.body)
+            let result = try await registryAuthenticator.authenticate(
+                serverAddress: input.serveraddress ?? "",
+                credentials: .init(
+                    username: input.username ?? "",
+                    password: input.password ?? "",
+                    identityToken: input.identitytoken ?? ""
+                )
+            )
+            return json(status: .ok, RegistryAuthResponse(
+                Status: result.status,
+                IdentityToken: result.identityToken
+            ))
         case (.GET, "/info"):
             let all = await runtime.listContainers(all: true)
             let images = await runtime.listImages()
@@ -2382,7 +2399,16 @@ private func parseDockerByteSize(_ value: String) -> Int64? {
 }
 
 private struct VolumeListEnvelope: Encodable { let Volumes: [DockerVolumeResponse]; let Warnings: [String] }
-private struct RegistryAuthRequest: Decodable { let username: String?; let password: String?; let identitytoken: String? }
+private struct RegistryAuthRequest: Decodable {
+    let username: String?
+    let password: String?
+    let serveraddress: String?
+    let identitytoken: String?
+}
+private struct RegistryAuthResponse: Encodable {
+    let Status: String
+    let IdentityToken: String
+}
 private actor PullProgressCollector {
     private(set) var values: [ImagePullProgress] = []
     func append(_ value: ImagePullProgress) { values.append(value) }

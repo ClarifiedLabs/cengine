@@ -409,8 +409,9 @@ public struct RegistrySearchClient: RegistrySearching, Sendable {
         registryIsLoopback: Bool
     ) throws -> BearerChallenge? {
         guard let header,
-              let bearer = header.range(of: "Bearer ", options: [.caseInsensitive]) else { return nil }
-        let parameters = challengeParameters(String(header[bearer.upperBound...]))
+              let parameters = authenticationChallenges(header).first(where: { $0.scheme == "bearer" })?.parameters else {
+            return nil
+        }
         guard let realmValue = parameters["realm"],
               let realm = URL(string: realmValue),
               let scheme = realm.scheme?.lowercased(),
@@ -421,6 +422,72 @@ public struct RegistrySearchClient: RegistrySearching, Sendable {
             throw EngineError(.internalError, "registry returned an invalid token authentication realm")
         }
         return BearerChallenge(realm: realm, service: parameters["service"] ?? "")
+    }
+
+    struct AuthenticationChallenge: Sendable {
+        let scheme: String
+        let parameters: [String: String]
+    }
+
+    static func authenticationChallenges(_ header: String) -> [AuthenticationChallenge] {
+        var challenges: [AuthenticationChallenge] = []
+        var index = header.startIndex
+        while index < header.endIndex {
+            while index < header.endIndex && (header[index].isWhitespace || header[index] == ",") {
+                index = header.index(after: index)
+            }
+            let schemeStart = index
+            while index < header.endIndex && !header[index].isWhitespace && header[index] != "," {
+                index = header.index(after: index)
+            }
+            let scheme = header[schemeStart..<index].lowercased()
+            while index < header.endIndex && header[index].isWhitespace {
+                index = header.index(after: index)
+            }
+            let parametersStart = index
+            var parametersEnd = header.endIndex
+            var quoted = false
+            var escaped = false
+            while index < header.endIndex {
+                let character = header[index]
+                if escaped {
+                    escaped = false
+                } else if character == "\\" && quoted {
+                    escaped = true
+                } else if character == "\"" {
+                    quoted.toggle()
+                } else if character == "," && !quoted {
+                    var lookahead = header.index(after: index)
+                    while lookahead < header.endIndex && header[lookahead].isWhitespace {
+                        lookahead = header.index(after: lookahead)
+                    }
+                    var tokenEnd = lookahead
+                    while tokenEnd < header.endIndex
+                        && !header[tokenEnd].isWhitespace
+                        && header[tokenEnd] != ","
+                        && header[tokenEnd] != "=" {
+                        tokenEnd = header.index(after: tokenEnd)
+                    }
+                    var afterToken = tokenEnd
+                    while afterToken < header.endIndex && header[afterToken].isWhitespace {
+                        afterToken = header.index(after: afterToken)
+                    }
+                    if afterToken == header.endIndex || header[afterToken] != "=" {
+                        parametersEnd = index
+                        index = lookahead
+                        break
+                    }
+                }
+                index = header.index(after: index)
+            }
+            if !scheme.isEmpty {
+                challenges.append(.init(
+                    scheme: scheme,
+                    parameters: challengeParameters(String(header[parametersStart..<parametersEnd]))
+                ))
+            }
+        }
+        return challenges
     }
 
     private static func challengeParameters(_ input: String) -> [String: String] {
@@ -437,6 +504,9 @@ public struct RegistrySearchClient: RegistrySearching, Sendable {
             guard index < input.endIndex, input[index] == "=" else { break }
             let key = input[keyStart..<index].trimmingCharacters(in: .whitespaces).lowercased()
             index = input.index(after: index)
+            while index < input.endIndex && input[index].isWhitespace {
+                index = input.index(after: index)
+            }
             var value = ""
             if index < input.endIndex, input[index] == "\"" {
                 index = input.index(after: index)

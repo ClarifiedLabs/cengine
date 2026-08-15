@@ -177,6 +177,15 @@ def test_authenticated_push_round_trip(client: docker.DockerClient):
                 raise
             time.sleep(0.2)
 
+    with pytest.raises(errors.APIError) as rejected:
+        client.login(
+            username=REGISTRY_AUTH["username"], password="wrong-password",
+            registry=endpoint, reauth=True,
+        )
+    assert rejected.value.response.status_code == 401
+    login = client.login(registry=endpoint, reauth=True, **REGISTRY_AUTH)
+    assert login == {"Status": "Login Succeeded", "IdentityToken": ""}
+
     reference = f"{endpoint}/compat/alpine:roundtrip"
     source = client.images.get(IMAGE)
     assert source.tag(reference)

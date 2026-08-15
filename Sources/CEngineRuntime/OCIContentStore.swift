@@ -1763,7 +1763,7 @@ struct OCIRegistryReference: Sendable {
     var APIHost: String { registry == "docker.io" ? "registry-1.docker.io" : registry }
 }
 
-private final class OCIRegistrySessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+final class OCIRegistrySessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -1771,19 +1771,43 @@ private final class OCIRegistrySessionDelegate: NSObject, URLSessionTaskDelegate
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        var redirected = request
-        let original = task.currentRequest?.url
-        let destination = request.url
-        if original?.scheme?.lowercased() != destination?.scheme?.lowercased()
-            || original?.host?.lowercased() != destination?.host?.lowercased()
-            || original?.port != destination?.port {
+        guard let original = task.currentRequest else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(Self.redirectedRequest(from: original, to: request))
+    }
+
+    static func redirectedRequest(from original: URLRequest, to proposed: URLRequest) -> URLRequest? {
+        if original.httpMethod == "POST",
+           original.value(forHTTPHeaderField: "Content-Type") == "application/x-www-form-urlencoded" {
+            return nil
+        }
+        if original.url?.scheme?.lowercased() == "https"
+            && proposed.url?.scheme?.lowercased() != "https" {
+            return nil
+        }
+        var redirected = proposed
+        if !sameOrigin(original.url, proposed.url) {
             redirected.setValue(nil, forHTTPHeaderField: "Authorization")
         }
-        completionHandler(redirected)
+        return redirected
+    }
+
+    static func sameOrigin(_ lhs: URL?, _ rhs: URL?) -> Bool {
+        guard let lhs, let rhs,
+              lhs.scheme?.lowercased() == rhs.scheme?.lowercased(),
+              lhs.host?.lowercased() == rhs.host?.lowercased() else {
+            return false
+        }
+        func port(_ url: URL) -> Int? {
+            url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80)
+        }
+        return port(lhs) == port(rhs)
     }
 }
 
-private actor OCIRegistryClient {
+actor OCIRegistryClient {
     struct ManifestResponse: Sendable { let data: Data; let mediaType: String; let digest: String? }
     private let reference: OCIRegistryReference
     private let credentials: RegistryCredentials?
@@ -1949,19 +1973,17 @@ private actor OCIRegistryClient {
         var request = original
         if let authorization {
             request.setValue(authorization, forHTTPHeaderField: "Authorization")
-        } else if let identityAuthorization {
-            request.setValue(identityAuthorization, forHTTPHeaderField: "Authorization")
-        } else if let basic = basicAuthorization {
-            request.setValue(basic, forHTTPHeaderField: "Authorization")
         }
         var (bytes, response) = try await session.bytes(for: request)
         guard var http = response as? HTTPURLResponse else {
             throw EngineError(.upstream, "registry returned a non-HTTP response")
         }
         if http.statusCode == 401,
+           let registryURL = try? url(""),
+           OCIRegistrySessionDelegate.sameOrigin(registryURL, http.url),
            let challenge = http.value(forHTTPHeaderField: "WWW-Authenticate") {
             _ = try await readBounded(bytes, maximumBytes: policy.errorBodyBytes)
-            authorization = try await bearerAuthorization(challenge)
+            authorization = try await challengeAuthorization(challenge)
             request.setValue(authorization, forHTTPHeaderField: "Authorization")
             (bytes, response) = try await session.bytes(for: request)
             guard let retried = response as? HTTPURLResponse else {
@@ -2014,31 +2036,23 @@ private actor OCIRegistryClient {
         )
     }
 
+    private func challengeAuthorization(_ challenge: String) async throws -> String {
+        let challenges = RegistrySearchClient.authenticationChallenges(challenge)
+        if challenges.contains(where: { $0.scheme == "bearer" }) {
+            return try await bearerAuthorization(challenge)
+        }
+        if challenges.contains(where: { $0.scheme == "basic" }), let basicAuthorization {
+            return basicAuthorization
+        }
+        throw EngineError(.internalError, "unsupported registry authentication challenge")
+    }
+
     private func bearerAuthorization(_ challenge: String) async throws -> String {
-        guard challenge.lowercased().hasPrefix("bearer ") else {
-            throw EngineError(.internalError, "unsupported registry authentication challenge")
-        }
-		let parameters = Self.authenticationParameters(String(challenge.dropFirst(7)))
-        guard let realm = parameters["realm"], var components = URLComponents(string: realm) else {
-            throw EngineError(.internalError, "registry bearer challenge has no realm")
-        }
-        var items = components.queryItems ?? []
-        if let service = parameters["service"] { items.append(.init(name: "service", value: service)) }
-        items.append(.init(name: "scope", value: parameters["scope"] ?? "repository:\(reference.repository):pull,push"))
-        components.queryItems = items
-        guard let tokenURL = components.url else { throw EngineError(.internalError, "invalid registry token URL") }
-        var request = URLRequest(url: tokenURL)
-        let registryHost = reference.APIHost.split(separator: ":").first.map(String.init)?
-            .lowercased()
-        let tokenHost = tokenURL.host?.lowercased()
-        let expectedScheme = reference.insecure ? "http" : "https"
-        let trustedCredentialHost = tokenURL.scheme?.lowercased() == expectedScheme
-            && (tokenHost == registryHost
-                || (reference.registry == "docker.io"
-                    && tokenHost == "auth.docker.io"))
-        if trustedCredentialHost, let basic = basicAuthorization {
-            request.setValue(basic, forHTTPHeaderField: "Authorization")
-        }
+        let request = try Self.bearerTokenRequest(
+            challenge: challenge,
+            reference: reference,
+            credentials: credentials
+        )
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw EngineError(.upstream, "registry token returned a non-HTTP response")
@@ -2058,14 +2072,74 @@ private actor OCIRegistryClient {
         return "Bearer \(token)"
     }
 
+    static func bearerTokenRequest(
+        challenge: String,
+        reference: OCIRegistryReference,
+        credentials: RegistryCredentials?
+    ) throws -> URLRequest {
+        guard let parameters = RegistrySearchClient.authenticationChallenges(challenge)
+            .first(where: { $0.scheme == "bearer" })?.parameters else {
+            throw EngineError(.internalError, "unsupported registry authentication challenge")
+        }
+        guard let realm = parameters["realm"],
+              let tokenURL = URL(string: realm),
+              let scheme = tokenURL.scheme?.lowercased(),
+              let host = tokenURL.host,
+              tokenURL.user == nil,
+              tokenURL.password == nil,
+              tokenURL.fragment == nil,
+              scheme == "https" || (scheme == "http" && reference.insecure && RegistrySearchClient.isLoopback(host)) else {
+            throw EngineError(.internalError, "registry bearer challenge has an invalid realm")
+        }
+        let scope = parameters["scope"] ?? "repository:\(reference.repository):pull,push"
+        let service = parameters["service"] ?? ""
+
+        if let credentials, !credentials.identityToken.isEmpty {
+            var form = URLComponents()
+            form.queryItems = [
+                .init(name: "client_id", value: "docker"),
+                .init(name: "grant_type", value: "refresh_token"),
+                .init(name: "refresh_token", value: credentials.identityToken),
+                .init(name: "scope", value: scope),
+                .init(name: "service", value: service),
+            ]
+            guard let body = form.percentEncodedQuery else {
+                throw EngineError(.internalError, "could not encode registry token request")
+            }
+            var request = URLRequest(url: tokenURL)
+            request.httpMethod = "POST"
+            request.httpBody = Data(body.utf8)
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            return request
+        }
+
+        guard var components = URLComponents(url: tokenURL, resolvingAgainstBaseURL: false) else {
+            throw EngineError(.internalError, "invalid registry token URL")
+        }
+        var items = components.queryItems ?? []
+        if !service.isEmpty { items.append(.init(name: "service", value: service)) }
+        items.append(.init(name: "scope", value: scope))
+        items.append(.init(name: "client_id", value: "docker"))
+        if let credentials, !credentials.username.isEmpty {
+            items.append(.init(name: "account", value: credentials.username))
+        }
+        components.queryItems = items
+        guard let url = components.url else {
+            throw EngineError(.internalError, "invalid registry token URL")
+        }
+        var request = URLRequest(url: url)
+        if let credentials, !credentials.username.isEmpty || !credentials.password.isEmpty {
+            request.setValue(
+                "Basic " + Data("\(credentials.username):\(credentials.password)".utf8).base64EncodedString(),
+                forHTTPHeaderField: "Authorization"
+            )
+        }
+        return request
+    }
+
     private var basicAuthorization: String? {
         guard let credentials, !credentials.username.isEmpty || !credentials.password.isEmpty else { return nil }
         return "Basic " + Data("\(credentials.username):\(credentials.password)".utf8).base64EncodedString()
-    }
-
-    private var identityAuthorization: String? {
-        guard let credentials, !credentials.identityToken.isEmpty else { return nil }
-        return "Bearer \(credentials.identityToken)"
     }
 
     private func url(_ suffix: String) throws -> URL {
@@ -2078,21 +2152,4 @@ private actor OCIRegistryClient {
         return value
     }
 
-	private static func authenticationParameters(_ value: String) -> [String: String] {
-		var result: [String: String] = [:]; var start = value.startIndex; var quoted = false; var escaped = false
-		func consume(_ end: String.Index) {
-			let component = value[start..<end]; let pair = component.split(separator: "=", maxSplits: 1)
-			if pair.count == 2 { result[String(pair[0]).trimmingCharacters(in: .whitespaces)] = String(pair[1]).trimmingCharacters(in: CharacterSet(charactersIn: " \"")) }
-		}
-		var index = value.startIndex
-		while index < value.endIndex {
-			let character = value[index]
-			if escaped { escaped = false }
-			else if character == "\\" && quoted { escaped = true }
-			else if character == "\"" { quoted.toggle() }
-			else if character == "," && !quoted { consume(index); start = value.index(after: index) }
-			index = value.index(after: index)
-		}
-		consume(value.endIndex); return result
-	}
 }
