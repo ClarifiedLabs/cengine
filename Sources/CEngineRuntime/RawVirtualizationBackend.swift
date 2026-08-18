@@ -348,6 +348,45 @@ enum RawExactContainerOwnershipGuard {
     }
 }
 
+/// A network-record refresh carries metadata for every container, but only
+/// running or paused records can cause guest execution mutations. Residual
+/// generation evidence on an inactive record must continue to fence that
+/// container's lifecycle without poisoning refreshes for unrelated containers.
+enum RawNetworkRefreshOwnershipGuard {
+    static func require(
+        _ container: ContainerRecord,
+        knownInstanceID: UUID?,
+        quarantinedGenerationCount: Int,
+        cleanupPendingGenerationCount: Int
+    ) throws {
+        let hasActiveExecution = container.phase == .running || container.phase == .paused
+        try RawExactContainerOwnershipGuard.require(
+            container,
+            knownInstanceID: knownInstanceID,
+            quarantinedGenerationCount:
+                hasActiveExecution ? quarantinedGenerationCount : 0,
+            cleanupPendingGenerationCount:
+                hasActiveExecution ? cleanupPendingGenerationCount : 0
+        )
+    }
+
+    static func require(
+        _ containers: [ContainerRecord],
+        knownContainers: [String: ContainerRecord],
+        quarantinedGenerationCounts: [String: Int],
+        cleanupPendingGenerationCounts: [String: Int]
+    ) throws {
+        for container in containers {
+            try require(
+                container,
+                knownInstanceID: knownContainers[container.id]?.instanceID,
+                quarantinedGenerationCount: quarantinedGenerationCounts[container.id] ?? 0,
+                cleanupPendingGenerationCount: cleanupPendingGenerationCounts[container.id] ?? 0
+            )
+        }
+    }
+}
+
 enum RawActiveContainerExecutionGuard {
     static func require(
         _ container: ContainerRecord,
@@ -5053,9 +5092,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func updateNetworkRecords(_ containers: [ContainerRecord]) async throws {
-        for container in containers {
-            try requireExactContainerOwnership(container)
-        }
+        try RawNetworkRefreshOwnershipGuard.require(
+            containers,
+            knownContainers: knownContainers,
+            quarantinedGenerationCounts: quarantinedShimGenerations.mapValues(\.count),
+            cleanupPendingGenerationCounts: cleanupPendingShims.mapValues(\.count)
+        )
         knownContainers = Dictionary(uniqueKeysWithValues: containers.map { ($0.id, $0) })
         activeContainers = Dictionary(uniqueKeysWithValues: containers.filter { $0.phase == .running || $0.phase == .paused }.map { ($0.id, $0) })
         for container in containers {

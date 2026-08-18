@@ -3032,6 +3032,71 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
 
     }
 
+    @Test func networkRefreshScopesGenerationOwnershipToActiveExecutions() throws {
+        var container = ContainerRecord(
+            id: "network-refresh-fence", name: "network-refresh-fence", image: "alpine"
+        )
+
+        var unrelated = ContainerRecord(
+            id: "network-refresh-new", name: "network-refresh-new", image: "alpine"
+        )
+        unrelated.phase = .created
+        var active = ContainerRecord(
+            id: "network-refresh-active", name: "network-refresh-active", image: "alpine"
+        )
+        active.phase = .running
+
+        for phase in [ContainerPhase.created, .exited, .dead] {
+            container.phase = phase
+            try RawNetworkRefreshOwnershipGuard.require(
+                [container, unrelated, active],
+                knownContainers: [container.id: container, active.id: active],
+                quarantinedGenerationCounts: [container.id: 1],
+                cleanupPendingGenerationCounts: [container.id: 1]
+            )
+        }
+
+        for phase in [ContainerPhase.running, .paused] {
+            container.phase = phase
+            #expect(throws: BackendResourceRollbackIncompleteError.self) {
+                try RawNetworkRefreshOwnershipGuard.require(
+                    [container],
+                    knownContainers: [container.id: container],
+                    quarantinedGenerationCounts: [container.id: 1],
+                    cleanupPendingGenerationCounts: [:]
+                )
+            }
+            #expect(throws: BackendResourceRollbackIncompleteError.self) {
+                try RawNetworkRefreshOwnershipGuard.require(
+                    [container],
+                    knownContainers: [container.id: container],
+                    quarantinedGenerationCounts: [:],
+                    cleanupPendingGenerationCounts: [container.id: 1]
+                )
+            }
+            try RawNetworkRefreshOwnershipGuard.require(
+                [container],
+                knownContainers: [container.id: container],
+                quarantinedGenerationCounts: [:],
+                cleanupPendingGenerationCounts: [:]
+            )
+        }
+
+        container.phase = .dead
+        var replacement = ContainerRecord(
+            id: container.id, instanceID: UUID(), name: container.name, image: container.image
+        )
+        replacement.phase = .dead
+        #expect(throws: BackendResourceRollbackIncompleteError.self) {
+            try RawNetworkRefreshOwnershipGuard.require(
+                [replacement],
+                knownContainers: [container.id: container],
+                quarantinedGenerationCounts: [:],
+                cleanupPendingGenerationCounts: [:]
+            )
+        }
+    }
+
     @Test func activeContainerExecutionGuardRejectsCompletedOrReplacedExecutions() throws {
         let container = ContainerRecord(
             id: "exec-completion-race",
