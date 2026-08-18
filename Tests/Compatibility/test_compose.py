@@ -22,7 +22,7 @@ COMPOSE_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose.yaml"
 COMPOSE_VOLUMES_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-volumes.yaml"
 COMPOSE_HEALTH_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-health.yaml"
 DEVELOPER_FIXTURE = REPO_ROOT / "Tests/Fixtures/compose/developer-loop"
-COMPOSE_VERSION = "5.4.0"
+COMPOSE_VERSION = "5.5.0"
 
 
 def compose(daemon, project: str, *arguments: str, compose_file=COMPOSE_FILE) -> subprocess.CompletedProcess[str]:

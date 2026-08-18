@@ -138,7 +138,7 @@ values are **Support**, **Intentional gap**, and **Undecided**.
 
 Rows inherited from the original inventory retain the pinned Podman commit as
 their origin. Rows identified as cengine-owned below are contracts added from
-Docker Engine semantics or observed Docker Compose 5.4.0 behavior.
+Docker Engine semantics or observed Docker Compose 5.5.0 behavior.
 
 ## Runtime semantics
 
@@ -373,7 +373,7 @@ These candidate decisions are docs-first and do not change accepted API behavior
 | `VOL-005` | `test_tmpfs_size_and_mode_options` | ✅ Pass | Support | **cengine-owned.** Structured tmpfs size and mode options are applied in the guest; `RTM-022` covers its default and explicit execution policy. |
 | `VOL-006` | `test_volume_preserves_inodes_across_link_and_rename` | ✅ Pass | Support | **cengine-owned.** Stable NFS file handles preserve hard-link identity across directory rename. |
 
-## Docker Compose 5.4.0
+## Docker Compose 5.5.0
 
 | ID | Contract | Status | Intent | Notes |
 |---|---|---|---|---|
@@ -384,7 +384,7 @@ These candidate decisions are docs-first and do not change accepted API behavior
 | `CMP-005` | `test_compose_exec_stop_start_and_restart` | ✅ Pass | Support | Compose exec and service lifecycle commands work without replacing the container. |
 | `CMP-006` | `test_compose_named_volume_down_semantics` | ✅ Pass | Support | Named data survives ordinary down and is deleted by `down --volumes`. |
 | `CMP-007` | `test_compose_waits_for_healthy_dependency` | ✅ Pass | Support | Health-conditioned dependencies start only after the prerequisite reports healthy. |
-| `CMP-008` | `test_developer_compose_build_uses_context_default_builder` | ✅ Pass | Support | **cengine-owned.** Bare context-qualified Compose 5.4.0 `build` and `up --build` select `cengine-builder`, create only `buildx_buildkit_cengine-builder0`, load the arm64 image, and run it. Managed setup registers the builder default under both the `cengine` context and its resolved Unix endpoint because Compose passes both to its standalone Buildx child. No `BUILDX_BUILDER`, `--builder`, temporary builder, legacy `/build` fallback, or emulated platform is involved. |
+| `CMP-008` | `test_developer_compose_build_uses_context_default_builder` | ✅ Pass | Support | **cengine-owned.** Bare context-qualified Compose 5.5.0 `build` and `up --build` select `cengine-builder`, create only `buildx_buildkit_cengine-builder0`, load the arm64 image, and run it. Managed setup registers the builder default under both the `cengine` context and its resolved Unix endpoint because Compose passes both to its standalone Buildx child. No `BUILDX_BUILDER`, `--builder`, temporary builder, legacy `/build` fallback, or emulated platform is involved. |
 | `CMP-009` | `test_developer_compose_source_edits_hot_reload_without_replacement` | ✅ Pass | Support | **cengine-owned.** Repeated host in-place and atomic-save edits plus a guest-originated atomic edit are observed through a 150 ms Python stable-content polling reloader without changing the service container or server process. The line-oriented reloader requires a complete newline-terminated payload and two consecutive matching reads before publication, matching and strengthening the `RTM-037` baseline. Compose Watch and event-only watchers remain out of scope. |
 | `CMP-010` | `test_developer_compose_rebuild_restart_recovery_and_teardown` | ✅ Pass | Support | **cengine-owned.** A changed image input rebuilds and recreates the service, an unchanged rebuild is idempotent, Compose restart preserves container identity, abrupt daemon recovery adopts the same service and builder, post-recovery source reload remains usable, and final teardown removes project resources. Recovery means adoption, not VM migration or cross-VM namespace sharing. |
 
