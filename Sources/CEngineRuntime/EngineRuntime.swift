@@ -255,8 +255,8 @@ public actor EngineRuntime {
                     try await cleanupBackendExecution(pending)
                 } catch {
                     quarantineCleanupPendingContainer(identifier)
-                    try? await persist()
-                    throw error
+                    try await persist()
+                    continue
                 }
                 verifiedCleanupIDs.insert(identifier)
                 switch pending.phase {
@@ -277,8 +277,8 @@ public actor EngineRuntime {
                 }
                 clearCleanupPending(identifier)
             }
-            // Do not proceed to restore networks or another policy-driven
-            // launch until the safe phase and cleared marker are durable.
+            // Publish every verified phase transition and every retained
+            // quarantine before unrelated recovery work begins.
             try await persist()
         }
         self.endpointAllocationCursors = try await endpointAllocationStore.load(default: [:])
@@ -321,15 +321,18 @@ public actor EngineRuntime {
         // `.dead` is a durable quarantine for an execution whose cleanup could
         // not be verified. It must never be treated as an inert record: a
         // backend process may still be live even though no monitor survived the
-        // previous daemon. Refuse to finish recovery until definitive deletion
-        // succeeds; stop is best-effort diagnostic context for delete failure.
-        for index in snapshot.containers.indices where snapshot.containers[index].phase == .dead {
+        // previous daemon. Retry unmarked quarantines here, while retaining any
+        // failed pending marker and continuing recovery for unrelated records.
+        for index in snapshot.containers.indices {
             let quarantined = snapshot.containers[index]
+            guard quarantined.phase == .dead,
+                  !cleanupIsPending(quarantined.id) else { continue }
             do {
                 try await cleanupBackendExecution(quarantined)
             } catch {
-                try? await persist()
-                throw error
+                quarantineCleanupPendingContainer(quarantined.id)
+                try await persist()
+                continue
             }
             verifiedCleanupIDs.insert(quarantined.id)
             if quarantined.startedAt == nil {
@@ -371,19 +374,19 @@ public actor EngineRuntime {
             } else {
                 guard stale.phase == .exited, stale.restartPolicy.name == "always" else { continue }
             }
-            var launchAttempted = false
+            var restarted = snapshot.containers[index]
+            restarted.restartCount += 1
+            // Preparation may launch or rediscover backend state. Fence that
+            // boundary durably before entering it, just as start is fenced.
+            markCleanupPending(restarted.id)
             do {
-                var restarted = snapshot.containers[index]
-                restarted.restartCount += 1
+                try await persist()
+            } catch {
+                clearCleanupPending(restarted.id)
+                throw error
+            }
+            do {
                 try await backend.prepare(restarted)
-                markCleanupPending(restarted.id)
-                do {
-                    try await persist()
-                } catch {
-                    clearCleanupPending(restarted.id)
-                    throw error
-                }
-                launchAttempted = true
                 restarted.ports = try await backend.start(restarted)
                 restarted.phase = .running; restarted.exitCode = nil; restarted.finishedAt = nil
                 let addresses = await backend.endpointAddresses(for: restarted)
@@ -399,18 +402,16 @@ public actor EngineRuntime {
                 try await persist()
                 recovered.append((restarted.id, startedAt))
             } catch {
-                guard launchAttempted else {
-                    snapshot.containers[index].phase = .dead
-                    snapshot.containers[index].exitCode = 127
-                    continue
-                }
+                // Restore the in-memory marker if final running-state
+                // publication failed after clearing it; the durable fence from
+                // before preparation remains authoritative.
                 markCleanupPending(stale.id)
                 do {
                     try await cleanupBackendExecution(snapshot.containers[index])
                 } catch {
                     quarantineCleanupPendingContainer(stale.id)
-                    try? await persist()
-                    throw error
+                    try await persist()
+                    continue
                 }
                 snapshot.containers[index].phase = .exited
                 snapshot.containers[index].finishedAt = Date()
@@ -434,12 +435,23 @@ public actor EngineRuntime {
             snapshot.images = Self.imageRecords(from: backendImages)
         }
         for index in snapshot.containers.indices where snapshot.containers[index].phase == .created {
+            let created = snapshot.containers[index]
+            markCleanupPending(created.id)
+            try await persist()
             do {
-                try await backend.prepare(snapshot.containers[index])
+                try await backend.prepare(created)
+                clearCleanupPending(created.id)
+                try await persist()
             } catch {
-                snapshot.containers[index].phase = .dead
-                snapshot.containers[index].exitCode = 127
-                snapshot.containers[index].finishedAt = Date()
+                markCleanupPending(created.id)
+                do {
+                    try await cleanupBackendExecution(created)
+                    clearCleanupPending(created.id)
+                    try await persist()
+                } catch {
+                    quarantineCleanupPendingContainer(created.id)
+                    try await persist()
+                }
             }
         }
         try await persist()
@@ -568,10 +580,6 @@ public actor EngineRuntime {
                     throw EngineError(.conflict, "container was removed or changed while it was starting")
                 }
             }
-            try await backend.prepare(record)
-            guard ownsLifecycleExecution(intent, record: record) else {
-                throw EngineError(.conflict, "container was removed or changed while it was starting")
-            }
             markCleanupPending(record.id)
             do {
                 try await persist()
@@ -586,15 +594,17 @@ public actor EngineRuntime {
             }
             let resolvedPorts: [PortBinding]
             do {
+                try await backend.prepare(record)
+                guard ownsLifecycleExecution(intent, record: record) else {
+                    throw EngineError(.conflict, "container was removed or changed while it was starting")
+                }
                 resolvedPorts = try await backend.start(record)
             } catch {
-                // `start` may fail after installing a partially-running backend
-                // execution. Preparation failures have not crossed that boundary
-                // and remain available for a later retry, but every attempted
-                // start must reset both the execution and its preparation.
-                let startError = error
+                // Both preparation and start may leave backend generations.
+                // Their shared durable fence remains until teardown is verified.
+                let launchError = error
                 try await rollbackFailedStart(original: record, started: record)
-                throw startError
+                throw launchError
             }
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
@@ -3462,8 +3472,8 @@ public actor EngineRuntime {
         markCleanupPending(identifier)
     }
 
-    /// A backend start can partially launch before throwing, or succeed before
-    /// publishing the running record fails. The pre-launch cleanup marker stays
+    /// Backend preparation or start can partially launch before throwing, or
+    /// succeed before publishing the running record fails. The cleanup marker stays
     /// set until definitive teardown and restoration are both durable.
     private func rollbackFailedStart(original: ContainerRecord, started: ContainerRecord) async throws {
         healthTasks.removeValue(forKey: original.id)?.cancel()
@@ -3725,8 +3735,8 @@ public actor EngineRuntime {
                     try await cleanupBackendExecution(removed)
                 } catch {
                     quarantineCleanupPendingContainer(identifier)
-                    try? await persist()
-                    throw error
+                    try await persist()
+                    continue
                 }
                 verifiedCleanupIDs.insert(identifier)
             }
@@ -4071,12 +4081,10 @@ public actor EngineRuntime {
                 startingContainerIDs.remove(identifier)
                 endLifecycleIntent(restartIntent, for: identifier)
             }
-            var crossedLaunchBoundary = false
+            var cleanupFencePersisted = false
             do {
                 var restarted = record; restarted.restartCount += 1
                 try await backend.delete(record)
-                guard ownsReconciliation(restartIntent, record: record) else { return }
-                try await backend.prepare(restarted)
                 guard ownsReconciliation(restartIntent, record: record) else { return }
                 markCleanupPending(identifier)
                 do {
@@ -4090,7 +4098,11 @@ public actor EngineRuntime {
                     try await persist()
                     return
                 }
-                crossedLaunchBoundary = true
+                cleanupFencePersisted = true
+                try await backend.prepare(restarted)
+                guard ownsReconciliation(restartIntent, record: record) else {
+                    throw EngineError(.conflict, "container changed while restart policy was preparing it")
+                }
                 restarted.ports = try await backend.start(restarted)
                 guard ownsReconciliation(restartIntent, record: record) else {
                     throw EngineError(.conflict, "container changed while restart policy was launching it")
@@ -4109,7 +4121,7 @@ public actor EngineRuntime {
                 startCompletionMonitor(identifier, startedAt: restartedAt)
                 return
             } catch {
-                guard crossedLaunchBoundary else { return }
+                guard cleanupFencePersisted else { return }
                 markCleanupPending(identifier)
                 do {
                     try await cleanupBackendExecution(record)

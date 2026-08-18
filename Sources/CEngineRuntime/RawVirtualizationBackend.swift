@@ -444,6 +444,176 @@ struct RawDeletedContainerReceipt: Codable, Equatable, Sendable {
     }
 }
 
+/// A preparation attempt lives outside the disposable container directory so
+/// cleanup can still attribute an exact instance after preparation rolled its
+/// state directory back or failed before creating one.
+struct RawContainerPreparationAttempt: Codable, Equatable, Sendable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    let containerID: String
+    let instanceID: UUID
+    let directoryIdentity: PersistentFileIdentity?
+    let cleanupContained: Bool
+
+    init(
+        container: ContainerRecord,
+        directoryIdentity: PersistentFileIdentity? = nil,
+        cleanupContained: Bool = false
+    ) {
+        schemaVersion = Self.currentSchemaVersion
+        containerID = container.id
+        instanceID = container.instanceID
+        self.directoryIdentity = directoryIdentity
+        self.cleanupContained = cleanupContained
+    }
+}
+
+/// Durable proof that this exact logical container entered raw preparation.
+/// An unbound attempt proves an absent state directory is safe to treat as
+/// cleaned; once bound, it also authorizes disposal of that exact partial
+/// directory when preparation did not reach `PreparedShimState` publication.
+enum RawContainerPreparationAttemptCoordinator {
+    static func begin(
+        _ container: ContainerRecord,
+        in containers: PersistentStateDirectory,
+        attempts: PersistentStateDirectory
+    ) throws {
+        let hasState = try containers.pendingDisposalIdentity(named: container.id) != nil
+            || containers.openDirectoryIfPresent(named: container.id) != nil
+        if let existing = try load(containerID: container.id, from: attempts), hasState {
+            guard existing.instanceID == container.instanceID else {
+                throw EngineError(.conflict, "container preparation attempt belongs to another instance")
+            }
+            return
+        }
+        try save(RawContainerPreparationAttempt(container: container), in: attempts)
+    }
+
+    static func bind(
+        _ container: ContainerRecord,
+        directoryIdentity: PersistentFileIdentity,
+        in attempts: PersistentStateDirectory
+    ) throws {
+        guard let existing = try load(containerID: container.id, from: attempts),
+              existing.instanceID == container.instanceID else {
+            throw EngineError(.conflict, "container preparation attempt is unavailable")
+        }
+        if existing.directoryIdentity == directoryIdentity,
+           !existing.cleanupContained { return }
+        try save(
+            RawContainerPreparationAttempt(
+                container: container, directoryIdentity: directoryIdentity
+            ),
+            in: attempts
+        )
+    }
+
+    static func recordContainedCleanup(
+        _ container: ContainerRecord,
+        directoryIdentity: PersistentFileIdentity,
+        in attempts: PersistentStateDirectory
+    ) throws {
+        guard let existing = try load(containerID: container.id, from: attempts),
+              existing.instanceID == container.instanceID,
+              existing.directoryIdentity == directoryIdentity else {
+            throw EngineError(.conflict, "contained cleanup does not match its preparation attempt")
+        }
+        try save(
+            RawContainerPreparationAttempt(
+                container: container,
+                directoryIdentity: directoryIdentity,
+                cleanupContained: true
+            ),
+            in: attempts
+        )
+    }
+
+    static func requireUnboundPartialState(
+        _ container: ContainerRecord,
+        stateDirectory: PersistentStateDirectory,
+        in attempts: PersistentStateDirectory
+    ) throws {
+        guard try stateDirectory.entryNames().isEmpty else {
+            throw EngineError(.conflict, "unbound container preparation state is not empty")
+        }
+        guard let attempt = try load(containerID: container.id, from: attempts),
+              attempt.instanceID == container.instanceID,
+              attempt.directoryIdentity == nil else {
+            throw EngineError(.conflict, "container cleanup is not an unbound preparation attempt")
+        }
+    }
+
+    static func requireCleanAbsence(
+        _ container: ContainerRecord,
+        in containers: PersistentStateDirectory,
+        attempts: PersistentStateDirectory
+    ) throws {
+        guard try containers.pendingDisposalIdentity(named: container.id) == nil,
+              try containers.openDirectoryIfPresent(named: container.id) == nil else {
+            throw EngineError(.conflict, "container preparation state disposal remains incomplete")
+        }
+        try require(container, in: attempts)
+        guard try containers.pendingDisposalIdentity(named: container.id) == nil,
+              try containers.openDirectoryIfPresent(named: container.id) == nil else {
+            throw EngineError(.conflict, "container preparation state changed while confirming cleanup")
+        }
+    }
+
+    static func require(
+        _ container: ContainerRecord,
+        directoryIdentity: PersistentFileIdentity? = nil,
+        in attempts: PersistentStateDirectory
+    ) throws {
+        guard let attempt = try load(containerID: container.id, from: attempts),
+              attempt.instanceID == container.instanceID else {
+            throw EngineError(.conflict, "container cleanup cannot be attributed to a preparation attempt")
+        }
+        if let directoryIdentity {
+            guard attempt.directoryIdentity == directoryIdentity else {
+                throw EngineError(.conflict, "partial container state does not match its preparation attempt")
+            }
+        } else {
+            guard attempt.directoryIdentity == nil || attempt.cleanupContained else {
+                throw EngineError(.conflict, "bound container preparation cleanup is not contained")
+            }
+        }
+    }
+
+    static func remove(containerID: String, from attempts: PersistentStateDirectory) throws {
+        try attempts.removeRegularFileIfPresent(named: attemptName(containerID))
+    }
+
+    private static func save(
+        _ attempt: RawContainerPreparationAttempt,
+        in attempts: PersistentStateDirectory
+    ) throws {
+        try attempts.replaceRegularFile(
+            named: attemptName(attempt.containerID),
+            data: try JSONEncoder().encode(attempt)
+        )
+    }
+
+    private static func load(
+        containerID: String,
+        from attempts: PersistentStateDirectory
+    ) throws -> RawContainerPreparationAttempt? {
+        guard let data = try attempts.readRegularFile(
+            named: attemptName(containerID), required: false
+        ) else { return nil }
+        let attempt = try JSONDecoder().decode(RawContainerPreparationAttempt.self, from: data)
+        guard attempt.schemaVersion == RawContainerPreparationAttempt.currentSchemaVersion,
+              attempt.containerID == containerID else {
+            throw EngineError(.conflict, "invalid container preparation attempt")
+        }
+        return attempt
+    }
+
+    private static func attemptName(_ containerID: String) -> String {
+        "\(containerID).preparation"
+    }
+}
+
 /// A deletion receipt lives outside the disposable container directory. It is
 /// written before disposal, allowing a removal retry (including after daemon
 /// restart) to distinguish the exact instance that was already deleted from a
@@ -467,6 +637,13 @@ enum RawDeletedContainerCoordinator {
         try receipts.replaceRegularFile(
             named: receiptName(container.id), data: try JSONEncoder().encode(receipt)
         )
+    }
+
+    static func hasReceipt(
+        containerID: String,
+        in receipts: PersistentStateDirectory
+    ) throws -> Bool {
+        try load(containerID: containerID, from: receipts) != nil
     }
 
     static func requireCompletedDeletion(
@@ -3480,6 +3657,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     public func prepare(_ container: ContainerRecord) async throws {
         try requireExactContainerOwnership(container)
+        // Publish the new cleanup proof before consuming an older deletion
+        // receipt so a crash between the two operations never leaves a gap.
+        try RawContainerPreparationAttemptCoordinator.begin(
+            container,
+            in: containersStateDirectory,
+            attempts: deletedContainersStateDirectory
+        )
         try RawDeletedContainerCoordinator.clearForPreparation(
             of: container,
             in: containersStateDirectory,
@@ -3507,6 +3691,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let stateDirectory = try freshContainerStateDirectory(for: container)
         let directory = stateDirectory.url
         let containerDirectoryIdentity = stateDirectory.identity
+        try RawContainerPreparationAttemptCoordinator.bind(
+            container,
+            directoryIdentity: containerDirectoryIdentity,
+            in: deletedContainersStateDirectory
+        )
         let preparation: (
             artifacts: RawContainerPreparationArtifacts,
             bindSources: [Int: PreparedBindSource],
@@ -3532,6 +3721,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
         } catch {
             let preparationError = error
             do {
+                try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
+                    container,
+                    directoryIdentity: containerDirectoryIdentity,
+                    in: deletedContainersStateDirectory
+                )
                 try disposeContainerDirectory(
                     container.id, expectedIdentity: containerDirectoryIdentity
                 )
@@ -3557,6 +3751,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let launchError = error
             do {
                 try await terminateEveryShim(for: container.id)
+                try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
+                    container,
+                    directoryIdentity: containerDirectoryIdentity,
+                    in: deletedContainersStateDirectory
+                )
                 preparedBindSources.removeValue(forKey: container.id)
                 try disposeContainerDirectory(
                     container.id, expectedIdentity: containerDirectoryIdentity
@@ -3592,6 +3791,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     try await self.terminateEveryShim(for: container.id)
                 },
                 discardWritableRoot: {
+                    try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
+                        container,
+                        directoryIdentity: containerDirectoryIdentity,
+                        in: self.deletedContainersStateDirectory
+                    )
                     preparedBindSources.removeValue(forKey: container.id)
                     try self.disposeContainerDirectory(
                         container.id, expectedIdentity: containerDirectoryIdentity
@@ -3946,9 +4150,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
             in: containers,
             retainedIdentities: retainedIdentities
         ) else {
-            try RawDeletedContainerCoordinator.requireCompletedDeletion(
-                of: container, in: containers, receipts: receipts
-            )
+            if try RawDeletedContainerCoordinator.hasReceipt(
+                containerID: container.id, in: receipts
+            ) {
+                try RawDeletedContainerCoordinator.requireCompletedDeletion(
+                    of: container, in: containers, receipts: receipts
+                )
+            } else {
+                try RawContainerPreparationAttemptCoordinator.requireCleanAbsence(
+                    container, in: containers, attempts: receipts
+                )
+            }
             try? logMonitors.removeValue(forKey: container.id)?.stop()
             bridges.removeValue(forKey: container.id)?.finishOutput()
             return
@@ -4932,11 +5144,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
             in: containersStateDirectory,
             retainedIdentities: containerDirectoryIdentities
         ) else {
-            try RawDeletedContainerCoordinator.requireCompletedDeletion(
-                of: container,
-                in: containersStateDirectory,
-                receipts: deletedContainersStateDirectory
-            )
+            if try RawDeletedContainerCoordinator.hasReceipt(
+                containerID: container.id, in: deletedContainersStateDirectory
+            ) {
+                try RawDeletedContainerCoordinator.requireCompletedDeletion(
+                    of: container,
+                    in: containersStateDirectory,
+                    receipts: deletedContainersStateDirectory
+                )
+            } else {
+                try RawContainerPreparationAttemptCoordinator.requireCleanAbsence(
+                    container,
+                    in: containersStateDirectory,
+                    attempts: deletedContainersStateDirectory
+                )
+            }
             portForwarder.stop(containerID: container.id)
             portForwardingRegistrations.removeValue(forKey: container.id)
             completionTasks.removeValue(forKey: container.id)?.task.cancel()
@@ -4951,7 +5173,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
             bridges.removeValue(forKey: container.id)?.finishOutput()
             return
         }
-        _ = try Self.exactPreparedShimState(for: container, in: stateDirectory)
+        if try Self.exactPreparedShimState(for: container, in: stateDirectory) == nil {
+            do {
+                try RawContainerPreparationAttemptCoordinator.require(
+                    container,
+                    directoryIdentity: stateDirectory.identity,
+                    in: deletedContainersStateDirectory
+                )
+            } catch {
+                try RawContainerPreparationAttemptCoordinator.requireUnboundPartialState(
+                    container,
+                    stateDirectory: stateDirectory,
+                    in: deletedContainersStateDirectory
+                )
+            }
+        }
         containerDirectoryIdentities[container.id] = stateDirectory.identity
         let directoryIdentity = try containersStateDirectory.pendingDisposalIdentity(
             named: container.id
@@ -5016,13 +5252,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
             bridges.removeValue(forKey: id)?.finishOutput()
             try disposeContainerDirectory(id, expectedIdentity: directory.identity)
         }
-        for name in try deletedContainersStateDirectory.entryNames()
-            where name.hasSuffix(".json") {
-            let containerID = String(name.dropLast(5))
-            if !containerIDs.contains(containerID) {
-                try RawDeletedContainerCoordinator.removeReceipt(
-                    containerID: containerID, from: deletedContainersStateDirectory
-                )
+        for name in try deletedContainersStateDirectory.entryNames() {
+            if name.hasSuffix(".json") {
+                let containerID = String(name.dropLast(5))
+                if !containerIDs.contains(containerID) {
+                    try RawDeletedContainerCoordinator.removeReceipt(
+                        containerID: containerID, from: deletedContainersStateDirectory
+                    )
+                }
+            } else if name.hasSuffix(".preparation") {
+                let containerID = String(name.dropLast(".preparation".count))
+                if !containerIDs.contains(containerID) {
+                    try RawContainerPreparationAttemptCoordinator.remove(
+                        containerID: containerID, from: deletedContainersStateDirectory
+                    )
+                }
             }
         }
     }

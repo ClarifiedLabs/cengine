@@ -4692,6 +4692,106 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(replacement.directory.pathStillNamesThisDirectory())
     }
 
+    @Test func rawPreparationAttemptProvesAbsentAndExactPartialStateCleanup() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let containersURL = root.appending(path: "containers")
+        let attemptsURL = root.appending(path: "attempts")
+        try FileManager.default.createDirectory(
+            at: containersURL, withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: attemptsURL, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let containers = try PersistentStateDirectory.open(containersURL)
+        let attempts = try PersistentStateDirectory.open(attemptsURL)
+        let container = ContainerRecord(
+            id: "preparation-attempt",
+            name: "preparation-attempt",
+            image: "alpine"
+        )
+        let deleted = try containers.createDirectory(named: container.id)
+        try RawDeletedContainerCoordinator.record(
+            container, directoryIdentity: deleted.identity, in: attempts
+        )
+        try FileManager.default.removeItem(at: deleted.url)
+        try RawContainerPreparationAttemptCoordinator.begin(
+            container, in: containers, attempts: attempts
+        )
+        // A crash before consuming the old receipt leaves both cleanup proofs valid.
+        try RawDeletedContainerCoordinator.requireCompletedDeletion(
+            of: container, in: containers, receipts: attempts
+        )
+        try RawContainerPreparationAttemptCoordinator.requireCleanAbsence(
+            container, in: containers, attempts: attempts
+        )
+        try RawDeletedContainerCoordinator.clearForPreparation(
+            of: container, in: containers, receipts: attempts
+        )
+        try RawContainerPreparationAttemptCoordinator.requireCleanAbsence(
+            container, in: containers, attempts: attempts
+        )
+
+        // A crash after canonical directory creation but before binding leaves
+        // only an empty directory. That exact window remains recoverable, while
+        // any content prevents an unbound attempt from authorizing disposal.
+        let unboundPartial = try containers.createDirectory(named: container.id)
+        #expect(throws: EngineError.self) {
+            try RawContainerPreparationAttemptCoordinator.requireCleanAbsence(
+                container, in: containers, attempts: attempts
+            )
+        }
+        try RawContainerPreparationAttemptCoordinator.requireUnboundPartialState(
+            container, stateDirectory: unboundPartial, in: attempts
+        )
+        try unboundPartial.replaceRegularFile(named: "unexpected", data: Data())
+        #expect(throws: EngineError.self) {
+            try RawContainerPreparationAttemptCoordinator.requireUnboundPartialState(
+                container, stateDirectory: unboundPartial, in: attempts
+            )
+        }
+        try FileManager.default.removeItem(at: unboundPartial.url)
+
+        let partial = try containers.createDirectory(named: container.id)
+        try RawContainerPreparationAttemptCoordinator.bind(
+            container, directoryIdentity: partial.identity, in: attempts
+        )
+        try RawContainerPreparationAttemptCoordinator.require(
+            container, directoryIdentity: partial.identity, in: attempts
+        )
+        #expect(throws: EngineError.self) {
+            try RawContainerPreparationAttemptCoordinator.require(container, in: attempts)
+        }
+        try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
+            container, directoryIdentity: partial.identity, in: attempts
+        )
+        let substituted = try containers.createDirectory(named: "substituted")
+        #expect(throws: EngineError.self) {
+            try RawContainerPreparationAttemptCoordinator.require(
+                container, directoryIdentity: substituted.identity, in: attempts
+            )
+        }
+
+        try FileManager.default.removeItem(at: partial.url)
+        try RawContainerPreparationAttemptCoordinator.requireCleanAbsence(
+            container, in: containers, attempts: attempts
+        )
+        let replacement = ContainerRecord(
+            id: container.id,
+            instanceID: UUID(),
+            name: container.name,
+            image: container.image
+        )
+        try RawContainerPreparationAttemptCoordinator.begin(
+            replacement, in: containers, attempts: attempts
+        )
+        try RawContainerPreparationAttemptCoordinator.require(replacement, in: attempts)
+        #expect(throws: EngineError.self) {
+            try RawContainerPreparationAttemptCoordinator.require(container, in: attempts)
+        }
+    }
+
     @Test func rawDeletionRetryClearsIdentityAfterDurableJournalRemoval() throws {
         enum SimulatedCrash: Error { case injected }
 
