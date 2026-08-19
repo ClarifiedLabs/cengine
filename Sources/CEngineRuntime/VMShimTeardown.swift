@@ -16,6 +16,7 @@ public enum VMShimTeardown {
         }
 
         var containerShims: [VMShimClient] = []
+        var failures: [String] = []
         if let containers = try rootDirectory.openDirectoryIfPresent(named: "containers") {
             for name in try containers.reconciledEntryNames() {
                 let directory = try containers.openDirectory(named: name)
@@ -24,24 +25,18 @@ public enum VMShimTeardown {
                     expectedContainerID: name,
                     expectedExecutable: expectedExecutable
                 )
-                guard launches.quarantined.isEmpty else {
-                    let details = launches.quarantined.map {
-                        "\($0.name): \($0.reason)"
-                    }.joined(separator: "; ")
-                    throw EngineError(
-                        .conflict,
-                        "cannot safely stop VM shims for container \(name): \(details)"
-                    )
-                }
+                failures.append(contentsOf: launches.quarantined.map {
+                    "\(name): \($0.name): \($0.reason)"
+                })
                 containerShims.append(contentsOf: launches.map(\.client))
             }
         }
 
-        var failures = await terminate(
+        failures.append(contentsOf: await terminate(
             containerShims,
             gracePeriodMilliseconds: gracePeriodMilliseconds,
             forceWaitMilliseconds: forceWaitMilliseconds
-        )
+        ))
         var terminatedCount = containerShims.count
 
         if let infrastructure = try rootDirectory.openDirectoryIfPresent(named: "infrastructure"),
@@ -67,9 +62,8 @@ public enum VMShimTeardown {
             if socketExists || statusExists {
                 let client = VMShimClient(specification: specification)
                 do {
-                    try await client.terminate(
-                        gracePeriodMilliseconds: gracePeriodMilliseconds,
-                        forceWaitMilliseconds: forceWaitMilliseconds
+                    try await client.requestAdministrativeShutdown(
+                        timeoutMilliseconds: gracePeriodMilliseconds
                     )
                     terminatedCount += 1
                 } catch {

@@ -22,9 +22,9 @@ enum CEngineServices {
         try runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(engineLabel)"])
     }
 
-    /// Quiesces the engine, stops every persistent VM shim, and only then
-    /// unregisters the privileged helper. Keeping this order prevents an old
-    /// infrastructure shim from reconnecting and reclaiming vmnet during zap.
+    /// Quiesces the engine, stops every provably owned VM shim, and then
+    /// unregisters the privileged helper. Every phase is attempted even when
+    /// an earlier one fails so uninstall can still remove all services.
     @MainActor static func teardownServices(
         agent: any AppService = SMAppService.agent(plistName: agentPlist),
         helper: any AppService = SMAppService.daemon(plistName: helperPlist),
@@ -35,14 +35,37 @@ enum CEngineServices {
             try await runVirtualMachineShutdown()
         }
     ) async throws {
+        var failures: [String] = []
         let agentWasRegistered = !needsRegistration(agent.status)
         if agentWasRegistered {
-            try await agent.unregister()
-            try await waitForEngineExit()
+            do {
+                try await agent.unregister()
+            } catch {
+                failures.append("engine service: \(EngineError.message(for: error))")
+            }
+            do {
+                try await waitForEngineExit()
+            } catch {
+                failures.append("engine exit: \(EngineError.message(for: error))")
+            }
         }
-        try await stopVirtualMachines()
+        do {
+            try await stopVirtualMachines()
+        } catch {
+            failures.append("VM shutdown: \(EngineError.message(for: error))")
+        }
         if !needsRegistration(helper.status) {
-            try await helper.unregister()
+            do {
+                try await helper.unregister()
+            } catch {
+                failures.append("network helper: \(EngineError.message(for: error))")
+            }
+        }
+        guard failures.isEmpty else {
+            throw EngineError(
+                .internalError,
+                "cengine service teardown was incomplete: \(failures.joined(separator: "; "))"
+            )
         }
     }
 
@@ -124,27 +147,44 @@ enum CEngineUserData {
 }
 
 enum UninstallSupport {
-    /// Headless teardown for `brew uninstall --cask cengine`: unregister both
-    /// launchd services and drop the Docker integration, then exit. User data is
-    /// deliberately left to the cask's delete/zap stanzas.
-    static func main() -> Never {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
-            exit(1) // watchdog: brew must never hang on a wedged teardown
-        }
-        Task {
-            do {
-                try await CEngineServices.teardownServices()
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "cengine uninstall: \(error.localizedDescription)\n".utf8
-                ))
-                exit(1)
-            }
-            let removal = DockerIntegration.remove(
+    @MainActor static func performBestEffortTeardown(
+        teardownServices: @MainActor () async throws -> Void = {
+            try await CEngineServices.teardownServices()
+        },
+        removeDockerIntegration: () -> DockerRemovalOutcome = {
+            DockerIntegration.remove(
                 recordingActiveContextTo: EnginePaths().activeContextMarker
             )
-            if let warning = removal.warning {
-                FileHandle.standardError.write(Data("cengine uninstall: \(warning)\n".utf8))
+        }
+    ) async -> [String] {
+        var warnings: [String] = []
+        do {
+            try await teardownServices()
+        } catch {
+            warnings.append(error.localizedDescription)
+        }
+        if let warning = removeDockerIntegration().warning {
+            warnings.append(warning)
+        }
+        return warnings
+    }
+
+    /// Headless teardown for `brew uninstall --cask cengine`: unregister both
+    /// launchd services and drop the Docker integration, then exit. User data is
+    /// deliberately left to the cask's delete/zap stanzas. Cleanup is best
+    /// effort: warnings must never prevent Homebrew from removing the app.
+    static func main() -> Never {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 20) {
+            FileHandle.standardError.write(Data(
+                "cengine uninstall warning: cleanup timed out; continuing removal\n".utf8
+            ))
+            exit(0) // watchdog: cleanup must never block application removal
+        }
+        Task { @MainActor in
+            for warning in await performBestEffortTeardown() {
+                FileHandle.standardError.write(Data(
+                    "cengine uninstall warning: \(warning)\n".utf8
+                ))
             }
             exit(0)
         }

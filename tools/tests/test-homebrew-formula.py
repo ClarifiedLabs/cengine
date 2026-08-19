@@ -35,12 +35,12 @@ class HomebrewFormulaTests(unittest.TestCase):
                 'args: ["/Applications/cengine.app", "--args", "--opened-by-installer"]',
                 cask,
             )
-            self.assertIn("must_succeed: false", cask)
+            self.assertEqual(cask.count("must_succeed: false"), 2)
             self.assertIn("early_script:", cask)
             self.assertIn('executable: "/bin/sh"', cask)
             self.assertIn('if [ -x "$1" ]; then "$1" --uninstall-support; fi', cask)
             self.assertIn('"/Applications/cengine.app/Contents/MacOS/cengine"', cask)
-            self.assertIn("must_succeed: true", cask)
+            self.assertNotIn("must_succeed: true", cask)
             self.assertIn("launchctl:", cask)
             self.assertIn('"dev.cengine.engine"', cask)
             self.assertIn('"dev.cengine.network-helper"', cask)

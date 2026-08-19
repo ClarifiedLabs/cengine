@@ -51,6 +51,50 @@ import CEngineCore
         #expect(sequence.entries == ["engine", "engine-exited", "shims", "helper"])
     }
 
+    @MainActor @Test func uninstallContinuesAfterVMShutdownFailure() async throws {
+        enum Failure: Error { case shutdown }
+        let sequence = TeardownSequenceRecorder()
+        let agent = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onUnregister: { sequence.record("engine") }
+        )
+        let helper = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onUnregister: { sequence.record("helper") }
+        )
+
+        await #expect(throws: EngineError.self) {
+            try await CEngineServices.teardownServices(
+                agent: agent,
+                helper: helper,
+                waitForEngineExit: { sequence.record("engine-exited") },
+                stopVirtualMachines: {
+                    sequence.record("shims")
+                    throw Failure.shutdown
+                }
+            )
+        }
+
+        #expect(sequence.entries == ["engine", "engine-exited", "shims", "helper"])
+        #expect(helper.unregisterCount == 1)
+    }
+
+    @MainActor @Test func headlessUninstallReportsCleanupFailuresWithoutFailing() async {
+        enum Failure: Error { case shutdown }
+
+        let warnings = await UninstallSupport.performBestEffortTeardown(
+            teardownServices: { throw Failure.shutdown },
+            removeDockerIntegration: {
+                .contextRemovalFailed("synthetic Docker cleanup failure")
+            }
+        )
+
+        #expect(warnings.count == 2)
+        #expect(warnings[1].contains("synthetic Docker cleanup failure"))
+    }
+
     @MainActor @Test func requiredNetworkingRegistersBeforeEngineAndOpensApprovalFromOnboarding() async {
         let suiteName = "AppModelTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

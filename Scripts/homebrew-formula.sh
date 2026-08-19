@@ -41,7 +41,9 @@ cask "cengine" do
                 "--",
                 "/Applications/cengine.app/Contents/MacOS/cengine",
               ],
-              must_succeed: true,
+              # Teardown is best effort. Homebrew's launchctl/delete stanzas
+              # must still remove cengine if stale VM ownership is ambiguous.
+              must_succeed: false,
             },
             launchctl: ["dev.cengine.engine", "dev.cengine.network-helper"],
             quit: "dev.cengine.app",

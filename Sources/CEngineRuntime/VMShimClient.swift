@@ -3643,6 +3643,25 @@ public final class VMShimClient: @unchecked Sendable {
     public func stop() async throws -> VMShimProtocol.Status { try await request(.stop, response: VMShimProtocol.Status.self) }
     public func shutdown() async throws -> VMShimProtocol.Status { try await request(.shutdown, response: VMShimProtocol.Status.self) }
 
+    /// Requests an authenticated shutdown without ever escalating to a process
+    /// signal. Infrastructure shims do not yet have the immutable launch
+    /// journal used to prove ownership of container shim process generations.
+    func requestAdministrativeShutdown(
+        timeoutMilliseconds: Int32 = 5_000
+    ) async throws {
+        invalidateRequests()
+        let deadline = Self.deadline(afterMilliseconds: timeoutMilliseconds)
+        let payload = try await runBlocking { [self] in
+            try requestData(
+                .shutdown,
+                payloadData: nil,
+                allowInvalidated: true,
+                deadlineNanoseconds: deadline
+            )
+        }
+        _ = try JSONDecoder().decode(VMShimProtocol.Status.self, from: payload)
+    }
+
     /// Permanently invalidates this client and terminates its exact shim generation.
     /// Existing request sockets are shut down before the bounded shutdown request,
     /// so a timed-out guest call cannot complete after a replacement shim starts.

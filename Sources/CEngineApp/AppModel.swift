@@ -523,25 +523,38 @@ extension SMAppService: AppService {}
             return
         }
         refreshTask?.cancel()
-        do {
-            try await CEngineServices.teardownServices(agent: agent, helper: helper)
-        } catch {
-            self.error = "Uninstall did not continue because cengine VMs could not be stopped: \(error.localizedDescription)"
-            return
-        }
-        let removal = DockerIntegration.remove(
-            recordingActiveContextTo: deleteData ? nil : activeContextMarkerURL
+        var warnings = await UninstallSupport.performBestEffortTeardown(
+            teardownServices: {
+                try await CEngineServices.teardownServices(
+                    agent: self.agent, helper: self.helper
+                )
+            },
+            removeDockerIntegration: {
+                DockerIntegration.remove(
+                    recordingActiveContextTo: deleteData ? nil : self.activeContextMarkerURL
+                )
+            }
         )
-        if let warning = removal.warning {
-            FileHandle.standardError.write(Data("cengine uninstall: \(warning)\n".utf8))
-        }
         if deleteData {
             do {
                 try CEngineUserData.removeAll()
             } catch {
-                self.error = "cengine was stopped, but uninstall did not continue because some data could not be deleted: \(error.localizedDescription)"
-                return
+                warnings.append("some data could not be deleted: \(error.localizedDescription)")
             }
+        }
+        for warning in warnings {
+            FileHandle.standardError.write(Data(
+                "cengine uninstall warning: \(warning)\n".utf8
+            ))
+        }
+        if !warnings.isEmpty {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Some cengine cleanup could not finish"
+            alert.informativeText = warnings.joined(separator: "\n\n")
+                + "\n\nApplication removal can still continue."
+            alert.addButton(withTitle: "Continue Uninstall")
+            alert.runModal()
         }
         NSWorkspace.shared.open(package)
         NSApplication.shared.terminate(nil)
