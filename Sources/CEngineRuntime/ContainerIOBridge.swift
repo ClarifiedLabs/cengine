@@ -777,18 +777,32 @@ public final class ContainerIOBridge: @unchecked Sendable {
         var entries: [LogEntry] = []
         var states: [JournalSegmentState] = []
         var activeHandle: FileHandle?
+        var openedSegments: [(
+            reference: JournalSegmentReference,
+            handle: FileHandle,
+            identity: PersistentFileIdentity
+        )] = []
         do {
-            for (index, reference) in manifest.segments.enumerated() {
+            for reference in manifest.segments {
                 let opened = try directory.openRegularFile(
-                    named: reference.name,
-                    expectedIdentity: reference.identity,
-                    access: .readWrite
+                    named: reference.name, access: .readWrite
                 )
+                openedSegments.append((reference, opened.handle, opened.identity))
+            }
+            guard zip(manifest.segments, openedSegments).allSatisfy({ pair in
+                PersistentFileIdentity.matches(
+                    expected: pair.0.identity,
+                    observed: pair.1.identity,
+                    onTrustedVolume: directory.identity.volumeUUID
+                )
+            }) else {
+                throw EngineError(.conflict, "container log journal segment changed")
+            }
+            for (index, opened) in openedSegments.enumerated() {
                 let handle = opened.handle
                 let data = try readAll(from: handle, maximumBytes: segmentLimit)
                 let recovery = decodeJournal(data, policy: policy)
                 guard data.isEmpty || recovery.recognized else {
-                    try? handle.close()
                     throw EngineError(.conflict, "container log journal segment is invalid")
                 }
                 if recovery.validByteCount != data.count {
@@ -798,21 +812,24 @@ public final class ContainerIOBridge: @unchecked Sendable {
                     try CheckedArithmetic.add($0, $1.payload.count)
                 }
                 states.append(.init(
-                    name: reference.name,
-                    identity: reference.identity,
+                    name: opened.reference.name,
+                    identity: opened.identity,
                     payloadBytes: payloadBytes,
                     recordCount: recovery.entries.count,
                     encodedBytes: recovery.validByteCount
                 ))
                 entries.append(contentsOf: recovery.entries)
-                if index == manifest.segments.count - 1 {
+                if index == openedSegments.count - 1 {
                     activeHandle = handle
                 } else {
                     try handle.close()
                 }
             }
+            if manifest.segments != states.map(\.reference) {
+                try publishJournalManifest(states.map(\.reference), in: directory)
+            }
         } catch {
-            try? activeHandle?.close()
+            for opened in openedSegments { try? opened.handle.close() }
             throw error
         }
         guard let recoveredActiveHandle = activeHandle else {

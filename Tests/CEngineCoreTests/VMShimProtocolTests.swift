@@ -211,10 +211,7 @@ private func makePreparedState(
         kernelPath: "/kernel",
         initialRamdiskPath: "/initramfs",
         rootDiskPath: directory.url.appending(path: "root.ext4").path,
-        rootDiskIdentity: .init(
-            device: artifacts.rootDiskIdentity.device,
-            inode: artifacts.rootDiskIdentity.inode
-        ),
+        rootDiskIdentity: artifacts.rootDiskIdentity.shimIdentity,
         rootDiskSize: artifacts.rootDiskSize,
         cpus: 2,
         memoryBytes: 512 * 1_024 * 1_024,
@@ -223,10 +220,7 @@ private func makePreparedState(
             tag: "cengine-io",
             source: directory.url.appending(path: "io", directoryHint: .isDirectory).path,
             readOnly: false,
-            sourceIdentity: .init(
-                device: artifacts.ioDirectoryIdentity.device,
-                inode: artifacts.ioDirectoryIdentity.inode
-            )
+            sourceIdentity: artifacts.ioDirectoryIdentity.shimIdentity
         )],
         socketPath: "/tmp/cengine-prepared-artifact.sock",
         logPath: directory.url.appending(path: "shim.log").path
@@ -241,6 +235,29 @@ private func makePreparedState(
         named: "prepared-shim.json", data: try JSONEncoder().encode(state)
     )
     return state
+}
+
+private func legacyIdentityData(
+    _ data: Data, device: UInt64
+) throws -> Data {
+    func transform(_ value: Any) -> Any {
+        if let values = value as? [Any] {
+            return values.map(transform)
+        }
+        guard var values = value as? [String: Any] else { return value }
+        for (key, child) in values {
+            values[key] = transform(child)
+        }
+        if values["device"] != nil, values["inode"] != nil {
+            values["device"] = NSNumber(value: device)
+            values.removeValue(forKey: "volumeUUID")
+        }
+        return values
+    }
+    return try JSONSerialization.data(
+        withJSONObject: transform(try JSONSerialization.jsonObject(with: data)),
+        options: [.sortedKeys]
+    )
 }
 
 private func makeExecArtifactRecord(
@@ -881,6 +898,70 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             intentURL: intent,
             specificationURL: specification,
             executablePath: executable
+        ))
+    }
+
+    @Test func legacyIdentityPromotionRequiresCoherentOwnershipEvidence() {
+        let oldDevice: UInt64 = 41
+        let currentDevice: UInt64 = 73
+        let volumeUUID = UUID()
+        let expected = [
+            PersistentFileIdentity(device: oldDevice, inode: 101),
+            PersistentFileIdentity(device: oldDevice, inode: 202),
+        ]
+        let observed = [
+            PersistentFileIdentity(
+                device: currentDevice, inode: 101, volumeUUID: volumeUUID
+            ),
+            PersistentFileIdentity(
+                device: currentDevice, inode: 202, volumeUUID: volumeUUID
+            ),
+        ]
+
+        #expect(!PersistentFileIdentity.currentMountMatches(
+            expected: expected[0], observed: observed[0]
+        ))
+        #expect(!PersistentFileIdentity.recoveryMatches(
+            expected: [expected[0]], observed: [observed[0]]
+        ))
+        #expect(PersistentFileIdentity.recoveryMatches(
+            expected: expected, observed: observed
+        ))
+        #expect(PersistentFileIdentity.matches(
+            expected: expected[0],
+            observed: observed[0],
+            onTrustedVolume: volumeUUID
+        ))
+        #expect(!PersistentFileIdentity.matches(
+            expected: expected[0],
+            observed: observed[0],
+            onTrustedVolume: UUID()
+        ))
+    }
+
+    @Test func legacyIdentityPromotionMapsEachOldFilesystemIndependently() {
+        let firstVolume = UUID()
+        let secondVolume = UUID()
+        let expected = [
+            PersistentFileIdentity(device: 11, inode: 101),
+            PersistentFileIdentity(device: 22, inode: 202),
+        ]
+        let observed = [
+            PersistentFileIdentity(device: 31, inode: 101, volumeUUID: firstVolume),
+            PersistentFileIdentity(device: 42, inode: 202, volumeUUID: secondVolume),
+        ]
+
+        #expect(PersistentFileIdentity.recoveryMatches(
+            expected: expected, observed: observed
+        ))
+        #expect(!PersistentFileIdentity.recoveryMatches(
+            expected: expected,
+            observed: [
+                observed[0],
+                PersistentFileIdentity(
+                    device: 31, inode: 202, volumeUUID: firstVolume
+                ),
+            ]
         ))
     }
 
@@ -1773,6 +1854,118 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(try generations.reconciledEntryNames().isEmpty)
     }
 
+    @Test func teardownEnumeratesLegacyGenerationAfterDeviceRemount() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let containerURL = root.appending(path: "containers/legacy-remount")
+        let runtimeURL = URL(
+            filePath: "/tmp/cengine-legacy-remount-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: containerURL, withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeURL, withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: runtimeURL)
+        }
+        let container = ContainerRecord(
+            id: "legacy-remount", name: "legacy-remount", image: "alpine"
+        )
+        let specification = VMShimProtocol.Specification(
+            containerID: container.id,
+            generation: 2,
+            token: "legacy-remount-token",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: containerURL.appending(path: "root.ext4").path,
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:02",
+            socketPath: runtimeURL.appending(path: "shim.sock").path,
+            logPath: containerURL.appending(path: "shim.log").path
+        )
+        let containerDirectory = try PersistentStateDirectory.open(containerURL)
+        let files = try VMShimClient.preparePersistentSpawn(
+            specification: specification,
+            container: container,
+            containerDirectory: containerDirectory,
+            executable: URL(filePath: "/usr/bin/yes")
+        )
+        let currentIntent = try JSONDecoder().decode(
+            VMShimClient.PersistentLaunchIntent.self,
+            from: Data(contentsOf: files.intentURL)
+        )
+        let intent = VMShimClient.PersistentLaunchIntent(
+            nonce: currentIntent.nonce,
+            createdAt: .distantPast,
+            specificationPath: currentIntent.specificationPath,
+            executablePath: currentIntent.executablePath,
+            containerDirectoryIdentity: currentIntent.containerDirectoryIdentity,
+            generationsDirectoryIdentity: currentIntent.generationsDirectoryIdentity,
+            generationDirectoryIdentity: currentIntent.generationDirectoryIdentity,
+            specification: currentIntent.specification,
+            container: currentIntent.container
+        )
+        let generationDirectory = try PersistentStateDirectory.open(files.directory)
+        try generationDirectory.replaceRegularFile(
+            named: "intent.json", data: try JSONEncoder().encode(intent)
+        )
+        let record = VMShimClient.PersistentLaunchRecord(
+            nonce: intent.nonce,
+            createdAt: intent.createdAt,
+            specificationPath: intent.specificationPath,
+            executablePath: intent.executablePath,
+            containerDirectoryIdentity: intent.containerDirectoryIdentity,
+            generationsDirectoryIdentity: intent.generationsDirectoryIdentity,
+            generationDirectoryIdentity: intent.generationDirectoryIdentity,
+            specification: specification,
+            processIdentifier: Int32.max,
+            processStartTime: UInt64.max,
+            container: container
+        )
+        try generationDirectory.replaceRegularFile(
+            named: "launch.json", data: try JSONEncoder().encode(record)
+        )
+        _ = try VMShimClient.preparePersistentRuntimeArtifacts(
+            intentURL: files.intentURL,
+            socketPaths: [specification.socketPath],
+            statusPath: specification.socketPath + ".status"
+        )
+        try FileManager.default.removeItem(at: runtimeURL)
+        try FileManager.default.removeItem(
+            at: generationDirectory.url.appending(path: "runtime-artifacts.json")
+        )
+        let priorDevice = containerDirectory.identity.device == 1
+            ? 2 : containerDirectory.identity.device - 1
+        for name in ["intent.json", "launch.json"] {
+            try generationDirectory.replaceRegularFile(
+                named: name,
+                data: try legacyIdentityData(
+                    Data(contentsOf: generationDirectory.url.appending(path: name)),
+                    device: priorDevice
+                )
+            )
+        }
+
+        let launches = try VMShimClient.persistedLaunches(
+            in: containerDirectory,
+            expectedContainerID: container.id,
+            expectedExecutable: URL(filePath: "/usr/bin/yes"),
+            processIdentifiersProvider: { .complete([]) }
+        )
+        #expect(launches.count == 1)
+        #expect(launches.quarantined.isEmpty)
+        _ = try await VMShimTeardown.terminateAll(
+            in: root,
+            expectedExecutable: URL(filePath: "/usr/bin/yes"),
+            gracePeriodMilliseconds: 1,
+            forceWaitMilliseconds: 1
+        )
+    }
+
     @Test func persistedLaunchRecoveryRetiresIncompletePreSpawnGenerations() throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let containerURL = root.appending(path: "containers/partial")
@@ -2105,7 +2298,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(selected != replacement)
     }
 
-    @Test func persistentRuntimeArtifactCleanupIsGenerationAndIdentityBound() throws {
+    @Test func persistentRuntimeArtifactCleanupIsGenerationAndIdentityBound() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let containerURL = root.appending(path: "containers/artifacts")
         let runtimeURL = URL(filePath: "/tmp/ce-artifacts-\(UUID().uuidString)")
@@ -2345,6 +2538,84 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         }
         #expect(try FileManager.default.contentsOfDirectory(atPath: runtimeURL.path)
             .allSatisfy { !$0.hasPrefix(".c-") && !$0.hasPrefix(".cengine-artifact-") })
+
+        let (missingSpecification, missingFiles) = try prepare(
+            generation: 70, socketName: "missing-runtime.sock"
+        )
+        _ = try VMShimClient.preparePersistentRuntimeArtifacts(
+            intentURL: missingFiles.intentURL,
+            socketPaths: [missingSpecification.socketPath],
+            statusPath: missingSpecification.socketPath + ".status"
+        )
+        try FileManager.default.removeItem(at: runtimeURL)
+        #expect(throws: PersistentRuntimeArtifactOwnershipUnresolvedError.self) {
+            try VMShimClient.cleanupPersistentRuntimeArtifacts(
+                intentURL: missingFiles.intentURL
+            )
+        }
+        let currentIntent = try JSONDecoder().decode(
+            VMShimClient.PersistentLaunchIntent.self,
+            from: Data(contentsOf: missingFiles.intentURL)
+        )
+        let recovered = try VMShimClient.persistedLaunches(
+            in: PersistentStateDirectory.open(containerURL),
+            expectedContainerID: container.id,
+            expectedExecutable: URL(filePath: "/usr/bin/yes"),
+            processIdentifiersProvider: { .complete([]) }
+        )
+        let recoveredClient = try #require(recovered.first {
+            $0.record.specification.generation == missingSpecification.generation
+        }?.client)
+        let prebootIntent = VMShimClient.PersistentLaunchIntent(
+            nonce: currentIntent.nonce,
+            createdAt: .distantPast,
+            specificationPath: currentIntent.specificationPath,
+            executablePath: currentIntent.executablePath,
+            containerDirectoryIdentity: currentIntent.containerDirectoryIdentity,
+            generationsDirectoryIdentity: currentIntent.generationsDirectoryIdentity,
+            generationDirectoryIdentity: currentIntent.generationDirectoryIdentity,
+            specification: currentIntent.specification,
+            container: currentIntent.container
+        )
+        try JSONEncoder().encode(prebootIntent).write(
+            to: missingFiles.intentURL, options: .atomic
+        )
+        await #expect(throws: PersistentRuntimeArtifactOwnershipUnresolvedError.self) {
+            try await recoveredClient.terminate(
+                gracePeriodMilliseconds: 0, forceWaitMilliseconds: 1
+            )
+        }
+        #expect(throws: PersistentRuntimeArtifactOwnershipUnresolvedError.self) {
+            try recoveredClient.removePersistentLaunchArtifacts()
+        }
+        #expect(throws: PersistentRuntimeArtifactOwnershipUnresolvedError.self) {
+            try VMShimClient.cleanupPersistentRuntimeArtifacts(
+                intentURL: missingFiles.intentURL
+            )
+        }
+        let currentRecord = try JSONDecoder().decode(
+            VMShimClient.PersistentLaunchRecord.self,
+            from: Data(contentsOf: missingFiles.recordURL)
+        )
+        let prebootRecord = VMShimClient.PersistentLaunchRecord(
+            nonce: currentRecord.nonce,
+            createdAt: prebootIntent.createdAt,
+            specificationPath: currentRecord.specificationPath,
+            executablePath: currentRecord.executablePath,
+            containerDirectoryIdentity: currentRecord.containerDirectoryIdentity,
+            generationsDirectoryIdentity: currentRecord.generationsDirectoryIdentity,
+            generationDirectoryIdentity: currentRecord.generationDirectoryIdentity,
+            specification: currentRecord.specification,
+            processIdentifier: currentRecord.processIdentifier,
+            processStartTime: currentRecord.processStartTime,
+            container: currentRecord.container
+        )
+        try JSONEncoder().encode(prebootRecord).write(
+            to: missingFiles.recordURL, options: .atomic
+        )
+        try VMShimClient.cleanupPersistentRuntimeArtifacts(
+            intentURL: missingFiles.intentURL
+        )
     }
 
     @Test func persistentRuntimePublicationFencesEveryGenerationAndRuntimeAncestor() throws {
@@ -2758,6 +3029,55 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(first.logIdentity == state.artifacts.shimLogIdentity)
         #expect(second.logIdentity == state.artifacts.shimLogIdentity)
         try state.artifacts.validate(in: directory)
+    }
+
+    @Test func preparedStateMigratesLegacyDeviceIdentityAfterRemount() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let containerURL = root.appending(path: "containers/remounted")
+        try FileManager.default.createDirectory(
+            at: containerURL, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = try PersistentStateDirectory.open(containerURL)
+        let original = try makePreparedState(
+            in: directory, containerID: "remounted"
+        )
+        let priorDevice = directory.identity.device == 1
+            ? 2 : directory.identity.device - 1
+        let persistedURL = containerURL.appending(path: "prepared-shim.json")
+        try directory.replaceRegularFile(
+            named: "prepared-shim.json",
+            data: try legacyIdentityData(
+                Data(contentsOf: persistedURL), device: priorDevice
+            )
+        )
+
+        let loadedState = try RawVirtualizationBackend.loadPreparedShimState(
+            from: containerURL
+        )
+        let loaded = try #require(loadedState)
+        #expect(loaded.directoryIdentity == directory.identity)
+        #expect(loaded.artifacts == original.artifacts)
+        #expect(loaded.specification == original.specification)
+        #expect(loaded.specification.rootDiskIdentity?.device == directory.identity.device)
+        #expect(loaded.specification.rootDiskIdentity?.volumeUUID == directory.identity.volumeUUID)
+        try loaded.artifacts.validate(in: directory)
+
+        let migrated = try JSONDecoder().decode(
+            RawVirtualizationBackend.PreparedShimState.self,
+            from: Data(contentsOf: persistedURL)
+        )
+        #expect(migrated.directoryIdentity.volumeUUID == directory.identity.volumeUUID)
+        #expect(migrated.directoryIdentity.device == directory.identity.device)
+        #expect(
+            migrated.specification.rootDiskIdentity?.volumeUUID
+                == directory.identity.volumeUUID
+        )
+        let secondState = try RawVirtualizationBackend.loadPreparedShimState(
+            from: containerURL
+        )
+        let second = try #require(secondState)
+        #expect(second.specification == loaded.specification)
     }
 
     @Test func preparedStateRejectsEveryReplacementArtifactInode() throws {
@@ -4072,16 +4392,12 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             kernelPath: "/kernel",
             initialRamdiskPath: "/initramfs",
             rootDiskPath: diskURL.path,
-            rootDiskIdentity: .init(
-                device: diskIdentity.device, inode: diskIdentity.inode
-            ),
+            rootDiskIdentity: diskIdentity.shimIdentity,
             rootDiskSize: UInt64(Data("original-disk".utf8).count),
             volumeDisks: [.init(
                 name: "data",
                 path: volumeURL.path,
-                identity: .init(
-                    device: volumeIdentity.device, inode: volumeIdentity.inode
-                ),
+                identity: volumeIdentity.shimIdentity,
                 size: UInt64(Data("original-volume".utf8).count)
             )],
             cpus: 1,
@@ -4091,9 +4407,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 tag: "cengine-io",
                 source: shareURL.path,
                 readOnly: false,
-                sourceIdentity: .init(
-                    device: shareIdentity.device, inode: shareIdentity.inode
-                )
+                sourceIdentity: shareIdentity.shimIdentity
             )],
             socketPath: "/tmp/descriptor.sock",
             logPath: root.appending(path: "shim.log").path
@@ -4134,6 +4448,36 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         }
     }
 
+    @Test func shimAttachmentResolverRejectsBootLocalLegacyIdentity() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskURL = root.appending(path: "root.ext4")
+        try Data(repeating: 0, count: 4_096).write(to: diskURL)
+        let identity = try PersistentStateDirectory.open(root).regularFileIdentity(
+            named: "root.ext4", expectedSize: 4_096
+        )
+        let specification = VMShimProtocol.Specification(
+            containerID: "legacy-attachment",
+            generation: 1,
+            token: "legacy-attachment-token",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: diskURL.path,
+            rootDiskIdentity: .init(device: identity.device, inode: identity.inode),
+            rootDiskSize: 4_096,
+            cpus: 1,
+            memoryBytes: 512 * 1_024 * 1_024,
+            macAddress: "02:ce:00:00:00:01",
+            socketPath: "/tmp/legacy-attachment.sock",
+            logPath: root.appending(path: "shim.log").path
+        )
+
+        #expect(throws: EngineError.self) {
+            _ = try VMShimAttachmentResolver.resolve(specification)
+        }
+    }
+
     @Test func shimAttachmentResolverRejectsRootAndBindSwapAtOpenBoundary() throws {
         for swappedBoundary in [
             VMShimAttachmentBoundary.rootDiskOpened,
@@ -4157,9 +4501,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 kernelPath: "/kernel",
                 initialRamdiskPath: "/initramfs",
                 rootDiskPath: diskURL.path,
-                rootDiskIdentity: .init(
-                    device: diskIdentity.device, inode: diskIdentity.inode
-                ),
+                rootDiskIdentity: diskIdentity.shimIdentity,
                 rootDiskSize: UInt64(Data("original".utf8).count),
                 cpus: 1,
                 memoryBytes: 512 * 1_024 * 1_024,
@@ -4168,17 +4510,17 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                     tag: "cengine-io",
                     source: shareURL.path,
                     readOnly: false,
-                    sourceIdentity: .init(
-                        device: shareIdentity.device, inode: shareIdentity.inode
-                    )
+                    sourceIdentity: shareIdentity.shimIdentity
                 )],
                 socketPath: "/tmp/swap.sock",
                 logPath: root.appending(path: "shim.log").path
             )
 
+            var reachedBoundary = false
             #expect(throws: EngineError.self) {
                 _ = try VMShimAttachmentResolver.resolve(specification) { boundary in
                     guard boundary == swappedBoundary else { return }
+                    reachedBoundary = true
                     switch boundary {
                     case .rootDiskOpened:
                         try FileManager.default.moveItem(
@@ -4197,6 +4539,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                     }
                 }
             }
+            #expect(reachedBoundary)
         }
     }
 
@@ -4218,7 +4561,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             kernelPath: "/kernel",
             initialRamdiskPath: "/initramfs",
             rootDiskPath: diskURL.path,
-            rootDiskIdentity: .init(device: identity.device, inode: identity.inode),
+            rootDiskIdentity: identity.shimIdentity,
             rootDiskSize: 4_096,
             cpus: 1,
             memoryBytes: 512 * 1_024 * 1_024,
@@ -4256,8 +4599,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 kernelPath: "/kernel",
                 initialRamdiskPath: "/initramfs",
                 rootDiskPath: diskURL.path,
-                rootDiskIdentity: included
-                    ? .init(device: identity.device, inode: identity.inode) : nil,
+                rootDiskIdentity: included ? identity.shimIdentity : nil,
                 rootDiskSize: included ? 4_096 : nil,
                 cpus: 1,
                 memoryBytes: 512 * 1_024 * 1_024,
@@ -4306,16 +4648,12 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             kernelPath: "/kernel",
             initialRamdiskPath: "/initramfs",
             rootDiskPath: rootDiskURL.path,
-            rootDiskIdentity: .init(
-                device: rootIdentity.device, inode: rootIdentity.inode
-            ),
+            rootDiskIdentity: rootIdentity.shimIdentity,
             rootDiskSize: 4_096,
             volumeDisks: [.init(
                 name: "data",
                 path: volumeURL.path,
-                identity: .init(
-                    device: volumeIdentity.device, inode: volumeIdentity.inode
-                ),
+                identity: volumeIdentity.shimIdentity,
                 size: 8_192
             )],
             cpus: 1,

@@ -222,10 +222,14 @@ public enum VMShimProtocol {
     public struct FileIdentity: Codable, Sendable, Equatable {
         public var device: UInt64
         public var inode: UInt64
+        /// Stable volume identity used when a launch specification is recovered
+        /// after macOS assigns the volume a different boot-local device number.
+        public var volumeUUID: UUID?
 
-        public init(device: UInt64, inode: UInt64) {
+        public init(device: UInt64, inode: UInt64, volumeUUID: UUID? = nil) {
             self.device = device
             self.inode = inode
+            self.volumeUUID = volumeUUID
         }
     }
 

@@ -6,15 +6,158 @@ import Foundation
 struct PersistentFileIdentity: Codable, Equatable, Hashable, Sendable {
     let device: UInt64
     let inode: UInt64
+    let volumeUUID: UUID?
 
-    init(device: UInt64, inode: UInt64) {
+    init(device: UInt64, inode: UInt64, volumeUUID: UUID? = nil) {
         self.device = device
         self.inode = inode
+        self.volumeUUID = volumeUUID
     }
 
-    init(_ information: stat) {
+    init(_ information: stat, volumeUUID: UUID? = nil) {
         device = UInt64(information.st_dev)
         inode = UInt64(information.st_ino)
+        self.volumeUUID = volumeUUID
+    }
+
+    static func capture(descriptor: CInt) throws -> PersistentFileIdentity {
+        var information = stat()
+        guard Darwin.fstat(descriptor, &information) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return PersistentFileIdentity(
+            information, volumeUUID: try volumeUUID(descriptor: descriptor)
+        )
+    }
+
+    private static func volumeUUID(descriptor: CInt) throws -> UUID {
+        var attributes = attrlist()
+        attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        attributes.volattr = ATTR_VOL_INFO | UInt32(ATTR_VOL_UUID)
+        var buffer = [UInt8](
+            repeating: 0, count: MemoryLayout<UInt32>.size + 16
+        )
+        let result = buffer.withUnsafeMutableBytes { bytes in
+            Darwin.fgetattrlist(
+                descriptor, &attributes, bytes.baseAddress, bytes.count, 0
+            )
+        }
+        guard result == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let length = buffer.withUnsafeBytes {
+            $0.loadUnaligned(as: UInt32.self)
+        }
+        guard length == buffer.count else {
+            throw EngineError(.internalError, "invalid filesystem volume identity")
+        }
+        let value = buffer.withUnsafeBytes { bytes -> NSUUID in
+            NSUUID(
+                uuidBytes: bytes.baseAddress!
+                    .advanced(by: MemoryLayout<UInt32>.size)
+                    .assumingMemoryBound(to: UInt8.self)
+            )
+        }
+        guard let result = UUID(uuidString: value.uuidString) else {
+            throw EngineError(.internalError, "invalid filesystem volume UUID")
+        }
+        return result
+    }
+
+    static func == (
+        lhs: PersistentFileIdentity, rhs: PersistentFileIdentity
+    ) -> Bool {
+        switch (lhs.volumeUUID, rhs.volumeUUID) {
+        case let (.some(left), .some(right)):
+            return left == right && lhs.inode == rhs.inode
+        case (.none, .none):
+            return lhs.device == rhs.device && lhs.inode == rhs.inode
+        default:
+            return false
+        }
+    }
+
+    func hash(into hasher: inout Hasher) {
+        if let volumeUUID {
+            hasher.combine(volumeUUID)
+            hasher.combine(inode)
+        } else {
+            hasher.combine(device)
+            hasher.combine(inode)
+        }
+    }
+
+    static func currentMountMatches(
+        expected: PersistentFileIdentity,
+        observed: PersistentFileIdentity
+    ) -> Bool {
+        if expected.volumeUUID != nil {
+            return expected == observed
+        }
+        return expected.device == observed.device && expected.inode == observed.inode
+    }
+
+    static func recoveryMatches(
+        expected: [PersistentFileIdentity],
+        observed: [PersistentFileIdentity]
+    ) -> Bool {
+        guard expected.count == observed.count, !expected.isEmpty else {
+            return expected.isEmpty && observed.isEmpty
+        }
+        if zip(expected, observed).allSatisfy({ pair in
+            currentMountMatches(expected: pair.0, observed: pair.1)
+        }) {
+            return true
+        }
+        guard expected.count > 1,
+              expected.allSatisfy({ $0.volumeUUID == nil }),
+              observed.allSatisfy({ $0.volumeUUID != nil }),
+              zip(expected, observed).allSatisfy({ pair in
+                  pair.0.inode == pair.1.inode
+              }) else {
+            return false
+        }
+        var observedVolumeByLegacyDevice: [UInt64: UUID] = [:]
+        var legacyDeviceByObservedVolume: [UUID: UInt64] = [:]
+        for (old, current) in zip(expected, observed) {
+            guard let volumeUUID = current.volumeUUID else { return false }
+            if let prior = observedVolumeByLegacyDevice[old.device], prior != volumeUUID {
+                return false
+            }
+            if let prior = legacyDeviceByObservedVolume[volumeUUID], prior != old.device {
+                return false
+            }
+            observedVolumeByLegacyDevice[old.device] = volumeUUID
+            legacyDeviceByObservedVolume[volumeUUID] = old.device
+        }
+        return true
+    }
+
+    static func matches(
+        expected: PersistentFileIdentity,
+        observed: PersistentFileIdentity,
+        onTrustedVolume volumeUUID: UUID?
+    ) -> Bool {
+        if expected.volumeUUID != nil {
+            return expected == observed
+        }
+        guard let volumeUUID,
+              observed.volumeUUID == volumeUUID else { return false }
+        return expected.inode == observed.inode
+    }
+
+    var shimIdentity: VMShimProtocol.FileIdentity {
+        .init(device: device, inode: inode, volumeUUID: volumeUUID)
+    }
+
+    static func persistedIdentity(
+        _ identity: VMShimProtocol.FileIdentity
+    ) -> PersistentFileIdentity {
+        .init(
+            device: identity.device,
+            inode: identity.inode,
+            volumeUUID: identity.volumeUUID
+        )
     }
 }
 
@@ -322,7 +465,7 @@ final class PersistentStateDirectory: @unchecked Sendable {
                 "unsafe persistent sparse file \(url.appending(path: name).path)"
             )
         }
-        let identity = PersistentFileIdentity(information)
+        let identity = try PersistentFileIdentity.capture(descriptor: file)
         createdIdentity = identity
         guard Darwin.ftruncate(file, off_t(size)) == 0,
               Darwin.fchmod(file, permissions) == 0,
@@ -332,7 +475,9 @@ final class PersistentStateDirectory: @unchecked Sendable {
         var finalInformation = stat()
         guard Darwin.fstat(file, &finalInformation) == 0,
               finalInformation.st_mode & S_IFMT == S_IFREG,
-              PersistentFileIdentity(finalInformation) == identity,
+              PersistentFileIdentity(
+                  finalInformation, volumeUUID: identity.volumeUUID
+              ) == identity,
               finalInformation.st_size == off_t(size),
               let current = try entryMetadata(named: name),
               current.identity == identity,
@@ -371,7 +516,7 @@ final class PersistentStateDirectory: @unchecked Sendable {
                 "unsafe persistent regular file \(url.appending(path: name).path)"
             )
         }
-        let identity = PersistentFileIdentity(information)
+        let identity = try PersistentFileIdentity.capture(descriptor: file)
         guard expectedIdentity == nil || expectedIdentity == identity,
               expectedSize == nil || UInt64(information.st_size) == expectedSize,
               let current = try entryMetadata(named: name),
@@ -411,7 +556,7 @@ final class PersistentStateDirectory: @unchecked Sendable {
                 "unsafe persistent regular file \(url.appending(path: name).path)"
             )
         }
-        let identity = PersistentFileIdentity(information)
+        let identity = try PersistentFileIdentity.capture(descriptor: file)
         guard expectedIdentity == nil || expectedIdentity == identity,
               let current = try entryMetadata(named: name),
               current.identity == identity,
@@ -496,7 +641,12 @@ final class PersistentStateDirectory: @unchecked Sendable {
             if errno == ENOENT { return nil }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        return (PersistentFileIdentity(information), information.st_mode & S_IFMT)
+        let volumeUUID = UInt64(information.st_dev) == identity.device
+            ? identity.volumeUUID : nil
+        return (
+            PersistentFileIdentity(information, volumeUUID: volumeUUID),
+            information.st_mode & S_IFMT
+        )
     }
 
     func removeEntryIfMatching(
@@ -1045,7 +1195,11 @@ final class PersistentStateDirectory: @unchecked Sendable {
                 if errno == ENOENT { continue }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            let observedIdentity = PersistentFileIdentity(observed)
+            let observedIdentity = PersistentFileIdentity(
+                observed,
+                volumeUUID: UInt64(observed.st_dev) == identity.device
+                    ? identity.volumeUUID : nil
+            )
             let observedType = observed.st_mode & S_IFMT
             let claim = "\(Self.childClaimPrefix)\(UUID().uuidString.lowercased())"
             guard Darwin.renameatx_np(
@@ -1064,7 +1218,10 @@ final class PersistentStateDirectory: @unchecked Sendable {
             guard Darwin.fstatat(
                 descriptor, claim, &claimedInformation, AT_SYMLINK_NOFOLLOW
             ) == 0,
-                  PersistentFileIdentity(claimedInformation) == observedIdentity,
+                  PersistentFileIdentity(
+                      claimedInformation,
+                      volumeUUID: observedIdentity.volumeUUID
+                  ) == observedIdentity,
                   claimedInformation.st_mode & S_IFMT == observedType else {
                 let error = EngineError(
                     .conflict, "persistent disposal child changed while claimed"
@@ -1222,7 +1379,9 @@ final class PersistentStateDirectory: @unchecked Sendable {
             throw EngineError(.internalError, "unsafe persistent state directory \(url.path)")
         }
         return PersistentStateDirectory(
-            descriptor: descriptor, identity: .init(information), url: url
+            descriptor: descriptor,
+            identity: try PersistentFileIdentity.capture(descriptor: descriptor),
+            url: url
         )
     }
 
@@ -1968,7 +2127,9 @@ public final class VMShimClient: @unchecked Sendable {
                 }
                 if waitForExit(launchedIdentity, timeoutMilliseconds: 1_000) {
                     do {
-                        try client.removePersistentLaunchArtifacts()
+                        try client.removePersistentLaunchArtifacts(
+                            allowUnpublishedLaunch: true
+                        )
                     } catch {
                         throw VMShimLaunchRollbackIncompleteError(
                             message: "VM shim launch ownership could not be persisted: "
@@ -2207,7 +2368,10 @@ public final class VMShimClient: @unchecked Sendable {
             )
         } catch {
             try? cleanupPersistentRuntimeArtifacts(
-                in: generation, specification: state.specification, hook: nil
+                in: generation,
+                specification: state.specification,
+                launchCreatedAt: state.intent.createdAt,
+                hook: nil
             )
             throw error
         }
@@ -2313,7 +2477,10 @@ public final class VMShimClient: @unchecked Sendable {
             return record
         } catch {
             try? cleanupPersistentRuntimeArtifacts(
-                in: generation, specification: state.specification, hook: nil
+                in: generation,
+                specification: state.specification,
+                launchCreatedAt: state.intent.createdAt,
+                hook: nil
             )
             throw error
         }
@@ -2330,8 +2497,14 @@ public final class VMShimClient: @unchecked Sendable {
             let state = try validatedLaunchState(
                 in: generation, expectedIntentURL: intentURL
             )
+            let launchCreatedAt = try validatedLaunchCreatedAt(
+                in: generation, state: state, requiresPublishedRecord: false
+            )
             try cleanupPersistentRuntimeArtifacts(
-                in: generation, specification: state.specification, hook: hook
+                in: generation,
+                specification: state.specification,
+                launchCreatedAt: launchCreatedAt,
+                hook: hook
             )
         } catch let error as PersistentRuntimeArtifactOwnershipUnresolvedError {
             throw error
@@ -2343,9 +2516,23 @@ public final class VMShimClient: @unchecked Sendable {
         }
     }
 
+    private static func launchPredatesCurrentBoot(_ createdAt: Date?) -> Bool {
+        guard let createdAt else { return false }
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0,
+              size == MemoryLayout<timeval>.size else { return false }
+        let boot = Date(
+            timeIntervalSince1970: Double(bootTime.tv_sec)
+                + Double(bootTime.tv_usec) / 1_000_000
+        )
+        return createdAt < boot
+    }
+
     private static func cleanupPersistentRuntimeArtifacts(
         in generation: PersistentStateDirectory,
         specification: VMShimProtocol.Specification,
+        launchCreatedAt: Date? = nil,
         hook: PersistentRuntimeArtifactHook? = nil
     ) throws {
         guard generation.pathStillNamesThisDirectory() else {
@@ -2362,9 +2549,22 @@ public final class VMShimClient: @unchecked Sendable {
                 launchPathsMatch(
                     URL(filePath: $0).deletingLastPathComponent().path, runtimePath
                 )
-            }), let runtime = try PersistentStateDirectory.openIfPresent(
+            }) else {
+                throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                    message: "VM shim runtime ownership journal is unavailable"
+                )
+            }
+            guard let runtime = try PersistentStateDirectory.openIfPresent(
                 URL(filePath: runtimePath)
-            ), runtime.pathStillNamesThisDirectory() else {
+            ) else {
+                guard launchPredatesCurrentBoot(launchCreatedAt) else {
+                    throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                        message: "VM shim runtime ownership journal and directory are unavailable"
+                    )
+                }
+                return
+            }
+            guard runtime.pathStillNamesThisDirectory() else {
                 throw PersistentRuntimeArtifactOwnershipUnresolvedError(
                     message: "VM shim runtime ownership journal and directory are unavailable"
                 )
@@ -2379,7 +2579,6 @@ public final class VMShimClient: @unchecked Sendable {
             return
         }
         guard record.schemaVersion == PersistentRuntimeArtifactRecord.currentSchemaVersion,
-              record.generationDirectoryIdentity == generation.identity,
               exactLaunchPathKey(record.runtimeDirectoryPath) != nil,
               !record.stagingDirectoryName.isEmpty,
               record.artifacts.count == expectedPaths.count,
@@ -2397,12 +2596,50 @@ public final class VMShimClient: @unchecked Sendable {
               }) else {
             throw EngineError(.conflict, "invalid VM shim runtime artifact ownership record")
         }
-        guard let runtime = try PersistentStateDirectory.openIfPresent(
+        let runtime = try PersistentStateDirectory.openIfPresent(
             URL(filePath: record.runtimeDirectoryPath)
-        ), runtime.identity == record.runtimeDirectoryIdentity,
-              runtime.pathStillNamesThisDirectory() else {
-            throw PersistentRuntimeArtifactOwnershipUnresolvedError(
-                message: "VM shim runtime directory ownership is missing or changed"
+        )
+        guard let runtime else {
+            guard launchPredatesCurrentBoot(launchCreatedAt) else {
+                throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                    message: "VM shim runtime directory ownership is missing or changed"
+                )
+            }
+            return
+        }
+        let expectedRuntimeNames = [record.stagingDirectoryName]
+            + record.artifacts.flatMap { [$0.name, $0.stagingName, $0.claimName] }
+        guard PersistentFileIdentity.recoveryMatches(
+            expected: [
+                record.generationDirectoryIdentity,
+                record.runtimeDirectoryIdentity,
+            ],
+            observed: [generation.identity, runtime.identity]
+        ), runtime.pathStillNamesThisDirectory() else {
+            guard record.generationDirectoryIdentity.volumeUUID == nil,
+                  record.runtimeDirectoryIdentity.volumeUUID == nil,
+                  launchPredatesCurrentBoot(launchCreatedAt) else {
+                throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                    message: "VM shim runtime directory ownership is missing or changed"
+                )
+            }
+            for name in expectedRuntimeNames where !name.isEmpty {
+                if try runtime.entryMetadata(named: name) != nil {
+                    throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                        message: "VM shim runtime directory ownership is missing or changed"
+                    )
+                }
+            }
+            return
+        }
+        func recoveredRuntimeIdentity(
+            _ expected: PersistentFileIdentity
+        ) -> PersistentFileIdentity {
+            guard expected.volumeUUID == nil else { return expected }
+            return PersistentFileIdentity(
+                device: runtime.identity.device,
+                inode: expected.inode,
+                volumeUUID: runtime.identity.volumeUUID
             )
         }
         let statusName = URL(
@@ -2426,9 +2663,10 @@ public final class VMShimClient: @unchecked Sendable {
             }
             return
         }
-        guard let stagingIdentity = record.stagingDirectoryIdentity else {
+        guard let storedStagingIdentity = record.stagingDirectoryIdentity else {
             throw EngineError(.conflict, "runtime staging identity is missing")
         }
+        let stagingIdentity = recoveredRuntimeIdentity(storedStagingIdentity)
         if record.phase == .creating {
             if let staging = try runtime.openDirectoryIfPresent(
                 named: record.stagingDirectoryName
@@ -2458,7 +2696,8 @@ public final class VMShimClient: @unchecked Sendable {
             )
         }
         for artifact in record.artifacts {
-            guard let identity = artifact.identity else { continue }
+            guard let storedIdentity = artifact.identity else { continue }
+            let identity = recoveredRuntimeIdentity(storedIdentity)
             let expectedType: mode_t = artifact.name == statusName ? S_IFREG : S_IFSOCK
             try requireOwnedArtifactOrAbsence(
                 in: runtime,
@@ -2748,9 +2987,18 @@ public final class VMShimClient: @unchecked Sendable {
               UUID(uuidString: intent.nonce)?.uuidString.lowercased() == intent.nonce,
               launchPathsMatch(intent.specificationPath, specificationURL.path),
               exactLaunchPathKey(intent.executablePath) != nil,
-              intent.containerDirectoryIdentity == containerDirectory.identity,
-              intent.generationsDirectoryIdentity == generationsDirectory.identity,
-              intent.generationDirectoryIdentity == directory.identity,
+              PersistentFileIdentity.recoveryMatches(
+                  expected: [
+                      intent.containerDirectoryIdentity,
+                      intent.generationsDirectoryIdentity,
+                      intent.generationDirectoryIdentity,
+                  ],
+                  observed: [
+                      containerDirectory.identity,
+                      generationsDirectory.identity,
+                      directory.identity,
+                  ]
+              ),
               intent.specification.containerID == intent.container.id,
               expectedContainerID == nil || intent.container.id == expectedContainerID else {
             throw EngineError(.internalError, "invalid VM shim launch intent \(intentURL.path)")
@@ -2809,6 +3057,30 @@ public final class VMShimClient: @unchecked Sendable {
             container: state.intent.container
         )
         return try persistentLaunchRecordsMatch(record, expected)
+    }
+
+    private static func validatedLaunchCreatedAt(
+        in generation: PersistentStateDirectory,
+        state: PersistentLaunchState,
+        requiresPublishedRecord: Bool
+    ) throws -> Date {
+        guard let data = try generation.readRegularFile(
+            named: "launch.json", required: false
+        ) else {
+            guard !requiresPublishedRecord else {
+                throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                    message: "VM shim published launch identity is unavailable"
+                )
+            }
+            return state.intent.createdAt
+        }
+        let record = try JSONDecoder().decode(PersistentLaunchRecord.self, from: data)
+        guard try validatedLaunchRecord(record, state: state) else {
+            throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                message: "VM shim published launch identity changed"
+            )
+        }
+        return record.createdAt
     }
 
     private static func awaitReadiness(
@@ -3297,7 +3569,9 @@ public final class VMShimClient: @unchecked Sendable {
         } catch { return false }
     }
 
-    func removePersistentLaunchArtifacts() throws {
+    func removePersistentLaunchArtifacts(
+        allowUnpublishedLaunch: Bool = false
+    ) throws {
         guard let persistentLaunchRecordURL, let persistentGenerationsDirectory,
               let persistentGenerationIdentity else { return }
         let directory = persistentLaunchRecordURL.deletingLastPathComponent()
@@ -3308,8 +3582,36 @@ public final class VMShimClient: @unchecked Sendable {
             guard generation.identity == persistentGenerationIdentity else {
                 throw EngineError(.conflict, "VM shim generation directory was replaced")
             }
+            let intentURL = generation.url.appending(path: "intent.json")
+            let state = try Self.validatedLaunchState(
+                in: generation, expectedIntentURL: intentURL
+            )
+            guard state.specification == specification else {
+                throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                    message: "VM shim launch contract changed before artifact cleanup"
+                )
+            }
+            if allowUnpublishedLaunch,
+               try generation.readRegularFile(
+                   named: "launch.json", required: false
+               ) == nil {
+                // spawn() has killed and reaped the exact process before using
+                // this branch. The shim publishes launch.json before creating
+                // runtime artifacts, so an unpublished generation owns only
+                // its descriptor-bound state directory.
+                try persistentGenerationsDirectory.disposeDirectory(
+                    named: directory.lastPathComponent,
+                    expectedIdentity: persistentGenerationIdentity
+                )
+                return
+            }
+            let launchCreatedAt = try Self.validatedLaunchCreatedAt(
+                in: generation, state: state, requiresPublishedRecord: true
+            )
             try Self.cleanupPersistentRuntimeArtifacts(
-                in: generation, specification: specification
+                in: generation,
+                specification: specification,
+                launchCreatedAt: launchCreatedAt
             )
             try persistentGenerationsDirectory.disposeDirectory(
                 named: directory.lastPathComponent,
@@ -3423,8 +3725,22 @@ public final class VMShimClient: @unchecked Sendable {
                 message: "VM shim generation ownership is unresolved during artifact cleanup"
             )
         }
+        let intentURL = generation.url.appending(path: "intent.json")
+        let state = try Self.validatedLaunchState(
+            in: generation, expectedIntentURL: intentURL
+        )
+        guard state.specification == specification else {
+            throw PersistentRuntimeArtifactOwnershipUnresolvedError(
+                message: "VM shim launch contract changed before artifact cleanup"
+            )
+        }
+        let launchCreatedAt = try Self.validatedLaunchCreatedAt(
+            in: generation, state: state, requiresPublishedRecord: true
+        )
         try Self.cleanupPersistentRuntimeArtifacts(
-            in: generation, specification: specification
+            in: generation,
+            specification: specification,
+            launchCreatedAt: launchCreatedAt
         )
     }
 

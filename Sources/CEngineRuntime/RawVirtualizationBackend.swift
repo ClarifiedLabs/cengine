@@ -904,6 +904,99 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
         }
     }
 
+    func refreshed(
+        in directory: PersistentStateDirectory
+    ) throws -> RawContainerPreparationArtifacts {
+        let rootDisk = try directory.regularFileIdentity(
+            named: "root.ext4", expectedSize: rootDiskSize
+        )
+        let shimLog = try directory.regularFileIdentity(named: "shim.log")
+        let execJournal = try directory.regularFileIdentity(
+            named: "exec-artifacts.jsonl"
+        )
+        let execCompaction = try directory.regularFileIdentity(
+            named: "exec-artifacts.compact"
+        )
+        let ioDirectory = try directory.openDirectory(named: "io")
+        var ioFiles: [String: PersistentFileIdentity] = [:]
+        for name in Self.directIOFileNames {
+            ioFiles[name] = try ioDirectory.regularFileIdentity(named: name)
+        }
+        var spoolDirectories: [String: PersistentFileIdentity]?
+        if outputSpoolDirectoryIdentities != nil {
+            spoolDirectories = [:]
+            for name in ["stdout.spool", "stderr.spool"] {
+                spoolDirectories?[name] = try ioDirectory.openDirectory(named: name).identity
+            }
+        }
+        let dockerLog = try ioDirectory.regularFileIdentity(named: "docker.log")
+        let dockerLogIndex = try ioDirectory.regularFileIdentity(
+            named: "docker.log.entries"
+        )
+        let dockerLogJournal: PersistentFileIdentity?
+        if dockerLogJournalDirectoryIdentity != nil {
+            dockerLogJournal = try ioDirectory.openDirectory(
+                named: "docker.log.journal"
+            ).identity
+        } else {
+            dockerLogJournal = nil
+        }
+
+        var expected = [
+            directoryIdentity, rootDiskIdentity, shimLogIdentity,
+            execArtifactJournalIdentity, execArtifactCompactionIdentity,
+            ioDirectoryIdentity, dockerLogIdentity, dockerLogIndexIdentity,
+        ]
+        var observed = [
+            directory.identity, rootDisk, shimLog, execJournal, execCompaction,
+            ioDirectory.identity, dockerLog, dockerLogIndex,
+        ]
+        for name in Self.directIOFileNames {
+            guard let old = ioFileIdentities[name], let current = ioFiles[name] else {
+                throw EngineError(.internalError, "missing direct-I/O file identity")
+            }
+            expected.append(old)
+            observed.append(current)
+        }
+        if let oldSpools = outputSpoolDirectoryIdentities,
+           let currentSpools = spoolDirectories {
+            for name in ["stdout.spool", "stderr.spool"] {
+                guard let old = oldSpools[name], let current = currentSpools[name] else {
+                    throw EngineError(.internalError, "missing output spool identity")
+                }
+                expected.append(old)
+                observed.append(current)
+            }
+        }
+        if let old = dockerLogJournalDirectoryIdentity,
+           let current = dockerLogJournal {
+            expected.append(old)
+            observed.append(current)
+        }
+        guard PersistentFileIdentity.recoveryMatches(
+            expected: expected, observed: observed
+        ) else {
+            throw EngineError(.conflict, "container preparation artifact identity changed")
+        }
+
+        let result = RawContainerPreparationArtifacts(
+            directoryIdentity: directory.identity,
+            rootDiskIdentity: rootDisk,
+            rootDiskSize: rootDiskSize,
+            shimLogIdentity: shimLog,
+            execArtifactJournalIdentity: execJournal,
+            execArtifactCompactionIdentity: execCompaction,
+            ioDirectoryIdentity: ioDirectory.identity,
+            ioFileIdentities: ioFiles,
+            outputSpoolDirectoryIdentities: spoolDirectories,
+            dockerLogIdentity: dockerLog,
+            dockerLogIndexIdentity: dockerLogIndex,
+            dockerLogJournalDirectoryIdentity: dockerLogJournal
+        )
+        try result.validate(in: directory)
+        return result
+    }
+
     func validate(in directory: PersistentStateDirectory) throws {
         guard directory.identity == directoryIdentity else {
             throw EngineError(.conflict, "container state directory identity changed")
@@ -2868,7 +2961,9 @@ enum RawDirectoryTransfer {
             var sourceInformation = stat()
             guard Darwin.fstat(sourceDescriptor, &sourceInformation) == 0,
                   sourceInformation.st_mode & S_IFMT == S_IFLNK,
-                  PersistentFileIdentity(sourceInformation) == original.identity else {
+                  PersistentFileIdentity(
+                      sourceInformation, volumeUUID: original.identity.volumeUUID
+                  ) == original.identity else {
                 throw EngineError(.conflict, "copy source symbolic link changed while opening")
             }
             try hook?(.entryOpened(path))
@@ -2889,7 +2984,9 @@ enum RawDirectoryTransfer {
                   destinationInformation.st_mode & S_IFMT == S_IFLNK else {
                 throw EngineError(.conflict, "copy destination symbolic link is unsafe")
             }
-            let destinationIdentity = PersistentFileIdentity(destinationInformation)
+            let destinationIdentity = try PersistentFileIdentity.capture(
+                descriptor: destinationDescriptor
+            )
             guard try readSymbolicLink(descriptor: destinationDescriptor) == target else {
                 throw EngineError(.conflict, "copy destination symbolic link target changed")
             }
@@ -3363,10 +3460,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             kernelPath: kernel.path,
             initialRamdiskPath: storageInitialRamdisk.path,
             rootDiskPath: disk.path,
-            rootDiskIdentity: .init(
-                device: infrastructureDiskIdentity.device,
-                inode: infrastructureDiskIdentity.inode
-            ),
+            rootDiskIdentity: infrastructureDiskIdentity.shimIdentity,
             rootDiskSize: Self.defaultStorageDiskBytes,
             cpus: 2,
             memoryBytes: 1 * 1_024 * 1_024 * 1_024,
@@ -6253,17 +6347,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let state = try JSONDecoder().decode(
             PreparedShimState.self, from: data
         )
-        let expectedRootIdentity = VMShimProtocol.FileIdentity(
-            device: state.artifacts.rootDiskIdentity.device,
-            inode: state.artifacts.rootDiskIdentity.inode
-        )
         let ioShares = state.specification.bindShares.filter { $0.tag == "cengine-io" }
-        let expectedIOIdentity = VMShimProtocol.FileIdentity(
-            device: state.artifacts.ioDirectoryIdentity.device,
-            inode: state.artifacts.ioDirectoryIdentity.inode
-        )
         guard state.schemaVersion == PreparedShimState.currentSchemaVersion,
-              state.directoryIdentity == directory.identity,
               state.artifacts.directoryIdentity == state.directoryIdentity,
               state.artifacts.rootDiskSize > 0,
               Set(state.artifacts.ioFileIdentities.keys)
@@ -6271,10 +6356,20 @@ public actor RawVirtualizationBackend: ContainerBackend {
               state.currentContainer.id == state.specification.containerID,
               expectedContainerID == nil || state.currentContainer.id == expectedContainerID,
               state.specification.kind == .container,
-              state.specification.rootDiskIdentity == expectedRootIdentity,
+              state.specification.rootDiskIdentity.map({ identity in
+                  Self.launchIdentity(
+                      .persistedIdentity(identity),
+                      references: state.artifacts.rootDiskIdentity
+                  )
+              }) == true,
               state.specification.rootDiskSize == state.artifacts.rootDiskSize,
               ioShares.count == 1,
-              ioShares[0].sourceIdentity == expectedIOIdentity,
+              ioShares[0].sourceIdentity.map({ identity in
+                  Self.launchIdentity(
+                      .persistedIdentity(identity),
+                      references: state.artifacts.ioDirectoryIdentity
+                  )
+              }) == true,
               ioShares[0].readOnly == false,
               VMShimClient.launchPathsMatch(
                 state.specification.rootDiskPath,
@@ -6290,11 +6385,71 @@ public actor RawVirtualizationBackend: ContainerBackend {
               ) else {
             throw EngineError(.internalError, "invalid prepared VM shim state at \(url.path)")
         }
-        try state.artifacts.validate(in: directory)
+        let artifacts = try state.artifacts.refreshed(in: directory)
+        var specification = state.specification
+        // Preserve an old same-boot launch specification long enough to adopt
+        // its live generation. Only a legacy device mismatch proves that the
+        // immutable launch contract was recorded before a remount.
+        let refreshLaunchIdentity = state.directoryIdentity.volumeUUID == nil
+            && state.directoryIdentity.device != directory.identity.device
+        if refreshLaunchIdentity {
+            specification.rootDiskIdentity = artifacts.rootDiskIdentity.shimIdentity
+            guard let ioShareIndex = specification.bindShares.firstIndex(
+                where: { $0.tag == "cengine-io" }
+            ) else {
+                throw EngineError(
+                    .internalError, "invalid prepared VM shim state at \(url.path)"
+                )
+            }
+            specification.bindShares[ioShareIndex].sourceIdentity =
+                artifacts.ioDirectoryIdentity.shimIdentity
+        }
+        if refreshLaunchIdentity, var spool = specification.outputSpool {
+            guard let directories = artifacts.outputSpoolDirectoryIdentities,
+                  let stdout = artifacts.ioFileIdentities["stdout"],
+                  let stderr = artifacts.ioFileIdentities["stderr"],
+                  let stdoutSpool = directories["stdout.spool"],
+                  let stderrSpool = directories["stderr.spool"] else {
+                throw EngineError(
+                    .internalError, "invalid prepared VM output spool state at \(url.path)"
+                )
+            }
+            spool.directoryIdentity = artifacts.ioDirectoryIdentity.shimIdentity
+            spool.stdoutIdentity = stdout.shimIdentity
+            spool.stderrIdentity = stderr.shimIdentity
+            spool.stdoutSpoolDirectoryIdentity = stdoutSpool.shimIdentity
+            spool.stderrSpoolDirectoryIdentity = stderrSpool.shimIdentity
+            specification.outputSpool = spool
+        }
+        let refreshed = PreparedShimState(
+            directoryIdentity: directory.identity,
+            artifacts: artifacts,
+            currentContainer: state.currentContainer,
+            specification: specification
+        )
+        if refreshLaunchIdentity && (
+            state.directoryIdentity.volumeUUID == nil
+                || state.specification != specification
+        ) {
+            try directory.replaceRegularFile(
+                named: "prepared-shim.json",
+                data: try JSONEncoder().encode(refreshed)
+            )
+        }
         guard directory.pathStillNamesThisDirectory() else {
             throw EngineError(.conflict, "prepared VM shim directory was replaced")
         }
-        return state
+        return refreshed
+    }
+
+    private static func launchIdentity(
+        _ identity: PersistentFileIdentity,
+        references artifact: PersistentFileIdentity
+    ) -> Bool {
+        if identity.volumeUUID != nil {
+            return identity == artifact
+        }
+        return identity.inode == artifact.inode
     }
 
     private func persistPreparedShimState(
@@ -6389,13 +6544,16 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let capacitySpecification = try Self.relaunchCapacitySpecification(
             for: container, prepared: prepared, preserving: preservedState
         )
+        let volumeDisks = try refreshedVolumeDisks(
+            (capacitySpecification ?? prepared.specification).volumeDisks
+        )
         let specification = try containerShimSpecification(
             container,
             directory: directory,
             artifacts: prepared.artifacts,
             bindSources: bindSources,
             generation: try nextShimGeneration(in: directory),
-            volumeDisks: (capacitySpecification ?? prepared.specification).volumeDisks,
+            volumeDisks: volumeDisks,
             capacitySpecification: capacitySpecification
         )
         try prepared.artifacts.validate(in: stateDirectory)
@@ -6471,18 +6629,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let policy = ContainerLogRetentionPolicy.default
             outputSpool = .init(
                 directoryPath: ioDirectory.path,
-                directoryIdentity: .init(
-                    device: artifacts.ioDirectoryIdentity.device,
-                    inode: artifacts.ioDirectoryIdentity.inode
-                ),
-                stdoutIdentity: .init(device: stdout.device, inode: stdout.inode),
-                stderrIdentity: .init(device: stderr.device, inode: stderr.inode),
-                stdoutSpoolDirectoryIdentity: .init(
-                    device: stdoutSpool.device, inode: stdoutSpool.inode
-                ),
-                stderrSpoolDirectoryIdentity: .init(
-                    device: stderrSpool.device, inode: stderrSpool.inode
-                ),
+                directoryIdentity: artifacts.ioDirectoryIdentity.shimIdentity,
+                stdoutIdentity: stdout.shimIdentity,
+                stderrIdentity: stderr.shimIdentity,
+                stdoutSpoolDirectoryIdentity: stdoutSpool.shimIdentity,
+                stderrSpoolDirectoryIdentity: stderrSpool.shimIdentity,
                 retainedBytes: policy.retainedBytes,
                 segmentBytes: policy.segmentBytes,
                 maximumSegments: policy.maximumSegments
@@ -6497,10 +6648,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             kernelPath: kernel.path,
             initialRamdiskPath: containerInitialRamdisk.path,
             rootDiskPath: directory.appending(path: "root.ext4").path,
-            rootDiskIdentity: .init(
-                device: artifacts.rootDiskIdentity.device,
-                inode: artifacts.rootDiskIdentity.inode
-            ),
+            rootDiskIdentity: artifacts.rootDiskIdentity.shimIdentity,
             rootDiskSize: artifacts.rootDiskSize,
             volumeDisks: volumeDisks,
             cpus: capacitySpecification?.cpus ?? max(container.cpus, 1),
@@ -6513,18 +6661,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     tag: "bind-\(index)",
                     source: share.shareRoot.path,
                     readOnly: mount.readOnly,
-                    sourceIdentity: .init(
-                        device: share.identity.device, inode: share.identity.inode
-                    )
+                    sourceIdentity: share.identity.shimIdentity
                 )
             } + [.init(
                 tag: "cengine-io",
                 source: ioDirectory.path,
                 readOnly: false,
-                sourceIdentity: .init(
-                    device: artifacts.ioDirectoryIdentity.device,
-                    inode: artifacts.ioDirectoryIdentity.inode
-                )
+                sourceIdentity: artifacts.ioDirectoryIdentity.shimIdentity
             )],
             socketRelays: bindSources.values.compactMap { source in
                 guard case .socket(let socket) = source else { return nil }
@@ -6743,6 +6886,38 @@ public actor RawVirtualizationBackend: ContainerBackend {
         )
     }
 
+    private func refreshedVolumeDisks(
+        _ disks: [VMShimProtocol.VolumeDisk]
+    ) throws -> [VMShimProtocol.VolumeDisk] {
+        let trustedVolumeUUID = try PersistentStateDirectory.open(root).identity.volumeUUID
+        return try disks.map { disk in
+            guard !disk.name.isEmpty, !disk.name.contains("/"),
+                  let expected = disk.identity, let size = disk.size,
+                  VMShimClient.launchPathsMatch(
+                      disk.path, volumeDiskURL(name: disk.name).path
+                  ) else {
+                throw EngineError(.conflict, "invalid persisted volume disk identity")
+            }
+            let url = URL(filePath: disk.path).standardizedFileURL
+            let directory = try PersistentStateDirectory.open(
+                url.deletingLastPathComponent()
+            )
+            let observed = try directory.regularFileIdentity(
+                named: url.lastPathComponent, expectedSize: size
+            )
+            guard PersistentFileIdentity.matches(
+                expected: .persistedIdentity(expected),
+                observed: observed,
+                onTrustedVolume: trustedVolumeUUID
+            ) else {
+                throw EngineError(.conflict, "persisted volume disk identity changed")
+            }
+            var result = disk
+            result.identity = observed.shimIdentity
+            return result
+        }
+    }
+
     private func ensureVolumeDisks(names: [String]) throws -> [VMShimProtocol.VolumeDisk] {
         let volumes = try PersistentStateDirectory.open(
             root.appending(path: "volumes", directoryHint: .isDirectory)
@@ -6769,7 +6944,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             return .init(
                 name: name,
                 path: disk.path,
-                identity: .init(device: identity.device, inode: identity.inode),
+                identity: identity.shimIdentity,
                 size: Self.defaultVolumeDiskBytes
             )
         }

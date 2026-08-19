@@ -62,8 +62,8 @@ enum VMShimAttachmentResolver {
             }
             let directory = try PersistentStateDirectory.open(URL(filePath: share.source))
             if let expected = share.sourceIdentity {
-                guard directory.identity.device == expected.device,
-                      directory.identity.inode == expected.inode else {
+                guard expected.volumeUUID != nil,
+                      directory.identity == .persistedIdentity(expected) else {
                     throw EngineError(.conflict, "container VM share identity changed")
                 }
             }
@@ -87,7 +87,9 @@ enum VMShimAttachmentResolver {
             var stableInformation = stat()
             let stableMatches = Darwin.fstat(stableDescriptor, &stableInformation) == 0
                 && stableInformation.st_mode & S_IFMT == S_IFDIR
-                && PersistentFileIdentity(stableInformation) == directory.identity
+                && PersistentFileIdentity(
+                    stableInformation, volumeUUID: directory.identity.volumeUUID
+                ) == directory.identity
             Darwin.close(stableDescriptor)
             guard stableMatches else {
                 throw EngineError(.conflict, "container VM stable share identity changed")
@@ -122,7 +124,9 @@ enum VMShimAttachmentResolver {
                   current.type == S_IFREG,
                   Darwin.fstat(handle.fileDescriptor, &information) == 0,
                   information.st_mode & S_IFMT == S_IFREG,
-                  PersistentFileIdentity(information) == identity,
+                  PersistentFileIdentity(
+                      information, volumeUUID: identity.volumeUUID
+                  ) == identity,
                   information.st_size >= 0,
                   expectedSize == nil || UInt64(information.st_size) == expectedSize else {
                 throw EngineError(.conflict, "container VM root disk path changed")
@@ -141,14 +145,16 @@ enum VMShimAttachmentResolver {
         }
         let url = URL(filePath: path).standardizedFileURL
         let parent = try PersistentStateDirectory.open(url.deletingLastPathComponent())
-        let expectedIdentity = expected.map {
-            PersistentFileIdentity(device: $0.device, inode: $0.inode)
-        }
         let opened = try parent.openRegularFile(
             named: url.lastPathComponent,
-            expectedIdentity: expectedIdentity,
             access: .readWrite
         )
+        if let expected {
+            guard expected.volumeUUID != nil,
+                  opened.identity == .persistedIdentity(expected) else {
+                throw EngineError(.conflict, "VM disk identity changed")
+            }
+        }
         return .init(
             parent: parent,
             name: url.lastPathComponent,
@@ -526,37 +532,32 @@ enum VMShimAttachmentResolver {
         let directory = try PersistentStateDirectory.open(
             URL(filePath: spool.directoryPath, directoryHint: .isDirectory)
         )
-        guard directory.identity == PersistentFileIdentity(
-            device: spool.directoryIdentity.device,
-            inode: spool.directoryIdentity.inode
+        guard directory.identity == PersistentFileIdentity.persistedIdentity(
+            spool.directoryIdentity
         ), directory.pathStillNamesThisDirectory() else {
             throw EngineError(.conflict, "container I/O directory changed")
         }
         let stdout = try directory.openRegularFile(
             named: "stdout",
-            expectedIdentity: PersistentFileIdentity(
-                device: spool.stdoutIdentity.device,
-                inode: spool.stdoutIdentity.inode
+            expectedIdentity: PersistentFileIdentity.persistedIdentity(
+                spool.stdoutIdentity
             ),
             access: .readWrite
         ).handle
         let stderr = try directory.openRegularFile(
             named: "stderr",
-            expectedIdentity: PersistentFileIdentity(
-                device: spool.stderrIdentity.device,
-                inode: spool.stderrIdentity.inode
+            expectedIdentity: PersistentFileIdentity.persistedIdentity(
+                spool.stderrIdentity
             ),
             access: .readWrite
         ).handle
         do {
             let stdoutDirectory = try directory.openDirectory(named: "stdout.spool")
             let stderrDirectory = try directory.openDirectory(named: "stderr.spool")
-            guard stdoutDirectory.identity == PersistentFileIdentity(
-                device: spool.stdoutSpoolDirectoryIdentity.device,
-                inode: spool.stdoutSpoolDirectoryIdentity.inode
-            ), stderrDirectory.identity == PersistentFileIdentity(
-                device: spool.stderrSpoolDirectoryIdentity.device,
-                inode: spool.stderrSpoolDirectoryIdentity.inode
+            guard stdoutDirectory.identity == PersistentFileIdentity.persistedIdentity(
+                spool.stdoutSpoolDirectoryIdentity
+            ), stderrDirectory.identity == PersistentFileIdentity.persistedIdentity(
+                spool.stderrSpoolDirectoryIdentity
             ), stdoutDirectory.pathStillNamesThisDirectory(),
                stderrDirectory.pathStillNamesThisDirectory() else {
                 throw EngineError(.conflict, "container output spool directory changed")
