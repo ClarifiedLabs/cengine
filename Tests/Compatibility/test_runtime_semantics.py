@@ -4198,7 +4198,9 @@ def test_extreme_cpu_values_fail_without_mutation(client: docker.DockerClient):
 
 
 @pytest.mark.compat("RTM-051")
-def test_global_connection_admission_recovers_capacity(daemon, client: docker.DockerClient):
+def test_global_connection_and_upload_admission_recovers_capacity(
+    daemon, client: docker.DockerClient
+):
     original_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     raised_soft_limit = max(original_limit[0], 1024)
     if original_limit[1] != resource.RLIM_INFINITY:
@@ -4231,6 +4233,44 @@ def test_global_connection_admission_recovers_capacity(daemon, client: docker.Do
             connection.close()
         resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
     wait_for_compat_value(client.ping, True, "API admission capacity recovery")
+
+    upload_head = (
+        "POST /v1.55/images/load HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/x-tar\r\n"
+        "Content-Length: 1\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    active_uploads: list[socket.socket] = []
+    queued_upload = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        for _ in range(8):
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.connect(str(daemon.socket))
+            connection.sendall(upload_head)
+            active_uploads.append(connection)
+        time.sleep(0.5)
+
+        queued_upload.settimeout(0.5)
+        queued_upload.connect(str(daemon.socket))
+        queued_upload.sendall(upload_head + b"x")
+        with pytest.raises(socket.timeout):
+            queued_upload.recv(4096)
+
+        active_uploads.pop().close()
+        queued_upload.settimeout(10)
+        response = b""
+        while b"\r\n" not in response:
+            chunk = queued_upload.recv(4096)
+            assert chunk, response
+            response += chunk
+        assert response.startswith(b"HTTP/1.1 400 Bad Request\r\n"), response
+        assert b"429 Too Many Requests" not in response, response
+    finally:
+        queued_upload.close()
+        for connection in active_uploads:
+            connection.close()
+    wait_for_compat_value(client.ping, True, "upload admission capacity recovery")
 
 
 @pytest.mark.compat("RTM-052")

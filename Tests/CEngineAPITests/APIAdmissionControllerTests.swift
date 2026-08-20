@@ -15,6 +15,19 @@ private final class UploadWriterTestState: @unchecked Sendable {
     var hasError: Bool { lock.withLock { !errors.isEmpty } }
 }
 
+private final class AdmissionDeliveryTestState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var leases: [APIAdmissionLease] = []
+
+    func append(_ lease: APIAdmissionLease) {
+        lock.withLock { leases.append(lease) }
+    }
+
+    func take() -> APIAdmissionLease? {
+        lock.withLock { leases.popLast() }
+    }
+}
+
 @Suite struct APIAdmissionControllerTests {
     @Test func leasesEnforceExactLimitsAndReleaseIdempotently() throws {
         let controller = APIAdmissionController(policy: .init(
@@ -43,6 +56,51 @@ private final class UploadWriterTestState: @unchecked Sendable {
         connection.release()
         #expect(controller.snapshot().connections == 0)
         _ = try controller.acquire(.connection)
+    }
+
+    @Test func excessUploadsWaitForCapacityAndCancellationReleasesQueue() throws {
+        let controller = APIAdmissionController(policy: .init(
+            connections: 2,
+            requests: 2,
+            bufferedRequestBytes: 8,
+            uploads: 1,
+            downloads: 2,
+            expensiveOperations: 2,
+            longLivedStreams: 2
+        ))
+        let first = try controller.acquire(.upload)
+        let delivered = DispatchSemaphore(value: 0)
+        let state = AdmissionDeliveryTestState()
+        let acquisition = try controller.acquireOrWait(.upload) { lease in
+            state.append(lease)
+            delivered.signal()
+        }
+        guard case .waiting = acquisition else {
+            Issue.record("excess upload should wait")
+            return
+        }
+        #expect(delivered.wait(timeout: .now() + 0.05) == .timedOut)
+
+        first.release()
+        #expect(delivered.wait(timeout: .now() + 2) == .success)
+        #expect(controller.snapshot().uploads == 1)
+        state.take()?.release()
+        #expect(controller.snapshot().uploads == 0)
+
+        let active = try controller.acquire(.upload)
+        let canceledDelivery = DispatchSemaphore(value: 0)
+        let canceled = try controller.acquireOrWait(.upload) { lease in
+            lease.release()
+            canceledDelivery.signal()
+        }
+        guard case .waiting(let waiter) = canceled else {
+            Issue.record("excess upload should wait")
+            return
+        }
+        waiter.cancel()
+        active.release()
+        #expect(canceledDelivery.wait(timeout: .now() + 0.05) == .timedOut)
+        #expect(controller.snapshot().uploads == 0)
     }
 
     @Test func uploadWriterQueuesOrderedIOOffCallerAndClosesDurably() throws {

@@ -118,6 +118,9 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     private var bodyReceivedBytes = 0
     private var uploadWriter: DockerUploadFileWriter?
     private var uploadURL: URL?
+    private var uploadRequest = false
+    private var uploadAdmissionWaiter: APIAdmissionWaiter?
+    private var uploadAdmissionID: UUID?
     private var pendingUploadWrites = 0
     private var uploadEndPending = false
     private var uploadReadsPaused = false
@@ -166,11 +169,33 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 if let bodyExpectedBytes, bodyExpectedBytes > effectiveMaximum {
                     throw EngineError(.payloadTooLarge, "request body too large")
                 }
+                uploadRequest = upload
                 if upload {
-                    uploadLease = try admission.acquire(.upload)
-                    let opened = try Self.openUploadFile()
-                    uploadURL = opened.url
-                    uploadWriter = DockerUploadFileWriter(handle: opened.handle)
+                    let admissionID = UUID()
+                    uploadAdmissionID = admissionID
+                    let contextReference = DockerHandlerContextReference(context)
+                    let acquisition = try admission.acquireOrWait(.upload) {
+                        [self, contextReference] lease in
+                        contextReference.context.eventLoop.execute {
+                            guard self.uploadAdmissionID == admissionID else {
+                                lease.release()
+                                return
+                            }
+                            self.uploadAdmissionWaiter = nil
+                            self.uploadAdmissionID = nil
+                            self.activateCurrentUpload(
+                                lease: lease, context: contextReference.context
+                            )
+                        }
+                    }
+                    switch acquisition {
+                    case .acquired(let lease):
+                        uploadAdmissionID = nil
+                        activateCurrentUpload(lease: lease, context: context)
+                    case .waiting(let waiter):
+                        uploadAdmissionWaiter = waiter
+                        pauseUploadReads(context: context)
+                    }
                 } else {
                     bufferedBodyLease = try admission.acquire(
                         .bufferedRequestBytes, amount: bodyExpectedBytes ?? 0
@@ -193,8 +218,8 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         case .body(var chunk):
             guard !discardingRequest else { return }
             let chunkBytes = chunk.readableBytes
-            let effectiveMaximum = uploadWriter == nil
-                ? min(maximumBodyBytes, 8 * 1_024 * 1_024) : maximumBodyBytes
+            let effectiveMaximum = uploadRequest
+                ? maximumBodyBytes : min(maximumBodyBytes, 8 * 1_024 * 1_024)
             guard chunkBytes <= effectiveMaximum - bodyReceivedBytes else {
                 rejectCurrentRequest(
                     context: context,
@@ -215,36 +240,31 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 return
             }
             do {
-                if bodyExpectedBytes == nil, uploadWriter == nil {
-                    try bufferedBodyLease?.increase(by: chunkBytes)
-                }
                 bodyReceivedBytes = try CheckedArithmetic.add(
                     bodyReceivedBytes, chunkBytes
                 )
-                if let uploadWriter {
+                if uploadRequest, uploadWriter == nil {
+                    if bufferedBodyLease == nil {
+                        bufferedBodyLease = try admission.acquire(
+                            .bufferedRequestBytes, amount: 0
+                        )
+                    }
+                    try bufferedBodyLease?.increase(by: chunkBytes)
+                    body.writeBuffer(&chunk)
+                } else if let uploadWriter {
                     let lease = try admission.acquire(
                         .bufferedRequestBytes, amount: chunkBytes
                     )
-                    let payload = Data(chunk.readableBytesView)
-                    pendingUploadWrites += 1
-                    pauseUploadReads(context: context)
-                    let contextReference = DockerHandlerContextReference(context)
-                    uploadWriter.write(payload) { [self, contextReference] error in
-                        lease.release()
-                        contextReference.context.eventLoop.execute { [self, contextReference] in
-                            guard self.uploadWriter === uploadWriter else { return }
-                            self.pendingUploadWrites -= 1
-                            if let error {
-                                self.rejectCurrentRequest(
-                                    context: contextReference.context,
-                                    response: dockerErrorResponse(error)
-                                )
-                            } else if self.pendingUploadWrites == 0 && !self.uploadEndPending {
-                                self.resumeUploadReads(context: contextReference.context)
-                            }
-                        }
-                    }
+                    writeUploadPayload(
+                        Data(chunk.readableBytesView),
+                        lease: lease,
+                        writer: uploadWriter,
+                        context: context
+                    )
                 } else {
+                    if bodyExpectedBytes == nil {
+                        try bufferedBodyLease?.increase(by: chunkBytes)
+                    }
                     body.writeBuffer(&chunk)
                 }
             } catch let error as EngineError {
@@ -272,30 +292,108 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
                 )
                 return
             }
-            if let uploadWriter {
+            if uploadRequest {
                 uploadEndPending = true
                 pauseUploadReads(context: context)
-                let contextReference = DockerHandlerContextReference(context)
-                uploadWriter.finish { [self, contextReference] error in
-                    contextReference.context.eventLoop.execute { [self, contextReference] in
-                        guard self.uploadWriter === uploadWriter else { return }
-                        self.uploadWriter = nil
-                        self.pendingUploadWrites = 0
-                        self.uploadEndPending = false
-                        self.resumeUploadReads(context: contextReference.context)
-                        if let error {
-                            self.rejectCurrentRequest(
-                                context: contextReference.context,
-                                response: dockerErrorResponse(error)
-                            )
-                        } else {
-                            self.completeCurrentRequest(context: contextReference.context)
-                        }
-                    }
+                if uploadAdmissionWaiter == nil {
+                    finishCurrentUpload(context: context)
                 }
                 return
             }
             completeCurrentRequest(context: context)
+        }
+    }
+
+    private func activateCurrentUpload(
+        lease: APIAdmissionLease,
+        context: ChannelHandlerContext
+    ) {
+        do {
+            let opened = try Self.openUploadFile()
+            let writer = DockerUploadFileWriter(handle: opened.handle)
+            uploadURL = opened.url
+            uploadWriter = writer
+            uploadLease = lease
+            if body.readableBytes > 0 {
+                guard let bufferedBodyLease else {
+                    throw EngineError(.internalError, "buffered upload is not admitted")
+                }
+                self.bufferedBodyLease = nil
+                let payload = Data(body.readableBytesView)
+                body = context.channel.allocator.buffer(capacity: 0)
+                writeUploadPayload(
+                    payload,
+                    lease: bufferedBodyLease,
+                    writer: writer,
+                    context: context
+                )
+            }
+            if uploadEndPending {
+                finishCurrentUpload(context: context)
+            } else if pendingUploadWrites == 0 {
+                resumeUploadReads(context: context)
+            }
+        } catch let error as EngineError {
+            lease.release()
+            rejectCurrentRequest(context: context, response: dockerErrorResponse(error))
+        } catch {
+            lease.release()
+            rejectCurrentRequest(
+                context: context,
+                response: dockerErrorResponse(
+                    EngineError(.internalError, EngineError.message(for: error))
+                )
+            )
+        }
+    }
+
+    private func writeUploadPayload(
+        _ payload: Data,
+        lease: APIAdmissionLease,
+        writer: DockerUploadFileWriter,
+        context: ChannelHandlerContext
+    ) {
+        pendingUploadWrites += 1
+        pauseUploadReads(context: context)
+        let contextReference = DockerHandlerContextReference(context)
+        writer.write(payload) { [self, contextReference] error in
+            lease.release()
+            contextReference.context.eventLoop.execute { [self, contextReference] in
+                guard self.uploadWriter === writer else { return }
+                self.pendingUploadWrites -= 1
+                if let error {
+                    self.rejectCurrentRequest(
+                        context: contextReference.context,
+                        response: dockerErrorResponse(error)
+                    )
+                } else if self.pendingUploadWrites == 0
+                            && !self.uploadEndPending
+                            && self.uploadAdmissionWaiter == nil {
+                    self.resumeUploadReads(context: contextReference.context)
+                }
+            }
+        }
+    }
+
+    private func finishCurrentUpload(context: ChannelHandlerContext) {
+        guard let uploadWriter else { return }
+        let contextReference = DockerHandlerContextReference(context)
+        uploadWriter.finish { [self, contextReference] error in
+            contextReference.context.eventLoop.execute { [self, contextReference] in
+                guard self.uploadWriter === uploadWriter else { return }
+                self.uploadWriter = nil
+                self.pendingUploadWrites = 0
+                self.uploadEndPending = false
+                self.resumeUploadReads(context: contextReference.context)
+                if let error {
+                    self.rejectCurrentRequest(
+                        context: contextReference.context,
+                        response: dockerErrorResponse(error)
+                    )
+                } else {
+                    self.completeCurrentRequest(context: contextReference.context)
+                }
+            }
         }
     }
 
@@ -448,6 +546,7 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
         uploadWriter = nil
         pendingUploadWrites = 0
         uploadEndPending = false
+        uploadRequest = false
         bodyExpectedBytes = nil
         bodyReceivedBytes = 0
         head = nil
@@ -456,6 +555,9 @@ public final class DockerHTTPHandler: ChannelInboundHandler, RemovableChannelHan
     }
 
     private func cleanupPendingRequest() {
+        uploadAdmissionWaiter?.cancel()
+        uploadAdmissionWaiter = nil
+        uploadAdmissionID = nil
         uploadWriter?.cancel()
         uploadWriter = nil
         pendingUploadWrites = 0
