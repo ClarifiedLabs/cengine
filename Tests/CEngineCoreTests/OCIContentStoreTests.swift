@@ -483,47 +483,108 @@ import Testing
         ).isEmpty)
     }
 
-    @Test func dockerArchiveRepoTagsNameUnannotatedOCIRoots() async throws {
+    @Test func dockerArchiveRepoTagsOverrideBuildKitLocalAnnotationsAcrossLoads() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstReference = "compat-buildx:first"
+        let secondReference = "compat-buildx:second"
+        let first = try writeBuildKitDockerLayout(
+            at: root.appending(path: "first"),
+            reference: firstReference,
+            configuration: Data(#"{"architecture":"arm64","os":"linux","config":{"Labels":{"target":"first"}},"rootfs":{"type":"layers","diff_ids":[]}}"#.utf8)
+        )
+        let second = try writeBuildKitDockerLayout(
+            at: root.appending(path: "second"),
+            reference: secondReference,
+            configuration: Data(#"{"architecture":"arm64","os":"linux","config":{"Labels":{"target":"second"}},"rootfs":{"type":"layers","diff_ids":[]}}"#.utf8)
+        )
+        let store = try OCIContentStore(root: root.appending(path: "store"))
+
+        let firstImport = try await store.importLayout(root.appending(path: "first"))
+        let secondImport = try await store.importLayout(root.appending(path: "second"))
+
+        #expect(firstImport.map(\.reference) == ["docker.io/library/compat-buildx:first"])
+        #expect(secondImport.map(\.reference) == ["docker.io/library/compat-buildx:second"])
+        #expect(await store.descriptor(for: firstReference) == first)
+        #expect(await store.descriptor(for: secondReference) == second)
+        #expect(await store.descriptor(for: "local:latest") == nil)
+    }
+
+    @Test func layerlessBuildKitDockerArchiveAcceptsNullDiffIDs() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let layout = root.appending(path: "layout")
-        let blobs = layout.appending(path: "blobs/sha256")
-        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
-        let configData = Data(#"{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#.utf8)
-        let configDigest = SHA256.hash(data: configData).map { String(format: "%02x", $0) }.joined()
-        try configData.write(to: blobs.appending(path: configDigest))
-        let config = OCIDescriptor(
-            mediaType: "application/vnd.oci.image.config.v1+json",
-            digest: "sha256:\(configDigest)",
-            size: Int64(configData.count)
+        let configuration = Data(
+            #"{"architecture":"arm64","os":"linux","config":{"Labels":{"probe.marker":"layerless"}},"rootfs":{"type":"layers","diff_ids":null}}"#.utf8
         )
-        let manifestData = try JSONEncoder().encode(OCIManifest(
-            schemaVersion: 2,
-            mediaType: "application/vnd.oci.image.manifest.v1+json",
-            config: config,
-            layers: [],
-            annotations: nil
-        ))
-        let manifestDigest = SHA256.hash(data: manifestData).map { String(format: "%02x", $0) }.joined()
-        try manifestData.write(to: blobs.appending(path: manifestDigest))
-        let manifest = OCIDescriptor(
-            mediaType: "application/vnd.oci.image.manifest.v1+json",
-            digest: "sha256:\(manifestDigest)",
-            size: Int64(manifestData.count)
+        _ = try writeBuildKitDockerLayout(
+            at: layout,
+            reference: "compat-buildx:layerless",
+            configuration: configuration
         )
-        try JSONEncoder().encode(OCIIndex(
-            schemaVersion: 2,
-            mediaType: "application/vnd.oci.image.index.v1+json",
-            manifests: [manifest],
-            annotations: nil
-        )).write(to: layout.appending(path: "index.json"))
-        try Data(#"[{"Config":"blobs/sha256/\#(configDigest)","RepoTags":["compat-buildx:test"],"Layers":[]}]"#.utf8)
-            .write(to: layout.appending(path: "manifest.json"))
-
         let store = try OCIContentStore(root: root.appending(path: "store"))
-        let imported = try await store.importLayout(layout)
 
-        #expect(imported.map(\.reference) == ["docker.io/library/compat-buildx:test"])
-        #expect(await store.descriptor(for: "compat-buildx:test") == manifest)
+        let imported = try await store.importLayout(layout)
+        let decoded = try JSONDecoder().decode(OCIImageConfiguration.self, from: configuration)
+
+        #expect(imported.map(\.reference) == ["docker.io/library/compat-buildx:layerless"])
+        #expect(decoded.rootfs.diffIDs.isEmpty)
+        #expect(imported.first?.manifests.first?.configuration?.rootFSDiffIDs == [])
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                OCIImageConfiguration.self,
+                from: Data(#"{"architecture":"arm64","os":"linux","rootfs":{"type":"layers"}}"#.utf8)
+            )
+        }
     }
+}
+
+private func writeBuildKitDockerLayout(
+    at layout: URL,
+    reference: String,
+    configuration: Data
+) throws -> OCIDescriptor {
+    let blobs = layout.appending(path: "blobs/sha256")
+    try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+    let configDigest = SHA256.hash(data: configuration).map {
+        String(format: "%02x", $0)
+    }.joined()
+    try configuration.write(to: blobs.appending(path: configDigest))
+    let config = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.config.v1+json",
+        digest: "sha256:\(configDigest)",
+        size: Int64(configuration.count)
+    )
+    let manifestData = try JSONEncoder().encode(OCIManifest(
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        config: config,
+        layers: [],
+        annotations: nil
+    ))
+    let manifestDigest = SHA256.hash(data: manifestData).map {
+        String(format: "%02x", $0)
+    }.joined()
+    try manifestData.write(to: blobs.appending(path: manifestDigest))
+    let manifest = OCIDescriptor(
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        digest: "sha256:\(manifestDigest)",
+        size: Int64(manifestData.count),
+        annotations: [
+            "io.containerd.image.name": reference,
+            "org.opencontainers.image.ref.name": "local",
+        ]
+    )
+    try JSONEncoder().encode(OCIIndex(
+        schemaVersion: 2,
+        mediaType: "application/vnd.oci.image.index.v1+json",
+        manifests: [manifest],
+        annotations: nil
+    )).write(to: layout.appending(path: "index.json"))
+    try JSONSerialization.data(withJSONObject: [[
+        "Config": "blobs/sha256/\(configDigest)",
+        "RepoTags": [reference],
+        "Layers": [],
+    ]], options: [.sortedKeys]).write(to: layout.appending(path: "manifest.json"))
+    return manifest
 }

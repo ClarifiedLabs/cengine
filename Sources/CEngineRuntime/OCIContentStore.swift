@@ -70,6 +70,21 @@ public struct OCIImageConfiguration: Codable, Sendable {
         public var diffIDs: [String]
 
         enum CodingKeys: String, CodingKey { case type; case diffIDs = "diff_ids" }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            type = try values.decode(String.self, forKey: .type)
+            guard values.contains(.diffIDs) else {
+                throw DecodingError.keyNotFound(
+                    CodingKeys.diffIDs,
+                    .init(
+                        codingPath: values.codingPath,
+                        debugDescription: "image rootfs requires diff_ids"
+                    )
+                )
+            }
+            diffIDs = try values.decodeIfPresent([String].self, forKey: .diffIDs) ?? []
+        }
     }
 
     public struct Configuration: Codable, Sendable {
@@ -650,17 +665,17 @@ public actor OCIContentStore {
             let selected = Set((selectedImages + selectedAttestations).map(\.digest))
             var seen = Set<String>()
             try importDescriptor(descriptor, selectedLeaves: selected, from: directory, seen: &seen)
-            var descriptorReferences: [String] = []
-            if let reference = descriptor.annotations?["org.opencontainers.image.ref.name"]
-                ?? descriptor.annotations?["io.containerd.image.name"] {
-                descriptorReferences.append(reference)
-            }
             let configurations = try Set(selectedImages.map {
                 try decoder.decode(OCIManifest.self, from: layoutData(for: $0, directory: directory)).config.digest
             })
-            descriptorReferences.append(contentsOf: archiveEntries.compactMap { entry in
+            var descriptorReferences = archiveEntries.compactMap { entry in
                 configurations.contains(entry.configDigest) ? entry.repoTags : nil
-            }.flatMap { $0 })
+            }.flatMap { $0 }
+            if descriptorReferences.isEmpty,
+               let reference = descriptor.annotations?["io.containerd.image.name"]
+                    ?? descriptor.annotations?["org.opencontainers.image.ref.name"] {
+                descriptorReferences.append(reference)
+            }
             if descriptorReferences.isEmpty { descriptorReferences = [descriptor.digest] }
             for reference in Set(descriptorReferences) {
                 let normalized = ImageReference.normalized(reference)

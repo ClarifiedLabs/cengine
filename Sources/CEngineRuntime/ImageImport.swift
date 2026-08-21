@@ -43,39 +43,44 @@ extension EngineRuntime {
         let loaded = try await backend.loadImages(
             fromOCILayout: layout, platforms: platforms
         )
-        var recordsByID: [String: ImageRecord] = [:]
+        var referenceOwners: [String: String] = [:]
         for image in loaded {
-            if var record = recordsByID[image.id] {
-                record.references = Array(Set(record.references + [image.reference])).sorted()
-                recordsByID[image.id] = record
-            } else {
-                let existingReferences = snapshot.images.first(where: {
-                    $0.id == image.id
-                })?.references ?? []
-                recordsByID[image.id] = ImageRecord(
-                    id: image.id,
-                    references: Array(
-                        Set(existingReferences + [image.reference])
-                    ).sorted(),
-                    createdAt: image.createdAt,
-                    size: image.size,
-                    architecture: image.architecture,
-                    os: image.os,
-                    targetDescriptor: image.targetDescriptor,
-                    manifests: image.manifests,
-                    preferredManifestDigest: image.preferredManifestDigest,
-                    identity: image.identity
-                )
+            referenceOwners[image.reference] = image.id
+        }
+        var recordsByID: [String: ImageRecord] = [:]
+        for image in loaded where recordsByID[image.id] == nil {
+            let importedReferences = referenceOwners.compactMap { reference, owner in
+                owner == image.id ? reference : nil
             }
+            guard !importedReferences.isEmpty else { continue }
+            let existingReferences = snapshot.images.first(where: {
+                $0.id == image.id
+            })?.references.filter {
+                referenceOwners[$0].map { $0 == image.id } ?? true
+            } ?? []
+            recordsByID[image.id] = ImageRecord(
+                id: image.id,
+                references: Array(Set(existingReferences + importedReferences)).sorted(),
+                createdAt: image.createdAt,
+                size: image.size,
+                architecture: image.architecture,
+                os: image.os,
+                targetDescriptor: image.targetDescriptor,
+                manifests: image.manifests,
+                preferredManifestDigest: image.preferredManifestDigest,
+                identity: image.identity
+            )
         }
         let records = recordsByID.values.sorted { $0.id < $1.id }
-        for record in records {
-            snapshot.images.removeAll {
-                $0.id == record.id
-                    || !$0.references.filter(record.references.contains).isEmpty
-            }
-            snapshot.images.append(record)
+        let loadedIDs = Set(records.map(\.id))
+        let loadedReferences = Set(records.flatMap(\.references))
+        snapshot.images = snapshot.images.compactMap { existing in
+            guard !loadedIDs.contains(existing.id) else { return nil }
+            var retained = existing
+            retained.references.removeAll(where: loadedReferences.contains)
+            return retained.references.isEmpty ? nil : retained
         }
+        snapshot.images.append(contentsOf: records)
         try await persist()
         for record in records {
             emitImageEvent("load", id: record.id, name: record.id)

@@ -414,3 +414,50 @@ def test_buildx_relaunches_missing_stopped_container_shim(daemon, client: docker
             env=docker_environment(docker_host), stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, timeout=60,
         )
+
+
+@pytest.mark.compat("BLD-007")
+def test_buildx_bake_load_immediately_publishes_every_target(
+    daemon, client: docker.DockerClient, managed_docker_integration, tmp_path: pathlib.Path,
+):
+    managed = managed_docker_integration
+    suffix = uuid.uuid4().hex[:8]
+    references = {
+        "first": f"compat-bake-first:{suffix}",
+        "second": f"compat-bake-second:{suffix}",
+    }
+    for reference in references.values():
+        managed.register_image(reference)
+    (tmp_path / "Dockerfile").write_text(
+        "FROM mirror.gcr.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b\n"
+        "ARG TARGET\n"
+        "RUN printf '%s' \"$TARGET\" >/target\n"
+        "LABEL compat.cengine.bake-target=$TARGET\n"
+    )
+    targets = "\n".join(
+        f'''target "{target}" {{
+  context = "{tmp_path}"
+  dockerfile = "Dockerfile"
+  args = {{ TARGET = "{target}" }}
+  tags = ["{reference}"]
+}}'''
+        for target, reference in references.items()
+    )
+    bake_file = tmp_path / "docker-bake.hcl"
+    bake_file.write_text(targets + "\n")
+
+    result = managed.run(
+        "--context", "cengine", "buildx", "bake",
+        f"--allow=fs.read={tmp_path}", "--file", str(bake_file),
+        "--load", "first", "second", timeout=300,
+    )
+
+    assert "ERROR" not in result.stdout
+    image_ids = set()
+    for target, reference in references.items():
+        image = client.images.get(reference)
+        image_ids.add(image.id)
+        assert image.labels["compat.cengine.bake-target"] == target
+    assert len(image_ids) == len(references)
+    with pytest.raises(docker.errors.ImageNotFound):
+        client.images.get("local:latest")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -26,6 +27,63 @@ MULTI_PLATFORM_IMAGE = "mirror.gcr.io/library/alpine:latest"
 BUSYBOX = "busybox:latest"
 REGISTRY_IMAGE = "registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
 REGISTRY_AUTH = {"username": "compat", "password": "compat-password"}
+
+
+def layerless_buildkit_archive(reference: str) -> bytes:
+    def encoded(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    config = encoded({
+        "architecture": "arm64",
+        "os": "linux",
+        "config": {"Labels": {"compat.cengine.layerless": "true"}},
+        "rootfs": {"type": "layers", "diff_ids": None},
+    })
+    config_digest = hashlib.sha256(config).hexdigest()
+    manifest = encoded({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": f"sha256:{config_digest}",
+            "size": len(config),
+        },
+        "layers": [],
+    })
+    manifest_digest = hashlib.sha256(manifest).hexdigest()
+    descriptor = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": f"sha256:{manifest_digest}",
+        "size": len(manifest),
+        "annotations": {
+            "io.containerd.image.name": reference,
+            "org.opencontainers.image.ref.name": "local",
+        },
+    }
+    entries = {
+        "oci-layout": encoded({"imageLayoutVersion": "1.0.0"}),
+        "index.json": encoded({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [descriptor],
+        }),
+        "manifest.json": encoded([{
+            "Config": f"blobs/sha256/{config_digest}",
+            "RepoTags": [reference],
+            "Layers": [],
+        }]),
+        f"blobs/sha256/{config_digest}": config,
+        f"blobs/sha256/{manifest_digest}": manifest,
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, contents in sorted(entries.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(contents)
+            archive.addfile(info, io.BytesIO(contents))
+    return buffer.getvalue()
+
+
 REGISTRY_FIXTURE = pathlib.Path(__file__).resolve().parents[1] / "Fixtures/registry"
 KNOWN_GAP = pytest.mark.xfail(strict=True)
 
@@ -375,3 +433,17 @@ def test_docker_cli_saves_multiple_images(client: docker.DockerClient, daemon, t
     }
     assert expected_configs <= exported_configs
     assert all(entry["RepoTags"] and all(entry["RepoTags"]) for entry in manifest)
+
+
+@pytest.mark.compat("IMG-025")
+def test_load_layerless_buildkit_archive_uses_docker_tag(client: docker.DockerClient):
+    reference = f"compat-layerless:{uuid.uuid4().hex[:8]}"
+
+    loaded = client.images.load(layerless_buildkit_archive(reference))
+
+    assert len(loaded) == 1
+    image = client.images.get(reference)
+    assert image.labels["compat.cengine.layerless"] == "true"
+    assert image.attrs["RootFS"]["Layers"] == []
+    with pytest.raises(errors.ImageNotFound):
+        client.images.get("local:latest")

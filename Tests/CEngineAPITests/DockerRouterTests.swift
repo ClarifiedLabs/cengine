@@ -238,6 +238,27 @@ private actor CompletionBackend: ContainerBackend {
     }
 }
 
+private actor SequencedImageLoadBackend: ContainerBackend {
+    private var batches: [[BackendImage]]
+
+    init(_ batches: [[BackendImage]]) {
+        self.batches = batches
+    }
+
+    func pullImage(_: String, platform _: String) async throws {}
+    func prepare(_: ContainerRecord) async throws {}
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func delete(_: ContainerRecord) async throws {}
+    func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
+        guard !batches.isEmpty else {
+            throw EngineError(.internalError, "unexpected image load")
+        }
+        return batches.removeFirst()
+    }
+}
+
 private actor NetworkRecordingBackend: ContainerBackend {
     private var requests: [String: NetworkRecord] = [:]
 
@@ -7075,6 +7096,55 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(load?.action == "load")
         #expect(load?.id == "sha256:0123456789abcdef")
         #expect(load?.attributes["name"] == load?.id)
+    }
+
+    @Test func imageLoadMovesOnlyOverlappingTagsBetweenImages() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstID = "sha256:" + String(repeating: "2", count: 64)
+        let secondID = "sha256:" + String(repeating: "1", count: 64)
+        func image(_ id: String, _ reference: String) -> BackendImage {
+            BackendImage(
+                id: id,
+                reference: reference,
+                size: 1,
+                architecture: "arm64",
+                os: "linux"
+            )
+        }
+        let backend = SequencedImageLoadBackend([
+            [
+                image(firstID, "docker.io/library/local:latest"),
+                image(firstID, "docker.io/library/compat-buildx:first"),
+            ],
+            [
+                image(secondID, "docker.io/library/local:latest"),
+                image(secondID, "docker.io/library/compat-buildx:second"),
+                image(firstID, "docker.io/library/compat-buildx:first-alias"),
+            ],
+        ])
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+        let archive = OCIArchive.tar(entries: [("placeholder", Data())])
+
+        for _ in 0..<2 {
+            let response = await router.route(.init(
+                method: .POST,
+                uri: "/v1.44/images/load",
+                body: archive
+            ))
+            #expect(response.status == .ok)
+        }
+
+        #expect(try await runtime.image("compat-buildx:first").references == [
+            "docker.io/library/compat-buildx:first",
+            "docker.io/library/compat-buildx:first-alias",
+        ])
+        #expect(Set(try await runtime.image("compat-buildx:second").references) == [
+            "docker.io/library/compat-buildx:second",
+            "docker.io/library/local:latest",
+        ])
+        #expect(try await runtime.image("local:latest").id == secondID)
     }
 
     @Test func startingAStoppedContainerPreservesItsPreparedBackend() async throws {
