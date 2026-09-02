@@ -16,6 +16,20 @@ Containerization and does not run a shared Linux VM containing Docker.
   disk. Start boots a fresh guest from that disk and launches the workload as PID
   1 in new PID, mount, IPC, UTS, network, and cgroup namespaces.
 
+Shim Unix sockets use an owner-only, randomly named boot-session directory such
+as `/tmp/ce-501-<nonce>`. The short temporary path is required by Darwin's Unix
+socket path limit, but its ownership record is durable: the cengine data root
+stores the boot-session UUID, canonical path, owner UID, volume UUID, and inode.
+Daemon replacements in the same boot reopen only that exact directory identity;
+a new boot creates and records a fresh random directory without deleting a path
+that may now belong to another process.
+
+Cleanup also treats the persisted generation journal as the authority. A
+same-boot directory identity mismatch fails closed. A generation proven to
+predate the current boot may retire its stale publication only after confirming
+that none of its recorded artifact, staging, or claim names exist in the
+replacement directory; it never removes or changes the replacement directory.
+
 ## Workload and exec semantics
 
 The workload ext4 filesystem replaces `/` in the workload mount namespace; it is

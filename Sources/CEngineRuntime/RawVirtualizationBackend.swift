@@ -3313,6 +3313,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     static let completedExecSnapshotGlobalBytes = 256 * 1_024 * 1_024
 
     private let root: URL
+    private let runtimeNamespace: VMShimRuntimeNamespace
     private let containersStateDirectory: PersistentStateDirectory
     private let deletedContainersStateDirectory: PersistentStateDirectory
     private let kernel: URL
@@ -3392,6 +3393,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
         self.kernel = kernel
         self.containerInitialRamdisk = containerInitialRamdisk
         self.automaticNetworkPool = automaticNetworkPool
+        let runtimeNamespace = try VMShimRuntimeNamespace.acquire(
+            stateDirectory: PersistentStateDirectory.open(dataRoot)
+        )
+        self.runtimeNamespace = runtimeNamespace
         let containers = dataRoot.appending(path: "containers", directoryHint: .isDirectory)
         let deletedContainers = dataRoot.appending(
             path: "deleted-containers", directoryHint: .isDirectory
@@ -3465,15 +3470,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
             cpus: 2,
             memoryBytes: 1 * 1_024 * 1_024 * 1_024,
             macAddress: "02:ce:00:00:00:01",
-            socketPath: try Self.makeRuntimeSocketPath(),
+            socketPath: try runtimeNamespace.makeSocketPath(),
             logPath: infrastructureRoot.appending(path: "shim.log").path,
             kernelArguments: [
                 tokenIssuer.kernelArgument,
                 "cengine.management_address=\(Self.managementServerAddress)/10",
                 "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
             ],
-            fileSystemSocketPath: try Self.makeRuntimeSocketPath(),
-            networkSocketPath: try Self.makeRuntimeSocketPath(),
+            fileSystemSocketPath: try runtimeNamespace.makeSocketPath(),
+            networkSocketPath: try runtimeNamespace.makeSocketPath(),
             networkNamespace: networkNamespace,
             vlans: [VMShimProtocol.managementVLAN]
         )
@@ -6673,7 +6678,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 guard case .socket(let socket) = source else { return nil }
                 return .init(path: socket.path.path, port: socket.port)
             }.sorted { $0.port < $1.port },
-            socketPath: try Self.makeRuntimeSocketPath(),
+            socketPath: try runtimeNamespace.makeSocketPath(),
             logPath: directory.appending(path: "shim.log").path,
             kernelArguments: [
                 "cengine.management_address=\(Self.managementAddress(for: container.id))",
@@ -7017,7 +7022,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         var specification = shim.specification
         specification.generation += 1
         specification.token = Self.randomToken()
-        specification.socketPath = try Self.makeRuntimeSocketPath()
+        specification.socketPath = try runtimeNamespace.makeSocketPath()
         specification.volumeDisks = try ensureVolumeDisks(names: desiredNames)
         try prepared.artifacts.validate(in: containerDirectory)
         let replacement = try await launchTrackedShim(
@@ -7214,21 +7219,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return path
     }
 
+    private static let ephemeralRuntimeNamespace: Result<VMShimRuntimeNamespace, Error> = Result {
+        try VMShimRuntimeNamespace.createEphemeral()
+    }
+
+    /// Focused shim tests construct specifications without a complete backend.
+    /// Production allocations use the backend's persisted boot-session namespace.
     static func makeRuntimeSocketPath() throws -> String {
-        let directory = "/tmp/cengine-\(getuid())"
-        if Darwin.mkdir(directory, 0o700) != 0, errno != EEXIST {
-            throw EngineError(.internalError, "could not create shim runtime directory: \(String(cString: strerror(errno)))")
-        }
-        var metadata = stat()
-        guard Darwin.lstat(directory, &metadata) == 0,
-              metadata.st_mode & S_IFMT == S_IFDIR,
-              metadata.st_uid == getuid() else {
-            throw EngineError(.unauthorized, "shim runtime directory is not owned by the current user")
-        }
-        guard Darwin.chmod(directory, 0o700) == 0 else {
-            throw EngineError(.internalError, "could not secure shim runtime directory: \(String(cString: strerror(errno)))")
-        }
-        return "\(directory)/\(UUID().uuidString).sock"
+        try ephemeralRuntimeNamespace.get().makeSocketPath()
     }
 
     private static func randomToken() -> String {

@@ -2618,6 +2618,122 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         )
     }
 
+    @Test func prebootRuntimeCleanupRetiresModernReplacedDirectoryWithoutMutation() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let containerURL = root.appending(path: "containers/preboot-runtime-replacement")
+        let runtimeURL = URL(
+            filePath: "/tmp/ce-pr-\(UUID().uuidString.prefix(8).lowercased())",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: containerURL, withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeURL, withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: runtimeURL)
+        }
+
+        let container = ContainerRecord(
+            id: "preboot-runtime-replacement",
+            name: "preboot-runtime-replacement",
+            image: "alpine"
+        )
+        let specification = VMShimProtocol.Specification(
+            containerID: container.id,
+            generation: 1,
+            token: "preboot-runtime-replacement-token",
+            kernelPath: "/kernel",
+            initialRamdiskPath: "/initramfs",
+            rootDiskPath: containerURL.appending(path: "root.ext4").path,
+            cpus: 1,
+            memoryBytes: 268_435_456,
+            macAddress: "02:ce:00:00:00:01",
+            socketPath: runtimeURL.appending(path: "shim.sock").path,
+            logPath: containerURL.appending(path: "shim.log").path
+        )
+        let files = try VMShimClient.preparePersistentSpawn(
+            specification: specification,
+            container: container,
+            containerDirectory: PersistentStateDirectory.open(containerURL),
+            executable: URL(filePath: "/usr/bin/yes")
+        )
+        let currentIntent = try JSONDecoder().decode(
+            VMShimClient.PersistentLaunchIntent.self,
+            from: Data(contentsOf: files.intentURL)
+        )
+        let intent = VMShimClient.PersistentLaunchIntent(
+            nonce: currentIntent.nonce,
+            createdAt: .distantPast,
+            specificationPath: currentIntent.specificationPath,
+            executablePath: currentIntent.executablePath,
+            containerDirectoryIdentity: currentIntent.containerDirectoryIdentity,
+            generationsDirectoryIdentity: currentIntent.generationsDirectoryIdentity,
+            generationDirectoryIdentity: currentIntent.generationDirectoryIdentity,
+            specification: currentIntent.specification,
+            container: currentIntent.container
+        )
+        let generation = try PersistentStateDirectory.open(files.directory)
+        try generation.replaceRegularFile(
+            named: "intent.json", data: try JSONEncoder().encode(intent)
+        )
+        let launch = VMShimClient.PersistentLaunchRecord(
+            nonce: intent.nonce,
+            createdAt: intent.createdAt,
+            specificationPath: intent.specificationPath,
+            executablePath: intent.executablePath,
+            containerDirectoryIdentity: intent.containerDirectoryIdentity,
+            generationsDirectoryIdentity: intent.generationsDirectoryIdentity,
+            generationDirectoryIdentity: intent.generationDirectoryIdentity,
+            specification: specification,
+            processIdentifier: Int32.max,
+            processStartTime: UInt64.max,
+            container: container
+        )
+        try generation.replaceRegularFile(
+            named: "launch.json", data: try JSONEncoder().encode(launch)
+        )
+
+        let publication = try VMShimClient.preparePersistentRuntimeArtifacts(
+            intentURL: files.intentURL,
+            socketPaths: [specification.socketPath],
+            statusPath: specification.socketPath + ".status"
+        )
+        let listener = try UnixSocket.listen(
+            path: publication.stagedPath(for: specification.socketPath)
+        )
+        try Data("old-status".utf8).write(to: URL(
+            filePath: publication.stagedPath(for: specification.socketPath + ".status")
+        ))
+        let runtimeRecord = try VMShimClient.publishPersistentRuntimeArtifacts(publication)
+        Darwin.close(listener)
+
+        try FileManager.default.removeItem(at: runtimeURL)
+        try FileManager.default.createDirectory(
+            at: runtimeURL, withIntermediateDirectories: false
+        )
+        let sentinel = runtimeURL.appending(path: "replacement-sentinel")
+        try Data("replacement".utf8).write(to: sentinel)
+
+        try VMShimClient.cleanupPersistentRuntimeArtifacts(intentURL: files.intentURL)
+        #expect(try Data(contentsOf: sentinel) == Data("replacement".utf8))
+        for artifact in runtimeRecord.artifacts {
+            #expect(!FileManager.default.fileExists(
+                atPath: runtimeURL.appending(path: artifact.name).path
+            ))
+        }
+
+        let collisionName = try #require(runtimeRecord.artifacts.first?.name)
+        let collision = runtimeURL.appending(path: collisionName)
+        try Data("replacement-collision".utf8).write(to: collision)
+        #expect(throws: PersistentRuntimeArtifactOwnershipUnresolvedError.self) {
+            try VMShimClient.cleanupPersistentRuntimeArtifacts(intentURL: files.intentURL)
+        }
+        #expect(try Data(contentsOf: collision) == Data("replacement-collision".utf8))
+    }
+
     @Test func persistentRuntimePublicationFencesEveryGenerationAndRuntimeAncestor() throws {
         enum RelocatedChain: CaseIterable, Equatable { case generation, runtime }
 
@@ -7262,6 +7378,166 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
     #endif
 
     #if os(macOS)
+    @Test func runtimeNamespaceReusesOneBootAndRotatesForTheNext() throws {
+        let stateURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let parentURL = URL(
+            filePath: "/tmp/cr-\(UUID().uuidString.prefix(8).lowercased())",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: stateURL, withIntermediateDirectories: false
+        )
+        try FileManager.default.createDirectory(
+            at: parentURL, withIntermediateDirectories: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: stateURL)
+            try? FileManager.default.removeItem(at: parentURL)
+        }
+        let state = try PersistentStateDirectory.open(stateURL)
+        let firstBoot = UUID()
+        let secondBoot = UUID()
+        let first = try VMShimRuntimeNamespace.acquire(
+            stateDirectory: state,
+            runtimeParentURL: parentURL,
+            bootSessionUUID: firstBoot,
+            nonceProvider: { String(repeating: "1", count: 32) }
+        )
+        let firstSocket = try first.makeSocketPath()
+        var information = stat()
+        #expect(Darwin.lstat(first.url.path, &information) == 0)
+        #expect(information.st_uid == getuid())
+        #expect(information.st_mode & 0o7777 == 0o700)
+        #expect(firstSocket.hasPrefix(first.url.path + "/"))
+        #expect(firstSocket.utf8.count < MemoryLayout<sockaddr_un>.size - 2)
+        #expect(!first.url.lastPathComponent.elementsEqual("cengine-\(getuid())"))
+
+        let reused = try VMShimRuntimeNamespace.acquire(
+            stateDirectory: state,
+            runtimeParentURL: parentURL,
+            bootSessionUUID: firstBoot,
+            nonceProvider: { String(repeating: "2", count: 32) }
+        )
+        #expect(reused.url == first.url)
+        #expect(reused.directory.identity == first.directory.identity)
+
+        let oldSentinel = first.url.appending(path: "old-epoch-sentinel")
+        try Data("old".utf8).write(to: oldSentinel)
+        let rotated = try VMShimRuntimeNamespace.acquire(
+            stateDirectory: state,
+            runtimeParentURL: parentURL,
+            bootSessionUUID: secondBoot,
+            nonceProvider: { String(repeating: "2", count: 32) }
+        )
+        #expect(rotated.url != first.url)
+        #expect(rotated.directory.identity != first.directory.identity)
+        #expect(try Data(contentsOf: oldSentinel) == Data("old".utf8))
+        let recordData = try #require(try state.readRegularFile(
+            named: VMShimRuntimeNamespace.epochRecordName
+        ))
+        let record = try JSONDecoder().decode(
+            VMShimRuntimeNamespace.EpochRecord.self, from: recordData
+        )
+        #expect(record.bootSessionUUID == secondBoot)
+        #expect(record.directoryPath == rotated.url.path)
+        #expect(record.directoryIdentity == rotated.directory.identity)
+    }
+
+    @Test func runtimeNamespaceSkipsPreexistingRandomCandidateWithoutMutation() throws {
+        let stateURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let parentURL = URL(
+            filePath: "/tmp/cr-\(UUID().uuidString.prefix(8).lowercased())",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: stateURL, withIntermediateDirectories: false
+        )
+        try FileManager.default.createDirectory(
+            at: parentURL, withIntermediateDirectories: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: stateURL)
+            try? FileManager.default.removeItem(at: parentURL)
+        }
+
+        let firstNonce = String(repeating: "c", count: 32)
+        let secondNonce = String(repeating: "d", count: 32)
+        let collision = parentURL.appending(
+            path: "ce-\(getuid())-\(firstNonce.prefix(24))",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: collision, withIntermediateDirectories: false
+        )
+        let sentinel = collision.appending(path: "foreign-sentinel")
+        try Data("foreign".utf8).write(to: sentinel)
+        var nonces = [firstNonce, secondNonce]
+
+        let namespace = try VMShimRuntimeNamespace.acquire(
+            stateDirectory: PersistentStateDirectory.open(stateURL),
+            runtimeParentURL: parentURL,
+            bootSessionUUID: UUID(),
+            nonceProvider: { nonces.removeFirst() }
+        )
+
+        #expect(namespace.url != collision)
+        #expect(namespace.url.lastPathComponent == "ce-\(getuid())-\(secondNonce.prefix(24))")
+        #expect(try Data(contentsOf: sentinel) == Data("foreign".utf8))
+    }
+
+    @Test func runtimeNamespaceRejectsSameBootReplacementAndInsecureMode() throws {
+        let stateURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let parentURL = URL(
+            filePath: "/tmp/cr-\(UUID().uuidString.prefix(8).lowercased())",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: stateURL, withIntermediateDirectories: false
+        )
+        try FileManager.default.createDirectory(
+            at: parentURL, withIntermediateDirectories: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: stateURL)
+            try? FileManager.default.removeItem(at: parentURL)
+        }
+        let state = try PersistentStateDirectory.open(stateURL)
+        let boot = UUID()
+        let namespace = try VMShimRuntimeNamespace.acquire(
+            stateDirectory: state,
+            runtimeParentURL: parentURL,
+            bootSessionUUID: boot,
+            nonceProvider: { String(repeating: "a", count: 32) }
+        )
+
+        #expect(Darwin.chmod(namespace.url.path, 0o755) == 0)
+        #expect(throws: EngineError.self) {
+            _ = try VMShimRuntimeNamespace.acquire(
+                stateDirectory: state,
+                runtimeParentURL: parentURL,
+                bootSessionUUID: boot
+            )
+        }
+        #expect(Darwin.chmod(namespace.url.path, 0o700) == 0)
+
+        let detached = parentURL.appending(path: "detached")
+        try FileManager.default.moveItem(at: namespace.url, to: detached)
+        try FileManager.default.createDirectory(
+            at: namespace.url, withIntermediateDirectories: false
+        )
+        #expect(Darwin.chmod(namespace.url.path, 0o700) == 0)
+        let sentinel = namespace.url.appending(path: "replacement-sentinel")
+        try Data("replacement".utf8).write(to: sentinel)
+        #expect(throws: EngineError.self) {
+            _ = try VMShimRuntimeNamespace.acquire(
+                stateDirectory: state,
+                runtimeParentURL: parentURL,
+                bootSessionUUID: boot
+            )
+        }
+        #expect(try Data(contentsOf: sentinel) == Data("replacement".utf8))
+    }
+
     @Test func runtimeSocketsRemainBelowDarwinPathLimitForLongDataRoots() throws {
         let socket = try RawVirtualizationBackend.makeRuntimeSocketPath()
         let longRoot = "/tmp/" + String(repeating: "nested-data-root/", count: 20)
@@ -7280,7 +7556,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         )
 
         #expect(socket.utf8.count < 104)
-        #expect(socket.hasPrefix("/tmp/cengine-\(getuid())/"))
+        #expect(socket.hasPrefix("/tmp/ce-\(getuid())-"))
         #expect(
             VMShimClient.specificationURL(for: specification).path
                 == URL(filePath: longRoot).appending(path: "shim.json").path

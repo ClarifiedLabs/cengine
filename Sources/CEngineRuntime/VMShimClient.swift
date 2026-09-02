@@ -2616,9 +2616,12 @@ public final class VMShimClient: @unchecked Sendable {
             ],
             observed: [generation.identity, runtime.identity]
         ), runtime.pathStillNamesThisDirectory() else {
-            guard record.generationDirectoryIdentity.volumeUUID == nil,
-                  record.runtimeDirectoryIdentity.volumeUUID == nil,
-                  launchPredatesCurrentBoot(launchCreatedAt) else {
+            // No process or socket listener can survive a macOS reboot. If this
+            // fully validated launch predates the current boot, a directory now
+            // reachable at the same lexical path is a replacement. Never mutate
+            // that replacement; only prove that none of this generation's
+            // unpredictable names has reappeared before retiring its journal.
+            guard launchPredatesCurrentBoot(launchCreatedAt) else {
                 throw PersistentRuntimeArtifactOwnershipUnresolvedError(
                     message: "VM shim runtime directory ownership is missing or changed"
                 )
