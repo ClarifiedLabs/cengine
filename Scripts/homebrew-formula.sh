@@ -27,10 +27,10 @@ cask "cengine" do
 
   pkg "cengine-${version}.pkg"
 
-  postflight do
-    system_command "/usr/bin/open",
-                   args: ["/Applications/cengine.app", "--args", "--opened-by-installer"],
-                   must_succeed: false
+  postflight_steps do
+    run "/usr/bin/open",
+        args:         ["/Applications/cengine.app", "--args", "--opened-by-installer"],
+        must_succeed: false
   end
 
   uninstall early_script: {

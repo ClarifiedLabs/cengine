@@ -29,10 +29,12 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn('depends_on formula: "docker"', cask)
             self.assertNotIn('depends_on macos: ">= :tahoe"', cask)
             self.assertIn('pkg "cengine-1.2.3.pkg"', cask)
-            self.assertIn("postflight do", cask)
-            self.assertIn('system_command "/usr/bin/open"', cask)
+            self.assertIn("postflight_steps do", cask)
+            self.assertNotIn("postflight do", cask)
+            self.assertIn('run "/usr/bin/open"', cask)
+            self.assertNotIn("system_command", cask)
             self.assertIn(
-                'args: ["/Applications/cengine.app", "--args", "--opened-by-installer"]',
+                '["/Applications/cengine.app", "--args", "--opened-by-installer"]',
                 cask,
             )
             self.assertEqual(cask.count("must_succeed: false"), 2)
