@@ -42,6 +42,8 @@ jobs:
           set -euo pipefail
           version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
           case "$version" in 26|26.*) ;; *) echo "Xcode 26 is required; found $version" >&2; exit 1;; esac
+      - name: Validate Homebrew cask
+        run: python3 tools/tests/test-homebrew-formula.py
       - name: Cache Xcode Swift packages
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:

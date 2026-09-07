@@ -8,7 +8,10 @@ def main() -> None:
     kernel_release = read(REPO_ROOT / ".github/workflows/kernel-release.yml")
     makefile = read(REPO_ROOT / "Makefile")
     engine_entitlements = read(REPO_ROOT / "Configuration/cengine.entitlements")
-    for needle in ("- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: macos-26", "make test"):
+    for needle in (
+        "- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: macos-26", "make test",
+        "python3 tools/tests/test-homebrew-formula.py",
+    ):
         require_contains(test, needle, "test.yml")
     for needle in (
         "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
