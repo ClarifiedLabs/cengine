@@ -50,6 +50,39 @@ func TestApplyLayerResolvesForwardHardlinks(t *testing.T) {
 	}
 }
 
+func TestApplyLayerPreservesSpecialModesAfterPopulatingDirectory(t *testing.T) {
+	root := t.TempDir()
+	var archive bytes.Buffer
+	writer := tar.NewWriter(&archive)
+	for _, header := range []*tar.Header{
+		{Name: "data", Typeflag: tar.TypeDir, Mode: 03770},
+		{Name: "data/file", Typeflag: tar.TypeReg, Mode: 06750},
+	} {
+		header.Uid, header.Gid = os.Getuid(), os.Getgid()
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayer(root, &archive); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]os.FileMode{
+		"data":      os.ModeDir | os.ModeSetgid | os.ModeSticky | 0770,
+		"data/file": os.ModeSetuid | os.ModeSetgid | 0750,
+	} {
+		info, err := os.Stat(filepath.Join(root, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode() != want {
+			t.Fatalf("%s mode = %v, want %v", name, info.Mode(), want)
+		}
+	}
+}
+
 func TestApplyLayerRejectsSymlinkParentTraversal(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

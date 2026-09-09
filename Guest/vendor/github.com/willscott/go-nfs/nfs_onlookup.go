@@ -43,6 +43,12 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusNotDir, err}
 	}
 
+	if access, ok := fs.(AccessFilesystem); ok {
+		mask, err := access.Access(fs.Join(p...), 2)
+		if err != nil || mask&2 == 0 {
+			return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
+		}
+	}
 	// Special cases for "." and ".."
 	if bytes.Equal(obj.Filename, []byte(".")) {
 		resp, err := lookupSuccessResponse(obj.Handle, p, p, fs)
@@ -70,6 +76,9 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 		return nil
 	}
 
+	if !validOperationName(obj.Filename) {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	reqPath := append(p, string(obj.Filename))
 	if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
 		return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}

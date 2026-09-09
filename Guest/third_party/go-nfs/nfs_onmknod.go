@@ -53,6 +53,9 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 	}
 
+	if !validOperationName(obj.Filename) {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	if len(string(obj.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}
@@ -70,8 +73,7 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 
 	switch nfs_ftype(ftype) {
-	case FTYPE_NF3CHR:
-	case FTYPE_NF3BLK:
+	case FTYPE_NF3CHR, FTYPE_NF3BLK:
 		// read devicedata3 = {sattr3, specdata3}
 		attrs, err := ReadSetFileAttributes(w.req.Body)
 		if err != nil {
@@ -86,7 +88,13 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
 
-		err = cu.Mknod(newFilePath, uint32(attrs.Mode(parent.Mode())), specData1, specData2)
+		mode := uint32(attrs.Mode(parent.Mode()).Perm())
+		if nfs_ftype(ftype) == FTYPE_NF3CHR {
+			mode |= 0020000
+		} else {
+			mode |= 0060000
+		}
+		err = cu.Mknod(newFilePath, mode, specData1, specData2)
 		if err != nil {
 			return &NFSStatusError{NFSStatusAccess, err}
 		}

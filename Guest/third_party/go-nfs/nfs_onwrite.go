@@ -64,10 +64,11 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	preOpCache := ToFileAttribute(info, fullPath).AsCache()
 
 	// now the actual op.
-	file, err := fs.OpenFile(fs.Join(path...), os.O_RDWR, info.Mode().Perm())
+	file, err := fs.OpenFile(fs.Join(path...), os.O_WRONLY, info.Mode().Perm())
 	if err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
+	defer file.Close()
 	if req.Offset > 0 {
 		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
 			return &NFSStatusError{NFSStatusIO, err}

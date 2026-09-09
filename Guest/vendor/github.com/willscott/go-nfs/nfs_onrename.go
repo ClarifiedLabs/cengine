@@ -41,6 +41,9 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
 
+	if !validOperationName(from.Filename) || !validOperationName(to.Filename) {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	if len(string(from.Filename)) > PathNameMax || len(string(to.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}

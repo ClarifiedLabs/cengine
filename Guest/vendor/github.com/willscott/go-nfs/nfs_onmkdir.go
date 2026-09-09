@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	mkdirDefaultMode = 755
+	mkdirDefaultMode = 0755
 )
 
 func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
@@ -34,6 +34,9 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
 
+	if !validOperationName(obj.Filename) {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	if len(string(obj.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}
@@ -59,6 +62,11 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 
+	// Creation inherits setgid from the parent; only a later SETATTR may clear it.
+	if info, err := fs.Lstat(newFolderPath); err == nil && info.Mode()&os.ModeSetgid != 0 && attrs.SetMode != nil {
+		mode := *attrs.SetMode | 02000
+		attrs.SetMode = &mode
+	}
 	fp := userHandle.ToHandle(fs, newFolder)
 	changer := userHandle.Change(fs)
 	if changer != nil {

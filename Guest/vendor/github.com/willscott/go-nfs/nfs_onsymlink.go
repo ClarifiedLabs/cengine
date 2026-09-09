@@ -34,6 +34,9 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
 
+	if !validOperationName(obj.Filename) {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	if len(string(obj.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}

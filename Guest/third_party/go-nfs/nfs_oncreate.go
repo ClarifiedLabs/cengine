@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"math"
 	"os"
 
 	"github.com/go-git/go-billy/v5"
@@ -55,6 +56,9 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
 
+	if !validOperationName(obj.Filename) {
+		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+	}
 	if len(string(obj.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, nil}
 	}
@@ -76,10 +80,25 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 
-	file, err := fs.Create(newFilePath)
+	flags := os.O_WRONLY | os.O_CREATE
+	if how == createModeGuarded {
+		flags |= os.O_EXCL
+	}
+	// Apply size explicitly; an unchecked CREATE must not unconditionally truncate.
+	file, err := fs.OpenFile(newFilePath, flags, attrs.Mode(0666))
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
 		return &NFSStatusError{NFSStatusAccess, err}
+	}
+	defer file.Close()
+	if attrs.SetSize != nil {
+		if *attrs.SetSize > math.MaxInt64 {
+			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+		}
+		if err := file.Truncate(int64(*attrs.SetSize)); err != nil {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		attrs.SetSize = nil
 	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("Error Creating: %v", err)

@@ -90,7 +90,16 @@ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
 	f := FileAttribute{}
 
 	m := info.Mode()
-	f.FileMode = uint32(m)
+	f.FileMode = uint32(m.Perm())
+	if m&os.ModeSetuid != 0 {
+		f.FileMode |= 04000
+	}
+	if m&os.ModeSetgid != 0 {
+		f.FileMode |= 02000
+	}
+	if m&os.ModeSticky != 0 {
+		f.FileMode |= 01000
+	}
 	if info.IsDir() {
 		f.Type = FileTypeDirectory
 	} else if m&os.ModeSymlink != 0 {
@@ -206,24 +215,11 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 	} else if errors.Is(err, os.ErrPermission) {
 		return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 	} else if err != nil {
-		return nil
+		return err
 	}
 	curr := ToFileAttribute(curOS, file)
+	_, kernelPermissions := fs.(AccessFilesystem)
 
-	if s.SetMode != nil {
-		mode := os.FileMode(*s.SetMode) & os.ModePerm
-		if mode != curr.Mode().Perm() {
-			if changer == nil {
-				return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
-			}
-			if err := changer.Chmod(file, mode); err != nil {
-				if errors.Is(err, os.ErrPermission) {
-					return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
-				}
-				return err
-			}
-		}
-	}
 	if s.SetUID != nil || s.SetGID != nil {
 		euid := curr.UID
 		if s.SetUID != nil {
@@ -233,7 +229,10 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 		if s.SetGID != nil {
 			egid = *s.SetGID
 		}
-		if euid != curr.UID || egid != curr.GID {
+		if euid == ^uint32(0) || egid == ^uint32(0) {
+			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+		}
+		if euid != curr.UID || egid != curr.GID || kernelPermissions {
 			if changer == nil {
 				return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
 			}
@@ -245,8 +244,22 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 			}
 		}
 	}
+	if s.SetMode != nil {
+		mode := s.Mode(0)
+		if curOS.Mode()&os.ModeSymlink == 0 && (kernelPermissions || mode != curOS.Mode()&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky)) {
+			if changer == nil {
+				return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
+			}
+			if err := changer.Chmod(file, mode); err != nil {
+				if errors.Is(err, os.ErrPermission) {
+					return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
+				}
+				return err
+			}
+		}
+	}
 	if s.SetSize != nil {
-		if curr.Mode()&os.ModeSymlink != 0 {
+		if curOS.Mode()&os.ModeSymlink != 0 {
 			return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
 		}
 		fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
@@ -255,6 +268,7 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 		} else if err != nil {
 			return err
 		}
+		defer fp.Close()
 		if *s.SetSize > math.MaxInt64 {
 			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
 		}
@@ -293,7 +307,17 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 // Mode returns a mode if specified or the provided default mode.
 func (s *SetFileAttributes) Mode(def os.FileMode) os.FileMode {
 	if s.SetMode != nil {
-		return os.FileMode(*s.SetMode) & os.ModePerm
+		mode := os.FileMode(*s.SetMode) & os.ModePerm
+		if *s.SetMode&04000 != 0 {
+			mode |= os.ModeSetuid
+		}
+		if *s.SetMode&02000 != 0 {
+			mode |= os.ModeSetgid
+		}
+		if *s.SetMode&01000 != 0 {
+			mode |= os.ModeSticky
+		}
+		return mode
 	}
 	return def
 }

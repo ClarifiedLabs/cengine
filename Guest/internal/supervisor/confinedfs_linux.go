@@ -504,9 +504,45 @@ type confinedCopyManifestEntry struct {
 	Handle     []byte `json:"handle"`
 }
 
+type confinedCopyRootMetadata struct {
+	Filesystem [2]int32 `json:"filesystem"`
+	Device     uint64   `json:"device"`
+	Inode      uint64   `json:"inode"`
+	UID        uint32   `json:"uid"`
+	GID        uint32   `json:"gid"`
+	Mode       uint32   `json:"mode"`
+}
+
 type confinedCopyManifest struct {
 	Version uint32                      `json:"version"`
 	Entries []confinedCopyManifestEntry `json:"entries"`
+	Root    *confinedCopyRootMetadata   `json:"root,omitempty"`
+}
+
+func confinedRootMetadata(fd int) (confinedCopyRootMetadata, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return confinedCopyRootMetadata{}, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return confinedCopyRootMetadata{}, unix.ENOTDIR
+	}
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(fd, &filesystem); err != nil {
+		return confinedCopyRootMetadata{}, err
+	}
+	return confinedCopyRootMetadata{
+		Filesystem: filesystem.Fsid.Val, Device: stat.Dev, Inode: stat.Ino,
+		UID: stat.Uid, GID: stat.Gid, Mode: stat.Mode & 07777,
+	}, nil
+}
+
+func applyConfinedRootMetadata(fd int, metadata confinedCopyRootMetadata) error {
+	// Ownership changes may clear set-ID bits. Apply the final mode last.
+	if err := unix.Fchown(fd, int(metadata.UID), int(metadata.GID)); err != nil {
+		return err
+	}
+	return unix.Fchmod(fd, metadata.Mode)
 }
 
 type confinedCopyState struct {
@@ -515,6 +551,20 @@ type confinedCopyState struct {
 }
 
 func copyConfinedDirectory(source *confinedRoot, destination *confinedRoot) error {
+	sourceMetadata, err := confinedRootMetadata(source.fd)
+	if err != nil {
+		return fmt.Errorf("stat copy-up source root: %w", err)
+	}
+	originalMetadata, err := confinedRootMetadata(destination.fd)
+	if err != nil {
+		return fmt.Errorf("stat copy-up destination root: %w", err)
+	}
+	// Retain a usable descriptor before applying possibly restrictive root modes.
+	metadataFD, err := unix.Openat(destination.fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(metadataFD)
 	if err := unix.Mkdirat(destination.fd, confinedCopyTransactionName, 0700); err != nil {
 		return fmt.Errorf("create copy-up transaction: %w", err)
 	}
@@ -570,7 +620,7 @@ func copyConfinedDirectory(source *confinedRoot, destination *confinedRoot) erro
 	if err := syncConfinedDirectory(staging.fd); err != nil {
 		return rollback(fmt.Errorf("sync copy-up staging directory: %w", err))
 	}
-	if err := writeConfinedCopyManifest(transaction.fd, state.created); err != nil {
+	if err := writeConfinedCopyManifest(transaction.fd, state.created, &originalMetadata); err != nil {
 		return rollback(fmt.Errorf("commit copy-up manifest: %w", err))
 	}
 
@@ -593,8 +643,13 @@ func copyConfinedDirectory(source *confinedRoot, destination *confinedRoot) erro
 			return rollback(fmt.Errorf("publish copy-up entry %q: %w", name, err))
 		}
 	}
-	if err := syncConfinedDirectory(destination.fd); err != nil {
-		return rollback(fmt.Errorf("sync published copy-up entries: %w", err))
+	// The durable manifest covers root metadata as well as published entries,
+	// including an empty source. Keep the destination writable until publication.
+	if err := applyConfinedRootMetadata(metadataFD, sourceMetadata); err != nil {
+		return rollback(fmt.Errorf("apply copy-up root metadata: %w", err))
+	}
+	if err := unix.Fsync(metadataFD); err != nil {
+		return rollback(fmt.Errorf("sync published copy-up entries and metadata: %w", err))
 	}
 	if err := removeConfinedTreeAt(destination.fd, confinedCopyTransactionName); err != nil {
 		return fmt.Errorf("remove committed copy-up transaction: %w", err)
@@ -632,11 +687,11 @@ func renameConfinedNoReplace(oldDirectory int, oldName string, newDirectory int,
 	return unix.Renameat(oldDirectory, oldName, newDirectory, newName)
 }
 
-func writeConfinedCopyManifest(transactionFD int, created []confinedCreatedEntry) error {
+func writeConfinedCopyManifest(transactionFD int, created []confinedCreatedEntry, root *confinedCopyRootMetadata) error {
 	if len(created) > maxConfinedCopyManifestEntries {
 		return fmt.Errorf("copy-up manifest exceeds %d entries", maxConfinedCopyManifestEntries)
 	}
-	manifest := confinedCopyManifest{Version: 1}
+	manifest := confinedCopyManifest{Version: 2, Root: root}
 	manifest.Entries = make([]confinedCopyManifestEntry, 0, len(created))
 	for _, entry := range created {
 		var stat unix.Stat_t
@@ -754,8 +809,11 @@ func readConfinedCopyManifest(transactionFD int) (confinedCopyManifest, error) {
 		}
 		return manifest, err
 	}
-	if manifest.Version != 1 || len(manifest.Entries) > maxConfinedCopyManifestEntries {
+	if (manifest.Version != 1 && manifest.Version != 2) || len(manifest.Entries) > maxConfinedCopyManifestEntries {
 		return manifest, errors.New("copy-up manifest has an unsupported version or entry count")
+	}
+	if manifest.Version == 2 && (manifest.Root == nil || manifest.Root.Mode & ^uint32(07777) != 0 || manifest.Root.UID == ^uint32(0) || manifest.Root.GID == ^uint32(0)) {
+		return manifest, errors.New("copy-up manifest has invalid root metadata")
 	}
 	seen := make(map[string]uint32, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
@@ -799,6 +857,18 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 		return fmt.Errorf("open stale copy-up transaction: %w", err)
 	}
 	transaction := &confinedRoot{fd: transactionFD}
+	// The journal lives in a workload-writable volume, but only a private
+	// supervisor-owned directory is authoritative. Guest root is trusted (as
+	// for NFS no-root-squash); an unprivileged writer cannot forge recovery.
+	var transactionStat unix.Stat_t
+	if err := unix.Fstat(transaction.fd, &transactionStat); err != nil {
+		_ = transaction.close()
+		return err
+	}
+	if transactionStat.Uid != uint32(os.Geteuid()) || transactionStat.Mode&0777 != 0700 {
+		_ = transaction.close()
+		return errors.New("copy-up transaction is not supervisor-owned and private")
+	}
 	manifest, manifestErr := readConfinedCopyManifest(transaction.fd)
 	if errors.Is(manifestErr, unix.ENOENT) {
 		_ = transaction.close()
@@ -813,6 +883,38 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 	}
 	_ = transaction.close()
 
+	if manifest.Root != nil {
+		current, err := confinedRootMetadata(destination.fd)
+		if err != nil {
+			return err
+		}
+		// st_dev depends on the VM's attachment order. The filesystem ID and
+		// root inode remain stable when the same volume moves from vdb to vdc.
+		if current.Filesystem != manifest.Root.Filesystem || current.Inode != manifest.Root.Inode {
+			return errors.New("copy-up destination root changed before recovery")
+		}
+		for index := range manifest.Entries {
+			if manifest.Entries[index].Device != manifest.Root.Device {
+				return errors.New("copy-up manifest entry belongs to another filesystem")
+			}
+			manifest.Entries[index].Device = current.Device
+		}
+		fd, err := unix.Openat(destination.fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		// Rollback always restores the pre-transaction ownership and mode, even
+		// if only chown completed before interruption. Preserve the journal on
+		// failure so the next initialization cannot accept a partial rollback.
+		err = applyConfinedRootMetadata(fd, *manifest.Root)
+		if err == nil {
+			err = unix.Fsync(fd)
+		}
+		_ = unix.Close(fd)
+		if err != nil {
+			return fmt.Errorf("restore copy-up root metadata: %w", err)
+		}
+	}
 	matching := make([]bool, len(manifest.Entries))
 	var first error
 	for index, entry := range manifest.Entries {
@@ -830,7 +932,10 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 			first = err
 		}
 	}
-	if err := removeConfinedTreeAt(destination.fd, confinedCopyTransactionName); err != nil && first == nil {
+	if first != nil {
+		return first
+	}
+	if err := removeConfinedTreeAt(destination.fd, confinedCopyTransactionName); err != nil {
 		first = err
 	}
 	if err := syncConfinedDirectory(destination.fd); err != nil && first == nil {

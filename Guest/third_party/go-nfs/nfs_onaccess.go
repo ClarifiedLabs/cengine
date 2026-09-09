@@ -23,6 +23,12 @@ func onAccess(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
+	if access, ok := fs.(AccessFilesystem); ok {
+		mask, err = access.Access(fs.Join(path...), mask)
+		if err != nil {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
+	}
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}

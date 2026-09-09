@@ -56,7 +56,7 @@ release-artifact testing, using `MARKETING_VERSION` from the Xcode project.
 `make test-compat` builds and signs the debug daemon, terminates orphaned
 compatibility daemons and VM shims owned by this worktree, removes their
 `cengine-compat-*` temporary roots, creates a cached Python virtual environment
-under `.build`, and runs the Docker API and Docker Compose 5.5.0 compatibility
+under `.build`, and runs the Docker API and Docker Compose 5.x compatibility
 suites. Every test gets a new daemon, temporary root, Unix socket, engine state,
 and VM set. Fixture images are fetched once into a versioned immutable seed
 content store under `.build` and APFS-cloned into each root, avoiding external registry state without
@@ -86,8 +86,10 @@ Set `CENGINE_TEST_IMAGE_SOURCE` when the fixture tag should be seeded from a
 private or internal mirror; the default `alpine:latest` fixture is seeded from
 `mirror.gcr.io/library/alpine:latest` to avoid Docker Hub's anonymous rate limit.
 The suite requires Docker Compose
-5.5.0 and kind (v0.32.0 is the reference version); install the checksum-pinned
-Compose plugin with `Scripts/install-compose-compat.sh`. GitHub-hosted runners
+5.x and kind (v0.32.0 is the reference version); minor and patch releases within
+Compose major version 5 are accepted. `bash Scripts/install-compose-compat.sh`
+installs a checksum-pinned reference Compose release, not a required patch
+version. GitHub-hosted runners
 cannot execute the VM-backed suite, so compatibility tests are currently a
 local gate rather than part of `.github/workflows/test.yml`.
 

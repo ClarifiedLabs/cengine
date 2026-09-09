@@ -22,7 +22,7 @@ COMPOSE_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose.yaml"
 COMPOSE_VOLUMES_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-volumes.yaml"
 COMPOSE_HEALTH_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-health.yaml"
 DEVELOPER_FIXTURE = REPO_ROOT / "Tests/Fixtures/compose/developer-loop"
-COMPOSE_VERSION = "5.5.0"
+COMPOSE_MAJOR_VERSION = "5"
 
 
 def compose(daemon, project: str, *arguments: str, compose_file=COMPOSE_FILE) -> subprocess.CompletedProcess[str]:
@@ -104,7 +104,7 @@ def managed_buildkit_identity(client) -> tuple[str, str]:
             if value.name.startswith("buildx_buildkit_")
         )
         raise AssertionError(
-            f"Compose {COMPOSE_VERSION} did not use the cengine context's default "
+            f"Compose {COMPOSE_MAJOR_VERSION}.x did not use the cengine context's default "
             f"cengine-builder; observed BuildKit containers: {observed}"
         ) from None
     state_volumes = [
@@ -132,8 +132,9 @@ def require_compose_version():
         ["docker", "compose", "version", "--short"], env=managed_docker_environment(), text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
     )
-    assert result.stdout.strip() == COMPOSE_VERSION, (
-        f"Docker Compose {COMPOSE_VERSION} is required; found {result.stdout.strip()}"
+    version = result.stdout.strip()
+    assert version.split(".", 1)[0] == COMPOSE_MAJOR_VERSION, (
+        f"Docker Compose {COMPOSE_MAJOR_VERSION}.x is required; found {version}"
     )
 
 

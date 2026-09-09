@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
@@ -45,11 +46,24 @@ type conn struct {
 func (c *conn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer c.Close()
+	stopClose := context.AfterFunc(connCtx, func() { _ = c.Close() })
+	defer stopClose()
 	c.writeSerializer = make(chan []byte, 1)
-	go c.serializeWrites(connCtx)
+	go func() {
+		c.serializeWrites(connCtx)
+		cancel() // release a queued response if the peer stops reading
+	}()
 
 	bio := bufio.NewReader(c.Conn)
+	timeout := c.Server.ReadTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
 	for {
+		if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return
+		}
 		w, err := c.readRequestHeader(connCtx, bio)
 		if err != nil {
 			if err == io.EOF {
@@ -62,6 +76,7 @@ func (c *conn) serve(ctx context.Context) {
 		Log.Tracef("request: %v", w.req)
 		err = c.handle(connCtx, w)
 		respErr := w.finish(connCtx)
+		w.releaseRequestBody()
 		if err != nil {
 			Log.Errorf("error handling req: %v", err)
 			// failure to handle at a level needing to close the connection.
@@ -87,6 +102,13 @@ func (c *conn) serializeWrites(ctx context.Context) {
 			return
 		case msg, ok := <-c.writeSerializer:
 			if !ok {
+				return
+			}
+			timeout := c.Server.ReadTimeout
+			if timeout <= 0 {
+				timeout = 30 * time.Second
+			}
+			if err := c.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 				return
 			}
 			// prepend the fragmentation header
@@ -122,7 +144,25 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 		}
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
-	appError := handler(ctx, w, c.Server.Handler)
+	invoke := func() error { return handler(ctx, w, c.Server.Handler) }
+	var appError error
+	if scoped, ok := c.Server.Handler.(RequestIdentityHandler); ok && w.req.Header.Proc != 0 {
+		identity, err := ParseAuthSys(w.req.Header.Cred)
+		if err != nil || w.req.Header.Verf.Flavor != 0 || len(w.req.Header.Verf.Body) != 0 {
+			if err := w.drain(ctx); err != nil {
+				return err
+			}
+			// RFC 5531: MSG_DENIED, AUTH_ERROR, AUTH_BADCRED (not accept_stat).
+			w.responded = true
+			if err := w.writeXdrHeader(); err != nil {
+				return err
+			}
+			return xdr.Write(w.writer, [3]uint32{1, 1, 1})
+		}
+		appError = scoped.WithIdentity(ctx, identity, invoke)
+	} else {
+		appError = invoke()
+	}
 	if drainErr := w.drain(ctx); drainErr != nil {
 		return drainErr
 	}
@@ -181,11 +221,20 @@ func (r *request) String() string {
 
 type response struct {
 	*conn
-	writer    *bytes.Buffer
-	responded bool
-	err       error
-	errorFmt  func(error) RPCError
-	req       *request
+	writer      *bytes.Buffer
+	responded   bool
+	err         error
+	errorFmt    func(error) RPCError
+	req         *request
+	releaseBody func()
+}
+
+func (w *response) releaseRequestBody() {
+	if w.releaseBody != nil {
+		w.req.Body = nil
+		w.releaseBody()
+		w.releaseBody = nil
+	}
 }
 
 func (w *response) writeXdrHeader() error {
@@ -290,7 +339,8 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, ErrInputInvalid
 	}
 	reqLen := fragment - uint32(1<<31)
-	if reqLen < 40 {
+	// A maximum-size WRITE plus bounded RPC/XDR framing and credentials.
+	if reqLen < 40 || reqLen > MaxRead+4096 {
 		return nil, ErrInputInvalid
 	}
 
@@ -313,16 +363,54 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		rpc.Header{},
 		&r,
 	}
-	if err = xdr.Read(&r, &req.Header); err != nil {
-		return nil, err
+	// Bound opaque_auth before allocation, not merely after decoding it.
+	for _, field := range []*uint32{&req.Header.Rpcvers, &req.Header.Prog, &req.Header.Vers, &req.Header.Proc} {
+		if err = binary.Read(&r, binary.BigEndian, field); err != nil {
+			return nil, err
+		}
+	}
+	for _, auth := range []*rpc.Auth{&req.Header.Cred, &req.Header.Verf} {
+		var length uint32
+		if err = binary.Read(&r, binary.BigEndian, &auth.Flavor); err != nil {
+			return nil, err
+		}
+		if err = binary.Read(&r, binary.BigEndian, &length); err != nil {
+			return nil, err
+		}
+		if length > 400 {
+			return nil, ErrInputInvalid
+		}
+		body := make([]byte, (length+3)&^3)
+		if _, err = io.ReadFull(&r, body); err != nil {
+			return nil, err
+		}
+		auth.Body = body[:length]
 	}
 
+	// Receive the entire bounded record before entering an identity scope.
+	// Slow clients must never occupy the finite credential-worker slots while
+	// withholding procedure arguments. Reserve against a server-wide memory
+	// budget before allocating, so many incomplete records cannot exhaust RAM.
+	release, err := c.Server.reserveRPCBytes(r.N)
+	if err != nil {
+		return nil, err
+	}
+	body := make([]byte, r.N)
+	if _, err := io.ReadFull(&r, body); err != nil {
+		release()
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	req.Body = &io.LimitedReader{R: bytes.NewReader(body), N: int64(len(body))}
 	w = &response{
 		conn:     c,
 		req:      &req,
 		errorFmt: basicErrorFormatter,
 		// TODO: use a pool for these.
-		writer: bytes.NewBuffer([]byte{}),
+		writer:      bytes.NewBuffer([]byte{}),
+		releaseBody: release,
 	}
 	return w, nil
 }

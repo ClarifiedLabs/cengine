@@ -391,7 +391,11 @@ func publishStaleConfinedCopyTransaction(
 	if err := state.copyDirectoryContents(source.fd, stagingFD, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeConfinedCopyManifest(transactionFD, state.created); err != nil {
+	metadata, err := confinedRootMetadata(destination.fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeConfinedCopyManifest(transactionFD, state.created, &metadata); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := readConfinedDirectory(stagingFD)

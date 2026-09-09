@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -30,23 +31,44 @@ func ServeNFS(address, root string) error {
 		return err
 	}
 	defer listener.Close()
-	return nfs.Serve(listener, newVolumeNFSHandler(root))
+	handler := newVolumeNFSHandler(root)
+	if handler.filesystem.rootErr != nil {
+		return handler.filesystem.rootErr
+	}
+	defer handler.filesystem.confined.Close()
+	defer handler.filesystem.rootFile.Close()
+	if err := handler.prepareExportRoot(); err != nil {
+		return err
+	}
+	return nfs.Serve(listener, handler)
 }
 
 type volumeNFSHandler struct {
-	filesystem *volumeNFSFilesystem
-	mu         sync.RWMutex
-	handles    map[string][]string
+	filesystem    *volumeNFSFilesystem
+	mu            sync.RWMutex
+	handles       map[string][]string
+	identitySlots chan struct{}
 }
 
 func newVolumeNFSHandler(root string) *volumeNFSHandler {
-	handler := &volumeNFSHandler{handles: make(map[string][]string)}
+	handler := &volumeNFSHandler{handles: make(map[string][]string), identitySlots: make(chan struct{}, 64)}
 	handler.filesystem = &volumeNFSFilesystem{
 		Filesystem: osfs.New(root, osfs.WithBoundOS()),
 		root:       root,
 		handles:    handler,
 	}
+	handler.filesystem.confined, handler.filesystem.rootErr = os.OpenRoot(root)
+	if handler.filesystem.rootErr == nil {
+		handler.filesystem.rootFile, handler.filesystem.rootErr = handler.filesystem.confined.Open(".")
+	}
 	return handler
+}
+
+func (handler *volumeNFSHandler) prepareExportRoot() error {
+	// The sibling storage service may create this ancestor with mode 0700
+	// first. This service-owned export root must be searchable by AUTH_SYS
+	// callers; named-volume roots below it keep their independent permissions.
+	return handler.filesystem.rootFile.Chmod(0755)
 }
 
 func (handler *volumeNFSHandler) Mount(context.Context, net.Conn, nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
@@ -131,8 +153,11 @@ func (handler *volumeNFSHandler) rename(from, to string) {
 
 type volumeNFSFilesystem struct {
 	billy.Filesystem
-	root    string
-	handles *volumeNFSHandler
+	root     string
+	confined *os.Root
+	rootFile *os.File
+	rootErr  error
+	handles  *volumeNFSHandler
 }
 
 func (filesystem *volumeNFSFilesystem) Rename(from, to string) error {
@@ -140,7 +165,10 @@ func (filesystem *volumeNFSFilesystem) Rename(from, to string) error {
 	if isExclusiveCopyupRename(from, to) {
 		err = filesystem.renameNoReplace(from, to)
 	} else {
-		err = filesystem.Filesystem.Rename(from, to)
+		if filesystem.rootErr != nil {
+			return filesystem.rootErr
+		}
+		err = filesystem.confined.Rename(filesystem.confinedName(from), filesystem.confinedName(to))
 	}
 	if err != nil {
 		return err
@@ -188,13 +216,10 @@ func (filesystem *volumeNFSFilesystem) renameNoReplace(from, to string) error {
 	if !fromOK || !toOK {
 		return os.ErrInvalid
 	}
-	rootFD, err := unix.Open(
-		filesystem.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0,
-	)
-	if err != nil {
-		return err
+	if filesystem.rootErr != nil {
+		return filesystem.rootErr
 	}
-	defer unix.Close(rootFD)
+	rootFD := int(filesystem.rootFile.Fd())
 	openParent := func(parts []string) (int, error) {
 		parent := "."
 		if len(parts) > 1 {
@@ -232,90 +257,54 @@ func (filesystem *volumeNFSFilesystem) renameNoReplace(from, to string) error {
 }
 
 func (filesystem *volumeNFSFilesystem) Chmod(name string, mode os.FileMode) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
+	if filesystem.rootErr != nil {
+		return filesystem.rootErr
 	}
-	return os.Chmod(path, mode)
+	return filesystem.confined.Chmod(filesystem.confinedName(name), mode)
 }
-
 func (filesystem *volumeNFSFilesystem) Lchown(name string, uid, gid int) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
+	if filesystem.rootErr != nil {
+		return filesystem.rootErr
 	}
-	return os.Lchown(path, uid, gid)
+	return filesystem.confined.Lchown(filesystem.confinedName(name), uid, gid)
 }
-
 func (filesystem *volumeNFSFilesystem) Chown(name string, uid, gid int) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
+	if filesystem.rootErr != nil {
+		return filesystem.rootErr
 	}
-	return os.Chown(path, uid, gid)
+	return filesystem.confined.Chown(filesystem.confinedName(name), uid, gid)
 }
-
 func (filesystem *volumeNFSFilesystem) Chtimes(name string, atime, mtime time.Time) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
+	if filesystem.rootErr != nil {
+		return filesystem.rootErr
 	}
-	return os.Chtimes(path, atime, mtime)
+	return filesystem.confined.Chtimes(filesystem.confinedName(name), atime, mtime)
 }
-
 func (filesystem *volumeNFSFilesystem) Mknod(name string, mode, major, minor uint32) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
+	// A confined pathname does not confine device I/O in the storage VM.
+	if mode&unix.S_IFMT != unix.S_IFIFO {
+		return unix.EPERM
 	}
-	return unix.Mknod(path, mode, int(unix.Mkdev(major, minor)))
+	return filesystem.withParent(name, func(fd int, base string) error { return unix.Mknodat(fd, base, mode, int(unix.Mkdev(major, minor))) })
 }
-
 func (filesystem *volumeNFSFilesystem) Mkfifo(name string, mode uint32) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
-	}
-	return unix.Mkfifo(path, mode)
+	return filesystem.Mknod(name, mode|unix.S_IFIFO, 0, 0)
 }
-
 func (filesystem *volumeNFSFilesystem) Socket(name string) error {
-	path, err := filesystem.hostPath(name)
-	if err != nil {
-		return err
-	}
-	descriptor, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(descriptor)
-	return unix.Bind(descriptor, &unix.SockaddrUnix{Name: path})
-}
-
-func (filesystem *volumeNFSFilesystem) Link(path, link string) error {
-	source, err := filesystem.hostPath(path)
-	if err != nil {
-		return err
-	}
-	destination, err := filesystem.hostPath(link)
-	if err != nil {
-		return err
-	}
-	return unix.Link(source, destination)
-}
-
-func (filesystem *volumeNFSFilesystem) hostPath(name string) (string, error) {
-	clean := filepath.Clean(name)
-	if filepath.IsAbs(clean) {
-		relative, err := filepath.Rel(filesystem.root, clean)
-		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return clean, nil
+	return filesystem.withParent(name, func(fd int, base string) error {
+		descriptor, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return err
 		}
-		clean = strings.TrimPrefix(clean, string(filepath.Separator))
+		defer unix.Close(descriptor)
+		return unix.Bind(descriptor, &unix.SockaddrUnix{Name: fmt.Sprintf("/proc/self/fd/%d/%s", fd, base)})
+	})
+}
+func (filesystem *volumeNFSFilesystem) Link(path, link string) error {
+	if filesystem.rootErr != nil {
+		return filesystem.rootErr
 	}
-	clean = filepath.Clean(string(filepath.Separator) + clean)
-	clean = strings.TrimPrefix(clean, string(filepath.Separator))
-	return filepath.Join(filesystem.root, clean), nil
+	return filesystem.confined.Link(filesystem.confinedName(path), filesystem.confinedName(link))
 }
 
 func splitPath(path string) []string {

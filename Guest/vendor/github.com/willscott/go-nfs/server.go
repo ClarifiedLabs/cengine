@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -13,7 +14,33 @@ import (
 type Server struct {
 	Handler
 	ID [8]byte
+	// ReadTimeout bounds receipt of each RPC record, including idle connections.
+	// Zero selects 30 seconds. Cancellation also closes active connections.
+	ReadTimeout time.Duration
 	context.Context
+	receiveMu    sync.Mutex
+	receiveBytes int64
+}
+
+const maxBufferedRPCBytes int64 = 64 << 20
+
+func (s *Server) reserveRPCBytes(size int64) (func(), error) {
+	s.receiveMu.Lock()
+	if size < 0 || size > maxBufferedRPCBytes-s.receiveBytes {
+		s.receiveMu.Unlock()
+		// Close/retry rather than wait while retaining a client's partial frame.
+		return nil, errors.New("NFS receive budget exhausted")
+	}
+	s.receiveBytes += size
+	s.receiveMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.receiveMu.Lock()
+			s.receiveBytes -= size
+			s.receiveMu.Unlock()
+		})
+	}, nil
 }
 
 // RegisterMessageHandler registers a handler for a specific

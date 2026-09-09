@@ -126,7 +126,7 @@ func applyLayer(root string, source io.Reader) error {
 
 func metadata(path string, header *tar.Header) error {
 	if err := os.Lchown(path, header.Uid, header.Gid); err != nil { return err }
-	if header.Typeflag != tar.TypeSymlink { if err := os.Chmod(path, os.FileMode(header.Mode)); err != nil { return err } }
+	if header.Typeflag != tar.TypeSymlink { if err := os.Chmod(path, header.FileInfo().Mode()); err != nil { return err } }
 	for name, value := range header.Xattrs { if err := unix.Lsetxattr(path, name, []byte(value), 0); err != nil && !errors.Is(err, unix.ENOTSUP) { return err } }
 	modified := unix.NsecToTimespec(header.ModTime.UnixNano())
 	accessed := modified
