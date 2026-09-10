@@ -346,20 +346,30 @@ import Testing
     private final class StopState: @unchecked Sendable {
         private let lock = NSLock()
         private var cancellations = 0
+        private var cancellationTime: ContinuousClock.Instant?
         private var completion: (@Sendable () -> Void)?
         var count: Int { lock.withLock { cancellations } }
-        func cancel() { lock.withLock { cancellations += 1 } }
+        var cancelledAt: ContinuousClock.Instant? { lock.withLock { cancellationTime } }
+        func cancel() {
+            lock.withLock {
+                cancellations += 1
+                cancellationTime = .now
+            }
+        }
         func sent(_ completion: @escaping @Sendable () -> Void) { lock.withLock { self.completion = completion } }
         func reply() { let callback = lock.withLock { completion }; callback?() }
     }
 
-    @Test func missingStopReplyIsBoundedAndLateReplyIsHarmless() async {
+    @Test func missingStopReplyIsBoundedAndLateReplyIsHarmless() async throws {
         let state = StopState()
         let started = ContinuousClock.now
         await VMNetUplink.awaitStopReply(timeout: .milliseconds(10), cancel: { state.cancel() }) {
             state.sent($0)
         }
-        #expect(started.duration(to: ContinuousClock.now) < .seconds(1))
+        // Measure the timeout callback, not when this MainActor test gets to
+        // resume: parallel tests can keep the actor busy long after cancellation.
+        let cancelledAt = try #require(state.cancelledAt)
+        #expect(started.duration(to: cancelledAt) < .seconds(1))
         #expect(state.count == 1)
         state.reply()
         state.reply()
