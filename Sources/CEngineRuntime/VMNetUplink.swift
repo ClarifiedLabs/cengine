@@ -107,16 +107,12 @@ final class VMNetUplink: VMShimUplink, @unchecked Sendable {
     // cancellation before continuation installation and a late helper reply.
     static func awaitStopReply(
         timeout: Duration,
+        makeTimeoutTimer: TimeoutTimerFactory = VMNetUplink.makeTimeoutTimer,
         cancel: @escaping @Sendable () -> Void,
         send: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void
     ) async {
         let reply = VMNetUplinkStopReply(cancel: cancel)
-        let timer = DispatchSource.makeTimerSource(queue: timeoutQueue)
-        let components = timeout.components
-        let delay = max(0, Double(components.seconds)
-            + Double(components.attoseconds) / 1_000_000_000_000_000_000)
-        timer.schedule(deadline: .now() + delay)
-        timer.setEventHandler { reply.finish() }
+        let timer = makeTimeoutTimer(timeout) { reply.finish() }
         timer.activate()
         defer { timer.cancel() }
         await withTaskCancellationHandler {
@@ -200,6 +196,7 @@ final class VMNetUplink: VMShimUplink, @unchecked Sendable {
 
     static func awaitUplinkReply(
         timeout: Duration,
+        makeTimeoutTimer: TimeoutTimerFactory = VMNetUplink.makeTimeoutTimer,
         completionHook: (@Sendable () -> Void)? = nil,
         connectionCancellation: @escaping @Sendable (xpc_connection_t) -> Void = {
             xpc_connection_cancel($0)
@@ -218,7 +215,7 @@ final class VMNetUplink: VMShimUplink, @unchecked Sendable {
                 let shouldStart = reply.install(
                     continuation: continuation,
                     timeout: timeout,
-                    timeoutQueue: timeoutQueue
+                    makeTimeoutTimer: makeTimeoutTimer
                 )
                 if shouldStart {
                     start(reply)
@@ -227,6 +224,24 @@ final class VMNetUplink: VMShimUplink, @unchecked Sendable {
         } onCancel: {
             reply.finish(.failure(CancellationError()))
         }
+    }
+
+    // Factories return an inactive timer and must not invoke the handler inline:
+    // reply installation owns activation and may hold its state lock.
+    typealias TimeoutTimerFactory = @Sendable (
+        Duration, @escaping @Sendable () -> Void
+    ) -> DispatchSourceTimer
+
+    private static func makeTimeoutTimer(
+        timeout: Duration, handler: @escaping @Sendable () -> Void
+    ) -> DispatchSourceTimer {
+        let timer = DispatchSource.makeTimerSource(queue: timeoutQueue)
+        let components = timeout.components
+        let delay = max(0, Double(components.seconds)
+            + Double(components.attoseconds) / 1_000_000_000_000_000_000)
+        timer.schedule(deadline: .now() + delay)
+        timer.setEventHandler(handler: handler)
+        return timer
     }
 
     private static func signingRequirement(identifier: String, teamIdentifier: String) -> String {
@@ -363,7 +378,7 @@ final class VMNetUplinkReply: @unchecked Sendable {
     func install(
         continuation: CheckedContinuation<VMNetUplinkTransport, Error>,
         timeout: Duration,
-        timeoutQueue: DispatchQueue
+        makeTimeoutTimer: VMNetUplink.TimeoutTimerFactory
     ) -> Bool {
         lock.lock()
         if isFinished {
@@ -378,14 +393,7 @@ final class VMNetUplinkReply: @unchecked Sendable {
         }
 
         self.continuation = continuation
-        let timer = DispatchSource.makeTimerSource(queue: timeoutQueue)
-        let components = timeout.components
-        let delay = max(
-            0,
-            Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
-        )
-        timer.schedule(deadline: .now() + delay)
-        timer.setEventHandler {
+        let timer = makeTimeoutTimer(timeout) {
             self.finish(.failure(EngineError(
                 .unsupported,
                 "timed out waiting for privileged networking helper; enable Networking in the cengine app"

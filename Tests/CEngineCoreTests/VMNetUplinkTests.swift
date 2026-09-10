@@ -15,14 +15,6 @@ import Testing
         func record() { lock.withLock { value += 1 } }
     }
 
-    private final class CompletionTime: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value: UInt64?
-
-        func record() { lock.withLock { value = DispatchTime.now().uptimeNanoseconds } }
-        func load() -> UInt64? { lock.withLock { value } }
-    }
-
     private final class ReplyBox: @unchecked Sendable {
         private let lock = NSLock()
         private var value: VMNetUplinkReply?
@@ -89,18 +81,6 @@ import Testing
         xpc_connection_set_event_handler(connection) { _ in }
         xpc_connection_activate(connection)
         return connection
-    }
-
-    private static func waitUntil(
-        timeoutNanoseconds: UInt64 = 1_000_000_000,
-        _ predicate: () -> Bool
-    ) -> Bool {
-        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
-        repeat {
-            if predicate() { return true }
-            usleep(1_000)
-        } while DispatchTime.now().uptimeNanoseconds < deadline
-        return predicate()
     }
 
     private static func expectDatagramPeerIsClosed(_ peer: CInt) {
@@ -242,8 +222,8 @@ import Testing
     }
 
     @Test func unavailablePrivilegedNetworkingHelperHasBoundedDeadline() async throws {
-        let started = DispatchTime.now().uptimeNanoseconds
-        let completionTime = CompletionTime()
+        let timeout = ManualVMNetTimeout()
+        let startReached = AsyncSignal()
         let completionCount = EventState()
         let cancellationCount = EventState()
         let replyBox = ReplyBox()
@@ -252,13 +232,10 @@ import Testing
         defer { close(late.peer) }
         var timeoutError: EngineError?
 
-        do {
-            _ = try await VMNetUplink.awaitUplinkReply(
-                timeout: .milliseconds(25),
-                completionHook: {
-                    completionTime.record()
-                    completionCount.record()
-                },
+        let task = Task {
+            try await VMNetUplink.awaitUplinkReply(
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
+                completionHook: { completionCount.record() },
                 connectionCancellation: {
                     cancellationCount.record()
                     xpc_connection_cancel($0)
@@ -266,7 +243,18 @@ import Testing
             ) { reply in
                 replyBox.store(reply)
                 reply.attach(connection)
+                startReached.signal()
             }
+        }
+        await startReached.wait()
+        #expect(timeout.duration == .seconds(5))
+        #expect(!timeout.isCancelled)
+        #expect(completionCount.count == 0)
+        #expect(cancellationCount.count == 0)
+        timeout.fire()
+        do {
+            _ = try await task.value
+            Issue.record("privileged networking request unexpectedly succeeded without a reply")
         } catch let error as EngineError {
             timeoutError = error
         } catch {
@@ -276,11 +264,8 @@ import Testing
         let error = try #require(timeoutError)
         #expect(error.code == .unsupported)
         #expect(error.message.contains("timed out waiting for privileged networking helper"))
-        let completed = try #require(completionTime.load())
-        #expect(completed >= started)
-        if completed >= started {
-            #expect(completed - started < 1_000_000_000)
-        }
+        #expect(timeout.isCancelled)
+        timeout.fire()
         #expect(completionCount.count == 1)
         #expect(cancellationCount.count == 1)
 
@@ -291,8 +276,22 @@ import Testing
         #expect(completionCount.count == 1)
     }
 
+    @Test(.timeLimit(.minutes(1))) func dispatchUplinkTimeoutCompletesWithoutHelperReply() async {
+        // Exercise the production scheduler without requiring a fast CI runner.
+        do {
+            _ = try await VMNetUplink.awaitUplinkReply(timeout: .milliseconds(1)) { _ in }
+            Issue.record("privileged networking request unexpectedly succeeded without a reply")
+        } catch let error as EngineError {
+            #expect(error.code == .unsupported)
+            #expect(error.message.contains("timed out waiting for privileged networking helper"))
+        } catch {
+            Issue.record("unexpected privileged networking timeout error: \(error)")
+        }
+    }
+
     @Test func successfulUplinkReplyCancelsTimeoutAndWinsConcurrentCancellation() async throws {
         let completionCount = EventState()
+        let timeout = ManualVMNetTimeout()
         let completionStarted = AsyncSignal()
         let allowCompletion = DispatchSemaphore(value: 0)
         let weakReply = WeakReplyBox()
@@ -305,7 +304,7 @@ import Testing
 
         let task = Task {
             try await VMNetUplink.awaitUplinkReply(
-                timeout: .seconds(5),
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
                 completionHook: {
                     completionCount.record()
                     completionStarted.signal()
@@ -325,15 +324,18 @@ import Testing
 
         #expect(result.descriptor == successful.transport.descriptor)
         #expect(fcntl(result.descriptor, F_GETFD) >= 0)
+        #expect(timeout.isCancelled)
+        timeout.fire()
         #expect(completionCount.count == 1)
-        #expect(Self.waitUntil { weakReply.isReleased() })
+        timeout.clearHandler()
+        #expect(weakReply.isReleased())
         close(result.descriptor)
     }
 
     @Test func callerCancellationWinsAndDiscardsLateUplinkSuccess() async throws {
         let completionCount = EventState()
         let cancellationCount = EventState()
-        let completionTime = CompletionTime()
+        let timeout = ManualVMNetTimeout()
         let replyBox = ReplyBox()
         let startReached = AsyncSignal()
         let connection = Self.connection()
@@ -342,13 +344,8 @@ import Testing
 
         let task = Task {
             try await VMNetUplink.awaitUplinkReply(
-                // The full suite can delay this test task before it issues cancellation.
-                // Keep the guard timeout independent from the latency assertion below.
-                timeout: .seconds(30),
-                completionHook: {
-                    completionTime.record()
-                    completionCount.record()
-                },
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
+                completionHook: { completionCount.record() },
                 connectionCancellation: {
                     cancellationCount.record()
                     xpc_connection_cancel($0)
@@ -361,7 +358,6 @@ import Testing
         }
 
         await startReached.wait()
-        let cancelledAt = DispatchTime.now().uptimeNanoseconds
         task.cancel()
         do {
             _ = try await task.value
@@ -371,11 +367,8 @@ import Testing
             Issue.record("unexpected privileged networking cancellation error: \(error)")
         }
 
-        let completed = try #require(completionTime.load())
-        #expect(completed >= cancelledAt)
-        if completed >= cancelledAt {
-            #expect(completed - cancelledAt < 1_000_000_000)
-        }
+        #expect(timeout.isCancelled)
+        timeout.fire()
         #expect(completionCount.count == 1)
         #expect(cancellationCount.count == 1)
 
@@ -387,6 +380,7 @@ import Testing
     }
 
     @Test func cancellationBeforeReplyInstallationCompletesExactlyOnce() async throws {
+        let timeout = ManualVMNetTimeout()
         let ready = AsyncSignal()
         let proceed = AsyncSignal()
         let completionCount = EventState()
@@ -395,7 +389,7 @@ import Testing
             ready.signal()
             await proceed.wait()
             return try await VMNetUplink.awaitUplinkReply(
-                timeout: .seconds(5),
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
                 completionHook: { completionCount.record() }
             ) { _ in
                 startCount.record()
@@ -413,8 +407,41 @@ import Testing
             Issue.record("unexpected pre-install cancellation error: \(error)")
         }
 
+        #expect(timeout.duration == nil)
         #expect(startCount.count == 0)
         #expect(completionCount.count == 1)
     }
+}
+
+// Capture the real timeout callback but never schedule it on a wall clock. Tests
+// fire it after an explicit request-installation handshake, even after cancellation
+// to model an already-enqueued timer event. The caller still activates/cancels the
+// dispatch source, so timer lifecycle assertions exercise production behavior.
+final class ManualVMNetTimeout: @unchecked Sendable {
+    private let lock = NSLock()
+    private var timer: DispatchSourceTimer?
+    private var handler: (@Sendable () -> Void)?
+    private var requestedDuration: Duration?
+
+    var duration: Duration? { lock.withLock { requestedDuration } }
+    var isCancelled: Bool { lock.withLock { timer?.isCancelled ?? false } }
+
+    func makeTimer(timeout: Duration, handler: @escaping @Sendable () -> Void) -> DispatchSourceTimer {
+        let timer = DispatchSource.makeTimerSource()
+        timer.schedule(deadline: .distantFuture)
+        lock.withLock {
+            self.timer = timer
+            self.handler = handler
+            requestedDuration = timeout
+        }
+        return timer
+    }
+
+    func fire() {
+        let callback = lock.withLock { handler }
+        callback?()
+    }
+
+    func clearHandler() { lock.withLock { handler = nil } }
 }
 #endif

@@ -346,50 +346,79 @@ import Testing
     private final class StopState: @unchecked Sendable {
         private let lock = NSLock()
         private var cancellations = 0
-        private var cancellationTime: ContinuousClock.Instant?
         private var completion: (@Sendable () -> Void)?
         var count: Int { lock.withLock { cancellations } }
-        var cancelledAt: ContinuousClock.Instant? { lock.withLock { cancellationTime } }
-        func cancel() {
-            lock.withLock {
-                cancellations += 1
-                cancellationTime = .now
-            }
-        }
+        func cancel() { lock.withLock { cancellations += 1 } }
         func sent(_ completion: @escaping @Sendable () -> Void) { lock.withLock { self.completion = completion } }
         func reply() { let callback = lock.withLock { completion }; callback?() }
     }
 
-    @Test func missingStopReplyIsBoundedAndLateReplyIsHarmless() async throws {
+    @Test func missingStopReplyIsBoundedAndLateReplyIsHarmless() async {
         let state = StopState()
-        let started = ContinuousClock.now
-        await VMNetUplink.awaitStopReply(timeout: .milliseconds(10), cancel: { state.cancel() }) {
-            state.sent($0)
+        let timeout = ManualVMNetTimeout()
+        let sent = Signal()
+        let task = Task {
+            await VMNetUplink.awaitStopReply(
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
+                cancel: { state.cancel() }
+            ) {
+                state.sent($0)
+                sent.signal()
+            }
         }
-        // Measure the timeout callback, not when this MainActor test gets to
-        // resume: parallel tests can keep the actor busy long after cancellation.
-        let cancelledAt = try #require(state.cancelledAt)
-        #expect(started.duration(to: cancelledAt) < .seconds(1))
+        await sent.wait()
+        #expect(timeout.duration == .seconds(5))
+        #expect(state.count == 0)
+        #expect(!timeout.isCancelled)
+        // Expire the installed deadline explicitly, independent of CI scheduling.
+        timeout.fire()
+        await task.value
+        #expect(timeout.isCancelled)
         #expect(state.count == 1)
         state.reply()
         state.reply()
+        timeout.fire()
+        #expect(state.count == 1)
+    }
+
+    @Test(.timeLimit(.minutes(1))) func dispatchStopTimeoutCompletesWithoutHelperReply() async {
+        let state = StopState()
+        let cancelled = Signal()
+        // Keep coverage of the production scheduler without a latency assertion.
+        await VMNetUplink.awaitStopReply(timeout: .zero, cancel: {
+            state.cancel()
+            cancelled.signal()
+        }) { _ in }
+        // A zero deadline may finish before continuation installation; wait for
+        // cancellation bookkeeping too, not just the resumed continuation.
+        await cancelled.wait()
         #expect(state.count == 1)
     }
 
     @Test func successfulStopReplyCompletesExactlyOnce() async {
         let state = StopState()
-        await VMNetUplink.awaitStopReply(timeout: .seconds(30), cancel: { state.cancel() }) { complete in
+        let timeout = ManualVMNetTimeout()
+        await VMNetUplink.awaitStopReply(
+            timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
+            cancel: { state.cancel() }
+        ) { complete in
             complete()
             complete()
         }
+        #expect(timeout.isCancelled)
+        timeout.fire()
         #expect(state.count == 1)
     }
 
     @Test func cancellationReleasesStopWaitWithoutHelperReply() async {
         let state = StopState()
+        let timeout = ManualVMNetTimeout()
         let sent = Signal()
         let task = Task {
-            await VMNetUplink.awaitStopReply(timeout: .seconds(30), cancel: { state.cancel() }) {
+            await VMNetUplink.awaitStopReply(
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
+                cancel: { state.cancel() }
+            ) {
                 state.sent($0)
                 sent.signal()
             }
@@ -397,18 +426,24 @@ import Testing
         await sent.wait()
         task.cancel()
         await task.value
+        #expect(timeout.isCancelled)
         state.reply()
+        timeout.fire()
         #expect(state.count == 1)
     }
 
     @Test func cancellationBeforeStopInstallationDoesNotSend() async {
         let state = StopState()
+        let timeout = ManualVMNetTimeout()
         let entered = Signal()
         let release = Signal()
         let task = Task {
             entered.signal()
             await release.wait()
-            await VMNetUplink.awaitStopReply(timeout: .seconds(30), cancel: { state.cancel() }) { _ in
+            await VMNetUplink.awaitStopReply(
+                timeout: .seconds(5), makeTimeoutTimer: timeout.makeTimer,
+                cancel: { state.cancel() }
+            ) { _ in
                 Issue.record("pre-cancelled stop must not send a request")
             }
         }
@@ -416,6 +451,8 @@ import Testing
         task.cancel()
         release.signal()
         await task.value
+        #expect(timeout.isCancelled)
+        timeout.fire()
         #expect(state.count == 1)
     }
 }
