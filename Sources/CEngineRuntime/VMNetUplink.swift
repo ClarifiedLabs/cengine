@@ -4,7 +4,13 @@ import Darwin
 import Foundation
 @preconcurrency import XPC
 
-final class VMNetUplink: @unchecked Sendable {
+protocol VMShimUplink: AnyObject, Sendable {
+    var fabricFileHandle: FileHandle { get }
+    func setDisconnectHandler(_ handler: @escaping @Sendable () -> Void)
+    func stop() async
+}
+
+final class VMNetUplink: VMShimUplink, @unchecked Sendable {
     private static let timeoutQueue = DispatchQueue(
         label: "com.cengine.vmnet-uplink-timeout",
         qos: .userInitiated
@@ -86,11 +92,40 @@ final class VMNetUplink: @unchecked Sendable {
         // The opaque resource ID includes the engine-root namespace and cannot
         // collide with an identically named Docker network in another daemon.
         networkID.withCString { xpc_dictionary_set_string(message, "network-id", $0) }
-        await withCheckedContinuation { continuation in
-            xpc_connection_send_message_with_reply(connection, message, nil) { _ in
-                xpc_connection_cancel(self.connection)
-                continuation.resume()
+        await Self.awaitStopReply(
+            timeout: .seconds(5),
+            cancel: { xpc_connection_cancel(self.connection) }
+        ) { complete in
+            xpc_connection_send_message_with_reply(self.connection, message, nil) { _ in
+                complete()
             }
+        }
+    }
+
+    // Helper shutdown must not indefinitely hold the fabric configuration queue.
+    // All terminal paths cancel the connection and resume exactly once, including
+    // cancellation before continuation installation and a late helper reply.
+    static func awaitStopReply(
+        timeout: Duration,
+        cancel: @escaping @Sendable () -> Void,
+        send: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void
+    ) async {
+        let reply = VMNetUplinkStopReply(cancel: cancel)
+        let timer = DispatchSource.makeTimerSource(queue: timeoutQueue)
+        let components = timeout.components
+        let delay = max(0, Double(components.seconds)
+            + Double(components.attoseconds) / 1_000_000_000_000_000_000)
+        timer.schedule(deadline: .now() + delay)
+        timer.setEventHandler { reply.finish() }
+        timer.activate()
+        defer { timer.cancel() }
+        await withTaskCancellationHandler {
+            if Task.isCancelled { reply.finish() }
+            await withCheckedContinuation { continuation in
+                if reply.install(continuation) { send { reply.finish() } }
+            }
+        } onCancel: {
+            reply.finish()
         }
     }
 
@@ -221,6 +256,40 @@ final class VMNetUplink: @unchecked Sendable {
         var output = Data(frame.prefix(12))
         output.append(frame.dropFirst(16))
         return output
+    }
+}
+
+private final class VMNetUplinkStopReply: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancel: (@Sendable () -> Void)?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var finished = false
+
+    init(cancel: @escaping @Sendable () -> Void) { self.cancel = cancel }
+
+    func install(_ continuation: CheckedContinuation<Void, Never>) -> Bool {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            continuation.resume()
+            return false
+        }
+        self.continuation = continuation
+        lock.unlock()
+        return true
+    }
+
+    func finish() {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let cancel = self.cancel
+        self.cancel = nil
+        lock.unlock()
+        cancel?()
+        continuation?.resume()
     }
 }
 

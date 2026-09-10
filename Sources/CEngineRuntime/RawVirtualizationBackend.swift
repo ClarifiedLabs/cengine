@@ -7201,13 +7201,49 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ = try await infrastructure.configureFabric(networks: values.sorted { $0.id < $1.id })
     }
 
-    private static func recoverOrLaunch(_ specification: VMShimProtocol.Specification) async throws -> VMShimClient {
-        let specURL = VMShimClient.specificationURL(for: specification)
-        if let data = try? Data(contentsOf: specURL), let existing = try? JSONDecoder().decode(VMShimProtocol.Specification.self, from: data) {
-            let client = VMShimClient(specification: existing)
-            if (try? await client.status()) != nil { return client }
+    static func recoverOrLaunch(
+        _ specification: VMShimProtocol.Specification,
+        executableUUID: UUID? = RunningExecutableIdentity.uuid,
+        probe: (VMShimClient) async throws -> VMShimProtocol.Status = {
+            try await $0.status(timeoutMilliseconds: 2_000)
+        },
+        launch: (VMShimProtocol.Specification) async throws -> VMShimClient = {
+            try await VMShimClient.launch(specification: $0)
         }
-        return try await VMShimClient.launch(specification: specification)
+    ) async throws -> VMShimClient {
+        let specURL = VMShimClient.specificationURL(for: specification)
+        let directory = try PersistentStateDirectory.open(specURL.deletingLastPathComponent())
+        if let data = try directory.readRegularFile(named: specURL.lastPathComponent, required: false) {
+            let existing = try JSONDecoder().decode(VMShimProtocol.Specification.self, from: data)
+            guard existing.kind == .storage, existing.containerID == specification.containerID,
+                  VMShimClient.launchPathsMatch(existing.rootDiskPath, specification.rootDiskPath),
+                  VMShimClient.launchPathsMatch(VMShimClient.specificationURL(for: existing).path, specURL.path) else {
+                throw EngineError(.conflict, "infrastructure VM ownership does not match this engine root")
+            }
+            let client = VMShimClient(specification: existing)
+            let status: VMShimProtocol.Status?
+            do {
+                status = try await probe(client)
+            } catch {
+                if error is CancellationError || Task.isCancelled { throw CancellationError() }
+                // A timeout is not permission to start a second writer for the
+                // shared disk. Only a definitively dead recorded process (or
+                // fully removed runtime artifacts) permits crash recovery.
+                try InfrastructureRecovery.requireExited(existing)
+                status = nil
+            }
+            if let status {
+                try InfrastructureRecovery.validate(
+                    status, specification: existing, executableUUID: executableUUID
+                )
+                guard existing.rootDiskIdentity == specification.rootDiskIdentity else {
+                    throw EngineError(.conflict, "running infrastructure VM disk identity changed")
+                }
+                return client
+            }
+        }
+        try Task.checkCancellation()
+        return try await launch(specification)
     }
 
     static func storageAdministrativeSocketPath(for infrastructure: VMShimClient) throws -> String {

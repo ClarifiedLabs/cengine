@@ -197,21 +197,40 @@ enum VMShimAttachmentResolver {
     private var serviceListener: Int32 = -1
     private var serviceRelays: [UUID: BidirectionalDescriptorRelay] = [:]
     private var hostSocketRelays: [UnixVirtioSocketRelay] = []
-    private let fabric = TrunkNetworkFabric()
+    private let fabric: TrunkNetworkFabric
+    private let startUplink: @MainActor (VMShimClient.FabricNetwork, String) async throws -> any VMShimUplink
+    private var fabricConfiguration: Task<Void, Error>?
+    private var fabricConfigurationGeneration: UUID?
     private var networkListener: Int32 = -1
     private var networkBridge: NetworkStreamBridge?
     private var networkBridges: [String: NetworkBridgeRegistration] = [:]
     private var activeVLANs: [UInt16]
-    private var uplinks: [String: VMNetUplink] = [:]
+    private var uplinks: [String: any VMShimUplink] = [:]
     private var uplinkRecoveries: [String: UplinkRecovery] = [:]
-    private var fabricNetworks: [String: VMShimClient.FabricNetwork] = [:]
+    private var desiredFabricNetworks: [String: VMShimClient.FabricNetwork] = [:]
+    private(set) var fabricNetworks: [String: VMShimClient.FabricNetwork] = [:]
 
-    public init(
+    public convenience init(
         specification: VMShimProtocol.Specification,
         launchIntentURL: URL? = nil
     ) {
+        self.init(
+            specification: specification,
+            launchIntentURL: launchIntentURL,
+            startUplink: { try await VMNetUplink.start(network: $0, namespace: $1) }
+        )
+    }
+
+    init(
+        specification: VMShimProtocol.Specification,
+        launchIntentURL: URL? = nil,
+        fabric: TrunkNetworkFabric = TrunkNetworkFabric(),
+        startUplink: @escaping @MainActor (VMShimClient.FabricNetwork, String) async throws -> any VMShimUplink
+    ) {
         self.specification = specification
         self.launchIntentURL = launchIntentURL
+        self.fabric = fabric
+        self.startUplink = startUplink
         activeVLANs = specification.vlans
     }
 
@@ -596,6 +615,7 @@ enum VMShimAttachmentResolver {
             state: state,
             processIdentifier: getpid(),
             processStartTime: VMShimClient.processStartTime(for: getpid()),
+            executableUUID: RunningExecutableIdentity.uuid,
             exitCode: exitCode,
             error: failure
         )
@@ -730,30 +750,89 @@ enum VMShimAttachmentResolver {
         await fabric.unregister(.init(endpointID), registration: generation)
     }
 
-    private func configureFabric(_ values: [VMShimClient.FabricNetwork]) async throws {
-        let desired = Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) })
-        let dockerHostGateways = Dictionary(uniqueKeysWithValues: values.compactMap { network in
-            network.internalNetwork || network.isolated || network.gateway.isEmpty ? nil : (network.vlan, network.gateway)
-        })
-        await fabric.configureDockerHostDNS(gateways: dockerHostGateways)
-        for id in Set(fabricNetworks.keys).union(desired.keys) where fabricNetworks[id] != desired[id] {
-            await cancelUplinkRecovery(id: id)
-            if let existing = uplinks.removeValue(forKey: id) {
-                await fabric.unregister(.init("uplink-\(id)")); await existing.stop()
+    func configureFabric(_ values: [VMShimClient.FabricNetwork]) async throws {
+        // MainActor alone does not serialize across helper/fabric awaits. Queue
+        // whole reconciliations so an older start cannot outlive a removal.
+        let previous = fabricConfiguration
+        let generation = UUID()
+        let task = Task { @MainActor in
+            _ = try? await previous?.value
+            try Task.checkCancellation()
+            try await self.applyFabric(values)
+        }
+        fabricConfiguration = task
+        fabricConfigurationGeneration = generation
+        defer {
+            if fabricConfigurationGeneration == generation {
+                fabricConfiguration = nil
+                fabricConfigurationGeneration = nil
             }
-            fabricNetworks.removeValue(forKey: id)
-            guard let network = desired[id] else { continue }
-            fabricNetworks[id] = network
-            if network.isolated { continue }
-            let uplink = try await VMNetUplink.start(
-                network: network,
-                namespace: specification.networkNamespace
-            )
-            await installUplink(uplink, network: network)
+        }
+        try await withTaskCancellationHandler {
+            if Task.isCancelled { task.cancel() }
+            try await task.value
+        } onCancel: {
+            task.cancel()
         }
     }
 
-    private func installUplink(_ uplink: VMNetUplink, network: VMShimClient.FabricNetwork) async {
+    var dockerHostGateways: [UInt16: String] {
+        Dictionary(uniqueKeysWithValues: fabricNetworks.values.compactMap { network in
+            network.internalNetwork || network.isolated || network.gateway.isEmpty
+                ? nil : (network.vlan, network.gateway)
+        })
+    }
+
+    private func refreshFabricDNS() async {
+        await fabric.configureDockerHostDNS(gateways: dockerHostGateways)
+    }
+
+    private func applyFabric(_ values: [VMShimClient.FabricNetwork]) async throws {
+        let desired = Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) })
+        desiredFabricNetworks = desired
+        let ids = Set(fabricNetworks.keys).union(desired.keys).union(uplinkRecoveries.keys)
+        let changed = ids.sorted().filter { id in
+            guard let network = desired[id] else { return true }
+            return fabricNetworks[id] != network || (!network.isolated && uplinks[id] == nil)
+        }
+        // Detach ownership before any suspension: a delayed disconnect must not
+        // launch recovery while this reconciliation is stopping its old uplink.
+        let retired = changed.map { id in
+            let uplink = uplinks.removeValue(forKey: id)
+            let recovery = uplinkRecoveries.removeValue(forKey: id)
+            recovery?.task.cancel()
+            fabricNetworks.removeValue(forKey: id)
+            return (id: id, uplink: uplink, recovery: recovery)
+        }
+        await refreshFabricDNS()
+        for entry in retired {
+            await entry.recovery?.task.value
+            if let uplink = entry.uplink {
+                await fabric.unregister(.init("uplink-\(entry.id)"))
+                await uplink.stop()
+            }
+        }
+        try Task.checkCancellation()
+        // Complete removals/isolation before any fallible start. An unrelated
+        // helper rejection must not leave an obsolete external uplink active.
+        for id in changed {
+            if let network = desired[id], network.isolated { fabricNetworks[id] = network }
+        }
+        for id in changed {
+            guard let network = desired[id], !network.isolated else { continue }
+            let uplink = try await startUplink(network, specification.networkNamespace)
+            try await installUplink(uplink, network: network)
+        }
+        try Task.checkCancellation()
+        // A disconnect can arrive while another network is being installed.
+        guard desired.allSatisfy({ id, network in
+            fabricNetworks[id] == network && (network.isolated || uplinks[id] != nil)
+        }) else {
+            throw EngineError(.internalError, "network fabric uplink disconnected during configuration")
+        }
+    }
+
+    private func installUplink(_ uplink: any VMShimUplink, network: VMShimClient.FabricNetwork) async throws {
         let registration = UUID()
         let onDisconnect: @Sendable () -> Void = { [weak self, weak uplink] in
             Task { @MainActor [weak self, weak uplink] in
@@ -774,21 +853,33 @@ enum VMShimAttachmentResolver {
             registration: registration,
             onDisconnect: onDisconnect
         )
+        guard !Task.isCancelled, uplinks[network.id] === uplink else {
+            if uplinks[network.id] === uplink { uplinks.removeValue(forKey: network.id) }
+            await fabric.unregister(.init("uplink-\(network.id)"), registration: registration)
+            await uplink.stop()
+            throw CancellationError()
+        }
+        fabricNetworks[network.id] = network
+        await refreshFabricDNS()
     }
 
-    private func uplinkDisconnected(id: String, uplink: VMNetUplink, registration: UUID) {
+    private func uplinkDisconnected(id: String, uplink: any VMShimUplink, registration: UUID) {
         guard uplinks[id] === uplink else { return }
         uplinks.removeValue(forKey: id)
+        fabricNetworks.removeValue(forKey: id)
         FileHandle.standardError.write(Data("vmnet uplink \(id) disconnected; recreating it\n".utf8))
         let fabric = self.fabric
-        Task {
+        let cleanup = Task {
             await fabric.unregister(.init("uplink-\(id)"), registration: registration)
+            await self.refreshFabricDNS()
             await uplink.stop()
         }
 
         uplinkRecoveries.removeValue(forKey: id)?.task.cancel()
         let generation = UUID()
         let task = Task { @MainActor [weak self] in
+            // A stop uses the same helper resource ID as its replacement.
+            await cleanup.value
             guard let self else { return }
             await self.recoverUplink(id: id, generation: generation)
         }
@@ -804,20 +895,17 @@ enum VMShimAttachmentResolver {
         }
 
         while !Task.isCancelled, uplinkRecoveries[id]?.generation == generation,
-              uplinks[id] == nil, let network = fabricNetworks[id], !network.isolated {
+              uplinks[id] == nil, let network = desiredFabricNetworks[id], !network.isolated {
             do {
-                let replacement = try await VMNetUplink.start(
-                    network: network,
-                    namespace: specification.networkNamespace
-                )
+                let replacement = try await startUplink(network, specification.networkNamespace)
                 guard !Task.isCancelled,
                       uplinkRecoveries[id]?.generation == generation,
                       uplinks[id] == nil,
-                      fabricNetworks[id] == network else {
+                      desiredFabricNetworks[id] == network else {
                     await replacement.stop()
                     return
                 }
-                await installUplink(replacement, network: network)
+                try await installUplink(replacement, network: network)
                 FileHandle.standardError.write(Data("vmnet uplink \(id) restored\n".utf8))
                 return
             } catch {
@@ -831,12 +919,6 @@ enum VMShimAttachmentResolver {
                 catch { return }
             }
         }
-    }
-
-    private func cancelUplinkRecovery(id: String) async {
-        guard let recovery = uplinkRecoveries.removeValue(forKey: id) else { return }
-        recovery.task.cancel()
-        await recovery.task.value
     }
 
     private func acceptStorageClient(_ descriptor: Int32) async {

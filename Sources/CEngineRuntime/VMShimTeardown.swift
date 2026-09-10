@@ -3,13 +3,15 @@ import Foundation
 
 /// Stops every VM shim whose durable ownership records belong to one engine root.
 /// Uninstall uses this before removing the privileged helper or moving engine data.
+/// Upgrades require complete shutdown before replacing shared VM infrastructure.
 public enum VMShimTeardown {
     public static func terminateAll(
         in root: URL,
         expectedExecutable: URL = Bundle.main.executableURL
             ?? URL(filePath: CommandLine.arguments[0]),
         gracePeriodMilliseconds: Int32 = 5_000,
-        forceWaitMilliseconds: Int32 = 1_000
+        forceWaitMilliseconds: Int32 = 1_000,
+        requireCompleteShutdown: Bool = false
     ) async throws -> Int {
         guard let rootDirectory = try PersistentStateDirectory.openIfPresent(root) else {
             return 0
@@ -39,6 +41,16 @@ public enum VMShimTeardown {
         ))
         var terminatedCount = containerShims.count
 
+        // A failed or quarantined container may still depend on shared storage.
+        // Uninstall remains best-effort; an upgrade must leave infrastructure up
+        // until every container's ownership and termination are resolved.
+        if requireCompleteShutdown, !failures.isEmpty {
+            throw EngineError(
+                .internalError,
+                "could not stop all cengine VM shims: \(failures.joined(separator: "; "))"
+            )
+        }
+
         if let infrastructure = try rootDirectory.openDirectoryIfPresent(named: "infrastructure"),
            let data = try infrastructure.readRegularFile(named: "shim.json", required: false) {
             let specification = try JSONDecoder().decode(
@@ -63,13 +75,32 @@ public enum VMShimTeardown {
                 let client = VMShimClient(specification: specification)
                 do {
                     try await client.requestAdministrativeShutdown(
-                        timeoutMilliseconds: gracePeriodMilliseconds
+                        timeoutMilliseconds: gracePeriodMilliseconds,
+                        waitForExit: requireCompleteShutdown,
+                        exitWaitMilliseconds: forceWaitMilliseconds,
+                        expectedExecutable: expectedExecutable
                     )
                     terminatedCount += 1
                 } catch {
-                    failures.append(
-                        "infrastructure: \(EngineError.message(for: error))"
-                    )
+                    let shutdownError = error
+                    do {
+                        // The raw specification passed the ownership check above.
+                        // A failed RPC is not proof of life, but disappearing socket
+                        // artifacts alone are not proof of exit after a rejected peer.
+                        guard requireCompleteShutdown,
+                              FileManager.default.fileExists(
+                                  atPath: specification.socketPath + ".status"
+                              ) else { throw shutdownError }
+                        try InfrastructureRecovery.requireExited(specification)
+                        guard FileManager.default.fileExists(
+                            atPath: specification.socketPath + ".status"
+                        ) else { throw shutdownError }
+                        terminatedCount += 1
+                    } catch {
+                        failures.append(
+                            "infrastructure: \(EngineError.message(for: shutdownError))"
+                        )
+                    }
                 }
             }
         }

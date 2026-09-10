@@ -3635,8 +3635,15 @@ public final class VMShimClient: @unchecked Sendable {
             && persistentContainerDirectory?.identity == directoryIdentity
     }
 
-    public func status() async throws -> VMShimProtocol.Status {
-        let status = try await request(.status, response: VMShimProtocol.Status.self)
+    public func status(
+        timeoutMilliseconds: Int32? = nil
+    ) async throws -> VMShimProtocol.Status {
+        let status = try await request(
+            .status,
+            payloadData: nil,
+            response: VMShimProtocol.Status.self,
+            deadlineNanoseconds: timeoutMilliseconds.map { Self.deadline(afterMilliseconds: $0) }
+        )
         remember(status)
         return status
     }
@@ -3649,20 +3656,71 @@ public final class VMShimClient: @unchecked Sendable {
     /// Requests an authenticated shutdown without ever escalating to a process
     /// signal. Infrastructure shims do not yet have the immutable launch
     /// journal used to prove ownership of container shim process generations.
+    /// Strict callers bind the kernel peer to the expected executable and exact
+    /// storage launch tuple before sending credentials, then verify its exit.
+    /// Request and process exit each have bounded waits, so a slow VM stop
+    /// cannot consume the process-exit grace. Inspection injection is internal
+    /// and only for isolated socket-transport tests.
     func requestAdministrativeShutdown(
-        timeoutMilliseconds: Int32 = 5_000
+        timeoutMilliseconds: Int32 = 5_000,
+        waitForExit: Bool = false,
+        exitWaitMilliseconds: Int32 = 1_000,
+        expectedExecutable: URL = Bundle.main.executableURL
+            ?? URL(filePath: CommandLine.arguments[0]),
+        inspectionProvider: (@Sendable (CInt) -> ProcessInspection?)? = nil
     ) async throws {
         invalidateRequests()
         let deadline = Self.deadline(afterMilliseconds: timeoutMilliseconds)
-        let payload = try await runBlocking { [self] in
-            try requestData(
+        try await runBlocking { [self] in
+            var peerIdentity: ProcessIdentity?
+            let checkPeer: ((CInt) throws -> Void)?
+            if waitForExit {
+                checkPeer = { descriptor in
+                    let identity = try Self.administrativePeerIdentity(descriptor: descriptor)
+                    let inspection: ProcessInspection?
+                    if let inspectionProvider {
+                        inspection = inspectionProvider(identity.processIdentifier)
+                    } else {
+                        inspection = Self.inspectProcess(
+                            identity.processIdentifier, identityProvider: Self.identity(for:)
+                        )
+                    }
+                    guard let inspection,
+                          Self.administrativeInspectionMatches(
+                              inspection, peerIdentity: identity,
+                              specification: self.specification,
+                              expectedExecutable: expectedExecutable
+                          ) else {
+                        throw EngineError(
+                            .conflict, "VM shim socket peer does not match the infrastructure launch"
+                        )
+                    }
+                    peerIdentity = identity
+                }
+            } else {
+                checkPeer = nil
+            }
+            let payload = try requestData(
                 .shutdown,
                 payloadData: nil,
                 allowInvalidated: true,
-                deadlineNanoseconds: deadline
+                deadlineNanoseconds: deadline,
+                checkPeer: checkPeer
+            )
+            let status = try JSONDecoder().decode(VMShimProtocol.Status.self, from: payload)
+            guard waitForExit else { return }
+            guard let peerIdentity,
+                  status.containerID == specification.containerID,
+                  status.generation == specification.generation,
+                  status.processIdentifier == peerIdentity.processIdentifier,
+                  status.processStartTime == peerIdentity.startTime else {
+                throw EngineError(.conflict, "VM shim shutdown status does not match its socket peer")
+            }
+            try Self.waitForAdministrativeExit(
+                peerIdentity,
+                deadlineNanoseconds: Self.deadline(afterMilliseconds: exitWaitMilliseconds)
             )
         }
-        _ = try JSONDecoder().decode(VMShimProtocol.Status.self, from: payload)
     }
 
     /// Permanently invalidates this client and terminates its exact shim generation.
@@ -3867,7 +3925,8 @@ public final class VMShimClient: @unchecked Sendable {
         _ operation: VMShimProtocol.Operation,
         payloadData: Data?,
         allowInvalidated: Bool = false,
-        deadlineNanoseconds: UInt64? = nil
+        deadlineNanoseconds: UInt64? = nil,
+        checkPeer: ((CInt) throws -> Void)? = nil
     ) throws -> Data {
         let envelope = VMShimProtocol.Envelope(token: specification.token, operation: operation, payload: payloadData)
         let timeout = deadlineNanoseconds.map { Self.remainingMilliseconds(until: $0) }
@@ -3881,6 +3940,8 @@ public final class VMShimClient: @unchecked Sendable {
             throw error
         }
         defer { unregisterAndClose(descriptor) }
+        // Capture the kernel peer before the request can cause it to exit.
+        try checkPeer?(descriptor)
         let frame: Data
         if let deadlineNanoseconds {
             let flags = fcntl(descriptor, F_GETFL)
@@ -3898,6 +3959,11 @@ public final class VMShimClient: @unchecked Sendable {
         }
         let reply = try VMShimProtocol.decode(frame)
         guard reply.id == envelope.id else { throw EngineError(.internalError, "VM shim response id mismatch") }
+        if checkPeer != nil {
+            guard reply.token == envelope.token, reply.operation == envelope.operation else {
+                throw EngineError(.conflict, "VM shim shutdown response authentication mismatch")
+            }
+        }
         if let failure = reply.error {
             if failure.code == GuestProtocol.resourceRollbackIncompleteErrorCode {
                 throw BackendResourceRollbackIncompleteError(failure.message)
@@ -4069,6 +4135,80 @@ public final class VMShimClient: @unchecked Sendable {
             usleep(10_000)
         }
         return true
+    }
+
+    /// Path/argv evidence deliberately does not compare executable UUIDs: an
+    /// upgrade must be able to shut down the old image at the same trusted path.
+    static func administrativeInspectionMatches(
+        _ inspection: ProcessInspection,
+        peerIdentity: ProcessIdentity,
+        specification: VMShimProtocol.Specification,
+        expectedExecutable: URL
+    ) -> Bool {
+        specification.kind == .storage
+            && specification.containerID == "cengine-storage"
+            && inspection.identityBefore == peerIdentity
+            && inspection.identityAfter == peerIdentity
+            && inspection.arguments.count == 4
+            && launchPathsMatch(inspection.executablePath, expectedExecutable.path)
+            && launchPathsMatch(inspection.arguments[0], expectedExecutable.path)
+            && inspection.arguments[1] == "vm-shim"
+            && inspection.arguments[2] == "--spec"
+            && launchPathsMatch(
+                inspection.arguments[3], specificationURL(for: specification).path
+            )
+    }
+
+    private static func administrativePeerIdentity(descriptor: CInt) throws -> ProcessIdentity {
+        var processIdentifier = pid_t()
+        var length = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(
+            descriptor, SOL_LOCAL, LOCAL_PEERPID, &processIdentifier, &length
+        ) == 0,
+        length == MemoryLayout<pid_t>.size,
+        let identity = try liveAdministrativeIdentity(for: processIdentifier) else {
+            throw EngineError(.conflict, "VM shim socket peer identity is unavailable")
+        }
+        return identity
+    }
+
+    /// Unlike best-effort process inspection, an unreadable live PID is not
+    /// evidence of exit. kill(pid, 0) only checks existence; no signal is sent.
+    private static func liveAdministrativeIdentity(
+        for processIdentifier: CInt
+    ) throws -> ProcessIdentity? {
+        guard processIdentifier > 1 else {
+            throw EngineError(.conflict, "VM shim socket peer PID is invalid")
+        }
+        if let identity = identity(for: processIdentifier) { return identity }
+        if Darwin.kill(processIdentifier, 0) == -1, errno == ESRCH { return nil }
+        throw EngineError(.conflict, "could not verify VM shim process identity \(processIdentifier)")
+    }
+
+    static func waitForAdministrativeExit(
+        _ identity: ProcessIdentity,
+        deadlineNanoseconds: UInt64,
+        identityProvider: ((CInt) throws -> ProcessIdentity?)? = nil
+    ) throws {
+        let identityProvider = identityProvider ?? liveAdministrativeIdentity(for:)
+        while true {
+            do {
+                if try identityProvider(identity.processIdentifier) != identity { return }
+            } catch {
+                // Darwin can stop exposing proc_pidinfo while an exiting process
+                // still exists. Retry that transition, but never treat an unreadable
+                // identity as proof of exit or extend the shutdown deadline.
+                guard remainingMilliseconds(until: deadlineNanoseconds) > 0 else { throw error }
+            }
+            let remaining = remainingMilliseconds(until: deadlineNanoseconds)
+            guard remaining > 0 else {
+                throw EngineError(
+                    .internalError,
+                    "VM shim \(identity.processIdentifier) did not exit after administrative shutdown"
+                )
+            }
+            usleep(UInt32(min(10, remaining)) * 1_000)
+        }
     }
 
     static func processStartTime(for processIdentifier: CInt) -> UInt64? {

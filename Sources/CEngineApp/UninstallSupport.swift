@@ -1,3 +1,4 @@
+import AppKit
 import CEngineCore
 import Darwin
 import Dispatch
@@ -69,14 +70,20 @@ enum CEngineServices {
         }
     }
 
-    private static func runVirtualMachineShutdown() async throws {
+    /// Upgrade must fail closed; unlike uninstall, incomplete VM teardown must
+    /// prevent removal of networking and registration of replacement services.
+    static func stopVirtualMachinesForUpgrade() async throws {
+        try await runVirtualMachineShutdown(forUpgrade: true)
+    }
+
+    private static func runVirtualMachineShutdown(forUpgrade: Bool = false) async throws {
         let executable = Bundle.main.bundleURL
             .appending(path: "Contents/MacOS/cengine-engine")
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw EngineError(.notFound, "bundled cengine engine is missing")
         }
         try await Task.detached {
-            try run(executable.path, ["system", "shutdown"])
+            try run(executable.path, ["system", "shutdown"] + (forUpgrade ? ["--for-upgrade"] : []))
         }.value
     }
 
@@ -169,6 +176,31 @@ enum UninstallSupport {
         return warnings
     }
 
+    /// Homebrew runs early_script before its quit stanza. Stop the GUI first:
+    /// otherwise its polling task can re-register an agent during teardown.
+    @MainActor static func performHeadlessTeardown(
+        quitApplication: @MainActor () async throws -> Void = quitOtherApplications,
+        teardown: @MainActor () async -> [String] = { await performBestEffortTeardown() }
+    ) async -> [String] {
+        do { try await quitApplication() }
+        catch { return ["could not quiesce the cengine app: \(error.localizedDescription)"] }
+        return await teardown()
+    }
+
+    @MainActor private static func quitOtherApplications() async throws {
+        let applications = NSRunningApplication.runningApplications(
+            withBundleIdentifier: CEngineUserData.appIdentifier
+        ).filter { $0.processIdentifier != getpid() }
+        for application in applications { application.terminate() }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while applications.contains(where: { !$0.isTerminated }) {
+            guard ContinuousClock.now < deadline else {
+                throw EngineError(.conflict, "quit cengine before removing or upgrading it")
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
     /// Headless teardown for `brew uninstall --cask cengine`: unregister both
     /// launchd services and drop the Docker integration, then exit. User data is
     /// deliberately left to the cask's delete/zap stanzas. Cleanup is best
@@ -181,7 +213,7 @@ enum UninstallSupport {
             exit(0) // watchdog: cleanup must never block application removal
         }
         Task { @MainActor in
-            for warning in await performBestEffortTeardown() {
+            for warning in await performHeadlessTeardown() {
                 FileHandle.standardError.write(Data(
                     "cengine uninstall warning: \(warning)\n".utf8
                 ))

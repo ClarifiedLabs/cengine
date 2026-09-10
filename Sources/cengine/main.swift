@@ -11,7 +11,7 @@ private final class DaemonLock {
     private let descriptor: Int32
 
     init(url: URL) throws {
-        descriptor = open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        descriptor = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw EngineError(.internalError, "could not open daemon lock at \(url.path)") }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             close(descriptor)
@@ -59,7 +59,7 @@ private final class DaemonLock {
         let socket = option("--socket", in: arguments) ?? paths.socket.path
         let lockURL = URL(filePath: socket + ".lock")
         let daemonLock = try DaemonLock(url: lockURL)
-        _ = daemonLock
+        defer { withExtendedLifetime(daemonLock) {} }
         let requestedRoot = option("--root", in: arguments).map {
             URL(filePath: $0, directoryHint: .isDirectory)
         } ?? paths.data
@@ -67,6 +67,10 @@ private final class DaemonLock {
             at: requestedRoot, withIntermediateDirectories: true
         )
         let root = requestedRoot.resolvingSymlinksInPath().standardizedFileURL
+        // API endpoints are configurable: different sockets must still exclude
+        // concurrent writers and upgrade teardown for the same engine data root.
+        let rootLock = try DaemonLock(url: root.appending(path: ".daemon.lock"))
+        defer { withExtendedLifetime(rootLock) {} }
         let backend: any ContainerBackend
         if arguments.contains("--metadata-only") {
             backend = MetadataOnlyBackend()
@@ -245,7 +249,25 @@ private final class DaemonLock {
             throw EngineError(.unsupported, "Apple silicon is required")
             #endif
         case "shutdown":
-            let count = try await VMShimTeardown.terminateAll(in: EnginePaths().data)
+            let options = try shutdownOptions(Array(arguments.dropFirst()))
+            let count: Int
+            if options.forUpgrade {
+                // SMAppService unregistration is asynchronous. Hold the same
+                // lock as daemon startup until every old disk writer is gone.
+                try FileManager.default.createDirectory(
+                    at: options.lock.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                let lock = try await acquireUpgradeLock(options.lock)
+                defer { withExtendedLifetime(lock) {} }
+                try FileManager.default.createDirectory(at: options.root, withIntermediateDirectories: true)
+                let rootLock = try await acquireUpgradeLock(options.root.appending(path: ".daemon.lock"))
+                defer { withExtendedLifetime(rootLock) {} }
+                count = try await VMShimTeardown.terminateAll(
+                    in: options.root, requireCompleteShutdown: true
+                )
+            } else {
+                count = try await VMShimTeardown.terminateAll(in: options.root)
+            }
             print("stopped \(count) cengine VM shim\(count == 1 ? "" : "s")")
         case "configure-docker":
             let options = try dockerConfigurationOptions(Array(arguments.dropFirst()))
@@ -255,6 +277,51 @@ private final class DaemonLock {
         case "install": try await SystemManager.install(paths: EnginePaths())
         case "uninstall": try SystemManager.uninstall(paths: EnginePaths())
         default: throw EngineError(.badRequest, "system command is not implemented yet")
+        }
+    }
+
+    private static func shutdownOptions(_ arguments: [String]) throws -> (root: URL, lock: URL, forUpgrade: Bool) {
+        var root: URL?
+        var socket: URL?
+        var forUpgrade = false
+        var index = 0
+        while index < arguments.count {
+            let flag = arguments[index]
+            if flag == "--for-upgrade", !forUpgrade {
+                forUpgrade = true
+                index += 1
+                continue
+            }
+            guard index + 1 < arguments.count,
+                  arguments[index + 1].hasPrefix("/") else {
+                throw EngineError(.badRequest, "system shutdown requires absolute --root and --socket paths")
+            }
+            let value = URL(filePath: arguments[index + 1]).standardizedFileURL
+            switch flag {
+            case "--root" where root == nil: root = value.resolvingSymlinksInPath()
+            case "--socket" where socket == nil: socket = value
+            default: throw EngineError(.badRequest, "invalid system shutdown option: \(flag)")
+            }
+            index += 2
+        }
+        guard (root == nil) == (socket == nil) else {
+            throw EngineError(.badRequest, "system shutdown --root and --socket must be supplied together")
+        }
+        let paths = EnginePaths()
+        return (root ?? paths.data, socket.map { URL(filePath: $0.path + ".lock") } ?? paths.lock, forUpgrade)
+    }
+
+    private static func acquireUpgradeLock(_ url: URL) async throws -> DaemonLock {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while true {
+            try Task.checkCancellation()
+            do { return try DaemonLock(url: url) }
+            catch let error as EngineError where error.code == .conflict {
+                guard ContinuousClock.now < deadline else {
+                    throw EngineError(.conflict, "engine is still running; stop its service before upgrading VMs")
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
         }
     }
 

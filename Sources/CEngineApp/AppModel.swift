@@ -55,7 +55,8 @@ extension SMAppService: AppService {}
         return Self.isVersion(runningVersion, olderThan: appVersion)
     }
     var canRestartEngineService: Bool {
-        engineServiceEnabled && agent.status == .enabled && !isManagingEngineService
+        engineServiceEnabled && !isManagingEngineService
+            && (agent.status == .enabled || !automaticServiceRegistrationAllowed)
     }
 
     var containerSettingsValidationMessage: String? {
@@ -94,6 +95,10 @@ extension SMAppService: AppService {}
     private let serviceRegistrationRevision: String?
     private let serviceRegistrationDefaults: UserDefaults
     private let waitForServiceUnregistration: () async throws -> Void
+    private let stopVirtualMachinesForUpgrade: () async throws -> Void
+    private var hasAttemptedServiceStartup = false
+    // A failed migration remains fenced until an explicit enable/restart retry.
+    private var automaticServiceRegistrationAllowed: Bool
     private let restartRegisteredEngine: @Sendable () async throws -> Void
     private var refreshTask: Task<Void, Never>?
     private var previousStats: [String: ContainerStatsSample] = [:]
@@ -117,6 +122,9 @@ extension SMAppService: AppService {}
         waitForServiceUnregistration: @escaping () async throws -> Void = {
             try await Task.sleep(for: .seconds(2))
         },
+        stopVirtualMachinesForUpgrade: @escaping () async throws -> Void = {
+            try await CEngineServices.stopVirtualMachinesForUpgrade()
+        },
         restartRegisteredEngine: @escaping @Sendable () async throws -> Void = {
             try await Task.detached { try CEngineServices.restartEngine() }.value
         },
@@ -136,6 +144,9 @@ extension SMAppService: AppService {}
         self.serviceRegistrationRevision = serviceRegistrationRevision
         self.serviceRegistrationDefaults = serviceRegistrationDefaults
         self.waitForServiceUnregistration = waitForServiceUnregistration
+        self.stopVirtualMachinesForUpgrade = stopVirtualMachinesForUpgrade
+        automaticServiceRegistrationAllowed = serviceRegistrationRevision == nil
+            || serviceRegistrationDefaults.string(forKey: Self.serviceRegistrationRevisionKey) == serviceRegistrationRevision
         self.restartRegisteredEngine = restartRegisteredEngine
         engineServiceEnabled = serviceRegistrationDefaults.object(forKey: Self.engineServiceEnabledKey) as? Bool ?? true
         engineServiceState = try? EngineServiceState.load(from: paths.serviceState)
@@ -172,23 +183,36 @@ extension SMAppService: AppService {}
     }
 
     func start() async {
+        guard !hasAttemptedServiceStartup, !isManagingEngineService else { return }
+        isManagingEngineService = true
         do {
-            let registrationChanged = try await unregisterOutdatedServicesIfNeeded()
-            if engineServiceEnabled {
-                try registerRequiredNetworking()
-                try registerEngineIfNetworkingIsReady()
-            }
-            if registrationChanged, let serviceRegistrationRevision {
-                serviceRegistrationDefaults.set(
-                    serviceRegistrationRevision,
-                    forKey: Self.serviceRegistrationRevisionKey
-                )
-            }
+            try await prepareRequiredServices()
         } catch {
             self.error = "Could not enable required cengine services: \(error.localizedDescription)"
         }
+        isManagingEngineService = false
         updateServiceStatus()
         startPolling()
+    }
+
+    private func prepareRequiredServices() async throws {
+        // Set both fences before the first suspension, including startup invoked
+        // by onboarding or Enable before the window's startup task runs.
+        hasAttemptedServiceStartup = true
+        automaticServiceRegistrationAllowed = false
+        let registrationChanged = try await unregisterOutdatedServicesIfNeeded()
+        if engineServiceEnabled {
+            try registerRequiredNetworking()
+            try registerEngineIfNetworkingIsReady()
+        }
+        if registrationChanged, let serviceRegistrationRevision {
+            serviceRegistrationDefaults.set(
+                serviceRegistrationRevision,
+                forKey: Self.serviceRegistrationRevisionKey
+            )
+        }
+        automaticServiceRegistrationAllowed = true
+        error = nil
     }
 
     func setActive(_ active: Bool) {
@@ -211,12 +235,15 @@ extension SMAppService: AppService {}
     }
 
     func completeOnboarding() async {
+        guard !isManagingEngineService else { return }
+        isManagingEngineService = true
+        defer { isManagingEngineService = false }
         serviceRegistrationDefaults.set(true, forKey: AppPreferenceKeys.completedOnboarding)
         serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
         showOnboarding = false
+        engineServiceEnabled = true
         do {
-            try registerRequiredNetworking()
-            try registerEngineIfNetworkingIsReady()
+            try await prepareRequiredServices()
             if helper.status == .requiresApproval { openLoginItemsSettings() }
             error = nil
         } catch {
@@ -237,8 +264,7 @@ extension SMAppService: AppService {}
         serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
         defer { isManagingEngineService = false }
         do {
-            try registerRequiredNetworking()
-            try registerEngineIfNetworkingIsReady()
+            try await prepareRequiredServices()
             engineServiceActionStatus = helper.status == .enabled ? "Enabled" : "Waiting for networking approval"
             refreshError = nil
         } catch {
@@ -272,7 +298,7 @@ extension SMAppService: AppService {}
 
     func restartEngineService() async {
         guard !isManagingEngineService else { return }
-        guard engineServiceEnabled, agent.status == .enabled else {
+        guard canRestartEngineService else {
             error = "Enable the cengine engine service before restarting it."
             return
         }
@@ -282,7 +308,13 @@ extension SMAppService: AppService {}
         refreshError = nil
         defer { isManagingEngineService = false }
         do {
-            try await restartRegisteredEngine()
+            if automaticServiceRegistrationAllowed {
+                try await restartRegisteredEngine()
+            } else {
+                // Restart is also the explicit retry for an incomplete upgrade,
+                // even when the old agent has already been unregistered.
+                try await prepareRequiredServices()
+            }
             engineServiceActionStatus = "Restart requested"
             engineStatus = "Starting…"
         } catch {
@@ -338,7 +370,7 @@ extension SMAppService: AppService {}
     }
 
     func refresh() async {
-        guard !isRefreshing else { return }
+        guard automaticServiceRegistrationAllowed, !isManagingEngineService, !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         do {
@@ -359,6 +391,7 @@ extension SMAppService: AppService {}
             async let networkData = client.get("/v1.55/networks")
             async let diskData = client.get("/v1.55/system/df?verbose=true")
             let payloads = try await (versionData, infoData, containerData, imageData, networkData, diskData)
+            guard automaticServiceRegistrationAllowed, !isManagingEngineService else { return }
             let decoder = JSONDecoder()
             let version = try decoder.decode(VersionResponse.self, from: payloads.0)
             let info = try decoder.decode(InfoResponse.self, from: payloads.1)
@@ -518,10 +551,13 @@ extension SMAppService: AppService {}
     }
 
     func uninstall(deleteData: Bool) async {
+        guard !isManagingEngineService else { return }
         guard let package = Bundle.main.url(forResource: "cengine-uninstall", withExtension: "pkg") else {
             error = "The signed cengine uninstaller is missing."
             return
         }
+        isManagingEngineService = true
+        automaticServiceRegistrationAllowed = false
         refreshTask?.cancel()
         var warnings = await UninstallSupport.performBestEffortTeardown(
             teardownServices: {
@@ -628,6 +664,10 @@ extension SMAppService: AppService {}
             try await agent.unregister()
             unregisteredService = true
         }
+        // This strict command waits for daemon quiescence and verifies owned VM
+        // exits. It must run even if cask teardown already removed the agent.
+        // Keep networking available until all VMs have stopped successfully.
+        try await stopVirtualMachinesForUpgrade()
         if helper.status == .enabled || helper.status == .requiresApproval {
             try await helper.unregister()
             unregisteredService = true

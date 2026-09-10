@@ -9,7 +9,11 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// onCommit - note this is a no-op, as we always push writes to the backing store.
+// onCommit is a no-op because onWrite synchronously flushes every successful
+// WRITE before acknowledging FILE_SYNC, even when UNSTABLE was requested. This
+// server therefore has no acknowledged unstable writes left to flush (RFC 1813
+// section 3.3.21). This invariant does not cover writes acknowledged by older
+// servers that returned FILE_SYNC without syncing.
 func onCommit(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
 	handle, err := xdr.ReadOpaque(w.req.Body)

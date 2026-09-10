@@ -68,7 +68,18 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
-	defer file.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			file.Close()
+		}
+	}()
+	// billy.File does not require Sync. Fail closed rather than claim stable
+	// storage for a backend (or wrapper) that cannot flush this descriptor.
+	syncer, ok := file.(interface{ Sync() error })
+	if !ok {
+		return &NFSStatusError{statusFromWriteError(billy.ErrNotSupported), billy.ErrNotSupported}
+	}
 	if req.Offset > 0 {
 		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
 			return &NFSStatusError{NFSStatusIO, err}
@@ -83,7 +94,16 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
 	}
-	if err := file.Close(); err != nil {
+	// RFC 1813 section 3.3.7 permits stronger stability than requested. Keep
+	// returning FILE_SYNC for every WRITE, but only after flushing its data and
+	// metadata through the same open descriptor, including partial writes.
+	if err := syncer.Sync(); err != nil {
+		Log.Errorf("error syncing: %v", err)
+		return &NFSStatusError{statusFromWriteError(err), err}
+	}
+	err = file.Close()
+	closed = true
+	if err != nil {
 		Log.Errorf("error closing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
 	}

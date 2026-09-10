@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/osfs"
 	nfs "github.com/willscott/go-nfs"
 	"github.com/willscott/go-nfs/helpers"
 	"github.com/willscott/go-nfs/helpers/memfs"
@@ -88,6 +89,13 @@ type trackingFile struct {
 	onClose func()
 }
 
+func (f *trackingFile) Sync() error {
+	if syncer, ok := f.File.(interface{ Sync() error }); ok {
+		return syncer.Sync()
+	}
+	return billy.ErrNotSupported
+}
+
 func (f *trackingFile) Close() error {
 	f.onClose()
 	return f.File.Close()
@@ -98,13 +106,13 @@ func TestNFS(t *testing.T) {
 		util.DefaultLogger.SetDebug(true)
 	}
 
-	// make an empty in-memory server.
+	// Use a disk-backed server: successful NFS writes require real Sync support.
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	mem := NewTrackingFS(memfs.New())
+	mem := NewTrackingFS(osfs.New(t.TempDir(), osfs.WithBoundOS()))
 
 	defer func() {
 		if opened := mem.ListOpened(); len(opened) > 0 {
@@ -112,7 +120,7 @@ func TestNFS(t *testing.T) {
 		}
 	}()
 
-	// File needs to exist in the root for memfs to acknowledge the root exists.
+	// Seed the export with a sample file.
 	r, _ := mem.Create("/test")
 	r.Close()
 
@@ -144,20 +152,20 @@ func TestNFS(t *testing.T) {
 	}
 
 	// Validate sample file creation
-	_, err = target.Create("/helloworld.txt", 0666)
+	_, err = target.Create("/helloworld.txt", 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info, err := mem.Stat("/helloworld.txt"); err != nil {
 		t.Fatal(err)
 	} else {
-		if info.Size() != 0 || info.Mode().Perm() != 0666 {
+		if info.Size() != 0 || info.Mode().Perm() != 0600 {
 			t.Fatal("incorrect creation.")
 		}
 	}
 
 	// Validate writing to a file.
-	f, err := target.OpenFile("/helloworld.txt", 0666)
+	f, err := target.OpenFile("/helloworld.txt", 0600)
 	if err != nil {
 		t.Fatal(err)
 	}

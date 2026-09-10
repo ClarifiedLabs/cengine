@@ -139,3 +139,41 @@ therefore requests administrator authorization. Homebrew installs the same PKG
 with its command-line installer, so `brew install` requests `sudo` rather than
 showing Installer.app's authorization dialog. The package marks the app bundle
 as non-relocatable so PackageKit always installs it at `/Applications/cengine.app`.
+
+### Preventive Homebrew upgrade coordination
+
+The preventive fix distinguishes a surviving VM's **mapped Mach-O `LC_UUID`**
+from the replacement executable at the same installed path. Updated daemons
+refuse stale or legacy/unknown infrastructure identities without mutating that
+infrastructure or starting another shared-disk writer. A failed status probe is
+not proof that the writer exited. Reopen the updated app to complete coordinated
+retirement and recreation; do not delete engine data to bypass the refusal.
+
+App service-revision migration fences polling and automatic registration before
+any suspension, then unregisters the engine agent, waits for strict VM shutdown,
+unregisters the networking helper, waits for service unregistration, and registers
+replacement services as permitted by the enabled/approval state. Networking stays
+available until container writers and shared infrastructure have exited. Failure
+keeps automatic registration fenced until an explicit Enable/Restart retry.
+`cengine system shutdown --for-upgrade` waits for and holds the same socket and
+canonical engine-root lifetime locks as the daemon throughout strict teardown,
+preventing recreation even by a daemon using a different API socket. A stopped VM
+or unlinked socket alone does not establish process exit.
+
+Homebrew's headless teardown first quits other cengine GUI instances so their
+polling cannot re-register services during removal. This cask cleanup remains
+best-effort; the updated app's strict migration is the fail-closed upgrade gate.
+Recovery preserves container roots, named volumes, and network metadata, but can
+stop workloads and require explicit starts: **zero downtime is not promised**.
+Replacing an installed binary does not retroactively give an already-running old
+binary this fix; older-release teardown may lack these safeguards. Likewise, the
+shared-volume stable-write correction requires the updated storage guest; an old
+running guest cannot retroactively gain correct NFS write acknowledgements.
+
+`RTM-056` and `RTM-057` are **VM verified**, including in the full suite; see the
+[compatibility ledger](docker-compatibility.md#preventive-upgrade-and-network-fabric-recovery).
+They exercise same-path replacement and truthful failed-fabric retries with real
+helper/guest egress. The replacement test atomically installs an **ad-hoc-signed
+private CLI with a new `LC_UUID`**; it does not simulate the full Developer ID,
+Homebrew package lifecycle, or XPC signature-validation transition. Real signed
+package upgrade validation remains a release requirement beyond these tests.

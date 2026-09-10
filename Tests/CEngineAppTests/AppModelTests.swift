@@ -109,6 +109,7 @@ import CEngineCore
         let model = AppModel(
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults,
             openLoginItemsSettings: { settingsOpenCount += 1 }
@@ -144,6 +145,7 @@ import CEngineCore
             home: home,
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults
         )
@@ -167,6 +169,7 @@ import CEngineCore
         let model = AppModel(
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults
         )
@@ -193,6 +196,7 @@ import CEngineCore
         let model = AppModel(
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults,
             openLoginItemsSettings: { settingsOpenCount += 1 }
@@ -217,9 +221,11 @@ import CEngineCore
         let model = AppModel(
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
-            waitForServiceUnregistration: { unregistrationWaitCount += 1 }
+            waitForServiceUnregistration: { unregistrationWaitCount += 1 },
+            stopVirtualMachinesForUpgrade: {}
         )
         defer { model.setActive(false) }
 
@@ -233,6 +239,242 @@ import CEngineCore
         #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
     }
 
+    @MainActor @Test(arguments: ["engine", "vms", "helper", "settled"])
+    func upgradeFencesReentrantLifecycleAndServiceActions(phase: String) async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("24", forKey: AppModel.serviceRegistrationRevisionKey)
+        defaults.set(true, forKey: AppModel.engineServiceEnabledKey)
+        let sequence = TeardownSequenceRecorder()
+        let suspension = ServiceTransitionSuspension()
+        let record: (String) async -> Void = { entry in
+            sequence.record(entry)
+            if entry == phase { await suspension.suspend() }
+        }
+        let agent = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onRegister: { sequence.record("register-engine") },
+            onUnregister: { await record("engine") }
+        )
+        let helper = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onRegister: { sequence.record("register-helper") },
+            onUnregister: { await record("helper") }
+        )
+        let client = UnavailableEngineClient()
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            client: client,
+            serviceRegistrationRevision: "25",
+            serviceRegistrationDefaults: defaults,
+            waitForServiceUnregistration: { await record("settled") },
+            stopVirtualMachinesForUpgrade: { await record("vms") },
+            restartRegisteredEngine: { Issue.record("unexpected engine restart") },
+            openLoginItemsSettings: { Issue.record("unexpected approval request") }
+        )
+        defer { model.setActive(false) }
+
+        // Activation may precede the window's startup task.
+        model.setActive(true)
+        await model.refresh()
+        #expect(await client.requestCount == 0)
+        let startup = Task { await model.start() }
+        await suspension.waitUntilSuspended()
+        let entriesWhileSuspended = sequence.entries
+
+        #expect(model.isManagingEngineService)
+        #expect(!model.canRestartEngineService)
+        model.setActive(false)
+        model.setActive(true)
+        await model.refresh()
+        await model.start()
+        await model.enableEngineService()
+        await model.disableEngineService()
+        await model.restartEngineService()
+        await model.completeOnboarding()
+        await Task.yield()
+
+        #expect(sequence.entries == entriesWhileSuspended)
+        #expect(agent.registerCount == 0)
+        #expect(helper.registerCount == 0)
+        #expect(await client.requestCount == 0)
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "24")
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
+        #expect(!defaults.bool(forKey: AppPreferenceKeys.completedOnboarding))
+        #expect(model.showOnboarding)
+
+        suspension.resume()
+        await startup.value
+        await model.start()
+
+        #expect(sequence.entries == ["engine", "vms", "helper", "settled", "register-helper", "register-engine"])
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
+        #expect(model.engineServiceEnabled)
+        #expect(!model.isManagingEngineService)
+        #expect(model.error == nil)
+    }
+
+    @MainActor @Test(arguments: ["engine", "vms", "helper", "settled", "register-helper", "register-engine"])
+    func failedUpgradeStaysFencedUntilExplicitRestartRetry(phase: String) async {
+        enum Failure: Error { case upgrade }
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("24", forKey: AppModel.serviceRegistrationRevisionKey)
+        defaults.set(true, forKey: AppModel.engineServiceEnabledKey)
+        let sequence = TeardownSequenceRecorder()
+        var shouldFail = true
+        let record: (String) throws -> Void = { entry in
+            sequence.record(entry)
+            if shouldFail, entry == phase { throw Failure.upgrade }
+        }
+        let agent = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onRegister: { try record("register-engine") },
+            onUnregister: { try record("engine") }
+        )
+        let helper = MockAppService(
+            status: .enabled,
+            statusAfterRegistration: .enabled,
+            onRegister: { try record("register-helper") },
+            onUnregister: { try record("helper") }
+        )
+        let client = UnavailableEngineClient()
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            client: client,
+            serviceRegistrationRevision: "25",
+            serviceRegistrationDefaults: defaults,
+            waitForServiceUnregistration: { try record("settled") },
+            stopVirtualMachinesForUpgrade: { try record("vms") },
+            restartRegisteredEngine: { Issue.record("retry must redo migration, not kickstart") }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+        let fullSequence = ["engine", "vms", "helper", "settled", "register-helper", "register-engine"]
+        let failureIndex = fullSequence.firstIndex(of: phase)!
+        #expect(sequence.entries == Array(fullSequence.prefix(failureIndex + 1)))
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "24")
+        #expect(model.error != nil)
+        #expect(!model.isManagingEngineService)
+        #expect(model.engineServiceEnabled)
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
+        #expect(model.canRestartEngineService)
+        let entriesAfterFailure = sequence.entries
+
+        model.setActive(true)
+        await model.refresh()
+        await model.start()
+        await Task.yield()
+        #expect(sequence.entries == entriesAfterFailure)
+        #expect(await client.requestCount == 0)
+        if phase == "engine" || phase == "vms" {
+            #expect(helper.unregisterCount == 0)
+            #expect(helper.status == .enabled)
+        }
+
+        shouldFail = false
+        await model.restartEngineService()
+
+        #expect(sequence.entries.filter { $0 == "vms" }.count == (phase == "engine" ? 1 : 2))
+        #expect(sequence.entries.suffix(2) == ["register-helper", "register-engine"])
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
+        #expect(agent.status == .enabled)
+        #expect(helper.status == .enabled)
+        #expect(model.error == nil)
+    }
+
+    @MainActor @Test(arguments: [true, false], [nil, "24"] as [String?])
+    func upgradeStopsOrphanedVMsWithoutChangingEnabledPreference(enabled: Bool, previousRevision: String?) async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(previousRevision, forKey: AppModel.serviceRegistrationRevisionKey)
+        defaults.set(enabled, forKey: AppModel.engineServiceEnabledKey)
+        let sequence = TeardownSequenceRecorder()
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            client: UnavailableEngineClient(),
+            serviceRegistrationRevision: "25",
+            serviceRegistrationDefaults: defaults,
+            waitForServiceUnregistration: { Issue.record("no registrations to settle") },
+            stopVirtualMachinesForUpgrade: { sequence.record("vms") }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+        await model.refresh()
+
+        #expect(sequence.entries == ["vms"])
+        #expect(agent.unregisterCount == 0)
+        #expect(helper.unregisterCount == 0)
+        #expect(agent.registerCount == (enabled ? 1 : 0))
+        #expect(helper.registerCount == (enabled ? 1 : 0))
+        #expect(model.engineServiceEnabled == enabled)
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey) == enabled)
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
+        #expect(model.showOnboarding)
+    }
+
+    @MainActor @Test(arguments: ["enable", "onboarding"])
+    func explicitEnablePathsRetryPendingUpgrade(action: String) async {
+        enum Failure: Error { case shutdown }
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("24", forKey: AppModel.serviceRegistrationRevisionKey)
+        defaults.set(false, forKey: AppModel.engineServiceEnabledKey)
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        var shutdownCount = 0
+        let model = AppModel(
+            agent: agent,
+            helper: helper,
+            client: UnavailableEngineClient(),
+            serviceRegistrationRevision: "25",
+            serviceRegistrationDefaults: defaults,
+            waitForServiceUnregistration: { Issue.record("no registrations to settle") },
+            stopVirtualMachinesForUpgrade: {
+                shutdownCount += 1
+                if shutdownCount == 1 { throw Failure.shutdown }
+            }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "24")
+        #expect(!model.engineServiceEnabled)
+        #expect(!defaults.bool(forKey: AppModel.engineServiceEnabledKey))
+        #expect(agent.registerCount == 0)
+        #expect(helper.registerCount == 0)
+
+        if action == "enable" {
+            await model.enableEngineService()
+        } else {
+            await model.completeOnboarding()
+        }
+
+        #expect(shutdownCount == 2)
+        #expect(agent.registerCount == 1)
+        #expect(helper.registerCount == 1)
+        #expect(model.engineServiceEnabled)
+        #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
+        #expect(defaults.bool(forKey: AppPreferenceKeys.completedOnboarding) == (action == "onboarding"))
+        #expect(model.error == nil)
+    }
+
     @MainActor @Test func currentAppBuildKeepsEnabledServiceRegistrations() async {
         let suiteName = "AppModelTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -243,9 +485,11 @@ import CEngineCore
         let model = AppModel(
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
-            waitForServiceUnregistration: { Issue.record("unexpected registration delay") }
+            waitForServiceUnregistration: { Issue.record("unexpected registration delay") },
+            stopVirtualMachinesForUpgrade: { Issue.record("unexpected VM shutdown") }
         )
         defer { model.setActive(false) }
 
@@ -269,6 +513,7 @@ import CEngineCore
             home: home,
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults
         )
@@ -298,6 +543,7 @@ import CEngineCore
         let model = AppModel(
             agent: agent,
             helper: helper,
+            client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults,
             restartRegisteredEngine: { await recorder.record() }
@@ -357,7 +603,8 @@ private actor RestartRecorder {
     var status: SMAppService.Status
     let statusAfterRegistration: SMAppService.Status
     let registrationError: Error?
-    let onUnregister: (() -> Void)?
+    let onRegister: (() throws -> Void)?
+    let onUnregister: (() async throws -> Void)?
     var registerCount = 0
     var unregisterCount = 0
 
@@ -365,24 +612,52 @@ private actor RestartRecorder {
         status: SMAppService.Status,
         statusAfterRegistration: SMAppService.Status,
         registrationError: Error? = nil,
-        onUnregister: (() -> Void)? = nil
+        onRegister: (() throws -> Void)? = nil,
+        onUnregister: (() async throws -> Void)? = nil
     ) {
         self.status = status
         self.statusAfterRegistration = statusAfterRegistration
         self.registrationError = registrationError
+        self.onRegister = onRegister
         self.onUnregister = onUnregister
     }
 
     func register() throws {
         registerCount += 1
+        try onRegister?()
         status = statusAfterRegistration
         if let registrationError { throw registrationError }
     }
 
     func unregister() async throws {
         unregisterCount += 1
-        onUnregister?()
         status = .notRegistered
+        try await onUnregister?()
+    }
+}
+
+@MainActor private final class ServiceTransitionSuspension {
+    private var suspended = false
+    private var entered: CheckedContinuation<Void, Never>?
+    private var release: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        await withCheckedContinuation { continuation in
+            release = continuation
+            suspended = true
+            entered?.resume()
+            entered = nil
+        }
+    }
+
+    func waitUntilSuspended() async {
+        if suspended { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+
+    func resume() {
+        release?.resume()
+        release = nil
     }
 }
 
@@ -471,7 +746,11 @@ private actor RestartRecorder {
 }
 
 private actor UnavailableEngineClient: AppEngineClient {
-    func get(_: String) async throws -> Data { throw DashboardError("unavailable") }
+    private(set) var requestCount = 0
+    func get(_: String) async throws -> Data {
+        requestCount += 1
+        throw DashboardError("unavailable")
+    }
     func post(_: String, body _: Data) async throws -> Data { throw DashboardError("unavailable") }
 }
 

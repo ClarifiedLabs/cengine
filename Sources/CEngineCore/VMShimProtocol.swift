@@ -65,6 +65,9 @@ public enum VMShimProtocol {
         /// was born. A PID alone is not a stable process identity because
         /// Darwin may reuse it after the shim exits.
         public var processStartTime: UInt64?
+        /// UUID of the executable mapped by this process, not the replacement
+        /// binary currently at its path. Absent on legacy shims.
+        public var executableUUID: UUID?
         public var exitCode: Int32?
         public var error: String?
 
@@ -74,11 +77,13 @@ public enum VMShimProtocol {
             state: State,
             processIdentifier: Int32,
             processStartTime: UInt64? = nil,
+            executableUUID: UUID? = nil,
             exitCode: Int32? = nil,
             error: String? = nil
         ) {
             self.containerID = containerID; self.generation = generation; self.state = state
             self.processIdentifier = processIdentifier; self.processStartTime = processStartTime
+            self.executableUUID = executableUUID
             self.exitCode = exitCode; self.error = error
         }
     }

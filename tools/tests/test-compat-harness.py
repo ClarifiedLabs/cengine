@@ -1,34 +1,325 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
+import io
+import json
 import pathlib
 import re
+import runpy
 import shlex
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "Tests" / "Compatibility"))
 
+import harness  # noqa: E402
 from harness import (  # noqa: E402
     DOCKER_AMBIENT_CONFIG_VARIABLES,
     DOCKER_ENDPOINT_VARIABLES,
     COMPATIBILITY_OWNER_FILE,
+    COMPATIBILITY_EXECUTABLES_FILE,
     VMNET_TEARDOWN_SETTLE_SECONDS,
     compatibility_environment,
     compatibility_image_cache_key,
+    compatibility_registered_executables,
     compatibility_root_owned_by,
     compatibility_runtime_processes,
     control_plane_status_is_ready,
     docker_environment,
     managed_docker_environment,
     persisted_container_record,
+    register_compatibility_executable,
+    terminate_compatibility_runtime,
 )
 
 
+def test_original_executable_cleanup() -> None:
+    binary = pathlib.Path("/build/cengine")
+    with tempfile.TemporaryDirectory() as temporary:
+        temporary_root = pathlib.Path(temporary)
+        work = temporary_root / "cengine-compat-owned"
+        work.mkdir()
+        root = work / "root"
+        root.mkdir()
+        unowned = temporary_root / "cengine-compat-unowned"
+        unowned.mkdir()
+        foreign = temporary_root / "cengine-compat-foreign"
+        foreign.mkdir()
+        (foreign / COMPATIBILITY_OWNER_FILE).write_text("/other/cengine\n")
+        manual = pathlib.Path("/tmp/manual-cengine/root")
+        commands = {
+            101: f"{binary} daemon --root {root} --socket /tmp/owned.sock",
+            102: f"{binary} vm-shim --spec {root}/infrastructure/shim.json",
+            103: f"{binary} vm-shim --spec {manual}/infrastructure/shim.json",
+            104: f"{binary} daemon --root {manual}",
+            105: f"/other/cengine daemon --root {root}",
+            106: f"{binary} daemon --root {unowned}/root",
+            107: f"{binary} vm-shim --spec {foreign}/root/infrastructure/shim.json",
+            108: f"{binary} daemon --root /production/root --root {root}",
+            109: f"{binary} daemon --root {root} --root /production/root",
+            110: f"{binary} daemon --root {root} --root {root}",
+            111: f"{binary} daemon --root=/production/root --root {root}",
+            112: f"{binary} vm-shim --spec {root}/infrastructure/shim.json --spec /production/shim.json",
+            113: f"{binary} vm-shim --spec /production/shim.json --spec {root}/infrastructure/shim.json",
+            114: f"{binary} vm-shim --spec {root}/infrastructure/shim.json --spec={root}/other.json",
+            115: f"{binary} daemon --socket {root}/docker.sock",
+            116: f"{binary} daemon --root /production/root --socket {root}/docker.sock",
+            117: f"{binary} vm-shim --spec {root}-other/infrastructure/shim.json",
+            118: f"{binary} vm-shim --spec {root}/../other/shim.json",
+            119: f"{binary} system shutdown --root {root}",
+            120: "/build/cengine daemon --root /production/root --root /tmp/cengine-compat-owned/root",
+            121: "/build/cengine vm-shim --spec /production/infrastructure/shim.json --label cengine-compat-decoy",
+            122: f"{binary} daemon --root /production/root --label cengine-compat-decoy",
+        }
+        process_table = "\n".join(f"{pid} {command}" for pid, command in commands.items())
+        with patch.object(harness.tempfile, "gettempdir", return_value=temporary):
+            assert not compatibility_runtime_processes(binary, process_table=process_table)
+            assert [value.pid for value in compatibility_runtime_processes(
+                binary, roots=(manual,), process_table=process_table,
+            )] == [103, 104]
+            # Explicit roots authorize cleanup even before their owner marker is written.
+            assert [value.pid for value in compatibility_runtime_processes(
+                binary, roots=(root,), process_table=process_table,
+            )] == [101, 102]
+            (work / COMPATIBILITY_OWNER_FILE).write_text(f"{binary}\n")
+            for roots in ((), (root,)):
+                assert [value.pid for value in compatibility_runtime_processes(
+                    binary, roots=roots, process_table=process_table,
+                )] == [101, 102]
+            assert not compatibility_runtime_processes(
+                binary, roots=(pathlib.Path("/tmp/cengine-compat-owned/root"),),
+                process_table=process_table,
+            )
+
+
+def test_reset_rechecks_removed_roots() -> None:
+    reset_main = runpy.run_path(str(REPO_ROOT / "Scripts/reset-compat-runtime.py"))["main"]
+    binary = pathlib.Path("/build/cengine")
+    for extra_arguments in ([], ["--root", "/tmp/manual-cengine/root"]):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = pathlib.Path(temporary) / "cengine-compat-reset"
+            root = work / "root"
+            root.mkdir(parents=True)
+            (work / COMPATIBILITY_OWNER_FILE).write_text(f"{binary}\n")
+            staged = work / "upgrade-bin" / "cengine"
+            staged.parent.mkdir()
+            staged.write_text("staged executable")
+            register_compatibility_executable(work, binary, staged)
+            commands = [
+                f"{binary} daemon --root {root}",
+                f"{staged.resolve()} vm-shim --spec {root}/infrastructure/shim.json",
+            ]
+            process_table = "\n".join(f"{pid} {command}" for pid, command in enumerate(commands, 401))
+            # Simulate processes reappearing after termination and removal of owner markers.
+            with patch.object(harness.tempfile, "gettempdir", return_value=temporary), \
+                    patch.dict(reset_main.__globals__, {"terminate_compatibility_runtime": lambda *a, **k: []}), \
+                    patch.object(harness.subprocess, "run", return_value=SimpleNamespace(stdout=process_table)), \
+                    patch.object(harness.os, "kill") as signal_process, \
+                    patch.object(sys, "argv", ["reset-compat-runtime.py", "--binary", str(binary), *extra_arguments]), \
+                    patch.object(sys, "stderr", io.StringIO()) as stderr:
+                try:
+                    reset_main()
+                except SystemExit as error:
+                    assert str(error) == "compatibility runtime reset did not reach a clean state"
+                else:
+                    raise AssertionError("reset forgot owned runtime paths after removing their markers")
+                signal_process.assert_not_called()
+                for command in commands:
+                    assert command in stderr.getvalue()
+            assert not work.exists()
+
+
+def test_staged_executable_cleanup() -> None:
+    binary = REPO_ROOT / ".build/test-compat/cengine"
+    with tempfile.TemporaryDirectory() as temporary:
+        temporary_root = pathlib.Path(temporary)
+        work = temporary_root / "cengine-compat-upgrade"
+        work.mkdir()
+        root = work / "root"
+        root.mkdir()
+        owner = work / COMPATIBILITY_OWNER_FILE
+        original_owner = f"{binary.resolve()}\n"
+        owner.write_text(original_owner)
+        staged = work / "upgrade-bin" / "cengine"
+        staged.parent.mkdir()
+        staged.write_text("staged executable")
+        staged = staged.resolve()
+        register_compatibility_executable(work, binary, staged)
+        register_compatibility_executable(work, binary, staged)  # Idempotent.
+        assert owner.read_text() == original_owner
+        assert compatibility_root_owned_by(work, binary)
+        assert not compatibility_root_owned_by(work, staged)
+        assert compatibility_registered_executables(work, binary) == (staged,)
+        assert compatibility_registered_executables(work, pathlib.Path("/other/cengine")) == ()
+        registry = work / COMPATIBILITY_EXECUTABLES_FILE
+        registration = registry.read_bytes()
+        for owner_binary, executable in ((staged, staged), (binary, binary)):
+            try:
+                register_compatibility_executable(work, owner_binary, executable)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted unowned directory or external executable")
+            assert registry.read_bytes() == registration
+
+        commands = {
+            301: f"{binary.resolve()} daemon --root {root} --socket /tmp/owned.sock",
+            302: f"{staged} daemon --root {root.resolve()} --socket /tmp/staged.sock",
+            303: f"{staged} vm-shim --spec {root}/infrastructure/shim.json",
+            304: f"{staged} vm-shim --spec {root}/vms/container/shim.json",
+            305: f"{staged}.other daemon --root {root}",
+            306: f"{staged} daemon --root {root}-other",
+            307: f"{staged} vm-shim --spec {root}-other/infrastructure/shim.json",
+            308: f"{staged} daemon --root /production/root --socket {root}/docker.sock",
+            309: f"{staged} system shutdown --root {root}",
+            310: f"{staged} vm-shim --spec {root}/../other/shim.json",
+            311: f"/other/cengine daemon --root {root}",
+            312: f"{staged} daemon --root /tmp/cengine-compat-other/root",
+            313: f"{staged} daemon --root /production/root --root {root}",
+            314: f"{staged} daemon --root {root} --root /production/root",
+            315: f"{staged} vm-shim --spec {root}/infrastructure/shim.json --spec /production/shim.json",
+            316: f"{staged} vm-shim --spec /production/shim.json --spec {root}/infrastructure/shim.json",
+            317: f"{binary.resolve()} daemon --root /production/root --label cengine-compat-decoy",
+            318: f"{binary.resolve()} vm-shim --spec /production/infrastructure/shim.json --label cengine-compat-decoy",
+            319: f"{binary.resolve()} daemon --root /production/root --root {root}",
+        }
+        process_table = "\n".join(f"{pid} {command}" for pid, command in commands.items())
+        with patch.object(harness.tempfile, "gettempdir", return_value=temporary):
+            for roots in ((), (root,)):
+                assert [process.pid for process in compatibility_runtime_processes(
+                    binary, roots=roots, process_table=process_table,
+                )] == [301, 302, 303, 304]
+            assert not compatibility_runtime_processes(
+                binary, roots=(work / "other",), process_table=process_table,
+            )
+            # Foundation's child argv uses /var even when the staged parent was
+            # launched through /private/var; ownership and root checks still apply.
+            if str(staged).startswith("/private/var/"):
+                alias = str(staged).removeprefix("/private")
+                alias_table = "\n".join([
+                    f"801 {alias} vm-shim --spec {root}/infrastructure/shim.json",
+                    f"802 {alias} vm-shim --spec /production/infrastructure/shim.json",
+                    f"803 {alias}.other vm-shim --spec {root}/infrastructure/shim.json",
+                ])
+                for owner_binary, roots in ((binary, ()), (binary, (root,)), (staged, (root,))):
+                    assert [process.pid for process in compatibility_runtime_processes(
+                        owner_binary, roots=roots, process_table=alias_table,
+                    )] == [801]
+            # Simulate killed pytest: only the durable marker/registry and original binary remain.
+            live = commands.copy()
+            def snapshot(*args, **kwargs):
+                return SimpleNamespace(stdout="\n".join(
+                    f"{pid} {command}" for pid, command in live.items()
+                ))
+            def kill(pid, signal):
+                del live[pid]
+            with patch.object(harness.subprocess, "run", side_effect=snapshot), \
+                    patch.object(harness.os, "kill", side_effect=kill), \
+                    patch.object(harness.time, "sleep"):
+                stopped = terminate_compatibility_runtime(binary, timeout=0)
+            assert [process.pid for process in stopped] == [301, 302, 303, 304]
+            assert set(live) == set(commands) - {301, 302, 303, 304}
+
+            # Invalid registrations fail closed before signaling anything or deleting the root.
+            for invalid in (["../external/cengine"], [str(binary)], ["."], [7], {}):
+                registry.write_text(json.dumps(invalid))
+                with patch.object(harness.os, "kill") as signal_process:
+                    try:
+                        terminate_compatibility_runtime(binary, timeout=0)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError(f"accepted invalid registry: {invalid}")
+                    signal_process.assert_not_called()
+                assert work.is_dir()
+            registry.write_bytes(registration)
+            staged.unlink()
+            staged.symlink_to(binary)
+            try:
+                compatibility_registered_executables(work, binary)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted escaped executable symlink")
+            staged.unlink()
+            staged.write_text("replacement executable")
+
+            # Exercise the actual reset entry point with all process operations mocked.
+            reset_main = runpy.run_path(str(REPO_ROOT / "Scripts/reset-compat-runtime.py"))["main"]
+            live = commands.copy()
+            with patch.object(sys, "argv", ["reset-compat-runtime.py", "--binary", str(binary)]), \
+                    patch.object(harness.subprocess, "run", side_effect=snapshot), \
+                    patch.object(harness.os, "kill", side_effect=PermissionError("stop failed")):
+                try:
+                    reset_main()
+                except PermissionError:
+                    pass
+                else:
+                    raise AssertionError("reset ignored failed process termination")
+            assert owner.read_text() == original_owner
+            assert registry.read_bytes() == registration
+            assert live == commands
+            with patch.object(sys, "argv", ["reset-compat-runtime.py", "--binary", str(binary)]), \
+                    patch.object(harness.subprocess, "run", side_effect=snapshot), \
+                    patch.object(harness.os, "kill", side_effect=kill), \
+                    patch.object(harness.time, "sleep"):
+                reset_main()
+            assert not work.exists()
+            assert set(live) == set(commands) - {301, 302, 303, 304}
+
+
+def test_upgrade_finally_cleanup() -> None:
+    # Load only the cleanup helper: regression checks need neither pytest/docker nor VMs.
+    path = REPO_ROOT / "Tests/Compatibility/test_upgrade_recovery.py"
+    source = ast.parse(path.read_text())
+    function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "_restore_upgrade_daemon")
+    namespace: dict = {"pathlib": pathlib}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    original = pathlib.Path("/build/cengine")
+    staged = pathlib.Path("/tmp/cengine-compat-upgrade/upgrade-bin/cengine")
+    for failures in ((), ("stop",), ("shutdown",), ("stop", "shutdown"),
+                     ("terminate",), ("stop", "shutdown", "terminate"), ("start",)):
+        events = []
+        def action(name):
+            events.append(name)
+            if name in failures:
+                raise RuntimeError(name)
+        def start():
+            assert daemon.binary == original
+            action("start")
+        daemon = SimpleNamespace(
+            binary=staged, root=pathlib.Path("/tmp/cengine-compat-upgrade/root"),
+            stop=lambda: action("stop"), start=start,
+        )
+        def terminate(binary, *, roots):
+            assert binary == original and roots == (daemon.root,)
+            action("terminate")
+        namespace["_strict_shutdown"] = lambda value: action("shutdown")
+        namespace["terminate_compatibility_runtime"] = terminate
+        try:
+            namespace["_restore_upgrade_daemon"](daemon, original)
+        except RuntimeError:
+            assert failures
+        else:
+            assert not failures
+        assert daemon.binary == original
+        assert events == ["stop", "shutdown", "terminate"] + (
+            [] if "terminate" in failures else ["start"]
+        )
+
+
 def main() -> None:
+    test_original_executable_cleanup()
+    test_staged_executable_cleanup()
+    test_reset_rechecks_removed_roots()
+    test_upgrade_finally_cleanup()
     ambient = {
         "PATH": "/test/bin",
         "DOCKER_CONFIG": "/isolated/docker",
@@ -85,23 +376,6 @@ def main() -> None:
     ])
 
     binary = REPO_ROOT / ".build/xcode-derived/Build/Products/Debug/cengine"
-    compatibility_root = pathlib.Path("/private/var/folders/test/T/cengine-compat-owned/root")
-    process_table = "\n".join([
-        f"101 {binary.resolve()} daemon --root {compatibility_root} --socket /tmp/owned.sock",
-        f"102 {binary.resolve()} vm-shim --spec {compatibility_root}/infrastructure/shim.json",
-        f"103 {binary.resolve()} vm-shim --spec /tmp/manual-cengine/root/infrastructure/shim.json",
-        "104 /Applications/cengine.app/Contents/MacOS/cengine vm-shim --spec /tmp/installed/shim.json",
-        f"105 /other/worktree/.build/xcode-derived/Build/Products/Debug/cengine vm-shim --spec {compatibility_root}/shim.json",
-    ])
-    automatic = compatibility_runtime_processes(binary, process_table=process_table)
-    assert [value.pid for value in automatic] == [101, 102]
-    explicit_root = compatibility_runtime_processes(
-        binary,
-        roots=(pathlib.Path("/tmp/manual-cengine/root"),),
-        process_table=process_table,
-    )
-    assert [value.pid for value in explicit_root] == [103]
-
     with tempfile.TemporaryDirectory() as temporary:
         owned_root = pathlib.Path(temporary)
         (owned_root / COMPATIBILITY_OWNER_FILE).write_text(f"{binary.resolve()}\n")

@@ -15,6 +15,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "Tests" / "Compatibility"))
 
 from harness import (  # noqa: E402
+    compatibility_registered_executables,
     compatibility_root_owned_by,
     compatibility_runtime_processes,
     terminate_compatibility_runtime,
@@ -44,13 +45,24 @@ def main() -> None:
 
     binary = args.binary.resolve()
 
+    temporary_root = pathlib.Path(tempfile.gettempdir())
+    owned_roots = [
+        directory for directory in temporary_root.glob("cengine-compat-*")
+        if directory.is_dir() and compatibility_root_owned_by(directory, binary)
+    ]
+    # Retain original roots and staged paths for checks after deleting their markers.
+    target_roots = tuple(directory / "root" for directory in owned_roots) + tuple(args.root)
+    registered = [
+        (executable, directory / "root")
+        for directory in owned_roots
+        for executable in compatibility_registered_executables(directory, binary)
+    ]
     stopped = terminate_compatibility_runtime(binary)
     for root in args.root:
         stopped.extend(terminate_compatibility_runtime(binary, roots=(root,)))
 
-    temporary_root = pathlib.Path(tempfile.gettempdir())
     removed = 0
-    for directory in temporary_root.glob("cengine-compat-*"):
+    for directory in owned_roots:
         if directory.is_dir() and compatibility_root_owned_by(directory, binary):
             shutil.rmtree(directory)
             removed += 1
@@ -83,8 +95,10 @@ def main() -> None:
 
     remaining_processes = compatibility_runtime_processes(
         binary,
-        roots=tuple(root.resolve() for root in args.root),
+        roots=target_roots,
     )
+    for executable, root in registered:
+        remaining_processes.extend(compatibility_runtime_processes(executable, roots=(root,)))
     remaining_roots = [
         directory
         for directory in temporary_root.glob("cengine-compat-*")
