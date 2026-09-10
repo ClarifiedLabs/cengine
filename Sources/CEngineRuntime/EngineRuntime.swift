@@ -3765,8 +3765,11 @@ public actor EngineRuntime {
     public func events(since: Date? = nil, until: Date? = nil) -> AsyncStream<RuntimeEvent> {
         let id = UUID()
         let (stream, continuation) = AsyncStream.makeStream(of: RuntimeEvent.self)
-        for event in eventHistory where (since == nil || event.date >= since!) && (until == nil || event.date <= until!) {
-            continuation.yield(event)
+        // Docker only replays buffered events when a time bound was requested.
+        if since != nil || until != nil {
+            for event in eventHistory where (since == nil || event.date >= since!) && (until == nil || event.date <= until!) {
+                continuation.yield(event)
+            }
         }
         if let until, until <= Date() {
             continuation.finish()

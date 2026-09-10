@@ -10330,12 +10330,45 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(await historical.next() == nil)
     }
 
-    @Test func runtimeReplaysBoundedEventHistory() async throws {
+    @Test func runtimeDefaultEventsSkipHistoryAndPublishLiveEvents() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root)
+        let stale = try await runtime.createContainer(ContainerRecord(name: "stale", image: "debian"))
+        try await runtime.removeContainer(stale.id, force: false)
+
+        let stream = await runtime.events()
+        var iterator = stream.makeAsyncIterator()
+        let live = try await runtime.createContainer(ContainerRecord(name: "live", image: "debian"))
+        try await runtime.removeContainer(live.id, force: false)
+        let created = await iterator.next()
+        let destroyed = await iterator.next()
+        #expect(created?.action == "create")
+        #expect(created?.id == live.id)
+        #expect(destroyed?.action == "destroy")
+        #expect(destroyed?.id == live.id)
+    }
+
+    @Test func runtimeSinceOnlyEventsReplayHistoryAndPublishLiveEvents() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try await EngineRuntime(root: root)
+        let since = Date()
+        let historical = try await runtime.createContainer(ContainerRecord(name: "historical", image: "debian"))
+        let stream = await runtime.events(since: since)
+        var iterator = stream.makeAsyncIterator()
+        let live = try await runtime.createContainer(ContainerRecord(name: "live", image: "debian"))
+        #expect(await iterator.next()?.id == historical.id)
+        #expect(await iterator.next()?.id == live.id)
+    }
+
+    @Test(arguments: [false, true])
+    func runtimeReplaysBoundedEventHistory(untilOnly: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let runtime = try await EngineRuntime(root: root)
         let record = try await runtime.createContainer(ContainerRecord(name: "historical", image: "debian"))
-        let stream = await runtime.events(since: Date().addingTimeInterval(-60), until: Date())
+        let stream = await runtime.events(since: untilOnly ? nil : Date().addingTimeInterval(-60), until: Date())
         var iterator = stream.makeAsyncIterator()
         #expect(await iterator.next()?.id == record.id)
         #expect(await iterator.next() == nil)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import json
-import threading
 import time
 
 import docker
@@ -19,34 +18,58 @@ def test_filtered_container_events(client: docker.DockerClient):
     key = "dev.cengine.events"
     value = str(time.time_ns())
     name = f"compat-events-{value}"
-    container = client.containers.create(IMAGE, command=["true"], name=name, labels={key: value})
-    stream = client.events(
-        decode=True,
-        filters={"type": "container", "container": name, "label": f"{key}={value}"},
+    response = client.api._get(
+        client.api._url("/events"),
+        params={"filters": json.dumps({"type": ["container"], "container": [name], "label": [f"{key}={value}"]})},
+        stream=True, timeout=10,
     )
     events: list[dict] = []
     actions: set[str] = set()
-    ready = threading.Event()
 
-    def consume() -> None:
-        for event in stream:
-            events.append(dict(event))
+    try:
+        response.raise_for_status()
+        # Response headers establish the subscription before generating events.
+        container = client.containers.create(IMAGE, command=["true"], name=name, labels={key: value})
+        container.start()
+        assert container.wait(timeout=60)["StatusCode"] == 0
+        container.remove()
+        for line in response.iter_lines():
+            if not line:
+                continue
+            event = json.loads(line)
+            events.append(event)
             actions.add(event["Action"])
-            ready.set()
             if event.get("Action") == "destroy":
-                return
-
-    reader = threading.Thread(target=consume)
-    reader.start()
-    assert ready.wait(timeout=10), "event history did not establish the stream subscription"
-    container.start()
-    assert container.wait(timeout=60)["StatusCode"] == 0
-    container.remove()
-    reader.join(timeout=10)
-    stream.close()
-    assert not reader.is_alive()
+                break
+    finally:
+        response.close()
     assert actions >= {"create", "start", "die", "destroy"}, json.dumps(events, indent=2)
     assert all(event["Type"] == "container" for event in events)
+
+
+@pytest.mark.compat("RTM-055")
+def test_default_events_do_not_replay_deleted_containers(client: docker.DockerClient):
+    key = "dev.cengine.events"
+    value = str(time.time_ns())
+    labels = {key: value}
+    stale = client.containers.create(IMAGE, command=["true"], labels=labels)
+    stale.remove()
+
+    response = client.api._get(
+        client.api._url("/events"),
+        params={"filters": json.dumps({"type": ["container"], "label": [f"{key}={value}"]})},
+        stream=True, timeout=10,
+    )
+    try:
+        response.raise_for_status()
+        live = client.containers.create(IMAGE, command=["true"], labels=labels)
+        live.remove()
+        stream = (json.loads(line) for line in response.iter_lines() if line)
+        events = [next(stream), next(stream)]
+        assert [event["Action"] for event in events] == ["create", "destroy"], events
+        assert all(event["Actor"]["ID"] == live.id for event in events), events
+    finally:
+        response.close()
 
 
 @pytest.mark.compat("EVT-002")
