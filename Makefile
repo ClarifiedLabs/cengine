@@ -154,6 +154,7 @@ test-release:
 	@python3 tools/tests/test-homebrew-formula.py
 	@python3 tools/tests/test-launchd-plists.py
 	@python3 tools/tests/test-package.py
+	@python3 tools/tests/test-installer.py
 
 clean:
 	rm -rf .build dist

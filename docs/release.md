@@ -125,14 +125,32 @@ Replace `X.Y.Z` with the Xcode project's current `MARKETING_VERSION`. The local
 package is intentionally unsigned; `pkgutil --check-signature` reports that
 state. CI produces the Developer ID signed, notarized, and stapled package.
 
-The Homebrew Cask opens `cengine.app` with an installer-only argument after
-installation and upgrades. A fresh install exits before showing the app or
-registering services; the user opens cengine to begin onboarding. An upgrade or
-standard reinstall resumes an explicitly enabled engine, with preserved service
-state providing the one-time signal for upgrades from older releases. An active
-`cengine` Docker context is restored on the next managed engine start. The
-postflight launch is non-fatal so package installation still works in headless
-sessions.
+The PKG's `Scripts/Installer/postinstall` opens `cengine.app` with
+`--opened-by-installer` after installing its payload, whether installed directly
+or through Homebrew. The launch runs in the active console user's existing GUI
+session with that user's credentials and home directory, never as root or as the
+authorizing administrator. Installs to a non-boot volume or without a desktop
+session skip the launch. Launch failures are non-fatal and log a request to open
+cengine manually.
+
+A fresh install exits before showing the app or registering services; the user
+opens cengine to begin onboarding. An upgrade or standard reinstall resumes an
+explicitly enabled engine, with preserved service state providing the one-time
+signal for upgrades from older releases. An active `cengine` Docker context is
+restored on the next managed engine start.
+
+Quit cengine before a direct PKG upgrade. If an installed app is still running,
+`open` would reactivate that old process without rerunning startup migration. The
+script skips automatic launch when it detects a running installed app (or cannot
+check), and logs a request to quit and reopen it. It never force-quits the app or
+requests a second instance. Homebrew upgrades already quit the app during teardown.
+
+Do not move this launch into a Homebrew `postflight_steps` hook. Homebrew's
+sandbox blocks LaunchServices, including `open` and `lsregister`, even with
+`network_access: true`; this can surface as the misleading `kLSNoExecutableErr`.
+Vendor PKG scripts run outside that sandbox. Publish the updated PKG and generated
+cask together: an older PKG without this script will not automatically resume the
+engine when installed using the hookless cask.
 
 The PKG installs `/Applications/cengine.app` and `/usr/local/bin/cengine` and
 therefore requests administrator authorization. Homebrew installs the same PKG

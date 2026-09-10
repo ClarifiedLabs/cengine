@@ -27,16 +27,6 @@ cask "cengine" do
 
   pkg "cengine-${version}.pkg"
 
-  postflight_steps do
-    # Older Homebrew versions do not accept must_succeed on run steps.
-    # Opening the app is best effort, including on headless CI runners.
-    run "/bin/sh",
-        args: [
-          "-c", '"\$@" || true', "--", "/usr/bin/open",
-          "/Applications/cengine.app", "--args", "--opened-by-installer",
-        ]
-  end
-
   uninstall early_script: {
               executable: "/bin/sh",
               args: [

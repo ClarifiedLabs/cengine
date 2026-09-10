@@ -31,18 +31,13 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertIn('depends_on formula: "docker"', cask)
             self.assertNotIn('depends_on macos: ">= :tahoe"', cask)
             self.assertIn('pkg "cengine-1.2.3.pkg"', cask)
-            self.assertIn("postflight_steps do", cask)
-            self.assertNotIn("postflight do", cask)
-            self.assertIn('run "/bin/sh"', cask)
-            self.assertIn('"/usr/bin/open",', cask)
-            self.assertIn('\'"$@" || true\'', cask)
+            # LaunchServices is forbidden in Homebrew's flight-step sandbox.
+            # The vendor PKG owns the installer launch, not a cask workaround.
+            self.assertNotIn("postflight", cask)
+            self.assertNotIn("installer script:", cask)
+            self.assertNotIn("/usr/bin/open", cask)
+            self.assertNotIn("--opened-by-installer", cask)
             self.assertNotIn("system_command", cask)
-            self.assertIn(
-                '"/Applications/cengine.app", "--args", "--opened-by-installer",',
-                cask,
-            )
-            postflight = cask.split("postflight_steps do", 1)[1].split("\n  end", 1)[0]
-            self.assertNotIn("must_succeed:", postflight)
             self.assertEqual(cask.count("must_succeed: false"), 1)
             self.assertIn("early_script:", cask)
             self.assertIn('executable: "/bin/sh"', cask)
@@ -71,7 +66,7 @@ class HomebrewFormulaTests(unittest.TestCase):
             self.assertFalse((root / "Formula/cengine.rb").exists())
 
     @unittest.skipUnless(shutil.which("brew"), "Homebrew is required to load the cask DSL")
-    def test_homebrew_loads_cask_and_postflight_is_best_effort(self) -> None:
+    def test_homebrew_installation_uses_only_the_vendor_pkg(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             subprocess.run([SCRIPT], check=True, env=os.environ | {
@@ -83,35 +78,18 @@ class HomebrewFormulaTests(unittest.TestCase):
                 "brew", "ruby", "-e",
                 'require "cask/cask_loader"; '
                 f"cask = Cask::CaskLoader::FromContentLoader.new(File.read({cask_path})).load(config: nil); "
-                "steps = cask.artifacts.grep(Cask::Artifact::PostflightSteps).flat_map(&:steps); "
-                "puts JSON.generate(steps)",
+                "install_artifacts = cask.artifacts.select { |artifact| artifact.respond_to?(:install_phase) }; "
+                "puts JSON.generate({ "
+                "install_artifacts: install_artifacts.map { |artifact| artifact.class.name }, "
+                "packages: cask.artifacts.grep(Cask::Artifact::Pkg).map(&:summarize) })",
             ], capture_output=True, text=True, timeout=60, env=os.environ | {
                 "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ANALYTICS": "1",
                 "HOMEBREW_DEVELOPER": "1",
             })
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            steps = json.loads(result.stdout)
-            self.assertEqual(len(steps), 1)
-            step = steps[0]
-            self.assertEqual(step["type"], "run")
-            self.assertEqual(step["command"]["path"], "/bin/sh")
-            args = step["args"]
-            self.assertEqual(args[:4], ["-c", '"$@" || true', "--", "/usr/bin/open"])
-            self.assertEqual(args[4:], [
-                "/Applications/cengine.app", "--args", "--opened-by-installer",
-            ])
-            # Substitute only the executable: a headless runner's failed `open`
-            # must not fail installation, and arguments must survive unchanged.
-            mock_open = root / "mock open"
-            for status in (0, 1, 42):
-                with self.subTest(status=status):
-                    mock_open.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$@"\nexit {status}\n')
-                    mock_open.chmod(0o755)
-                    result = subprocess.run([
-                        "/bin/sh", *args[:3], str(mock_open), *args[4:], "argument with spaces",
-                    ], capture_output=True, text=True, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.splitlines(), args[4:] + ["argument with spaces"])
+            artifacts = json.loads(result.stdout)
+            self.assertEqual(artifacts["install_artifacts"], ["Cask::Artifact::Pkg"])
+            self.assertEqual(artifacts["packages"], ["cengine-1.2.3.pkg"])
 
     def test_uninstall_script_skips_missing_app_executable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

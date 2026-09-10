@@ -11,6 +11,7 @@ def main() -> None:
     for needle in (
         "- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: macos-26", "make test",
         "python3 tools/tests/test-homebrew-formula.py",
+        "python3 tools/tests/test-package.py", "python3 tools/tests/test-installer.py",
     ):
         require_contains(test, needle, "test.yml")
     for needle in (

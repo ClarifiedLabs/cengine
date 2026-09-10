@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+# PackageKit supplies the target volume as $3. Never open an app on the host
+# when installing to another volume, or when this script is invoked manually.
+[ "${3:-}" = / ] || exit 0
+[ "$(/usr/bin/id -u)" = 0 ] || exit 0
+app=/Applications/cengine.app
+[ -x "$app/Contents/MacOS/cengine" ] || exit 0
+
+# Use the active desktop session, not the authorizing administrator or an
+# inherited USER/SUDO_USER. A headless install must not create a GUI session.
+console_uid="$(/usr/bin/stat -f %u /dev/console 2>/dev/null)" || exit 0
+case "$console_uid" in
+    ''|*[!0-9]*) exit 0 ;;
+esac
+[ "$console_uid" -ge 501 ] || exit 0
+/bin/launchctl print "gui/$console_uid" >/dev/null 2>&1 || exit 0
+
+# Homebrew quits the old app before upgrading; a direct PKG install might not.
+# Do not reactivate the old executable (which cannot rerun startup migration),
+# kill it, or create a second service-managing instance. Also skip on probe error.
+pgrep_status=0
+/usr/bin/pgrep -u "$console_uid" -f '^/Applications/cengine[.]app/Contents/MacOS/cengine([[:space:]]|$)' \
+    </dev/null >/dev/null 2>&1 || pgrep_status=$?
+if [ "$pgrep_status" -ne 1 ]; then
+    echo "cengine was installed. Quit and reopen cengine to finish the upgrade." >&2
+    exit 0
+fi
+
+# asuser selects the bootstrap session but does not drop root credentials.
+# sudo supplies the user's credentials and HOME; open dispatches without
+# waiting for the app to exit. The app decides whether an engine should resume.
+if ! /bin/launchctl asuser "$console_uid" \
+    /usr/bin/sudo -n -H -u "#$console_uid" -- \
+    /usr/bin/open "$app" --args --opened-by-installer \
+    </dev/null >/dev/null 2>&1; then
+    echo "cengine was installed, but could not be opened automatically. Open /Applications/cengine.app to finish setup or resume the engine." >&2
+fi
+exit 0

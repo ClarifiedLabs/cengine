@@ -147,7 +147,8 @@ component_pkg="$BUILD_DIR/cengine-component.pkg"
 unsigned_pkg="$BUILD_DIR/cengine-$VERSION.unsigned.pkg"
 PKG_PATH="$OUTPUT_DIR/cengine-$VERSION.pkg"
 pkgbuild --root "$PAYLOAD_ROOT" --identifier "$PKG_IDENTIFIER" --version "$VERSION" \
-  --install-location / --ownership recommended --component-plist "$COMPONENT_PLIST" "$component_pkg"
+  --install-location / --ownership recommended --component-plist "$COMPONENT_PLIST" \
+  --scripts "$ROOT_DIR/Scripts/Installer" "$component_pkg"
 productbuild --package "$component_pkg" "$unsigned_pkg"
 if enabled "$SIGN_RELEASE"; then
   productsign --sign "$installer_identity" "$unsigned_pkg" "$PKG_PATH"

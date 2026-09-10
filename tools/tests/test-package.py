@@ -26,7 +26,7 @@ def main() -> None:
         'stapler staple', 'spctl --assess --type install', 'verify-entitlements.sh',
         "sed -nE 's/.*MARKETING_VERSION", 'xattr -cr "$PAYLOAD_ROOT"',
         'install_name_tool -delete_rpath', 'PackageFrameworks',
-        '--component-plist "$COMPONENT_PLIST"',
+        '--component-plist "$COMPONENT_PLIST"', '--scripts "$ROOT_DIR/Scripts/Installer"',
         'cengine-uninstall-component.pkg', '--distribution "$UNINSTALLER_DISTRIBUTION"',
         '--resources "$ROOT_DIR/Scripts/Uninstaller/Resources"', '--package-path "$BUILD_DIR"',
     ):
