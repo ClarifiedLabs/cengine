@@ -18,6 +18,14 @@ import Testing
         )
     }
 
+    private func publish(_ fixture: StorageRecoveryFixture) throws -> RawStorageShimRecovery.PreparedLaunch {
+        let launch = try RawStorageShimRecovery.prepareLaunch(fixture.specification)
+        _ = try RawStorageShimRecovery.publishLaunch(
+            specificationURL: launch.specificationURL, data: launch.data, diskHandle: launch.diskHandle
+        )
+        return launch
+    }
+
     private func status(uuid: UUID?) -> VMShimProtocol.Status {
         .init(
             containerID: "cengine-storage", generation: 1, state: .running,
@@ -58,15 +66,16 @@ import Testing
 
     @Test(arguments: ["same", "different", "legacy", "unknown-engine"])
     func onlySameExecutableCanBeAdopted(_ mode: String) async throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let spec = specification(in: root)
-        let original = try JSONEncoder().encode(spec)
+        let fixture = try StorageRecoveryFixture()
+        defer { fixture.remove() }
+        let launch = try publish(fixture)
+        defer { withExtendedLifetime(launch) {} }
+        let spec = launch.specification
+        let original = launch.data
         let path = VMShimClient.specificationURL(for: spec)
-        try original.write(to: path)
         let uuid = UUID()
-        let reply = status(uuid: mode == "legacy" ? nil : (mode == "different" ? UUID() : uuid))
+        var reply = status(uuid: mode == "legacy" ? nil : (mode == "different" ? UUID() : uuid))
+        reply.shimLaunchUUID = spec.shimLaunchUUID
         var launched = false
         do {
             let recovered = try await RawVirtualizationBackend.recoverOrLaunch(
@@ -101,26 +110,21 @@ import Testing
             try JSONEncoder().encode(reply).write(to: URL(filePath: spec.socketPath + ".status"))
         }
         let mayLaunch = mode == "reused-pid" || mode == "no-runtime"
-        var launched = false
         do {
-            _ = try await RawVirtualizationBackend.recoverOrLaunch(
-                spec,
-                probe: { _ in throw EngineError(.internalError, "unresponsive test peer") },
-                launch: { candidate in launched = true; return VMShimClient(specification: candidate) }
-            )
+            try InfrastructureRecovery.requireExited(spec)
             #expect(mayLaunch)
         } catch let error as EngineError {
             #expect(!mayLaunch)
             #expect(error.code == .conflict)
         }
-        #expect(launched == mayLaunch)
     }
 
     @Test func mismatchedStatusAndDiskCannotBeAdopted() async throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let spec = specification(in: root)
+        let fixture = try StorageRecoveryFixture()
+        defer { fixture.remove() }
+        let launch = try publish(fixture)
+        defer { withExtendedLifetime(launch) {} }
+        let spec = launch.specification
         let uuid = UUID()
         var reply = status(uuid: uuid)
         reply.containerID = "another-root"
@@ -129,22 +133,21 @@ import Testing
         }
         var oldSpec = spec
         oldSpec.rootDiskIdentity = .init(device: 1, inode: 2, volumeUUID: UUID())
-        try JSONEncoder().encode(oldSpec).write(to: VMShimClient.specificationURL(for: spec))
         let validStatus = status(uuid: uuid)
         await #expect(throws: EngineError.self) {
             _ = try await RawVirtualizationBackend.recoverOrLaunch(
-                spec, executableUUID: uuid, probe: { _ in validStatus },
+                oldSpec, executableUUID: uuid, probe: { _ in validStatus },
                 launch: { candidate in Issue.record("must not launch"); return VMShimClient(specification: candidate) }
             )
         }
     }
 
     @Test func cancellationDoesNotReplaceInfrastructure() async throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let spec = specification(in: root)
-        try JSONEncoder().encode(spec).write(to: VMShimClient.specificationURL(for: spec))
+        let fixture = try StorageRecoveryFixture()
+        defer { fixture.remove() }
+        let launch = try publish(fixture)
+        defer { withExtendedLifetime(launch) {} }
+        let spec = launch.specification
         await #expect(throws: CancellationError.self) {
             _ = try await RawVirtualizationBackend.recoverOrLaunch(
                 spec, probe: { _ in throw CancellationError() },

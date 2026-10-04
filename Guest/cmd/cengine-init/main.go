@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -14,19 +15,27 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"time"
 
 	"dev.cengine/guest/internal/boot"
+	"dev.cengine/guest/internal/diskbootstrap"
 	guestnetwork "dev.cengine/guest/internal/network"
 	"dev.cengine/guest/internal/operations"
 	"dev.cengine/guest/internal/protocol"
 	guestrootfs "dev.cengine/guest/internal/rootfs"
 	"dev.cengine/guest/internal/supervisor"
 	"dev.cengine/guest/internal/vsock"
+	"dev.cengine/guest/internal/workloadstorage"
 )
 
 type controlServer struct {
-	process *supervisor.Supervisor
-	setTime func(seconds, microseconds int64) error
+	managed         *workloadstorage.Server // installed before any control listener starts
+	process         *supervisor.Supervisor
+	setTime         func(seconds, microseconds int64) error
+	rootMu          sync.Mutex
+	rootConnections map[net.Conn]struct{}
+	rootSealed      bool
+	rootWorkers     sync.WaitGroup
 }
 
 func main() {
@@ -78,6 +87,11 @@ func main() {
 	if err := boot.MountKernelFilesystems(); err != nil {
 		log.Fatalf("mount kernel filesystems: %v", err)
 	}
+	verifiedBoot, err := diskbootstrap.RunVerified("container")
+	if err != nil {
+		log.Fatalf("disk bootstrap: %v", err)
+	}
+	defer verifiedBoot.Close()
 	if err := boot.MountBinfmtMisc(); err != nil {
 		log.Printf("mount binfmt_misc: %v", err)
 	}
@@ -106,6 +120,16 @@ func main() {
 	if err := guestnetwork.ConfigureManagement(managementAddress, uint16(vlan)); err != nil {
 		log.Fatalf("configure management network: %v", err)
 	}
+	state := &controlServer{process: supervisor.New(), setTime: operations.SetTime}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	managed, err := workloadstorage.NewManagedServer(verifiedBoot, state.process, state.cancelRootFS)
+	if err != nil {
+		log.Fatal("private workload storage startup refused")
+	}
+	state.managed = managed
+	var daemons sync.WaitGroup
+	startDaemon := func(run func()) { daemons.Add(1); go func() { defer daemons.Done(); run() }() }
 	listener, err := vsock.Listen(protocol.ControlPort)
 	if err != nil {
 		log.Fatalf("listen on control vsock: %v", err)
@@ -116,24 +140,42 @@ func main() {
 		log.Fatalf("listen on rootfs vsock: %v", err)
 	}
 	defer rootListener.Close()
-	go serveRootFS(rootListener)
-	state := &controlServer{process: supervisor.New(), setTime: operations.SetTime}
+	startDaemon(func() { state.serveRootFS(rootListener) })
 	execListener, err := vsock.Listen(protocol.ExecIOPort)
 	if err != nil {
 		log.Fatalf("listen on exec I/O vsock: %v", err)
 	}
 	defer execListener.Close()
-	go state.serveExecIO(execListener)
+	startDaemon(func() { state.serveExecIO(execListener) })
 	portListener, err := vsock.Listen(protocol.PortProxyPort)
 	if err != nil {
 		log.Fatalf("listen on port proxy vsock: %v", err)
 	}
 	defer portListener.Close()
-	go state.servePortProxy(portListener)
+	startDaemon(func() { state.servePortProxy(portListener) })
+	if managed != nil {
+		startDaemon(func() { _ = managed.Serve(ctx) })
+	}
+	defer func() {
+		cancel()
+		_ = listener.Close()
+		_ = rootListener.Close()
+		_ = execListener.Close()
+		_ = portListener.Close()
+		if managed != nil {
+			_ = managed.Close()
+		}
+		state.cancelRootFS()
+		daemons.Wait()
+		state.rootWorkers.Wait()
+	}()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
-			log.Printf("accept control connection: %v", err)
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+				return
+			}
+			log.Print("control accept failed")
 			continue
 		}
 		go state.serve(connection)
@@ -144,7 +186,13 @@ func (state *controlServer) servePortProxy(listener net.Listener) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
-			log.Printf("accept port proxy connection: %v", err)
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if !hostPeer(connection) {
+			_ = connection.Close()
 			continue
 		}
 		go state.handlePortProxy(connection)
@@ -153,6 +201,9 @@ func (state *controlServer) servePortProxy(listener net.Listener) {
 
 func (state *controlServer) handlePortProxy(connection net.Conn) {
 	defer connection.Close()
+	if !hostPeer(connection) {
+		return
+	}
 	request, err := protocol.ReadEnvelope(connection)
 	if err != nil {
 		return
@@ -284,7 +335,13 @@ func (state *controlServer) serveExecIO(listener net.Listener) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
-			log.Printf("accept exec I/O connection: %v", err)
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if !hostPeer(connection) {
+			_ = connection.Close()
 			continue
 		}
 		go state.handleExecIO(connection)
@@ -293,6 +350,9 @@ func (state *controlServer) serveExecIO(listener net.Listener) {
 
 func (state *controlServer) handleExecIO(connection net.Conn) {
 	defer connection.Close()
+	if !hostPeer(connection) {
+		return
+	}
 	request, err := protocol.ReadEnvelope(connection)
 	if err != nil {
 		return
@@ -330,23 +390,63 @@ func (state *controlServer) handleExecIO(connection net.Conn) {
 	state.process.WaitExec(value.ID)
 }
 
-func serveRootFS(listener net.Listener) {
+func hostPeer(connection net.Conn) bool {
+	peer, ok := connection.RemoteAddr().(vsock.Addr)
+	return ok && peer.CID == 2
+}
+
+func (state *controlServer) cancelRootFS() {
+	state.rootMu.Lock()
+	defer state.rootMu.Unlock()
+	state.rootSealed = true
+	for connection := range state.rootConnections {
+		_ = connection.Close()
+	}
+}
+
+func (state *controlServer) serveRootFS(listener net.Listener) {
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
-			log.Printf("accept rootfs connection: %v", err)
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+				return
+			}
 			continue
 		}
+		if !hostPeer(connection) {
+			_ = connection.Close()
+			continue
+		}
+		state.rootMu.Lock()
+		if state.rootSealed {
+			state.rootMu.Unlock()
+			_ = connection.Close()
+			continue
+		}
+		if state.rootConnections == nil {
+			state.rootConnections = make(map[net.Conn]struct{})
+		}
+		state.rootConnections[connection] = struct{}{}
+		state.rootWorkers.Add(1)
+		state.rootMu.Unlock()
 		go func() {
+			defer state.rootWorkers.Done()
+			defer func() { state.rootMu.Lock(); delete(state.rootConnections, connection); state.rootMu.Unlock() }()
 			defer connection.Close()
+			_ = connection.SetDeadline(time.Now().Add(120 * time.Second))
 			envelope, err := protocol.ReadEnvelope(connection)
+			// Layer transfer duration scales with image size. Cancellation closes
+			// owned rootfs connections; only the bounded envelope has a deadline.
+			if err == nil {
+				err = connection.SetDeadline(time.Time{})
+			}
 			response := protocol.ResponseEnvelope(envelope)
 			response.Operation = "prepare-rootfs"
 			if err == nil {
 				var request protocol.RootFSRequest
 				err = json.Unmarshal(envelope.Payload, &request)
 				if err == nil {
-					err = guestrootfs.Apply(request.RootDevice, request.Layers, connection)
+					err = state.process.WithRootFSPreparation(func() error { return guestrootfs.Apply(request.RootDevice, request.Layers, connection) })
 				}
 			}
 			if err != nil {
@@ -361,6 +461,9 @@ func serveRootFS(listener net.Listener) {
 
 func (state *controlServer) serve(connection net.Conn) {
 	defer connection.Close()
+	if !hostPeer(connection) {
+		return
+	}
 	for {
 		request, err := protocol.ReadEnvelope(connection)
 		if err != nil {
@@ -388,7 +491,11 @@ func (state *controlServer) serve(connection net.Conn) {
 }
 
 func (state *controlServer) handle(request protocol.Envelope) (json.RawMessage, error) {
+	// This closed observer vocabulary precedes all ordinary process admission.
+	// It cannot start or reconnect a workload or revive the private session.
 	switch request.Operation {
+	case "original-consumer-arm", "original-consumer-begin", "original-consumer-probe", "original-consumer-result", "original-consumer-release", "original-consumer-positive", "original-consumer-resume":
+		return state.managed.OriginalConsumerControl(request.Operation, request.Payload)
 	case "ping":
 		return json.RawMessage(`{"status":"ready"}`), nil
 	case "set-time":

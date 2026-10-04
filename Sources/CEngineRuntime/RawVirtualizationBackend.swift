@@ -5,6 +5,179 @@ import Darwin
 import Foundation
 import Virtualization
 
+/// Synchronous admission plus an asynchronous, bounded join. All mutable state
+/// is lock-protected so Raw's actor and the managed MainActor share this primitive.
+/// A revoked lease remains inventoried until its operation actually unwinds;
+/// timeout/cancellation is never converted into proof of quiescence.
+final class RawServiceWorkTracker: @unchecked Sendable {
+    struct Lease: Hashable, Sendable {
+        fileprivate let generation: UUID
+        fileprivate let id = UUID()
+    }
+    private let lock = NSLock()
+    private var generation = UUID()
+    private var closed = false
+    private var leases = Set<Lease>()
+    private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+
+    func begin() throws -> Lease {
+        try lock.withLock {
+            guard !closed else { throw EngineError(.conflict, "raw service work is fenced") }
+            let lease = Lease(generation: generation)
+            leases.insert(lease)
+            return lease
+        }
+    }
+    /// Destructive work is never dropped because admission closed. Its producer
+    /// is fenced separately; even an already-entered callback remains joinable.
+    func retainDestructiveWork() -> Lease {
+        lock.withLock {
+            let lease = Lease(generation: generation)
+            leases.insert(lease)
+            return lease
+        }
+    }
+    func requireQuiescent() throws {
+        try lock.withLock {
+            guard closed, leases.isEmpty else { throw EngineError(.conflict, "destructive work is not joined") }
+        }
+    }
+    func end(_ lease: Lease) {
+        let ready: [CheckedContinuation<Void, Error>] = lock.withLock {
+            guard leases.remove(lease) != nil, leases.isEmpty else { return [] }
+            let ready = Array(waiters.values); waiters.removeAll()
+            return ready
+        }
+        for waiter in ready { waiter.resume() }
+    }
+    func close() { lock.withLock { closed = true } }
+    func reopen() throws {
+        try lock.withLock {
+            guard closed, leases.isEmpty else { throw EngineError(.conflict, "raw service work has not quiesced") }
+            generation = UUID(); closed = false
+        }
+    }
+    func require(_ lease: Lease) throws {
+        try lock.withLock {
+            guard !closed, generation == lease.generation, leases.contains(lease) else {
+                throw EngineError(.conflict, "raw service callback belongs to a revoked generation")
+            }
+        }
+    }
+    func join(timeout: Duration = .seconds(30)) async throws {
+        let id = UUID()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let installed = lock.withLock {
+                guard closed else {
+                    continuation.resume(throwing: EngineError(.conflict, "raw service admission is not closed")); return false
+                }
+                guard !leases.isEmpty else { continuation.resume(); return false }
+                waiters[id] = continuation; return true
+            }
+            if installed {
+                Task {
+                    try? await Task.sleep(for: timeout)
+                    let waiter = self.lock.withLock { self.waiters.removeValue(forKey: id) }
+                    waiter?.resume(throwing: EngineError(.conflict, "raw service work did not quiesce; maintenance remains fenced"))
+                }
+            }
+        }
+    }
+}
+
+/// The production launch rollback seam never rediscovers a client by container
+/// ID. Even a late success or rollback-incomplete error can clean only its capture.
+enum RawTrackedShimLaunch {
+    static func run<Client: Sendable>(
+        launch: () async throws -> Client,
+        failedClient: (Error) -> Client?,
+        validate: (Client) async throws -> Void,
+        cleanup: (Client) async throws -> Void,
+        retain: (Client) async -> Void,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> Client {
+        var captured: Client?
+        do {
+            let client = try await launch(); captured = client
+            try await validate(client)
+            return client
+        } catch {
+            let launchError = error
+            if let client = captured ?? failedClient(error) {
+                do { try await cleanup(client) }
+                catch {
+                    await retain(client)
+                    throw BackendResourceRollbackIncompleteError(
+                        "VM shim launch failed: \(EngineError.message(for: launchError)); exact launch cleanup failed: \(EngineError.message(for: error))")
+                }
+            }
+            throw launchError
+        }
+    }
+
+    static func ownsCompletion<Client: AnyObject>(captured: Client, current: Client?,
+        generation: RawBackendExecutionFence.Token?, completion: RawBackendExecutionFence.Token?) -> Bool {
+        current === captured && generation != nil && generation == completion
+    }
+}
+
+enum RawServiceContainment {
+    struct JoinFailure: Error, LocalizedError {
+        let join: Error
+        let containment: Error
+        var errorDescription: String? {
+            "native launch join failed: \(join.localizedDescription); known-owner containment also failed: \(containment.localizedDescription)"
+        }
+    }
+    struct KnownOwnersFailure: Error, LocalizedError {
+        let failures: [Error]
+        var errorDescription: String? { failures.map(\.localizedDescription).joined(separator: "; ") }
+    }
+
+    /// Best effort over an exact captured owner population; never a complete
+    /// census or permission to discard unresolved/unpublished launch ownership.
+    static func containKnown<Owner: Sendable>(owners: [Owner], terminate: (Owner) async throws -> Void,
+        isolation: isolated (any Actor)? = #isolation) async throws {
+        var failures: [Error] = []
+        for owner in owners {
+            do { try await terminate(owner) } catch { failures.append(error) }
+        }
+        if !failures.isEmpty { throw KnownOwnersFailure(failures: failures) }
+    }
+
+    static func run(native: RawServiceWorkTracker, work: RawServiceWorkTracker,
+        nativeTimeout: Duration = .seconds(30), containKnown: (() async throws -> Void)? = nil,
+        contain: () async throws -> Void, joinManaged: () async throws -> Void,
+        census: () async throws -> Set<String>, isolation: isolated (any Actor)? = #isolation) async throws -> Set<String> {
+        do { try await native.join(timeout: nativeTimeout) }
+        catch {
+            let joinError = error
+            // A missing launch join is not permission to leave already-published
+            // VMs running. Keep the launch lease and generation fence untouched.
+            do {
+                if let containKnown { try await containKnown() }
+                else { try await contain() }
+            } catch { throw JoinFailure(join: joinError, containment: error) }
+            throw joinError // never report a complete contained census
+        }
+        do { try await contain() }
+        catch {
+            let censusError = error
+            // A malformed/unknown filesystem entry may reject the full census
+            // before it reaches any known VM. Failed observation cleanup must
+            // still attempt all captured native owners, without calling it complete.
+            if let containKnown {
+                do { try await containKnown() }
+                catch { throw KnownOwnersFailure(failures: [censusError, error]) }
+            }
+            throw censusError
+        }
+        try await work.join()
+        try await joinManaged()
+        return try await census()
+    }
+}
+
 struct RawBackendExecutionFence: Sendable {
     struct Token: Equatable, Sendable {
         fileprivate let value = UUID()
@@ -22,6 +195,8 @@ struct RawBackendExecutionFence: Sendable {
         if let token = tokens[identifier] { return token }
         return replace(identifier)
     }
+
+    func current(_ identifier: String) -> Token? { tokens[identifier] }
 
     func owns(_ identifier: String, token: Token) -> Bool {
         tokens[identifier] == token
@@ -153,6 +328,26 @@ enum RawCompletionPublisher {
         let publication = try publish()
         if publication.synchronizeFabric { await synchronizeFabric() }
         return publication.value
+    }
+}
+
+/// Passive completion may outlive its execution or original-consumer preflight.
+/// Validate after publication's last suspension, then retain admitted destructive
+/// work through stop: preflight must either reject this stop or join it before Arm.
+/// Explicit stop/kill and containment keep their separate admission policies.
+enum RawCompletionStop {
+    static func run<Value: Sendable>(
+        isolation _: isolated (any Actor) = #isolation,
+        work: RawServiceWorkTracker,
+        complete: () async throws -> Value,
+        ownsExecution: () -> Bool,
+        stop: () async throws -> Void
+    ) async throws -> Value {
+        let published = try await complete()
+        guard ownsExecution(), let lease = try? work.begin() else { return published }
+        defer { work.end(lease) }
+        try? await stop()
+        return published
     }
 }
 
@@ -769,6 +964,7 @@ enum RawFreshContainerStateCoordinator {
                 "container \(containerID) state changed before fresh preparation"
             )
         }
+        try RawDiskJournalDirectory.requireSafeAutomaticRootDisposal(existing)
         try containersDirectory.disposeDirectory(
             named: containerID,
             expectedIdentity: existing.identity,
@@ -816,9 +1012,17 @@ struct RawContainerPreparationArtifacts: Codable, Equatable, Sendable {
         in directory: PersistentStateDirectory,
         rootDiskSize: UInt64
     ) throws -> RawContainerPreparationArtifacts {
-        let rootDiskIdentity = try directory.createSparseRegularFile(
-            named: "root.ext4", size: rootDiskSize
+        try RawDiskJournalDirectory.prepare(directory)
+        guard case .created(let created) = try RawDiskInitialization.createNewDisk(
+            in: directory, named: "root.ext4", size: rootDiskSize
+        ) else { throw POSIXError(.EEXIST) }
+        let rootDiskIdentity = try directory.regularFileIdentity(
+            named: "root.ext4", expectedSize: rootDiskSize
         )
+        guard rootDiskIdentity.inode == created.record.diskIdentity.inode,
+              rootDiskIdentity.volumeUUID?.uuidString.lowercased() == created.record.diskIdentity.volumeUUID else {
+            throw RawDiskInitialization.Failure.unsafePath
+        }
         let shimLogIdentity = try directory.createSparseRegularFile(
             named: "shim.log", size: 0
         )
@@ -3318,11 +3522,24 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private let deletedContainersStateDirectory: PersistentStateDirectory
     private let kernel: URL
     private let containerInitialRamdisk: URL
+    private let diskBootstrapMetadata: GuestAssetInstaller.DiskBootstrapMetadata
     private let automaticNetworkPool: AutomaticNetworkPool
     private let store: OCIContentStore
-    private let tokenIssuer: VolumeAccessToken
     private let infrastructure: VMShimClient
-    private let storage: StorageAdministrativeClient
+    private let managedStorage: RawManagedStorageBackend?
+    private let prepareCompatibility: ManagedPrepareCompatibilityCoordinator?
+    private var recoveredStorageContainers = false
+    private var serviceMaintenance = false
+    private var serviceReplacementInProgress = false
+    private var storageLossObserver: (@Sendable () async -> Void)?
+    private var serviceGeneration = UUID()
+    private var attachmentRetirementTasks: [UUID: Task<Void, Never>] = [:]
+    private let serviceWork = RawServiceWorkTracker()
+    private let nativeLaunchWork = RawServiceWorkTracker()
+    private let destructiveTerminationWork = RawServiceWorkTracker()
+    private var originalConsumerObservation: (operation: String, handle: VMShimClient.OriginalConsumerObservation)?
+    private var serviceReplacements: [String: (StorageServiceTypes.ReplacementRequest, Task<BackendServiceReplacementResult, Error>)] = [:]
+    private var serviceReplacementRetries: [String: ManagedStorageLifecycleOwner.RetryableReplacementTimeout] = [:]
     private let portForwarder = PortForwarder()
     private var shims: [String: VMShimClient] = [:]
     /// Launch can cross `Process.run()` before readiness and then fail to prove
@@ -3379,6 +3596,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private static let execStartNeverRanExitCode: Int32 = 125
     private var preparedBindSources: [String: [Int: PreparedBindSource]] = [:]
     private var volumeStorageModes: [String: VolumeStorageMode] = [:]
+    private let sharedVolumeInitialization: SharedVolumeInitializationCoordinator
     private var containerDirectoryIdentities: [String: PersistentFileIdentity] = [:]
 
     public init(
@@ -3386,77 +3604,72 @@ public actor RawVirtualizationBackend: ContainerBackend {
         kernel: URL,
         containerInitialRamdisk: URL,
         storageInitialRamdisk: URL,
-        automaticNetworkPool: AutomaticNetworkPool = .default
+        automaticNetworkPool: AutomaticNetworkPool = .default,
+        sharedStorage: SharedStorageConfiguration? = nil,
+        compatibilityStoreLock: CanonicalDataStoreLock? = nil
     ) async throws {
-        let dataRoot = try Self.canonicalDataRoot(root)
+        let sharedStorage = try sharedStorage ?? ManagedStorageStartup.lifecycleConfiguration()
+        guard let compatibilityStoreLock else {
+            throw EngineError(.conflict, "lifecycle storage requires the held canonical data-store lock")
+        }
+        let dataRoot = root.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+        guard Self.storeLockGuardsDataRoot(compatibilityStoreLock.root, dataRoot: dataRoot) else {
+            throw EngineError(.conflict, "lifecycle storage requires the held canonical data-store lock")
+        }
+        let volumeNames = SharedVolumeInitializationCoordinator()
+        sharedVolumeInitialization = volumeNames
         self.root = dataRoot
         self.kernel = kernel
         self.containerInitialRamdisk = containerInitialRamdisk
+        let diskBootstrapMetadata = try GuestAssetInstaller.diskBootstrapMetadata(
+            kernel: kernel,
+            containerInitialRamdisk: containerInitialRamdisk,
+            storageInitialRamdisk: storageInitialRamdisk
+        )
+        self.diskBootstrapMetadata = diskBootstrapMetadata
+        // Authenticate assets and reject old/ambiguous stores before the first write.
+        try diskBootstrapMetadata.requireLifecycleStorageSupport(policy: sharedStorage.policy)
+        let lifecycleRoot = try await ManagedLifecycleStartupRoot.prepareForStartup(storeLock: compatibilityStoreLock)
+        let dataDirectory = lifecycleRoot.directory
+        try lifecycleRoot.validate()
+        try await ManagedLifecycleStartup.preflight(root: dataDirectory)
+        if let profile = diskBootstrapMetadata.prepareCompatibilityProfile {
+            prepareCompatibility = try ManagedPrepareCompatibilityCoordinator(storeLock: compatibilityStoreLock, profile: profile)
+        } else { prepareCompatibility = nil }
         self.automaticNetworkPool = automaticNetworkPool
-        let runtimeNamespace = try VMShimRuntimeNamespace.acquire(
-            stateDirectory: PersistentStateDirectory.open(dataRoot)
-        )
+        try lifecycleRoot.validate()
+        let runtimeNamespace = try await ManagedLifecycleStartup.acquireRuntimeNamespace(root: lifecycleRoot)
         self.runtimeNamespace = runtimeNamespace
-        let containers = dataRoot.appending(path: "containers", directoryHint: .isDirectory)
-        let deletedContainers = dataRoot.appending(
-            path: "deleted-containers", directoryHint: .isDirectory
-        )
-        let volumes = dataRoot.appending(path: "volumes", directoryHint: .isDirectory)
-        let infrastructureRoot = dataRoot.appending(
-            path: "infrastructure", directoryHint: .isDirectory
-        )
-        try FileManager.default.createDirectory(at: containers, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(
-            at: deletedContainers, withIntermediateDirectories: true
-        )
-        try FileManager.default.createDirectory(at: volumes, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: infrastructureRoot, withIntermediateDirectories: true)
-        containersStateDirectory = try PersistentStateDirectory.open(containers)
-        deletedContainersStateDirectory = try PersistentStateDirectory.open(deletedContainers)
+        try lifecycleRoot.validate()
+        let infrastructureRoot = dataRoot.appending(path: "infrastructure", directoryHint: .isDirectory)
+        containersStateDirectory = try lifecycleRoot.openOrCreateDirectory(named: "containers")
+        deletedContainersStateDirectory = try lifecycleRoot.openOrCreateDirectory(named: "deleted-containers")
+        try lifecycleRoot.validate()
+        let volumesDirectory = try dataDirectory.openOrCreateDirectory(named: "volumes", permissions: 0o700)
+        try lifecycleRoot.validate()
+        let infrastructureDirectory = try dataDirectory.openOrCreateDirectory(named: "infrastructure", permissions: 0o700)
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
+        try RawDiskJournalDirectory.prepare(volumesDirectory, repairPermissions: false)
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
+        try RawDiskJournalDirectory.prepare(infrastructureDirectory, repairPermissions: false)
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
         store = try OCIContentStore(root: dataRoot.appending(path: "content"))
-        if let data = try? Data(contentsOf: dataRoot.appending(path: "networks.json")),
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
+        let networkData = try dataDirectory.readRegularFile(named: "networks.json", required: false)
+        if let data = networkData,
            let state = try? JSONDecoder().decode([String: NetworkState].self, from: data) {
             networks = state.mapValues(\.record)
             networkVLANs = state.mapValues(\.vlan)
         }
-        if let data = try? Data(contentsOf: dataRoot.appending(path: "volume-storage.json")),
+        let volumeStorageData = try dataDirectory.readRegularFile(named: "volume-storage.json", required: false)
+        if let data = volumeStorageData,
            let state = try? JSONDecoder().decode([String: VolumeStorageMode].self, from: data) {
             volumeStorageModes = state
         }
 
-        let secretURL = infrastructureRoot.appending(path: "volume-token-secret")
-        let secret: Data
-        if FileManager.default.fileExists(atPath: secretURL.path) {
-            secret = try Data(contentsOf: secretURL)
-        } else {
-            secret = VolumeAccessToken.random().secret
-            try secret.write(to: secretURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretURL.path)
-        }
-        tokenIssuer = try VolumeAccessToken(secret: secret)
-
-        let networkNamespaceURL = infrastructureRoot.appending(path: "network-namespace")
-        let networkNamespace: String
-        if let data = try? Data(contentsOf: networkNamespaceURL),
-           let value = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !value.isEmpty {
-            networkNamespace = value
-        } else {
-            networkNamespace = Identifier.random()
-            try Data("\(networkNamespace)\n".utf8).write(
-                to: networkNamespaceURL, options: .atomic
-            )
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: networkNamespaceURL.path
-            )
-        }
-
+        let networkNamespace = try lifecycleRoot.networkNamespace(in: infrastructureDirectory)
         let disk = infrastructureRoot.appending(path: "volumes.ext4")
-        try Self.createSparseFile(at: disk, size: Self.defaultStorageDiskBytes)
-        let infrastructureDiskIdentity = try PersistentStateDirectory.open(
-            infrastructureRoot
-        ).regularFileIdentity(named: "volumes.ext4")
+        // Disk provisioning belongs to the ordered lifecycle startup.
         let infrastructureSpec = VMShimProtocol.Specification(
             kind: .storage,
             containerID: "cengine-storage",
@@ -3465,7 +3678,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             kernelPath: kernel.path,
             initialRamdiskPath: storageInitialRamdisk.path,
             rootDiskPath: disk.path,
-            rootDiskIdentity: infrastructureDiskIdentity.shimIdentity,
+            rootDiskIdentity: nil,
             rootDiskSize: Self.defaultStorageDiskBytes,
             cpus: 2,
             memoryBytes: 1 * 1_024 * 1_024 * 1_024,
@@ -3473,27 +3686,48 @@ public actor RawVirtualizationBackend: ContainerBackend {
             socketPath: try runtimeNamespace.makeSocketPath(),
             logPath: infrastructureRoot.appending(path: "shim.log").path,
             kernelArguments: [
-                tokenIssuer.kernelArgument,
                 "cengine.management_address=\(Self.managementServerAddress)/10",
                 "cengine.management_vlan=\(VMShimProtocol.managementVLAN)",
             ],
-            fileSystemSocketPath: try runtimeNamespace.makeSocketPath(),
             networkSocketPath: try runtimeNamespace.makeSocketPath(),
             networkNamespace: networkNamespace,
-            vlans: [VMShimProtocol.managementVLAN]
+            vlans: [VMShimProtocol.managementVLAN],
+            // Allocated only after positive death proof and the block FD lease.
+            shimLaunchUUID: nil,
+            diskBootstrapVersion: 1,
+            expectedInitramfsSHA256: diskBootstrapMetadata.expectedInitramfsSHA256(for: .storage)
         )
-        infrastructure = try await Self.recoverOrLaunch(infrastructureSpec)
-        storage = StorageAdministrativeClient(
-            socketPath: try Self.storageAdministrativeSocketPath(for: infrastructure),
-            tokenIssuer: tokenIssuer
-        )
-        _ = try await infrastructure.boot()
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
+        let startup = await ManagedLifecycleProductionStartup(retainedRoot: lifecycleRoot,
+            infrastructureDirectory: infrastructureDirectory,
+            installedHelperTeam: sharedStorage.installedHelperTeam, policy: sharedStorage.policy,
+            diskSize: Self.defaultStorageDiskBytes,
+            names: volumeNames, provenanceReference: diskBootstrapMetadata.storageInitramfsSHA256,
+            specification: infrastructureSpec, compatibility: prepareCompatibility)
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
+        let started = try await startup.start()
+        try lifecycleRoot.validate(infrastructure: infrastructureDirectory)
+        infrastructure = started.shim
+        managedStorage = started.backend
+    }
+
+    private func recoverPersistedContainers() async throws {
+        guard !recoveredStorageContainers else { return }
         for name in try containersStateDirectory.reconciledEntryNames() {
             let directory = try containersStateDirectory.openDirectory(named: name)
             containerDirectoryIdentities[name] = directory.identity
             let prepared = try Self.loadPreparedShimState(
                 from: directory, expectedContainerID: name
             )
+            if let prepared, let managedStorage,
+               try await managedStorage.hasIntents(containerID: name),
+               try RawDeletedContainerCoordinator.hasReceipt(containerID: name, in: deletedContainersStateDirectory) {
+                try RawDeletedContainerCoordinator.requireRecordedDeletion(of: prepared.currentContainer,
+                    directoryIdentity: directory.identity, in: deletedContainersStateDirectory)
+                // Whole-state history is deliberately retained for the next exact
+                // native census; it is not a recoverable/public container anymore.
+                continue
+            }
             if let prepared {
                 knownContainers[prepared.currentContainer.id] = prepared.currentContainer
                 let ioDirectory = try directory.openDirectory(named: "io")
@@ -3536,7 +3770,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                         throw EngineError(.conflict, "recovered VM shim ownership mismatch")
                     }
                     try await launch.client.terminate()
-                    try launch.client.removePersistentLaunchArtifacts()
+                    if managedStorage == nil { try launch.client.removePersistentLaunchArtifacts() }
                 } catch {
                     cleanupPendingShims[containerID, default: []].append(launch.client)
                 }
@@ -3552,6 +3786,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 )
             }
             if let selected {
+                if selected.client.specification.workloadStorageMode == .managed {
+                    guard selected.status.state == .running else {
+                        throw EngineError(.conflict, "managed workload is not eligible for live adoption")
+                    }
+                    guard let managedStorage, let container = prepared?.currentContainer,
+                          try await managedStorage.permitsLiveRecovery(container: container, shim: selected.client) else {
+                        throw EngineError(.conflict, "managed workload has no sealed live adoption proof")
+                    }
+                }
                 shims[containerID] = selected.client
                 knownContainers[containerID] = prepared?.currentContainer
             }
@@ -3563,7 +3806,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                         throw EngineError(.conflict, "recovered VM shim ownership mismatch")
                     }
                     try await launch.client.terminate()
-                    try launch.client.removePersistentLaunchArtifacts()
+                    if managedStorage == nil { try launch.client.removePersistentLaunchArtifacts() }
                 } catch {
                     cleanupPendingShims[containerID, default: []].append(launch.client)
                 }
@@ -3641,12 +3884,393 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 ))
             }
         }
+        recoveredStorageContainers = true
+    }
+
+    public func reconcileStorage(volumes: [VolumeRecord], containers: [ContainerRecord]) async throws {
+        if let managedStorage {
+            try await managedStorage.reconcile(volumes: volumes, containers: containers)
+            try await recoverPersistedContainers()
+            await managedStorage.observeRetirements({ [weak self] containerID, launch in
+                await self?.managedAttachmentRetired(containerID: containerID, launch: launch)
+            }, serviceLost: { [weak self] in await self?.managedServiceLost() })
+        }
+    }
+
+    public func observeManagedStorageLoss(_ observer: @escaping @Sendable () async -> Void) async {
+        storageLossObserver = observer
+        if serviceMaintenance { await observer() }
+    }
+
+    public func fenceManagedStorageService() async { fenceServiceWork(containers: []) }
+
+    private func managedServiceLost() async {
+        fenceServiceWork(containers: [])
+        await storageLossObserver?()
+    }
+
+    /// Only the signed, FD-pinned production replacement claim can reach Arm.
+    /// The original configured receipt is retained at successful runtime start.
+    private func prepareOriginalConsumerObservation(_ claim: ManagedPrepareCompatibilityQueue.OriginalClaim,
+        request: StorageServiceTypes.ReplacementRequest) async throws -> VMShimClient.OriginalConsumerObservation {
+        // Preflight runs before the lifecycle owner's observation cursor exists.
+        // Keep its finite stage through awaits so failures here reach both receipts
+        // without changing admission, the original deadline, or cleanup ownership.
+        var stage = OriginalConsumerFailureDiagnostic.Stage.preflightIdentity
+        do {
+            _ = try SignedCompatibilityIdentity.current(role: .engine)
+            guard let managedStorage, let compatibility = prepareCompatibility,
+                  compatibility.profile == ManagedPrepareCompatibilityProtocol.fullProfile,
+                  originalConsumerObservation == nil,
+                  let shim = shims[claim.request.container] else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            let epoch = serviceGeneration
+            let deadline = OriginalConsumerPreflightDeadline()
+            let generation = shim.specification.generation
+            guard let launch = shim.specification.shimLaunchUUID else {
+                throw OriginalConsumerObservationProtocol.Failure.invalid
+            }
+            let captured = OriginalConsumerPreflightIdentity(serviceGeneration: epoch, shimGeneration: generation,
+                launch: launch, instance: claim.request.containerInstance)
+            func check() throws {
+                _ = try deadline.remaining()
+                guard let currentLaunch = shim.specification.shimLaunchUUID else {
+                    throw OriginalConsumerObservationProtocol.Failure.invalid
+                }
+                let current = OriginalConsumerPreflightIdentity(serviceGeneration: serviceGeneration,
+                    shimGeneration: shim.specification.generation, launch: currentLaunch,
+                    instance: knownContainers[claim.request.container]?.instanceID.uuidString.lowercased() ?? "")
+                try OriginalConsumerPreflightIdentity.requireMatch(captured, current,
+                    captured: shim, currentClient: shims[claim.request.container])
+            }
+            stage = .preflightFreeze
+            // Close ordinary admission BEFORE hopping to the notification actor.
+            serviceWork.close(); nativeLaunchWork.close()
+            let managedEpoch = try await managedStorage.freezeOriginalConsumerWork()
+            try check()
+            stage = .preflightJoin
+            try await managedStorage.joinOriginalConsumerWork(managedEpoch, deadline: deadline)
+            try check()
+            // Whole notification callbacks have returned, including any callback
+            // that entered its destructive lane after we requested cancellation.
+            try await nativeLaunchWork.join(timeout: deadline.remaining()); try check()
+            try await serviceWork.join(timeout: deadline.remaining()); try check()
+            destructiveTerminationWork.close()
+            try await destructiveTerminationWork.join(timeout: deadline.remaining()); try check()
+            for task in attachmentRetirementTasks.values { await task.value; try check() }
+            try destructiveTerminationWork.requireQuiescent()
+            stage = .preflightBinding
+            let binding = try await managedStorage.originalRuntimeBinding(claim.request, replacement: request, shim: shim)
+            try check(); try destructiveTerminationWork.requireQuiescent()
+            // Arm itself checks the actual installed RUNNING machine and mounted
+            // positive through its bounded signed exchange, not an unbounded status RPC.
+            stage = .preflightCandidate
+            try compatibility.originalCandidate(.init(request: claim.request, binding: binding, ownerRequest: request), claim: claim)
+            stage = .preflightArm
+            let observation = try await managedStorage.armOriginalRuntime(binding,
+                request: claim.request, replacement: request, shim: shim)
+            // Store before any further throwing checks so every failed arm path releases.
+            originalConsumerObservation = (request.operationUUID, observation)
+            stage = .preflightArmReturn
+            try check(); try destructiveTerminationWork.requireQuiescent()
+            guard try await managedStorage.originalRuntimeBinding(claim.request, replacement: request, shim: shim) == binding
+            else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            try check(); try destructiveTerminationWork.requireQuiescent()
+            stage = .preflightArmedPublication
+            try compatibility.originalPublish(binding, phase: .armed, claim: claim)
+            if binding.caseName.isWritableFD || binding.caseName.isRoot {
+                // Stay inside the ORIGINAL preflight budget. Ordinary exec admission
+                // remains closed: the independent reader was started before capture
+                // and is triggered only over its already-owned bounded stream.
+                while true {
+                    stage = .preflightBaselineWait
+                    try Task.checkCancellation(); try check()
+                    if let baseline = try compatibility.originalBaseline(binding: binding, claim: claim) {
+                        stage = .preflightBaselineValidation
+                        try await managedStorage.validateOriginalBaseline(baseline)
+                        try check(); try destructiveTerminationWork.requireQuiescent()
+                        guard try await managedStorage.originalRuntimeBinding(claim.request, replacement: request, shim: shim) == binding
+                        else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+                        try check()
+                        stage = .preflightBaselineRecord
+                        try await observation.recordBackingBaseline(baseline)
+                        try check(); try destructiveTerminationWork.requireQuiescent()
+                        stage = .preflightBaselinePublication
+                        try compatibility.originalPublish(baseline, phase: .baselineAccepted, claim: claim)
+                        break
+                    }
+                    try await Task.sleep(for: min(.milliseconds(10), deadline.remaining()))
+                }
+            }
+            return observation
+        } catch { throw OriginalConsumerFailureDiagnostic.annotate(error, at: stage) }
+    }
+
+    public func validateManagedStorageReplacement(_ request: StorageServiceTypes.ReplacementRequest) async throws {
+        guard let managedStorage else { throw RawManagedStorageBackend.failure() }
+        try await managedStorage.validateServiceReplacement(request)
+    }
+
+    public func validateManagedStorageAvailability(_ scope: StorageServiceTypes.Scope) async throws {
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
+        guard let managedStorage else { throw RawManagedStorageBackend.failure() }
+        do { try await managedStorage.validateServiceAvailability(scope) }
+        catch ManagedStorageControlFailure.serviceUnavailable {
+            if serviceGeneration == epoch { await managedServiceLost() }
+            throw ManagedStorageControlFailure.serviceUnavailable
+        }
+        try requireServiceGeneration(epoch)
+    }
+
+    public func replaceManagedStorageService(_ request: StorageServiceTypes.ReplacementRequest,
+        volumes: [VolumeRecord], containers: [ContainerRecord]) async throws -> BackendServiceReplacementResult {
+        let retrying: Bool
+        if let (original, task) = serviceReplacements[request.operationUUID] {
+            guard original == request else { throw RawManagedStorageBackend.failure("replacement request changed") }
+            guard let retry = serviceReplacementRetries[request.operationUUID], retry.request == request else {
+                return try await task.value
+            }
+            retrying = true
+        } else { retrying = false }
+        guard let managedStorage, retrying || !serviceReplacementInProgress else { throw RawManagedStorageBackend.failure() }
+        if !retrying {
+            try await managedStorage.validateServiceReplacement(request)
+            guard !serviceReplacementInProgress else { throw RawManagedStorageBackend.failure() }
+        }
+        serviceReplacementRetries.removeValue(forKey: request.operationUUID)
+        serviceReplacementInProgress = true
+        // Retain the entire preflight + fault + release + containment operation.
+        let task = Task {
+            var claim: ManagedPrepareCompatibilityQueue.OriginalClaim?
+            var replacementEntered = false
+            do {
+                claim = try self.prepareCompatibility?.originalCapture(request)
+                let observation: VMShimClient.OriginalConsumerObservation?
+                if let claim { observation = try await self.prepareOriginalConsumerObservation(claim, request: request) }
+                else { observation = nil }
+                self.fenceServiceWork(containers: containers)
+                replacementEntered = true
+                let result = try await managedStorage.replaceService(request, volumes: volumes, containers: containers,
+                    observation: observation, originalClaim: claim, compatibility: self.prepareCompatibility) {
+                    try await self.containServiceExecutions(containers: containers)
+                }
+                try await OriginalConsumerFailureDiagnostic.step(claim != nil ? .resultPublication : nil) {
+                    if let claim, let compatibility = self.prepareCompatibility {
+                        if claim.request.caseName.isRoot {
+                            let evidence = try await managedStorage.rootEvidence(operationUUID: request.operationUUID)
+                            try compatibility.originalPublish(evidence, phase: .result, claim: claim)
+                        } else {
+                            let evidence = try await managedStorage.originalEvidence(operationUUID: request.operationUUID)
+                            try compatibility.originalPublish(OriginalConsumerRuntimeCarrier.Result(evidence), phase: .result, claim: claim)
+                        }
+                    }
+                }
+                self.originalConsumerObservation = nil
+                try OriginalConsumerFailureDiagnostic.step(claim != nil ? .workReopen : nil) {
+                    if claim != nil { try self.destructiveTerminationWork.reopen() }
+                    try self.nativeLaunchWork.reopen()
+                    try self.serviceWork.reopen()
+                }
+                self.serviceMaintenance = false; self.serviceReplacementInProgress = false
+                await managedStorage.observeRetirements({ [weak self] containerID, launch in
+                    await self?.managedAttachmentRetired(containerID: containerID, launch: launch)
+                }, serviceLost: { [weak self] in await self?.managedServiceLost() })
+                return result
+            } catch {
+                let failure = error
+                if let claim, let compatibility = self.prepareCompatibility {
+                    try? compatibility.originalPublish(OriginalConsumerRuntimeCarrier.Failed(requestID: claim.request.requestID,
+                        diagnostic: OriginalConsumerFailureDiagnostic.find(in: failure)), phase: .failed, claim: claim)
+                }
+                // RawManaged owns post-entry cleanup; preflight has not killed a
+                // worker, but must still release and run normal full containment.
+                if !replacementEntered {
+                    self.fenceServiceWork(containers: containers)
+                    await managedStorage.fenceOriginalConsumerFailure()
+                    return try await OriginalConsumerCleanup.run(operation: { throw failure }, release: {
+                        if let observation = self.originalConsumerObservation { _ = try await observation.handle.release() }
+                        self.originalConsumerObservation = nil
+                    }, contain: { _ = try await self.containServiceExecutions(containers: containers, nativeTimeout: .zero) })
+                }
+                if let retry = failure as? ManagedStorageLifecycleOwner.RetryableReplacementTimeout,
+                   retry.request == request {
+                    self.serviceReplacementRetries[request.operationUUID] = retry
+                }
+                throw failure
+            }
+        }
+        serviceReplacements[request.operationUUID] = (request, task)
+        return try await task.value
+    }
+
+    private func fenceServiceWork(containers: [ContainerRecord]) {
+        guard !serviceMaintenance else { return }
+        serviceWork.close(); nativeLaunchWork.close()
+        serviceMaintenance = true; serviceGeneration = UUID()
+        let ids = Set(containers.map(\.id)).union(knownContainers.keys).union(shims.keys)
+            .union(cleanupPendingShims.keys).union(freshPreparationInstances.keys).union(quarantinedShimGenerations.keys)
+        for id in ids {
+            _ = executionFence.replace(id)
+            completionTasks.removeValue(forKey: id)?.task.cancel()
+            activeContainers.removeValue(forKey: id)
+            if let registration = portForwardingRegistrations.removeValue(forKey: id) {
+                portForwarder.stop(containerID: id, registration: registration.registration)
+            }
+            try? logMonitors.removeValue(forKey: id)?.stop()
+            try? bridges[id]?.finishInput(); bridges[id]?.finishOutput()
+        }
+        for (id, owner) in execOwners where ids.contains(owner.containerID) {
+            try? execMonitors.removeValue(forKey: id)?.stop()
+            try? execBridges[id]?.finishInput(); execBridges[id]?.finishOutput()
+        }
+    }
+
+    private func containServiceExecutions(containers: [ContainerRecord],
+        nativeTimeout: Duration = .seconds(30)) async throws -> Set<String> {
+        // Also used on failed preflight/observation: worker death is not assumed.
+        // Join the narrow native publisher before a full census. If that join
+        // fails, still terminate exact known handles without retiring artifacts,
+        // clearing unknown launch ownership, or claiming complete containment.
+        try await RawServiceContainment.run(native: nativeLaunchWork, work: serviceWork,
+            nativeTimeout: nativeTimeout, containKnown: { try await self.containKnownServiceExecutions() },
+            contain: { _ = try await self.censusServiceExecutions(containers: containers, retireArtifacts: false) },
+            joinManaged: { try await self.managedStorage?.joinServiceReplacementWork() },
+            census: { try await self.censusServiceExecutions(containers: containers, retireArtifacts: true) })
+    }
+
+    private func containKnownServiceExecutions() async throws {
+        // Do not discover/overwrite launch ownership while its publisher is still
+        // unresolved. Each captured client retains its exact native identity;
+        // even successful termination here leaves all ownership maps fenced.
+        var seen = Set<String>()
+        let owners = (Array(shims.values) + cleanupPendingShims.values.flatMap { $0 })
+            .filter { seen.insert($0.persistentOwnershipKey).inserted }
+        try await RawServiceContainment.containKnown(owners: owners) { shim in
+            let lease = self.destructiveTerminationWork.retainDestructiveWork()
+            defer { self.destructiveTerminationWork.end(lease) }
+            try await shim.terminate()
+        }
+    }
+
+    /// Fail closed on disposal claims, including roots renamed out of their ID.
+    /// Never reconcile (delete) them or silently omit them from the native census.
+    static func serviceExecutionCensus(in directory: PersistentStateDirectory) throws -> Set<String> {
+        let names = try directory.entryNames()
+        guard !names.contains(where: { $0.hasPrefix(".cengine-disposal-") || $0.hasPrefix(".cengine-remove-") }) else {
+            throw EngineError(.conflict, "raw service census has unresolved disposal ownership")
+        }
+        guard names.allSatisfy({ $0.count == 64 && $0.allSatisfy(\.isHexDigit) }) else {
+            throw EngineError(.conflict, "raw service census has unknown container entries")
+        }
+        return Set(names)
+    }
+
+    private func censusServiceExecutions(containers: [ContainerRecord], retireArtifacts: Bool) async throws -> Set<String> {
+        let ids = try Self.serviceExecutionCensus(in: containersStateDirectory)
+            .union(shims.keys).union(cleanupPendingShims.keys).union(quarantinedShimGenerations.keys)
+        for id in ids.sorted() {
+            try await terminateEveryShim(for: id,
+                expectedInstanceID: containers.first(where: { $0.id == id })?.instanceID)
+            if retireArtifacts {
+                let directory = try containerStateDirectory(for: id)
+                if let prepared = try Self.loadPreparedShimState(from: directory, expectedContainerID: id) {
+                    for (execID, owner) in execOwners where owner.containerID == id {
+                        guard owner.containerInstanceID == prepared.currentContainer.instanceID,
+                              owner.containerDirectoryIdentity == directory.identity else { throw RawManagedStorageBackend.failure() }
+                        try execMonitors.removeValue(forKey: execID)?.stop()
+                        freezeExecBridge(execID: execID, preserveBridge: true)
+                        execShims.removeValue(forKey: execID)
+                        execRetirementDeadlines.removeValue(forKey: execID)
+                    }
+                    try Self.retireContainedExecArtifacts(containerID: id, in: directory, artifacts: prepared.artifacts)
+                    clearExecArtifactCleanupFailures(for: prepared.currentContainer)
+                }
+            }
+        }
+        // This is the complete contained census, NOT newly-exited containers.
+        // Engine filters its pre-maintenance running/paused records for events.
+        return ids
+    }
+
+    static func retireContainedExecArtifacts(containerID: String, in directory: PersistentStateDirectory,
+        artifacts: RawContainerPreparationArtifacts) throws {
+        for record in try RawExecArtifactJournal.activeRecords(containerID: containerID, in: directory, artifacts: artifacts) {
+            try RawExecArtifactTransaction.cleanup(containerID: containerID, execID: record.execID,
+                in: directory, artifacts: artifacts)
+        }
+    }
+
+    private func requireServiceGeneration(_ generation: UUID) throws {
+        guard !serviceMaintenance, serviceGeneration == generation else { throw RawManagedStorageBackend.failure() }
+    }
+
+    public func synchronizeVolumes(_ volumes: [VolumeRecord]) async throws {
+        try await managedStorage?.synchronize(volumes)
+    }
+
+    public func deleteVolume(_ volume: VolumeRecord) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        if let managedStorage {
+            let disk = try volumeDiskURL(name: volume.name)
+            try await managedStorage.delete(volume)
+            try serviceWork.require(workLease)
+            try Self.removeVolumeDisk(at: disk)
+            var modes = volumeStorageModes
+            modes.removeValue(forKey: volume.name)
+            try JSONEncoder().encode(modes).write(to: root.appending(path: "volume-storage.json"), options: .atomic)
+            volumeStorageModes = modes
+            return
+        }
+        try await deleteVolume(volume.name)
+    }
+
+    private func managedAttachmentRetired(containerID: String, launch: String) async {
+        let id = UUID()
+        let task = Task { await self.performManagedAttachmentRetired(containerID: containerID, launch: launch) }
+        attachmentRetirementTasks[id] = task
+        await task.value // Positive join, not cancellation or a generation flag.
+        attachmentRetirementTasks.removeValue(forKey: id)
+    }
+
+    private func performManagedAttachmentRetired(containerID: String, launch: String) async {
+        let epoch = serviceGeneration
+        guard !serviceMaintenance, let shim = shims[containerID], shim.specification.shimLaunchUUID == launch else { return }
+        // A notification is a containment hint, not a drain receipt. Retire uses
+        // exact authority replies; no unrelated container generation is touched.
+        _ = executionFence.replace(containerID)
+        activeContainers.removeValue(forKey: containerID)
+        if let registration = portForwardingRegistrations.removeValue(forKey: containerID) {
+            portForwarder.stop(containerID: containerID, registration: registration.registration)
+        }
+        // Even unknown authority state requires positive VM containment. Failure
+        // to obtain a drain receipt must not skip stopping this exact launch.
+        do { try await managedStorage?.retire(containerID: containerID, launch: launch) } catch { }
+        guard shims[containerID] === shim, shim.specification.shimLaunchUUID == launch else { return }
+        if epoch != serviceGeneration || serviceMaintenance {
+            // Maintenance cannot erase a callback that crossed retire's await.
+            // Retain its exact launch and STILL join destructive containment.
+            retainCleanupPendingShim(shim, for: containerID)
+        }
+        do { try await terminateShim(containerID, shim: shim) }
+        catch {
+            guard epoch == serviceGeneration, !serviceMaintenance else { return }
+            retainCleanupPendingShim(shim, for: containerID)
+        }
+    }
+
+    /// The store lock records the physical path (`realpath`, so `/private/var/…`),
+    /// while the data root is Foundation's canonical form, which drops the
+    /// `/private` prefix. Compare both in the data root's canonical form so a
+    /// temporary-directory store is recognized as the lock's own store.
+    static func storeLockGuardsDataRoot(_ lockRoot: URL, dataRoot: URL) -> Bool {
+        lockRoot.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL == dataRoot.standardizedFileURL
     }
 
     static func canonicalDataRoot(_ requested: URL) throws -> URL {
         let standardized = requested.standardizedFileURL
         try FileManager.default.createDirectory(
-            at: standardized, withIntermediateDirectories: true
+            at: standardized, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
         )
         let canonical = standardized.resolvingSymlinksInPath().standardizedFileURL
         _ = try PersistentStateDirectory.open(canonical)
@@ -3755,6 +4379,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func prepare(_ container: ContainerRecord) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
+        try await managedStorage?.requireReconciled()
+        try serviceWork.require(workLease)
         try requireExactContainerOwnership(container)
         // Publish the new cleanup proof before consuming an older deletion
         // receipt so a crash between the two operations never leaves a gap.
@@ -3770,11 +4400,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
         )
         if shims[container.id] != nil {
             if knownContainers[container.id] == nil {
-                knownContainers[container.id] = container
+                try requireServiceGeneration(epoch)
+        knownContainers[container.id] = container
             }
             return
         }
         if try await relaunchPreparedShim(container) != nil { return }
+        try requireServiceGeneration(epoch)
         guard freshPreparationInstances[container.id] == nil else {
             throw BackendResourceRollbackIncompleteError(
                 "container \(container.id) already has a fresh VM preparation in progress"
@@ -3787,6 +4419,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             }
         }
         let image = try await resolvedImage(container.image, platform: container.platform)
+        try requireServiceGeneration(epoch)
         let stateDirectory = try freshContainerStateDirectory(for: container)
         let directory = stateDirectory.url
         let containerDirectoryIdentity = stateDirectory.identity
@@ -3804,7 +4437,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let artifacts = try RawContainerPreparationArtifacts.create(
                 in: stateDirectory, rootDiskSize: Self.defaultRootDiskBytes
             )
-            let bindSources = try HostBindSourceResolver(
+            try requireServiceGeneration(epoch)
+        let bindSources = try HostBindSourceResolver(
                 root: root.appending(path: "bind-sources")
             ).resolve(container.mounts)
             let specification = try containerShimSpecification(
@@ -3818,8 +4452,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
             try artifacts.validate(in: stateDirectory)
             preparation = (artifacts, bindSources, specification)
         } catch {
+            try requireServiceGeneration(epoch)
             let preparationError = error
             do {
+                try RawDiskJournalDirectory.requireSafeAutomaticRootDisposal(stateDirectory)
                 try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
                     container,
                     directoryIdentity: containerDirectoryIdentity,
@@ -3829,6 +4465,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     container.id, expectedIdentity: containerDirectoryIdentity
                 )
             } catch {
+            try requireServiceGeneration(epoch)
                 throw BackendResourceRollbackIncompleteError(
                     "container VM preparation setup failed: "
                         + "\(EngineError.message(for: preparationError)); writable root cleanup failed: "
@@ -3847,9 +4484,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 expectedLogIdentity: preparation.artifacts.shimLogIdentity
             )
         } catch {
+            try requireServiceGeneration(epoch)
             let launchError = error
             do {
                 try await terminateEveryShim(for: container.id)
+                try requireServiceGeneration(epoch)
+                try RawDiskJournalDirectory.requireSafeAutomaticRootDisposal(stateDirectory)
                 try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
                     container,
                     directoryIdentity: containerDirectoryIdentity,
@@ -3860,6 +4500,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     container.id, expectedIdentity: containerDirectoryIdentity
                 )
             } catch {
+            try requireServiceGeneration(epoch)
                 throw BackendResourceRollbackIncompleteError(
                     "container VM preparation launch failed: \(EngineError.message(for: launchError)); "
                         + "partial shim cleanup failed: \(EngineError.message(for: error))"
@@ -3867,12 +4508,17 @@ public actor RawVirtualizationBackend: ContainerBackend {
             }
             throw launchError
         }
+        try requireServiceGeneration(epoch)
         retainCleanupPendingShim(shim, for: container.id)
         do {
             try preparation.artifacts.validate(in: stateDirectory)
-            _ = try await shim.boot()
+            if shim.specification.workloadStorageMode == .managed { _ = try await shim.bootWorkloadStorage() }
+            else { _ = try await shim.boot() }
+            try requireServiceGeneration(epoch)
             try await shim.prepareRootFS(contentStorePath: root.appending(path: "content").path, layers: image.manifest.layers)
+            try requireServiceGeneration(epoch)
             _ = try await shim.stop()
+            try requireServiceGeneration(epoch)
             try persistPreparedShimState(
                 container: container,
                 specification: preparation.specification,
@@ -3880,9 +4526,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 expectedDirectoryIdentity: containerDirectoryIdentity
             )
             removeCleanupPendingShim(shim, for: container.id)
+            try requireServiceGeneration(epoch)
             shims[container.id] = shim
-            knownContainers[container.id] = container
+            try requireServiceGeneration(epoch)
+        knownContainers[container.id] = container
         } catch {
+            try requireServiceGeneration(epoch)
             let preparationError = error
             try await PreparedShimFailureRecovery.perform(
                 preparationError: preparationError,
@@ -3890,6 +4539,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     try await self.terminateEveryShim(for: container.id)
                 },
                 discardWritableRoot: {
+                    try self.requireServiceGeneration(epoch)
+                    try RawDiskJournalDirectory.requireSafeAutomaticRootDisposal(stateDirectory)
                     try RawContainerPreparationAttemptCoordinator.recordContainedCleanup(
                         container,
                         directoryIdentity: containerDirectoryIdentity,
@@ -3905,6 +4556,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func start(_ container: ContainerRecord) async throws -> [PortBinding] {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        try await managedStorage?.requireReconciled()
+        try serviceWork.require(workLease)
         try requireExactContainerOwnership(container)
         guard knownContainers[container.id]?.instanceID == container.instanceID else {
             throw BackendResourceRollbackIncompleteError(
@@ -3931,6 +4586,36 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let image = try await resolvedImage(container.image, platform: container.platform)
         try requireExecutionGeneration(container.id, generation: generation)
         let modes = try resolveVolumeStorageModes(for: container)
+        let usesManagedStorage = managedStorage != nil && Self.volumeNames(in: container.mounts).contains { modes[$0] == .shared }
+        if usesManagedStorage, let managedStorage {
+            let launchUUID = UUID().uuidString.lowercased()
+            let specification = try await workload(container, image: image, volumeModes: modes, ioClaim: "")
+            let directory = try containerStateDirectory(for: container.id)
+            do {
+                return try await managedStorage.start(container: container, launchUUID: launchUUID, directory: directory,
+                    workload: specification, compatibility: prepareCompatibility, launchShim: {
+                        try await self.launchManagedShim(preparedShim, container: container, modes: modes,
+                            generation: generation, launchUUID: launchUUID)
+                    }, check: { shim in
+                        try await self.requireManagedExecution(container, shim: shim, generation: generation)
+                    }, consumeIOClaim: { shim, ioClaim in
+                        try await self.consumeManagedIOClaim(container, shim: shim, generation: generation, ioClaim: ioClaim)
+                    }, beforePublication: { shim in
+                        try await self.publishStartedContainer(container, shim: shim,
+                            generation: generation, portRegistration: portRegistration)
+                    })
+            } catch {
+                portForwarder.stop(containerID: container.id, registration: portRegistration)
+                if executionFence.owns(container.id, token: generation) {
+                    if portForwardingRegistrations[container.id]?.generation == generation {
+                        portForwardingRegistrations.removeValue(forKey: container.id)
+                    }
+                    activeContainers.removeValue(forKey: container.id)
+                }
+                throw error // EngineRuntime settles execution; the durable P/A fence remains.
+            }
+        }
+        try requireExecutionGeneration(container.id, generation: generation)
         let shim = try await reconfigureVolumeDisks(
             preparedShim, container: container, modes: modes, generation: generation
         )
@@ -3949,18 +4634,34 @@ public actor RawVirtualizationBackend: ContainerBackend {
         try attachmentState.artifacts.validate(in: attachmentDirectory)
         _ = try await shim.boot()
         try requireExecutionGeneration(container.id, generation: generation)
-        struct Prepared: Decodable { let status: String }
+        struct Prepared: Decodable, Sendable { let status: String }
         let ioClaim = RawContainerDirectIOHandles.containerGuestClaim(
             instanceID: container.instanceID,
             generation: attachmentState.specification.generation
         )
-        let prepared: Prepared = try await shim.guest(
-            operation: "prepare",
-            payload: try workload(
-                container, image: image, volumeModes: modes, ioClaim: ioClaim
-            ),
-            response: Prepared.self
-        )
+        let sharedNames = Self.volumeNames(in: container.mounts).filter { modes[$0] == .shared }
+        let prepared = try await sharedVolumeInitialization.withInitialization(of: sharedNames) {
+            // Waiting for another container's copyup permits actor reentrancy.
+            // A replaced execution must not send PREPARE or mutate its IO claim.
+            try requireExecutionGeneration(container.id, generation: generation)
+            try requireExactContainerOwnership(container)
+            guard shims[container.id] === shim else {
+                throw BackendResourceRollbackIncompleteError(
+                    "container VM changed while waiting to prepare shared volumes"
+                )
+            }
+            // A host-generated timeout cannot prove that the separate storage VM
+            // drained NFS work already received. Keep the coordinator lease until
+            // this RPC completes or its transport actually unwinds; safe ambiguous
+            // recovery requires a generation-fenced storage drain.
+            return try await shim.guest(
+                operation: "prepare",
+                payload: try workload(
+                    container, image: image, volumeModes: modes, ioClaim: ioClaim
+                ),
+                response: Prepared.self
+            )
+        }
         try requireExecutionGeneration(container.id, generation: generation)
         guard prepared.status == "prepared" else { throw EngineError(.internalError, "guest did not prepare workload") }
         let claimedIO = try RawContainerDirectIOHandles.open(
@@ -3972,6 +4673,41 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let response: Status = try await shim.guest(operation: "start", payload: Empty(), response: Status.self)
         try requireExecutionGeneration(container.id, generation: generation)
         guard response.status == "running" else { throw EngineError(.internalError, "workload did not start") }
+        return try await publishStartedContainer(container, shim: shim, generation: generation, portRegistration: portRegistration)
+    }
+
+    private func requireManagedExecution(_ container: ContainerRecord, shim: VMShimClient?,
+        generation: RawBackendExecutionFence.Token) throws {
+        try requireExecutionGeneration(container.id, generation: generation)
+        try requireExactContainerOwnership(container)
+        if let shim, shims[container.id] !== shim { throw RawManagedStorageBackend.failure() }
+    }
+
+    private func launchManagedShim(_ prepared: VMShimClient, container: ContainerRecord,
+        modes: [String: VolumeStorageMode], generation: RawBackendExecutionFence.Token, launchUUID: String) async throws -> VMShimClient {
+        try requireManagedExecution(container, shim: nil, generation: generation)
+        let shim = try await reconfigureVolumeDisks(prepared, container: container, modes: modes,
+            generation: generation, futureLaunchUUID: launchUUID)
+        try requireManagedExecution(container, shim: shim, generation: generation)
+        _ = try ensureIO(container, replacingStoppedSession: true)
+        return shim
+    }
+
+    private func consumeManagedIOClaim(_ container: ContainerRecord, shim: VMShimClient,
+        generation: RawBackendExecutionFence.Token, ioClaim: String) throws {
+        try requireManagedExecution(container, shim: shim, generation: generation)
+        let directory = try containerStateDirectory(for: container.id)
+        guard let state = try Self.loadPreparedShimState(from: directory, expectedContainerID: container.id),
+              state.currentContainer.instanceID == container.instanceID, state.specification == shim.specification else {
+            throw RawManagedStorageBackend.failure()
+        }
+        try state.artifacts.validate(in: directory)
+        let handles = try RawContainerDirectIOHandles.open(in: directory, artifacts: state.artifacts)
+        try handles.consumeGuestClaims(ioClaim, artifacts: state.artifacts)
+    }
+
+    private func publishStartedContainer(_ container: ContainerRecord, shim: VMShimClient,
+        generation: RawBackendExecutionFence.Token, portRegistration: PortForwarder.Registration) async throws -> [PortBinding] {
         do {
             var active = container
             if !container.ports.isEmpty {
@@ -4019,10 +4755,31 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func stop(_ container: ContainerRecord, timeoutSeconds: Int) async throws -> Int32 {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactContainerOwnership(container)
         if let code = completions[container.id] { return code }
         guard let shim = shims[container.id] else { return completions[container.id] ?? container.exitCode ?? 0 }
         let generation = executionFence.currentOrInstall(container.id)
+        let runtimeClose: RawManagedStorageBackend.RetirementHints.Close?
+        if let launch = shim.specification.shimLaunchUUID {
+            runtimeClose = await managedStorage?.beginRuntimeClose(container: container, launch: launch)
+        } else {
+            runtimeClose = nil
+        }
+        do {
+            try requireExecutionGeneration(container.id, generation: generation)
+            let code = try await stop(container, timeoutSeconds: timeoutSeconds, shim: shim, generation: generation)
+            if let runtimeClose { await managedStorage?.endRuntimeClose(runtimeClose) }
+            return code
+        } catch {
+            if let runtimeClose { await managedStorage?.endRuntimeClose(runtimeClose) }
+            throw error
+        }
+    }
+
+    private func stop(_ container: ContainerRecord, timeoutSeconds: Int, shim: VMShimClient,
+                      generation: RawBackendExecutionFence.Token) async throws -> Int32 {
         struct Signal: Encodable { let signal: Int }
         struct Empty: Encodable {}
         struct Status: Decodable { let status: String; let exitCode: Int? }
@@ -4032,7 +4789,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     try await shim.resume()
                 }
             } catch {
-                try await terminateShim(container.id, shim: shim)
+                try await terminateShim(container.id, shim: shim, expectedExecutionGeneration: generation)
                 return try await recordCompletion(container, code: 137, generation: generation)
             }
         }
@@ -4043,6 +4800,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 response: Status.self
             )
         }
+        try requireExecutionGeneration(container.id, generation: generation)
         if let existing = completionTasks[container.id], existing.generation == generation {
             let code: Int32
             var terminated = false
@@ -4061,7 +4819,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                         await existing.task.value
                     }
                 } catch {
-                    try await terminateShim(container.id, shim: shim)
+                    try await terminateShim(container.id, shim: shim, expectedExecutionGeneration: generation)
                     code = 137
                     terminated = true
                 }
@@ -4075,7 +4833,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                         try await shim.stop()
                     }
                 } catch {
-                    try await terminateShim(container.id, shim: shim)
+                    try await terminateShim(container.id, shim: shim, expectedExecutionGeneration: generation)
                 }
             }
             return published
@@ -4108,13 +4866,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 try await shim.stop()
             }
         } catch {
-            try await terminateShim(container.id, shim: shim)
+            try await terminateShim(container.id, shim: shim, expectedExecutionGeneration: generation)
         }
         return try await recordCompletion(container, code: code, generation: generation)
     }
 
     public func wait(_ container: ContainerRecord) async throws -> Int32 {
         try requireExactContainerOwnership(container)
+        let epoch = serviceGeneration
         if let code = completions[container.id] { return code }
         guard let shim = shims[container.id] else { return container.exitCode ?? 0 }
         let generation = executionFence.currentOrInstall(container.id)
@@ -4130,14 +4889,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
             }
             completionTasks[container.id] = (generation, task)
         }
-        let published = try await recordCompletion(
-            container, code: task.value, generation: generation
+        return try await RawCompletionStop.run(
+            work: destructiveTerminationWork,
+            complete: {
+                try await self.recordCompletion(container, code: task.value, generation: generation)
+            },
+            ownsExecution: {
+                !self.serviceMaintenance && self.serviceGeneration == epoch
+                    && self.executionFence.owns(container.id, token: generation)
+                    && self.shims[container.id] === shim
+                    && self.knownContainers[container.id]?.instanceID == container.instanceID
+            },
+            // Publish terminal backend state while guest control is still available.
+            // The admitted lease remains held across the entire stop suspension.
+            stop: { _ = try await shim.stop() }
         )
-        // Publish terminal backend state while guest control is still available.
-        // An exec-create request can otherwise re-enter this actor after the VM
-        // stops but before completion becomes visible and leak a shim error.
-        _ = try? await shim.stop()
-        return published
     }
 
     public func completion(_ container: ContainerRecord) async -> Int32? {
@@ -4147,6 +4913,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactContainerOwnership(container)
         guard knownContainers[container.id]?.instanceID == container.instanceID else {
             throw BackendResourceRollbackIncompleteError(
@@ -4156,6 +4924,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         guard let shim = shims[container.id] else { return .unavailable }
         _ = executionFence.currentOrInstall(container.id)
         let status = try await shim.status()
+        try serviceWork.require(workLease)
         switch status.state {
         case .running:
             struct Empty: Encodable {}
@@ -4163,6 +4932,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let workload: WorkloadStatus = try await shim.guest(
                 operation: "status", payload: Empty(), response: WorkloadStatus.self
             )
+            try serviceWork.require(workLease)
             guard workload.status == "running" else {
                 let code = Int32(workload.exitCode ?? 0)
                 completions[container.id] = code
@@ -4187,6 +4957,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func resize(
         _ container: ContainerRecord, width: UInt16, height: UInt16
     ) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactContainerOwnership(container)
         try requireActiveContainerExecution(container)
         guard let shim = shims[container.id] else {
@@ -4198,6 +4970,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             payload: TerminalSize(height: height, width: width),
             response: Status.self
         )
+        try serviceWork.require(workLease)
         guard status.status == "resized" else {
             throw EngineError(.internalError, "guest did not resize the container terminal")
         }
@@ -4290,6 +5063,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func prepareExec(_ exec: ExecRecord, container: ContainerRecord) async throws -> ContainerIOBridge {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
         try requireExactContainerOwnership(container)
         try requireActiveContainerExecution(container)
         guard exec.containerID == container.id,
@@ -4300,6 +5077,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         try requireActiveContainerExecution(container)
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         let image = try await resolvedImage(container.image, platform: container.platform)
+        try requireServiceGeneration(epoch)
         let containerDirectory = try containerStateDirectory(for: container.id)
         guard let prepared = try Self.loadPreparedShimState(
             from: containerDirectory, expectedContainerID: container.id
@@ -4381,10 +5159,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 response: Status.self
             )
         } catch {
+            try requireServiceGeneration(epoch)
             throw await normalizedExecPreparationError(
                 error, container: container, shim: shim
             )
         }
+        try requireServiceGeneration(epoch)
         guard status.status == "created" else {
             throw EngineError(.internalError, "guest did not prepare exec")
         }
@@ -4415,6 +5195,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private func retireExec(_ exec: ExecRecord, preserveBridge: Bool) async {
+        guard let workLease = try? serviceWork.begin() else { return }
+        defer { serviceWork.end(workLease) }
         var cleanupKey: RawExecCleanupKey?
         do {
             cleanupKey = try exactExecCleanupKey(for: exec)
@@ -4509,22 +5291,26 @@ public actor RawVirtualizationBackend: ContainerBackend {
 
     private func freezeExecBridge(execID: String, preserveBridge: Bool) {
         guard let bridge = execBridges[execID] else { return }
-        bridge.freezeCompleted(maximumBytes: Self.completedExecSnapshotPerExecBytes)
         guard preserveBridge else {
+            bridge.freezeCompleted(maximumBytes: Self.completedExecSnapshotPerExecBytes)
             execBridges.removeValue(forKey: execID)?.discardCompletedOutput()
             completedExecSnapshotBudget.remove(execID: execID)
             return
         }
         guard let owner = execOwners[execID] else { return }
-        let evicted = completedExecSnapshotBudget.register(
-            execID: execID,
-            containerID: owner.containerID,
-            containerInstanceID: owner.containerInstanceID,
-            bytes: bridge.retainedLogPayloadByteCount
-        )
+        let evicted = Self.freezeCompletedExecOutput(bridge, execID: execID,
+            containerID: owner.containerID, instanceID: owner.containerInstanceID,
+            budget: &completedExecSnapshotBudget)
         for identifier in evicted {
             execBridges.removeValue(forKey: identifier)?.discardCompletedOutput()
         }
+    }
+
+    static func freezeCompletedExecOutput(_ bridge: ContainerIOBridge, execID: String,
+        containerID: String, instanceID: UUID, budget: inout RawCompletedExecSnapshotBudget) -> [String] {
+        bridge.freezeCompleted(maximumBytes: Self.completedExecSnapshotPerExecBytes)
+        return budget.register(execID: execID, containerID: containerID,
+            containerInstanceID: instanceID, bytes: bridge.retainedLogPayloadByteCount)
     }
 
     private func recoverFailedExecArtifactCleanup(for container: ContainerRecord) async throws {
@@ -4788,6 +5574,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func startExec(
         _ exec: ExecRecord, consoleSize: TerminalSize?
     ) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactExecOwnership(exec)
         guard let shim = execShims[exec.id] else {
             throw EngineError(.notFound, "exec is unavailable")
@@ -4800,6 +5588,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 exec, consoleSize: consoleSize, deadlineNanoseconds: deadline
             )
         } catch {
+            try serviceWork.require(workLease)
             let startError = error
             var exitCode = Self.execStartNeverRanExitCode
             var containerTerminated = false
@@ -4897,16 +5686,23 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func startAttachedExec(
         _ exec: ExecRecord, consoleSize: TerminalSize?
     ) async throws -> CInt? {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactExecOwnership(exec)
         guard let shim = execShims[exec.id] else { throw EngineError(.notFound, "exec is unavailable") }
-        return try await shim.startExecStream(id: exec.id, consoleSize: consoleSize)
+        let descriptor = try await shim.startExecStream(id: exec.id, consoleSize: consoleSize)
+        do { try serviceWork.require(workLease) }
+        catch { Darwin.close(descriptor); throw error }
+        return descriptor
     }
 
     public func execCompletion(_ exec: ExecRecord) async -> Int32? {
+        let epoch = serviceGeneration
         guard (try? requireExactExecOwnership(exec)) != nil else { return nil }
         guard let shim = execShims[exec.id] else { return exec.exitCode }
         struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let exitCode: Int? }
         guard let value: Status = try? await shim.guest(operation: "wait-exec", payload: Request(id: exec.id), response: Status.self), value.status == "exited" else { return nil }
+        guard epoch == serviceGeneration, !serviceMaintenance, execShims[exec.id] === shim else { return nil }
         do {
             if let monitor = execMonitors[exec.id] {
                 try monitor.stop()
@@ -4948,10 +5744,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func execStatus(_ exec: ExecRecord) async -> Int32? {
+        let epoch = serviceGeneration
         guard (try? requireExactExecOwnership(exec)) != nil else { return nil }
         guard let shim = execShims[exec.id] else { return exec.exitCode }
         struct Request: Encodable { let id: String }; struct Status: Decodable { let status: String; let exitCode: Int? }
         guard let value: Status = try? await shim.guest(operation: "exec-status", payload: Request(id: exec.id), response: Status.self), value.status == "exited" else { return nil }
+        guard epoch == serviceGeneration, !serviceMaintenance, execShims[exec.id] === shim else { return nil }
         do {
             if let monitor = execMonitors[exec.id] {
                 try monitor.stop()
@@ -4971,6 +5769,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     public func resizeExec(
         _ exec: ExecRecord, width: UInt16, height: UInt16
     ) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactExecOwnership(exec)
         guard let shim = execShims[exec.id] else {
             throw EngineError(.notFound, "exec is unavailable")
@@ -4986,12 +5786,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
             payload: Request(id: exec.id, height: height, width: width),
             response: Status.self
         )
+        try serviceWork.require(workLease)
         guard status.status == "resized" else {
             throw EngineError(.internalError, "guest did not resize the exec terminal")
         }
     }
 
     public func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String) {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         let record = ExecRecord(
             containerID: container.id,
             containerInstanceID: container.instanceID,
@@ -5062,30 +5865,57 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func kill(_ container: ContainerRecord, signal: String) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactContainerOwnership(container)
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         struct Signal: Encodable { let signal: Int }; struct Status: Decodable { let status: String }
         _ = try await shim.guest(operation: "signal", payload: Signal(signal: Self.signalNumber(signal)), response: Status.self)
+        try serviceWork.require(workLease)
     }
 
-    public func pause(_ container: ContainerRecord) async throws { try requireExactContainerOwnership(container); guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.pause() }
-    public func resume(_ container: ContainerRecord) async throws { try requireExactContainerOwnership(container); guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }; _ = try await shim.resume() }
+    public func pause(_ container: ContainerRecord) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        try requireExactContainerOwnership(container)
+        guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
+        _ = try await shim.pause()
+        try serviceWork.require(workLease)
+    }
+    public func resume(_ container: ContainerRecord) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        try requireExactContainerOwnership(container)
+        guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
+        _ = try await shim.resume()
+        try serviceWork.require(workLease)
+    }
     public func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         _ = try await stop(container, timeoutSeconds: timeoutSeconds)
+        try serviceWork.require(workLease)
         if shims[container.id] == nil {
             guard try await relaunchPreparedShim(container) != nil else {
                 throw EngineError(.notFound, "container VM preparation is unavailable")
             }
         }
+        try serviceWork.require(workLease)
         _ = try await start(container)
     }
 
     public func updateResources(_ container: ContainerRecord) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
         try requireExactContainerOwnership(container)
         guard container.phase != .paused else {
             throw EngineError(.conflict, "cannot update resources while container \(container.id) is paused")
         }
         if container.phase != .running {
+            try await managedStorage?.retire(containerID: container.id, instanceID: container.instanceID)
+            try requireServiceGeneration(epoch)
             guard let originalShim = shims[container.id] else {
                 // A daemon can crash after terminating the old stopped shim but
                 // before registering its candidate. The persisted preparation
@@ -5095,11 +5925,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 guard try await relaunchPreparedShim(container) != nil else {
                     throw EngineError(.notFound, "container VM preparation is unavailable")
                 }
-                knownContainers[container.id] = container
+                try requireServiceGeneration(epoch)
+        knownContainers[container.id] = container
                 activeContainers.removeValue(forKey: container.id)
                 return
             }
-            let containerDirectory = try containerStateDirectory(for: container.id)
+            try requireServiceGeneration(epoch)
+        let containerDirectory = try containerStateDirectory(for: container.id)
             let originalPrepared = try Self.loadPreparedShimState(
                 from: containerDirectory, expectedContainerID: container.id
             )
@@ -5107,18 +5939,23 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 ?? knownContainers[container.id] ?? container
             try await StoppedResourceReplacementTransaction.perform(
                 terminateOriginal: {
+                    try self.requireServiceGeneration(epoch)
                     try await self.terminateShim(container.id, shim: originalShim)
                 },
                 launchCandidate: {
+                    try self.requireServiceGeneration(epoch)
                     guard try await self.relaunchPreparedShim(container) != nil else {
                         throw EngineError(.notFound, "container VM preparation is unavailable")
                     }
                 },
                 cleanupCandidate: {
+                    try self.requireServiceGeneration(epoch)
                     try await self.terminateEveryShim(for: container.id)
                 },
                 restoreOriginal: {
+                    try self.requireServiceGeneration(epoch)
                     try await self.terminateEveryShim(for: container.id)
+                    try self.requireServiceGeneration(epoch)
                     guard try await self.relaunchPreparedShim(
                         original, preservingCapacityFrom: originalPrepared
                     ) != nil else {
@@ -5128,7 +5965,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     self.activeContainers.removeValue(forKey: container.id)
                 }
             )
-            knownContainers[container.id] = container
+            try requireServiceGeneration(epoch)
+        knownContainers[container.id] = container
             activeContainers.removeValue(forKey: container.id)
             return
         }
@@ -5163,6 +6001,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         do {
             try await LiveResourceCanonicalTransaction.perform(
                 applyDesired: {
+                    try self.requireServiceGeneration(epoch)
                     try await self.applyLiveResources(
                         container,
                         shim: shim,
@@ -5173,6 +6012,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     )
                 },
                 persistDesired: {
+                    try self.requireServiceGeneration(epoch)
                     try self.persistPreparedShimState(
                         container: container,
                         specification: prepared.specification,
@@ -5181,11 +6021,13 @@ public actor RawVirtualizationBackend: ContainerBackend {
                     )
                 },
                 applyOriginal: {
+                    try self.requireServiceGeneration(epoch)
                     try await self.applyLiveResources(
                         original, shim: shim, compatibilityFailureAfterWrites: nil
                     )
                 },
                 persistOriginal: {
+                    try self.requireServiceGeneration(epoch)
                     try self.persistPreparedShimState(
                         container: original,
                         specification: prepared.specification,
@@ -5195,10 +6037,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 }
             )
         } catch {
+            try requireServiceGeneration(epoch)
             knownContainers[container.id] = original
             activeContainers[container.id] = original
             throw error
         }
+        try requireServiceGeneration(epoch)
         knownContainers[container.id] = container
         activeContainers[container.id] = container
     }
@@ -5233,11 +6077,51 @@ public actor RawVirtualizationBackend: ContainerBackend {
         }
     }
 
+    public func cleanupExecution(_ container: ContainerRecord) async throws {
+        try await cleanupContainer(container, removingState: false)
+    }
+
     public func delete(_ container: ContainerRecord) async throws {
+        try await cleanupContainer(container, removingState: true)
+    }
+
+    private func cleanupContainer(_ container: ContainerRecord, removingState: Bool) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
+        try await managedStorage?.requireReconciled()
+        try requireServiceGeneration(epoch)
+        if let known = knownContainers[container.id], known.instanceID != container.instanceID {
+            throw BackendResourceRollbackIncompleteError(
+                "container \(container.id) cleanup belongs to a different instance"
+            )
+        }
         try RawContainerInstanceCoordinator.requireNoConflictingFreshPreparation(
             of: container, in: freshPreparationInstances
         )
-        try completePendingContainerDeletionIfNeeded(container)
+        do {
+            if !removingState, let managedStorage {
+                try await managedStorage.settleExecution(container: container, in: containerStateDirectory(for: container.id))
+            } else {
+                try await managedStorage?.retire(containerID: container.id, instanceID: container.instanceID)
+            }
+        } catch {
+            try requireServiceGeneration(epoch)
+            try await terminateEveryShim(for: container.id, expectedInstanceID: container.instanceID, expectedServiceGeneration: epoch)
+            throw error // Preserve the failed P and writable root for explicit replacement.
+        }
+        try requireServiceGeneration(epoch)
+        let retainsManagedHistory = try await managedStorage?.hasIntents(containerID: container.id) ?? false
+        try requireServiceGeneration(epoch)
+        if removingState && !retainsManagedHistory {
+            try completePendingContainerDeletionIfNeeded(container)
+        } else if try containersStateDirectory.pendingDisposalIdentity(named: container.id) != nil {
+            // Only a durable removal intent may finish destructive disposal.
+            throw BackendResourceRollbackIncompleteError(
+                "container \(container.id) retains an unresolved state-directory removal"
+            )
+        }
         guard let stateDirectory = try Self.matchingContainerStateDirectory(
             for: container.id,
             in: containersStateDirectory,
@@ -5293,7 +6177,16 @@ public actor RawVirtualizationBackend: ContainerBackend {
         ) ?? stateDirectory.identity
         portForwarder.stop(containerID: container.id)
         portForwardingRegistrations.removeValue(forKey: container.id)
-        try await terminateEveryShim(for: container.id)
+        try await terminateEveryShim(for: container.id, expectedInstanceID: container.instanceID, expectedServiceGeneration: epoch)
+        try requireServiceGeneration(epoch)
+        try await managedStorage?.refreshTerminalContainment(container: container, in: stateDirectory)
+        try requireServiceGeneration(epoch)
+        guard stateDirectory.pathStillNamesThisDirectory(),
+              knownContainers[container.id].map({ $0.instanceID == container.instanceID }) ?? true else {
+            throw BackendResourceRollbackIncompleteError(
+                "container \(container.id) ownership changed during execution cleanup"
+            )
+        }
         completionTasks.removeValue(forKey: container.id)?.task.cancel()
         completions.removeValue(forKey: container.id)
         executionFence.remove(container.id)
@@ -5303,18 +6196,21 @@ public actor RawVirtualizationBackend: ContainerBackend {
         purgeExecResources(for: container)
         try? logMonitors.removeValue(forKey: container.id)?.stop()
         bridges.removeValue(forKey: container.id)?.finishOutput()
-        try RawDeletedContainerCoordinator.record(
-            container,
-            directoryIdentity: directoryIdentity,
-            in: deletedContainersStateDirectory
-        )
-        try disposeContainerDirectory(
-            container.id, expectedIdentity: directoryIdentity
-        )
+        if removingState {
+            try Self.finalizeContainerRemoval(container, directoryIdentity: directoryIdentity,
+                in: containersStateDirectory, receipts: deletedContainersStateDirectory,
+                retainedIdentities: &containerDirectoryIdentities, retainingManagedHistory: retainsManagedHistory)
+        }
+        // Execution rollback retains the exact root, initialization history,
+        // prepared-shim record and IO files for a later mount-only generation.
         clearExecArtifactCleanupFailures(for: container)
     }
 
     public func cleanupOrphans(keeping containerIDs: Set<String>) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        try await managedStorage?.requireReconciled()
+        try serviceWork.require(workLease)
         try containersStateDirectory.reconcileDisposals()
         for name in Array(containerDirectoryIdentities.keys) {
             if try containersStateDirectory.openDirectoryIfPresent(named: name) == nil {
@@ -5340,7 +6236,15 @@ public actor RawVirtualizationBackend: ContainerBackend {
             let directory = try containerStateDirectory(for: id)
             portForwarder.stop(containerID: id)
             portForwardingRegistrations.removeValue(forKey: id)
+            do { try await managedStorage?.retire(containerID: id) }
+            catch {
+                try serviceWork.require(workLease)
+                try await terminateEveryShim(for: id)
+                throw error // Keep root and journals; VM death is not storage drain.
+            }
+            try serviceWork.require(workLease)
             try await terminateEveryShim(for: id)
+            try serviceWork.require(workLease)
             completionTasks.removeValue(forKey: id)?.task.cancel()
             completions.removeValue(forKey: id)
             executionFence.remove(id)
@@ -5349,19 +6253,27 @@ public actor RawVirtualizationBackend: ContainerBackend {
             preparedBindSources.removeValue(forKey: id)
             try? logMonitors.removeValue(forKey: id)?.stop()
             bridges.removeValue(forKey: id)?.finishOutput()
-            try disposeContainerDirectory(id, expectedIdentity: directory.identity)
+            if try await managedStorage?.hasIntents(containerID: id) != true {
+                try serviceWork.require(workLease)
+                try RawDiskJournalDirectory.requireSafeAutomaticRootDisposal(directory)
+                try disposeContainerDirectory(id, expectedIdentity: directory.identity)
+            }
         }
         for name in try deletedContainersStateDirectory.entryNames() {
             if name.hasSuffix(".json") {
                 let containerID = String(name.dropLast(5))
-                if !containerIDs.contains(containerID) {
+                if !containerIDs.contains(containerID),
+                   try await managedStorage?.hasIntents(containerID: containerID) != true {
+                    try serviceWork.require(workLease)
                     try RawDeletedContainerCoordinator.removeReceipt(
                         containerID: containerID, from: deletedContainersStateDirectory
                     )
                 }
             } else if name.hasSuffix(".preparation") {
                 let containerID = String(name.dropLast(".preparation".count))
-                if !containerIDs.contains(containerID) {
+                if !containerIDs.contains(containerID),
+                   try await managedStorage?.hasIntents(containerID: containerID) != true {
+                    try serviceWork.require(workLease)
                     try RawContainerPreparationAttemptCoordinator.remove(
                         containerID: containerID, from: deletedContainersStateDirectory
                     )
@@ -5371,11 +6283,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func deleteVolume(_ name: String) async throws {
-        guard !name.isEmpty, !name.contains("/") else { throw EngineError(.badRequest, "invalid volume name") }
-        try await storage.deleteVolume(name)
-        try? FileManager.default.removeItem(at: volumeDiskURL(name: name))
-        volumeStorageModes.removeValue(forKey: name)
-        try persistVolumeStorageModes()
+        throw RawManagedStorageBackend.failure("managed volume deletion requires its immutable instance UUID")
     }
 
     public func restoreNetworks(_ values: [NetworkRecord]) async throws -> [NetworkRecord] {
@@ -5435,6 +6343,9 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func updateNetworkRecords(_ containers: [ContainerRecord]) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
+        guard !serviceMaintenance else { throw RawManagedStorageBackend.failure() }
         try RawNetworkRefreshOwnershipGuard.require(
             containers,
             knownContainers: knownContainers,
@@ -5444,22 +6355,29 @@ public actor RawVirtualizationBackend: ContainerBackend {
         knownContainers = Dictionary(uniqueKeysWithValues: containers.map { ($0.id, $0) })
         activeContainers = Dictionary(uniqueKeysWithValues: containers.filter { $0.phase == .running || $0.phase == .paused }.map { ($0.id, $0) })
         for container in containers {
+            try serviceWork.require(workLease)
             guard activeContainers[container.id] != nil, let shim = shims[container.id],
                   (try? await shim.status().state) == .running else { continue }
+            try serviceWork.require(workLease)
             let desired = Set(container.networks.map(\.networkID))
             let existing = appliedNetworks[container.id] ?? []
             struct NetworkRequest: Encodable { let endpoint: GuestProtocol.NetworkEndpoint?; let name: String? }
             struct Status: Decodable { let status: String }
             _ = try await shim.configureNetwork(vlans: desired.compactMap { networkVLANs[$0] } + [VMShimProtocol.managementVLAN])
+            try serviceWork.require(workLease)
             for id in existing.subtracting(desired) {
                 _ = try? await shim.guest(operation: "disconnect-network", payload: NetworkRequest(endpoint: nil, name: id), response: Status.self)
+                try serviceWork.require(workLease)
             }
             for endpoint in networkEndpoints(container) where !existing.contains(endpoint.networkID) {
                 _ = try await shim.guest(operation: "connect-network", payload: NetworkRequest(endpoint: endpoint, name: nil), response: Status.self)
+                try serviceWork.require(workLease)
             }
             appliedNetworks[container.id] = desired
         }
+        try serviceWork.require(workLease)
         try await synchronizeFabric()
+        try serviceWork.require(workLease)
     }
 
     public func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress] {
@@ -5508,6 +6426,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     public func copyIn(_ container: ContainerRecord, extractedDirectory: URL, destination: String, ownership: [ArchiveOwnership]) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactContainerOwnership(container)
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         let containerDirectory = try containerStateDirectory(for: container.id)
@@ -5539,13 +6459,66 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 throw EngineError(.conflict, "container copy transfer directory changed")
             }
         }
-        struct Owner: Encodable { let path: String; let user: UInt32; let group: UInt32 }; struct Request: Encodable { let source: String; let destination: String; let ownership: [Owner] }; struct Status: Decodable { let status: String }
-        try prepared.artifacts.validate(in: containerDirectory)
-        _ = try await shim.boot(); _ = try await shim.guest(operation: "copy-in", payload: Request(source: transfer, destination: destination, ownership: ownership.map { .init(path: $0.path, user: $0.user, group: $0.group) }), response: Status.self)
-        if container.phase != .running { _ = try? await shim.stop() }
+        let generation = executionFence.currentOrInstall(container.id)
+        try await Self.copyInToShim(shim, phase: container.phase, source: transfer,
+            destination: destination, ownership: ownership, validate: {
+                try await self.validateCopyIn(container, shim: shim, generation: generation,
+                    prepared: prepared, directory: containerDirectory, transfer: transferDirectory)
+            })
+    }
+
+    nonisolated static func copyInToShim(_ shim: VMShimClient, phase: ContainerPhase,
+        source: String, destination: String, ownership: [ArchiveOwnership],
+        validate: @Sendable () async throws -> Void) async throws {
+        struct Owner: Encodable { let path: String; let user: UInt32; let group: UInt32 }
+        struct Request: Encodable { let source: String; let destination: String; let ownership: [Owner] }
+        struct Status: Decodable { let status: String }
+        try await validate()
+        switch phase {
+        case .running:
+            // Public boot is deliberately forbidden for managed workloads. Copy
+            // uses only the already configured launch; status cannot grant boot
+            // or mount authority and every exchange retains its native proof.
+            let status = try await shim.status()
+            try await validate()
+            guard status.state == .running else {
+                throw EngineError(.conflict, "archive copy requires a running VM guest")
+            }
+        case .created:
+            guard shim.specification.workloadStorageMode == .none else {
+                throw EngineError(.conflict, "archive copy requires an active managed storage workload")
+            }
+            _ = try await shim.boot()
+            try await validate()
+        case .paused, .exited, .dead:
+            throw EngineError(.conflict, "archive copy requires a created or running container")
+        }
+        _ = try await shim.guest(operation: "copy-in", payload: Request(source: source,
+            destination: destination, ownership: ownership.map {
+                .init(path: $0.path, user: $0.user, group: $0.group)
+            }), response: Status.self)
+        try await validate()
+        if phase == .created { _ = try? await shim.stop() }
+    }
+
+    private func validateCopyIn(_ container: ContainerRecord, shim: VMShimClient,
+        generation: RawBackendExecutionFence.Token, prepared: PreparedShimState,
+        directory: PersistentStateDirectory, transfer: PersistentStateDirectory) throws {
+        try requireExactContainerOwnership(container)
+        try requireExecutionGeneration(container.id, generation: generation)
+        guard shims[container.id] === shim else {
+            throw EngineError(.conflict, "container copy VM shim changed")
+        }
+        if container.phase == .running { try requireActiveContainerExecution(container) }
+        try prepared.artifacts.validate(in: directory)
+        guard transfer.pathStillNamesThisDirectory() else {
+            throw EngineError(.conflict, "container copy transfer directory changed")
+        }
     }
 
     public func copyOut(_ container: ContainerRecord, source: String, destinationDirectory: URL) async throws {
+        let workLease = try serviceWork.begin()
+        defer { serviceWork.end(workLease) }
         try requireExactContainerOwnership(container)
         guard let shim = shims[container.id] else { throw EngineError(.notFound, "container VM shim is unavailable") }
         let containerDirectory = try containerStateDirectory(for: container.id)
@@ -5570,6 +6543,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         try prepared.artifacts.validate(in: containerDirectory)
         struct Request: Encodable { let source: String; let destination: String }; struct Status: Decodable { let status: String }
         _ = try await shim.guest(operation: "copy-out", payload: Request(source: source, destination: transfer), response: Status.self)
+        try serviceWork.require(workLease)
         try prepared.artifacts.validate(in: containerDirectory)
         let destination = try PersistentStateDirectory.open(destinationDirectory)
         try RawDirectoryTransfer.copyContents(from: transferDirectory, to: destination) {
@@ -5593,7 +6567,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
         code: Int32,
         generation: RawBackendExecutionFence.Token
     ) async throws -> Int32 {
-        try await RawCompletionPublisher.run(
+        if executionFence.owns(container.id, token: generation), let managedStorage {
+            try await managedStorage.retire(containerID: container.id, instanceID: container.instanceID)
+            try requireExecutionGeneration(container.id, generation: generation)
+        }
+        return try await RawCompletionPublisher.run(
             fence: executionFence,
             identifier: container.id,
             generation: generation,
@@ -5641,7 +6619,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ identifier: String,
         generation: RawBackendExecutionFence.Token
     ) throws {
-        guard executionFence.owns(identifier, token: generation) else {
+        guard !serviceMaintenance, executionFence.owns(identifier, token: generation) else {
             throw EngineError(.conflict, "container \(identifier) execution was replaced while starting")
         }
     }
@@ -5651,6 +6629,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     /// and writable root. A canonical shim is not sufficient while any sibling
     /// generation still has unresolved termination evidence.
     private func requireExactContainerOwnership(_ container: ContainerRecord) throws {
+        guard !serviceMaintenance else { throw RawManagedStorageBackend.failure() }
         try RawExactContainerOwnershipGuard.require(
             container,
             knownInstanceID: knownContainers[container.id]?.instanceID,
@@ -5664,6 +6643,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
     private func requireActiveContainerExecution(
         _ container: ContainerRecord
     ) throws {
+        guard !serviceMaintenance else { throw RawManagedStorageBackend.failure() }
         try RawActiveContainerExecutionGuard.require(
             container,
             activeInstanceID: activeContainers[container.id]?.instanceID,
@@ -5745,7 +6725,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
         )
     }
 
-    private func terminateShim(_ containerID: String, shim: VMShimClient) async throws {
+    private func terminateShim(_ containerID: String, shim: VMShimClient,
+        expectedExecutionGeneration: RawBackendExecutionFence.Token? = nil) async throws {
+        let destructiveLease = destructiveTerminationWork.retainDestructiveWork()
+        defer { destructiveTerminationWork.end(destructiveLease) }
         let directory = try containerStateDirectory(for: containerID)
         guard shim.ownsPersistedContainer(
             id: containerID, directoryIdentity: directory.identity
@@ -5754,15 +6737,20 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 "refusing to signal a VM shim without exact container-directory ownership"
             )
         }
-        completionTasks.removeValue(forKey: containerID)?.task.cancel()
+        let epoch = serviceGeneration
+        if RawTrackedShimLaunch.ownsCompletion(captured: shim, current: shims[containerID],
+            generation: expectedExecutionGeneration ?? executionFence.current(containerID), completion: completionTasks[containerID]?.generation) {
+            completionTasks.removeValue(forKey: containerID)?.task.cancel()
+        }
         try finishExecSessions(using: shim)
         try await shim.terminate()
+        guard epoch == serviceGeneration else { return }
         for identifier in execShims.compactMap({ identifier, value in
             value === shim ? identifier : nil
         }) {
             execShims.removeValue(forKey: identifier)
         }
-        try shim.removePersistentLaunchArtifacts()
+        if managedStorage == nil { try shim.removePersistentLaunchArtifacts() }
         if shims[containerID] === shim { shims.removeValue(forKey: containerID) }
         removeCleanupPendingShim(shim, for: containerID)
     }
@@ -5772,46 +6760,32 @@ public actor RawVirtualizationBackend: ContainerBackend {
         container: ContainerRecord,
         expectedLogIdentity: PersistentFileIdentity
     ) async throws -> VMShimClient {
-        do {
-            guard specification.containerID == container.id else {
-                throw EngineError(.conflict, "VM shim launch container identity mismatch")
-            }
-            let directory = try containerStateDirectory(for: specification.containerID)
-            let client = try await VMShimClient.launchPersisted(
-                specification: specification,
-                container: container,
-                containerDirectory: directory,
-                expectedLogIdentity: expectedLogIdentity
-            )
-            guard client.hasPersistentLaunchRecord else {
-                guard client.ownsPersistedContainer(
-                    id: specification.containerID,
-                    directoryIdentity: directory.identity
-                ) else {
-                    throw EngineError(.conflict, "VM shim launch ownership changed")
-                }
-                try await client.terminate()
-                throw EngineError(
-                    .conflict,
-                    "VM shim generation ownership disappeared while it was launching"
-                )
-            }
-            return client
-        } catch let failure as VMShimLaunchRollbackIncompleteError {
-            retainCleanupPendingShim(failure.client, for: specification.containerID)
-            throw BackendResourceRollbackIncompleteError(failure.message)
-        } catch {
-            let launchError = error
-            do {
-                try await terminateEveryShim(for: specification.containerID)
-            } catch {
-                throw BackendResourceRollbackIncompleteError(
-                    "VM shim launch failed: \(EngineError.message(for: launchError)); "
-                        + "generation cleanup failed: \(EngineError.message(for: error))"
-                )
-            }
-            throw launchError
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
+        let lease = try nativeLaunchWork.begin()
+        defer { nativeLaunchWork.end(lease) }
+        guard specification.containerID == container.id else {
+            throw EngineError(.conflict, "VM shim launch container identity mismatch")
         }
+        let directory = try containerStateDirectory(for: specification.containerID)
+        return try await RawTrackedShimLaunch.run(launch: {
+            try await VMShimClient.launchPersisted(specification: specification, container: container,
+                containerDirectory: directory, expectedLogIdentity: expectedLogIdentity)
+        }, failedClient: { ($0 as? VMShimLaunchRollbackIncompleteError)?.client }, validate: { client in
+            try self.requireServiceGeneration(epoch)
+            guard client.hasPersistentLaunchRecord,
+                  client.ownsPersistedContainer(id: container.id, directoryIdentity: directory.identity) else {
+                throw EngineError(.conflict, "VM shim generation ownership disappeared while launching")
+            }
+        }, cleanup: { client in
+            try await client.terminate()
+            if self.managedStorage == nil { try client.removePersistentLaunchArtifacts() }
+        }, retain: { client in
+            // A stale callback never adds ownership to the successor. On failure
+            // the immutable launch record remains in the fenced final census.
+            guard self.serviceGeneration == epoch, !self.serviceMaintenance else { return }
+            self.retainCleanupPendingShim(client, for: container.id)
+        })
     }
 
     private func retainCleanupPendingShim(_ shim: VMShimClient, for containerID: String) {
@@ -5831,7 +6805,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
     /// failed before publication. Failed clients remain registered so a later
     /// containment retry still owns the exact PID/socket identity. Callers may
     /// remove the writable root only after this returns successfully.
-    private func terminateEveryShim(for containerID: String) async throws {
+    private func terminateEveryShim(for containerID: String, expectedInstanceID: UUID? = nil,
+        expectedServiceGeneration: UUID? = nil) async throws {
+        let epoch = expectedServiceGeneration ?? serviceGeneration
+        guard epoch == serviceGeneration else { throw RawManagedStorageBackend.failure() }
+        let instanceID = expectedInstanceID ?? knownContainers[containerID]?.instanceID
         let containerDirectory: PersistentStateDirectory
         do {
             containerDirectory = try containerStateDirectory(for: containerID)
@@ -5845,7 +6823,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let persisted = try VMShimClient.persistedLaunches(
             in: containerDirectory,
             expectedContainerID: containerID,
-            expectedInstanceID: knownContainers[containerID]?.instanceID
+            expectedInstanceID: instanceID
         )
         quarantinedShimGenerations[containerID] = persisted.quarantined.isEmpty
             ? nil : persisted.quarantined
@@ -5871,6 +6849,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             }
         }
         for candidate in pending where seen.insert(candidate.persistentOwnershipKey).inserted {
+            guard epoch == serviceGeneration else { throw RawManagedStorageBackend.failure() }
             guard candidate.ownsPersistedContainer(
                 id: containerID, directoryIdentity: containerDirectory.identity
             ) else {
@@ -5882,7 +6861,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
             }
             do {
                 try await candidate.terminate()
-                try candidate.removePersistentLaunchArtifacts()
+                if managedStorage == nil { try candidate.removePersistentLaunchArtifacts() }
             } catch {
                 retained.append(candidate)
                 failures.append(
@@ -5891,18 +6870,20 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 )
             }
         }
+        guard epoch == serviceGeneration else { throw RawManagedStorageBackend.failure() }
         cleanupPendingShims[containerID] = retained.isEmpty ? nil : retained
         if failures.isEmpty {
             let remaining = try VMShimClient.persistedLaunches(
                 in: containerDirectory,
                 expectedContainerID: containerID,
-                expectedInstanceID: knownContainers[containerID]?.instanceID
+                expectedInstanceID: instanceID
             )
             quarantinedShimGenerations[containerID] = remaining.quarantined.isEmpty
                 ? nil : remaining.quarantined
-            if !remaining.isEmpty || !remaining.quarantined.isEmpty {
+            let unexpected = remaining.filter { managedStorage == nil || !seen.contains($0.client.persistentOwnershipKey) }
+            if !unexpected.isEmpty || !remaining.quarantined.isEmpty {
                 failures.append("new shim generations appeared while cleanup was in progress")
-                for launch in remaining {
+                for launch in unexpected {
                     retainCleanupPendingShim(launch.client, for: containerID)
                 }
             }
@@ -6245,6 +7226,25 @@ public actor RawVirtualizationBackend: ContainerBackend {
         )
     }
 
+    /// Called only after storage retirement and positive native termination.
+    /// The managed journal's historical census outlives public container removal.
+    static func finalizeContainerRemoval(_ container: ContainerRecord,
+        directoryIdentity: PersistentFileIdentity, in containers: PersistentStateDirectory,
+        receipts: PersistentStateDirectory, retainedIdentities: inout [String: PersistentFileIdentity],
+        retainingManagedHistory: Bool) throws {
+        guard retainedIdentities[container.id] == directoryIdentity,
+              try containers.openDirectory(named: container.id).identity == directoryIdentity else {
+            throw EngineError(.conflict, "container removal evidence changed")
+        }
+        try RawDeletedContainerCoordinator.record(container, directoryIdentity: directoryIdentity, in: receipts)
+        if !retainingManagedHistory {
+            try disposeContainerDirectory(container.id, expectedIdentity: directoryIdentity,
+                in: containers, retainedIdentities: &retainedIdentities)
+        }
+        // Otherwise preserve ALL root/journal/native-generation bytes together.
+        // A decoded removal receipt is not a replacement for native death proof.
+    }
+
     static func disposeContainerDirectory(
         _ containerID: String,
         expectedIdentity: PersistentFileIdentity,
@@ -6514,6 +7514,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ container: ContainerRecord,
         preservingCapacityFrom preservedState: PreparedShimState? = nil
     ) async throws -> VMShimClient? {
+        let epoch = serviceGeneration
+        try requireServiceGeneration(epoch)
         guard let stateDirectory = try existingContainerStateDirectory(
             for: container.id
         ) else { return nil }
@@ -6543,6 +7545,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         if !(cleanupPendingShims[container.id] ?? []).isEmpty || !persistentLaunches.isEmpty {
             try await terminateEveryShim(for: container.id)
         }
+        try requireServiceGeneration(epoch)
         let bindSources = try HostBindSourceResolver(
             root: root.appending(path: "bind-sources")
         ).resolve(container.mounts)
@@ -6567,8 +7570,10 @@ public actor RawVirtualizationBackend: ContainerBackend {
             container: container,
             expectedLogIdentity: prepared.artifacts.shimLogIdentity
         )
+        try requireServiceGeneration(epoch)
         retainCleanupPendingShim(shim, for: container.id)
         do {
+            try requireServiceGeneration(epoch)
             try persistPreparedShimState(
                 container: container,
                 specification: specification,
@@ -6577,15 +7582,19 @@ public actor RawVirtualizationBackend: ContainerBackend {
             )
             preparedBindSources[container.id] = bindSources
             removeCleanupPendingShim(shim, for: container.id)
+            try requireServiceGeneration(epoch)
             shims[container.id] = shim
-            knownContainers[container.id] = container
+            try requireServiceGeneration(epoch)
+        knownContainers[container.id] = container
             activeContainers.removeValue(forKey: container.id)
             return shim
         } catch {
+            try requireServiceGeneration(epoch)
             let persistenceError = error
             do {
                 try await terminateEveryShim(for: container.id)
             } catch {
+            try requireServiceGeneration(epoch)
                 throw BackendResourceRollbackIncompleteError(
                     "prepared shim selection could not be persisted: "
                         + "\(EngineError.message(for: persistenceError)); cleanup failed: "
@@ -6687,7 +7696,11 @@ public actor RawVirtualizationBackend: ContainerBackend {
             networkSocketPath: infrastructure.specification.networkSocketPath,
             vlans: container.networks.compactMap { networkVLANs[$0.networkID] } + [VMShimProtocol.managementVLAN],
             rosetta: VZLinuxRosettaDirectoryShare.availability == .installed,
-            outputSpool: outputSpool
+            outputSpool: outputSpool,
+            shimLaunchUUID: UUID().uuidString.lowercased(),
+            diskBootstrapVersion: 1,
+            expectedInitramfsSHA256: diskBootstrapMetadata.expectedInitramfsSHA256(for: .container),
+            workloadStorageMode: managedStorage != nil && Self.volumeNames(in: container.mounts).contains(where: { volumeStorageModes[$0] == .shared }) ? .managed : .none
         )
     }
 
@@ -6703,6 +7716,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
         let volumeDevices = try Dictionary(uniqueKeysWithValues: blockVolumes.enumerated().map {
             ($0.element, try Self.volumeDevicePath(index: $0.offset))
         })
+        var managedIDs: [String: String] = [:]
+        if let managedStorage {
+            for name in Self.volumeNames(in: container.mounts) where volumeModes[name] == .shared {
+                managedIDs[name] = try await managedStorage.volumeID(named: name)
+            }
+        }
         let mountOrder = Self.mountDestinationOrder(container.mounts.map(\.destination))
         let mounts = mountOrder.map { index -> GuestProtocol.Mount in
             let mount = container.mounts[index]
@@ -6726,7 +7745,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 : []
             return GuestProtocol.Mount(
                 kind: mount.kind.rawValue,
-                source: mount.kind == .bind ? "bind-\(index)" : mount.source,
+                source: mount.kind == .bind ? "bind-\(index)" : (managedIDs[mount.source] ?? mount.source),
                 device: mount.kind == .volume ? volumeDevices[mount.source] : nil,
                 destination: mount.destination,
                 readOnly: mount.readOnly,
@@ -6742,7 +7761,7 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return try Self.workloadSpecification(
             container: container, imageConfiguration: config,
             mounts: mounts, networks: networkEndpoints(container), hosts: networkHosts(container),
-            volumeServer: volumeModes.values.contains(.shared) ? Self.managementServerAddress : nil,
+            volumeServer: managedStorage == nil && volumeModes.values.contains(.shared) ? Self.managementServerAddress : nil,
             ioClaim: ioClaim
         )
     }
@@ -6899,13 +7918,18 @@ public actor RawVirtualizationBackend: ContainerBackend {
             guard !disk.name.isEmpty, !disk.name.contains("/"),
                   let expected = disk.identity, let size = disk.size,
                   VMShimClient.launchPathsMatch(
-                      disk.path, volumeDiskURL(name: disk.name).path
+                      disk.path, try volumeDiskURL(name: disk.name).path
                   ) else {
                 throw EngineError(.conflict, "invalid persisted volume disk identity")
             }
             let url = URL(filePath: disk.path).standardizedFileURL
             let directory = try PersistentStateDirectory.open(
                 url.deletingLastPathComponent()
+            )
+            try RawDiskJournalDirectory.prepare(directory)
+            try RawVolumeDiskProvisioning.validateExisting(
+                in: directory, named: url.lastPathComponent, size: size,
+                legacy: url.lastPathComponent != "disk.ext4"
             )
             let observed = try directory.regularFileIdentity(
                 named: url.lastPathComponent, expectedSize: size
@@ -6928,29 +7952,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
             root.appending(path: "volumes", directoryHint: .isDirectory)
         )
         return try names.map { name in
-            guard !name.isEmpty, !name.contains("/") else {
-                throw EngineError(.badRequest, "invalid volume name")
-            }
-            let disk = volumeDiskURL(name: name)
-            if try volumes.entryMetadata(named: disk.lastPathComponent) == nil {
-                do {
-                    _ = try volumes.createSparseRegularFile(
-                        named: disk.lastPathComponent, size: Self.defaultVolumeDiskBytes
-                    )
-                } catch let error as POSIXError where error.code == .EEXIST {
-                    // Another exact creator won publication. The no-follow
-                    // identity/size validation below decides whether it is usable.
-                }
-            }
-            let identity = try volumes.regularFileIdentity(
-                named: disk.lastPathComponent,
-                expectedSize: Self.defaultVolumeDiskBytes
-            )
-            return .init(
-                name: name,
-                path: disk.path,
-                identity: identity.shimIdentity,
-                size: Self.defaultVolumeDiskBytes
+            try RawVolumeDiskProvisioning.prepare(
+                in: volumes, name: name, size: Self.defaultVolumeDiskBytes
             )
         }
     }
@@ -6999,10 +8002,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
         _ shim: VMShimClient,
         container: ContainerRecord,
         modes: [String: VolumeStorageMode],
-        generation: RawBackendExecutionFence.Token
+        generation: RawBackendExecutionFence.Token,
+        futureLaunchUUID: String? = nil
     ) async throws -> VMShimClient {
         let desiredNames = Self.volumeNames(in: container.mounts).filter { modes[$0] != .shared }
-        if shim.specification.volumeDisks.map(\.name) == desiredNames { return shim }
+        let managed = managedStorage != nil && Self.volumeNames(in: container.mounts).contains { modes[$0] == .shared }
+        // Managed sessions are one-shot and never reuse an earlier launch's keys.
+        if !managed, shim.specification.workloadStorageMode == .none,
+           shim.specification.volumeDisks.map(\.name) == desiredNames { return shim }
         let containerDirectory = try containerStateDirectory(for: container.id)
         guard let prepared = try Self.loadPreparedShimState(
                 from: containerDirectory, expectedContainerID: container.id
@@ -7012,17 +8019,27 @@ public actor RawVirtualizationBackend: ContainerBackend {
                 .conflict, "volume reconfiguration does not match its durable preparation"
             )
         }
-        let status = try await shim.status()
-        try requireExecutionGeneration(container.id, generation: generation)
-        guard status.state != .running && status.state != .paused else {
-            throw EngineError(.conflict, "cannot change volume storage while the container VM is running")
+        if managed {
+            // Failed-P replacement may already have positively terminated it.
+            // Repeat exact owned termination, never infer death from no socket.
+            try await shim.terminate()
+        } else {
+            let status = try await shim.status()
+            try requireExecutionGeneration(container.id, generation: generation)
+            guard status.state != .running && status.state != .paused else {
+                throw EngineError(.conflict, "cannot change volume storage while the container VM is running")
+            }
         }
-        try await terminateShim(container.id, shim: shim)
+        try await terminateShim(container.id, shim: shim, expectedExecutionGeneration: generation)
         try requireExecutionGeneration(container.id, generation: generation)
         var specification = shim.specification
-        specification.generation += 1
+        specification.generation = try nextShimGeneration(in: containerDirectory.url)
         specification.token = Self.randomToken()
+        specification.shimLaunchUUID = futureLaunchUUID ?? UUID().uuidString.lowercased()
+        specification.diskBootstrapVersion = 1
+        specification.expectedInitramfsSHA256 = diskBootstrapMetadata.expectedInitramfsSHA256(for: .container)
         specification.socketPath = try runtimeNamespace.makeSocketPath()
+        specification.workloadStorageMode = managed ? .managed : .none
         specification.volumeDisks = try ensureVolumeDisks(names: desiredNames)
         try prepared.artifacts.validate(in: containerDirectory)
         let replacement = try await launchTrackedShim(
@@ -7030,12 +8047,12 @@ public actor RawVirtualizationBackend: ContainerBackend {
             container: container,
             expectedLogIdentity: prepared.artifacts.shimLogIdentity
         )
-        retainCleanupPendingShim(replacement, for: container.id)
         guard executionFence.owns(container.id, token: generation) else {
-            try await terminateEveryShim(for: container.id)
+            try await replacement.terminate()
             try requireExecutionGeneration(container.id, generation: generation)
             return replacement
         }
+        retainCleanupPendingShim(replacement, for: container.id)
         do {
             try persistPreparedShimState(
                 container: container,
@@ -7062,9 +8079,14 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return replacement
     }
 
-    private func volumeDiskURL(name: String) -> URL {
-        let digest = SHA256.hash(data: Data(name.utf8)).map { String(format: "%02x", $0) }.joined()
-        return root.appending(path: "volumes/\(digest).ext4")
+    static func removeVolumeDisk(at url: URL) throws {
+        try RawVolumeDiskProvisioning.remove(at: url)
+    }
+
+    private func volumeDiskURL(name: String) throws -> URL {
+        try RawVolumeDiskProvisioning.diskURL(
+            in: PersistentStateDirectory.open(root.appending(path: "volumes")), name: name
+        )
     }
 
     private func persistVolumeStorageModes() throws {
@@ -7211,32 +8233,42 @@ public actor RawVirtualizationBackend: ContainerBackend {
             try await VMShimClient.launch(specification: $0)
         }
     ) async throws -> VMShimClient {
-        let specURL = VMShimClient.specificationURL(for: specification)
-        let directory = try PersistentStateDirectory.open(specURL.deletingLastPathComponent())
-        if let data = try directory.readRegularFile(named: specURL.lastPathComponent, required: false) {
-            let existing = try JSONDecoder().decode(VMShimProtocol.Specification.self, from: data)
-            guard existing.kind == .storage, existing.containerID == specification.containerID,
-                  VMShimClient.launchPathsMatch(existing.rootDiskPath, specification.rootDiskPath),
-                  VMShimClient.launchPathsMatch(VMShimClient.specificationURL(for: existing).path, specURL.path) else {
-                throw EngineError(.conflict, "infrastructure VM ownership does not match this engine root")
-            }
-            let client = VMShimClient(specification: existing)
-            let status: VMShimProtocol.Status?
-            do {
-                status = try await probe(client)
-            } catch {
-                if error is CancellationError || Task.isCancelled { throw CancellationError() }
-                // A timeout is not permission to start a second writer for the
-                // shared disk. Only a definitively dead recorded process (or
-                // fully removed runtime artifacts) permits crash recovery.
-                try InfrastructureRecovery.requireExited(existing)
-                status = nil
-            }
-            if let status {
+        try Task.checkCancellation()
+        if let old = try RawStorageShimRecovery.publishedGeneration(for: specification) {
+            let identity = old.record.process
+            switch RawStorageShimRecovery.liveness(identity, observation: RawStorageShimRecovery.observe(identity.pid)) {
+            case .dead:
+                // launch revalidates every retained generation and acquires the
+                // actual block FD lease before writing a fresh immutable intent.
+                return try await launch(specification)
+            case .unknown:
+                throw EngineError(.conflict, "storage shim kernel identity is unavailable; explicit quiescence is required; preserve launch records")
+            case .alive:
+                let client = VMShimClient(specification: old.specification)
+                let status: VMShimProtocol.Status
+                do {
+                    status = try await probe(client)
+                } catch {
+                    if error is CancellationError || Task.isCancelled { throw CancellationError() }
+                    guard RawStorageShimRecovery.liveness(identity, observation: RawStorageShimRecovery.observe(identity.pid)) == .dead else {
+                        throw EngineError(.conflict, "storage shim status unavailable and death unproven; explicit quiescence is required; preserve launch records")
+                    }
+                    return try await launch(specification)
+                }
+                let (seconds, overflow) = identity.startSeconds.multipliedReportingOverflow(by: 1_000_000)
+                let (start, additionOverflow) = seconds.addingReportingOverflow(identity.startMicroseconds)
+                guard !overflow, !additionOverflow,
+                      status.shimLaunchUUID == old.specification.shimLaunchUUID,
+                      status.containerID == old.specification.containerID,
+                      status.generation == old.specification.generation,
+                      status.processIdentifier == identity.pid, status.processStartTime == start,
+                      RawStorageShimRecovery.liveness(identity, observation: RawStorageShimRecovery.observe(identity.pid)) == .alive else {
+                    throw EngineError(.conflict, "storage shim launch identity changed")
+                }
                 try InfrastructureRecovery.validate(
-                    status, specification: existing, executableUUID: executableUUID
+                    status, specification: old.specification, executableUUID: executableUUID
                 )
-                guard existing.rootDiskIdentity == specification.rootDiskIdentity else {
+                guard old.specification.rootDiskIdentity == specification.rootDiskIdentity else {
                     throw EngineError(.conflict, "running infrastructure VM disk identity changed")
                 }
                 return client
@@ -7244,15 +8276,6 @@ public actor RawVirtualizationBackend: ContainerBackend {
         }
         try Task.checkCancellation()
         return try await launch(specification)
-    }
-
-    static func storageAdministrativeSocketPath(for infrastructure: VMShimClient) throws -> String {
-        guard infrastructure.specification.kind == .storage,
-              let path = infrastructure.specification.fileSystemSocketPath,
-              !path.isEmpty else {
-            throw EngineError(.internalError, "storage shim has no administrative socket")
-        }
-        return path
     }
 
     private static let ephemeralRuntimeNamespace: Result<VMShimRuntimeNamespace, Error> = Result {
@@ -7266,7 +8289,8 @@ public actor RawVirtualizationBackend: ContainerBackend {
     }
 
     private static func randomToken() -> String {
-        let data = VolumeAccessToken.random().secret
+        var generator = SystemRandomNumberGenerator()
+        let data = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) }
         return data.map { String(format: "%02x", $0) }.joined()
     }
 
@@ -7344,13 +8368,233 @@ public actor RawVirtualizationBackend: ContainerBackend {
         return address + "/" + (subnet.split(separator: "/").dropFirst().first.map(String.init) ?? (address.contains(":") ? "64" : "24"))
     }
 
-    private static func createSparseFile(at url: URL, size: UInt64) throws {
-        guard !FileManager.default.fileExists(atPath: url.path) else { return }
-        guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw EngineError(.internalError, "could not create sparse disk") }
-        let handle = try FileHandle(forWritingTo: url); try handle.truncate(atOffset: size); try handle.close()
+    private struct NetworkState: Codable { let record: NetworkRecord; let vlan: UInt16 }
+}
+
+/// Journal parents are private and ACL-free. Tightening a safe owned directory
+/// is descriptor-relative; an unsafe directory is never repaired by pathname.
+enum RawDiskJournalDirectory {
+    static func prepare(_ directory: PersistentStateDirectory, repairPermissions: Bool = true) throws {
+        var information = stat()
+        guard Darwin.fstat(directory.descriptor, &information) == 0,
+              information.st_mode & S_IFMT == S_IFDIR,
+              information.st_uid == geteuid(), information.st_mode & 0o022 == 0,
+              directory.pathStillNamesThisDirectory() else {
+            throw RawDiskInitialization.Failure.unsafePath
+        }
+        try requireNoACL(directory.descriptor)
+        if information.st_mode & 0o7777 != 0o700 {
+            guard repairPermissions else { throw RawDiskInitialization.Failure.unsafePath }
+            guard Darwin.fchmod(directory.descriptor, 0o700) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            try directory.synchronize()
+        }
+        guard Darwin.fstat(directory.descriptor, &information) == 0,
+              information.st_uid == geteuid(), information.st_mode & 0o7777 == 0o700,
+              directory.pathStillNamesThisDirectory() else {
+            throw RawDiskInitialization.Failure.unsafePath
+        }
+        try requireNoACL(directory.descriptor)
     }
 
-    private struct NetworkState: Codable { let record: NetworkRecord; let vlan: UInt16 }
+    static func requireNoACL(_ descriptor: CInt) throws {
+        guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+            if errno == ENOENT { return }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var entry: acl_entry_t?
+        errno = 0
+        guard acl_get_entry(acl, ACL_FIRST_ENTRY.rawValue, &entry) == -1,
+              errno == EINVAL else { throw RawDiskInitialization.Failure.unsafePath }
+    }
+
+    static func requireSafeAutomaticRootDisposal(_ directory: PersistentStateDirectory) throws {
+        // Inspection also creates a lock for legacy mount-only roots; the lock
+        // alone is not initialization history. Every other artifact still is.
+        guard try directory.entryNames().contains(where: {
+            $0.hasPrefix(".raw-init-root.ext4.") && $0 != ".raw-init-root.ext4.lock"
+        }) else { return }
+        // Only fully acknowledged initialization can be discarded automatically.
+        // Missing, CREATED, SPENT and malformed histories require explicit removal.
+        if let disk = try? directory.openRegularFile(named: "root.ext4", access: .readOnly) {
+            defer { try? disk.handle.close() }
+            var information = stat()
+            if Darwin.fstat(disk.handle.fileDescriptor, &information) == 0,
+               information.st_size > 0,
+               let inspection = try? RawDiskInitialization.inspectExisting(
+                   in: directory, named: "root.ext4", expectedSize: UInt64(information.st_size)
+               ), case .journal(let record) = inspection, record.state == .initialized { return }
+        }
+        throw BackendResourceRollbackIncompleteError(
+            "writable root initialization is incomplete; preserving disk and journal evidence"
+        )
+    }
+}
+
+/// New direct volumes own a whole directory so deletion cannot leave an old
+/// initialization authorization behind for a same-name replacement.
+enum RawVolumeDiskProvisioning {
+    static func diskURL(in volumes: PersistentStateDirectory, name: String) throws -> URL {
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0) else {
+            throw EngineError(.badRequest, "invalid volume name")
+        }
+        try RawDiskJournalDirectory.prepare(volumes)
+        try requireNoDisposals(volumes)
+        let digest = SHA256.hash(data: Data(name.utf8)).map { String(format: "%02x", $0) }.joined()
+        let legacyName = "\(digest).ext4"
+        let directoryName = "\(digest).disk"
+        let legacy = try volumes.entryMetadata(named: legacyName)
+        let current = try volumes.entryMetadata(named: directoryName)
+        guard legacy == nil || current == nil else {
+            throw EngineError(.conflict, "volume has both legacy and journaled disk layouts")
+        }
+        if legacy != nil { return volumes.url.appending(path: legacyName) }
+        return volumes.url.appending(path: "\(directoryName)/disk.ext4")
+    }
+
+    static func prepare(
+        in volumes: PersistentStateDirectory, name: String, size: UInt64
+    ) throws -> VMShimProtocol.VolumeDisk {
+        let disk = try diskURL(in: volumes, name: name)
+        let legacy = disk.lastPathComponent != "disk.ext4"
+        let directory: PersistentStateDirectory
+        if legacy {
+            directory = volumes
+        } else {
+            let directoryName = disk.deletingLastPathComponent().lastPathComponent
+            if let existing = try volumes.openDirectoryIfPresent(named: directoryName) {
+                directory = existing
+                // An existing empty/partial directory is not a fresh allocation.
+            } else {
+                directory = try volumes.createDirectory(named: directoryName, permissions: 0o700)
+                try RawDiskJournalDirectory.prepare(directory)
+                guard case .created = try RawDiskInitialization.createNewDisk(
+                    in: directory, named: "disk.ext4", size: size
+                ) else { throw POSIXError(.EEXIST) }
+            }
+        }
+        try RawDiskJournalDirectory.prepare(directory)
+        try validateExisting(in: directory, named: disk.lastPathComponent, size: size, legacy: legacy)
+        let identity = try directory.regularFileIdentity(named: disk.lastPathComponent, expectedSize: size)
+        guard directory.pathStillNamesThisDirectory(),
+              try diskURL(in: volumes, name: name) == disk else {
+            throw EngineError(.conflict, "volume disk layout changed during preparation")
+        }
+        return .init(name: name, path: disk.path, identity: identity.shimIdentity, size: size)
+    }
+
+    static func validateExisting(
+        in directory: PersistentStateDirectory, named name: String, size: UInt64, legacy: Bool
+    ) throws {
+        switch try RawDiskInitialization.inspectExisting(in: directory, named: name, expectedSize: size) {
+        case .mountOnly: return
+        case .journal(let record):
+            guard !legacy, record.state != .spent else { throw RawDiskInitialization.Failure.alreadySpent }
+        case .quarantined: throw RawDiskInitialization.Failure.quarantined
+        }
+    }
+
+    static func requireNoDisposals(_ volumes: PersistentStateDirectory) throws {
+        // Do not let generic disposal reconciliation erase a disk without its
+        // actual writer lease. Any incomplete claim needs explicit recovery.
+        guard try !volumes.entryNames().contains(where: {
+            $0.hasPrefix(".cengine-disposal-") || $0.hasPrefix(".cengine-remove-")
+        }) else {
+            throw EngineError(.conflict, "volume disk disposal remains unresolved")
+        }
+    }
+
+    static func remove(at disk: URL, hook: PersistentDisposalHook? = nil) throws {
+        let parentURL = disk.deletingLastPathComponent()
+        let journaled = disk.lastPathComponent == "disk.ext4" && parentURL.lastPathComponent.hasSuffix(".disk")
+        let volumes = try PersistentStateDirectory.open(journaled ? parentURL.deletingLastPathComponent() : parentURL)
+        try RawDiskJournalDirectory.prepare(volumes)
+        try requireNoDisposals(volumes)
+        let directory: PersistentStateDirectory
+        if journaled {
+            let legacyName = String(parentURL.lastPathComponent.dropLast(5)) + ".ext4"
+            guard try volumes.entryMetadata(named: legacyName) == nil else {
+                throw EngineError(.conflict, "volume has both legacy and journaled disk layouts")
+            }
+            guard let existing = try volumes.openDirectoryIfPresent(named: parentURL.lastPathComponent) else { return }
+            directory = existing
+            try RawDiskJournalDirectory.prepare(directory)
+        } else {
+            directory = volumes
+            let newName = disk.deletingPathExtension().lastPathComponent + ".disk"
+            guard try volumes.entryMetadata(named: newName) == nil else {
+                throw EngineError(.conflict, "volume has both legacy and journaled disk layouts")
+            }
+            guard try directory.entryMetadata(named: disk.lastPathComponent) != nil else { return }
+            guard try !directory.entryNames().contains(where: {
+                $0.hasPrefix(".raw-init-\(disk.lastPathComponent).") && $0 != ".raw-init-\(disk.lastPathComponent).lock"
+            }) else { throw RawDiskInitialization.Failure.quarantined }
+        }
+        let opened = try directory.openRegularFile(named: disk.lastPathComponent, access: .readWrite)
+        defer { try? opened.handle.close() }
+        let descriptor = opened.handle.fileDescriptor
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            throw EngineError(.conflict, "volume disk is still attached or locked")
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        var information = stat()
+        guard Darwin.fstat(descriptor, &information) == 0,
+              information.st_uid == geteuid(), information.st_nlink == 1,
+              directory.pathStillNamesThisDirectory(), volumes.pathStillNamesThisDirectory(),
+              try directory.regularFileIdentity(named: disk.lastPathComponent) == opened.identity else {
+            throw RawDiskInitialization.Failure.unsafePath
+        }
+        try RawDiskJournalDirectory.requireNoACL(descriptor)
+        if journaled {
+            try volumes.disposeDirectory(named: parentURL.lastPathComponent, expectedIdentity: directory.identity, hook: hook)
+        } else {
+            guard try directory.removeEntryIfMatching(
+                named: disk.lastPathComponent, identity: opened.identity, type: S_IFREG,
+                claimName: ".cengine-remove-\(UUID().uuidString.lowercased())"
+            ) else { throw EngineError(.conflict, "volume disk changed before removal") }
+        }
+    }
+}
+
+/// Publishes initialization history only for an exact O_EXCL-created storage
+/// disk. Existing disks are inspected, never truncated or granted fresh history.
+enum RawStorageDiskProvisioning {
+    static func prepare(
+        in directory: PersistentStateDirectory,
+        size: UInt64,
+        afterMissingObservation: (() throws -> Void)? = nil
+    ) throws -> PersistentFileIdentity {
+        let name = "volumes.ext4"
+        try RawDiskJournalDirectory.prepare(directory)
+        var expectedIdentity = try directory.entryMetadata(named: name)?.identity
+        if expectedIdentity == nil {
+            try afterMissingObservation?()
+            switch try RawDiskInitialization.createNewDisk(in: directory, named: name, size: size) {
+            case .created(let created):
+                let observed = try directory.regularFileIdentity(named: name, expectedSize: size)
+                guard observed.inode == created.record.diskIdentity.inode,
+                      observed.volumeUUID?.uuidString.lowercased() == created.record.diskIdentity.volumeUUID else {
+                    throw RawDiskInitialization.Failure.unsafePath
+                }
+                expectedIdentity = observed
+            case .alreadyExists:
+                // Inspect the winner without manufacturing new authorization.
+                expectedIdentity = try directory.entryMetadata(named: name)?.identity
+            }
+        }
+        try RawVolumeDiskProvisioning.validateExisting(
+            in: directory, named: name, size: size, legacy: false
+        )
+        let identity = try directory.regularFileIdentity(
+            named: name, expectedIdentity: expectedIdentity, expectedSize: size
+        )
+        guard directory.pathStillNamesThisDirectory() else {
+            throw EngineError(.conflict, "storage disk parent directory changed")
+        }
+        return identity
+    }
 }
 
 struct RawNetworkStateTransaction {

@@ -102,6 +102,7 @@ public struct DockerRouter: Sendable {
     private let registrySearcher: any RegistrySearching
     private let registryAuthenticator: any RegistryAuthenticating
     private let decoder = JSONDecoder()
+    private var afterAnonymousVolumeCreation: (@Sendable () async throws -> Void)?
 
     private func nonEmpty(_ value: String?) -> String? {
         value.flatMap { $0.isEmpty ? nil : $0 }
@@ -134,6 +135,14 @@ public struct DockerRouter: Sendable {
         self.resourceScopeManager = resourceScopeManager
         self.registrySearcher = registrySearcher
         self.registryAuthenticator = registryAuthenticator
+    }
+
+    // Deterministic test boundary after volume publication, before container
+    // publication. No API input can install this hook or select an expected V.
+    init(runtime: EngineRuntime, root: URL,
+                     afterAnonymousVolumeCreation: @escaping @Sendable () async throws -> Void) {
+        self.init(runtime: runtime, root: root)
+        self.afterAnonymousVolumeCreation = afterAnonymousVolumeCreation
     }
 
     public func route(_ request: APIRequest) async -> APIResponse {
@@ -225,7 +234,13 @@ public struct DockerRouter: Sendable {
             let input = try decoder.decode(ContainerCreateRequest.self, from: request.body)
             let validated = try validateRuntimeInput(input)
             let name = query["name"].flatMap { $0.isEmpty ? nil : $0 } ?? String(Identifier.random().prefix(12))
-            var record = ContainerRecord(name: name, image: ImageReference.normalized(input.Image), processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
+            // Config digests are image IDs, not familiar repository names.
+            // Keep named references normalized for existing metadata consumers.
+            let isImageID = input.Image.hasPrefix("sha256:")
+                && input.Image.utf8.count == 71
+                && input.Image.dropFirst(7).allSatisfy { "0123456789abcdef".contains($0) }
+            let image = isImageID ? input.Image : ImageReference.normalized(input.Image)
+            var record = ContainerRecord(name: name, image: image, processArguments: (input.Entrypoint ?? []) + (input.Cmd ?? []))
             let defaults = try ContainerSettings.load(from: root.appending(path: ContainerSettings.fileName))
             record.memoryBytes = defaults.memoryBytes
             record.cpus = defaults.cpus
@@ -299,11 +314,17 @@ public struct DockerRouter: Sendable {
                 where !record.mounts.contains(where: { $0.destination == destination }) {
                 record.mounts.append(.init(kind: .volume, source: "", destination: destination))
             }
+            var expectedVolumeInstances: [String: UUID] = [:]
             for index in record.mounts.indices where record.mounts[index].kind == .volume && record.mounts[index].source.isEmpty {
                 let name = Identifier.random()
-                _ = try await runtime.createVolume(name: name, anonymous: true)
+                let volume = try await runtime.createVolume(name: name, anonymous: true)
+                guard let instance = volume.instanceID else {
+                    throw EngineError(.conflict, "anonymous volume has no durable instance identity")
+                }
+                expectedVolumeInstances[name] = instance
                 record.mounts[index].source = name
             }
+            if !expectedVolumeInstances.isEmpty { try await afterAnonymousVolumeCreation?() }
             record.ports = ports(from: input)
             record.networkDisabled = input.HostConfig?.NetworkMode == "none"
             for (networkName, endpoint) in input.NetworkingConfig?.EndpointsConfig ?? [:] {
@@ -332,7 +353,9 @@ public struct DockerRouter: Sendable {
                     record.networks.append(.init(networkID: network.id))
                 }
             }
-            let created = try await runtime.createContainer(record)
+            let created = try await runtime.createContainer(
+                record, expectedVolumeInstances: expectedVolumeInstances
+            )
             return json(status: .created, ContainerCreateResponse(Id: created.id, Warnings: []))
         case (.GET, let value) where value.hasPrefix("/containers/") && value.hasSuffix("/json"):
             let id = String(value.dropFirst("/containers/".count).dropLast("/json".count))
@@ -2539,6 +2562,23 @@ public struct ContainerInspectResponse: Codable, Sendable {
         struct TmpfsOptionsResponse: Codable, Sendable {
             let SizeBytes: Int64?; let Mode: UInt32?; let Options: [[String]]?
         }
+
+        init(_ mount: MountRecord, version: DockerAPIVersion) {
+            Type = mount.kind.rawValue
+            Name = mount.kind == .volume ? mount.source : nil
+            Source = mount.source
+            Destination = mount.destination
+            Driver = mount.kind == .volume ? "local" : ""
+            Mode = mount.readOnly ? "ro" : ""
+            RW = !mount.readOnly
+            Propagation = mount.propagation?.rawValue ?? ""
+            VolumeOptions = mount.kind == .volume ? .init(NoCopy: mount.noCopy, Subpath: mount.subpath) : nil
+            TmpfsOptions = mount.kind == .tmpfs ? .init(
+                SizeBytes: mount.tmpfsSizeBytes,
+                Mode: mount.tmpfsMode,
+                Options: version >= .init(major: 1, minor: 46) ? mount.tmpfsOptions : nil
+            ) : nil
+        }
     }
     public struct NetworkSettingsResponse: Codable, Sendable {
         let Bridge: String?; let SandboxID: String; let HairpinMode: Bool?
@@ -2564,20 +2604,7 @@ public struct ContainerInspectResponse: Codable, Sendable {
         State = .init(Status: record.phase.rawValue, Running: record.phase == .running, Paused: record.phase == .paused, Restarting: false, OOMKilled: false, Dead: record.phase == .dead, Pid: 0, ExitCode: record.exitCode ?? 0, Error: "", StartedAt: record.startedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", FinishedAt: record.finishedAt.map(formatter.string) ?? "0001-01-01T00:00:00Z", Health: record.healthStatus.map { .init(Status: $0, FailingStreak: record.healthFailingStreak ?? 0, Log: []) })
         Config = .init(Hostname: record.hostname, Domainname: record.effectiveDomainname, User: record.user, Tty: record.tty, AttachStdin: record.attachStdin, OpenStdin: record.openStdin, Env: record.environment, Cmd: record.processArguments, Image: record.image, WorkingDir: record.workingDirectory.isEmpty ? "/" : record.workingDirectory, Labels: record.labels, Healthcheck: record.healthcheck.map { .init(Test: $0.test, Interval: $0.intervalNanoseconds, Timeout: $0.timeoutNanoseconds, Retries: $0.retries, StartPeriod: $0.startPeriodNanoseconds, StartInterval: $0.startIntervalNanoseconds) })
         RestartCount = record.restartCount
-        let mounts = record.mounts.map { mount in
-            MountResponse(
-                Type: mount.kind.rawValue, Name: mount.kind == .volume ? mount.source : nil,
-                Source: mount.source, Destination: mount.destination, Driver: mount.kind == .volume ? "local" : "",
-                Mode: mount.readOnly ? "ro" : "", RW: !mount.readOnly,
-                Propagation: mount.propagation?.rawValue ?? "",
-                VolumeOptions: mount.kind == .volume ? .init(NoCopy: mount.noCopy, Subpath: mount.subpath) : nil,
-                TmpfsOptions: mount.kind == .tmpfs ? .init(
-                    SizeBytes: mount.tmpfsSizeBytes,
-                    Mode: mount.tmpfsMode,
-                    Options: version >= .init(major: 1, minor: 46) ? mount.tmpfsOptions : nil
-                ) : nil
-            )
-        }
+        let mounts = record.mounts.map { MountResponse($0, version: version) }
         let portBindings = Dictionary(grouping: record.ports, by: { "\($0.containerPort)/\($0.proto)" }).mapValues {
             $0.map { PortBindingResponse(HostIp: $0.hostIP, HostPort: String($0.hostPort)) }
         }

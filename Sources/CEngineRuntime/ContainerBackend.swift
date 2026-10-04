@@ -231,13 +231,38 @@ enum LiveResourceCanonicalTransaction {
     }
 }
 
+/// Observational result only; native containment and maintenance authority stay private.
+public struct BackendServiceReplacementResult: Sendable, Equatable {
+    public let request: StorageServiceTypes.ReplacementRequest
+    public let successor: StorageServiceTypes.Scope
+    public let containedContainerIDs: Set<String>
+
+    public init(request: StorageServiceTypes.ReplacementRequest,
+                successor: StorageServiceTypes.Scope, containedContainerIDs: Set<String>) {
+        self.request = request; self.successor = successor; self.containedContainerIDs = containedContainerIDs
+    }
+}
+
 public protocol ContainerBackend: Sendable {
+    func observeManagedStorageLoss(_ observer: @escaping @Sendable () async -> Void) async
+    /// Side-effect-free validation of the complete request and current sealed scope.
+    func validateManagedStorageReplacement(_ request: StorageServiceTypes.ReplacementRequest) async throws
+    /// Fresh readiness validation for exactly this scope, independent of replacement admission.
+    func validateManagedStorageAvailability(_ scope: StorageServiceTypes.Scope) async throws
+    func fenceManagedStorageService() async
+    func replaceManagedStorageService(_ request: StorageServiceTypes.ReplacementRequest,
+        volumes: [VolumeRecord], containers: [ContainerRecord]) async throws -> BackendServiceReplacementResult
     func shutdown() async
     func pullImage(_ reference: String, platform: String) async throws
     func prepare(_ container: ContainerRecord) async throws
     func start(_ container: ContainerRecord) async throws -> [PortBinding]
     func stop(_ container: ContainerRecord, timeoutSeconds: Int) async throws -> Int32
     func wait(_ container: ContainerRecord) async throws -> Int32
+    /// Definitively contain every execution generation without removing the
+    /// writable root, preparation, logs, or other persistent container state.
+    /// Success is positive teardown evidence; uncertainty must throw.
+    func cleanupExecution(_ container: ContainerRecord) async throws
+    /// Intentional container removal, including its persistent writable state.
     func delete(_ container: ContainerRecord) async throws
     func deleteLogs(for container: ContainerRecord) async throws
     func io(for container: ContainerRecord) async throws -> ContainerIOBridge
@@ -278,13 +303,20 @@ public protocol ContainerBackend: Sendable {
     func resume(_ container: ContainerRecord) async throws
     /// Restart implementations may stop the old execution before throwing.
     /// They must tolerate EngineRuntime following any failure with idempotent
-    /// `stop` and `delete` calls to remove a partial replacement.
+    /// `stop` and `cleanupExecution` calls to contain a partial replacement.
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws
     func updateResources(_ container: ContainerRecord) async throws
     func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress]
     func statistics(_ container: ContainerRecord) async throws -> BackendStatistics
     func top(_ container: ContainerRecord, arguments: [String]) async throws -> (titles: [String], processes: [[String]])
     func runHealthcheck(_ container: ContainerRecord, arguments: [String], timeoutSeconds: Int64) async throws -> (exitCode: Int32, output: String)
+    /// Called after canonical identity migration, before any recovery/cleanup.
+    /// Managed backends must reject journal/record identity mismatches.
+    func reconcileStorage(volumes: [VolumeRecord], containers: [ContainerRecord]) async throws
+    /// Canonically persisted records, serialized against typed volume deletion.
+    /// Omission is not deletion authority; retain unresolved journal generations.
+    func synchronizeVolumes(_ volumes: [VolumeRecord]) async throws
+    func deleteVolume(_ volume: VolumeRecord) async throws
     func deleteVolume(_ name: String) async throws
     func cleanupOrphans(keeping containerIDs: Set<String>) async throws
     func recover(_ container: ContainerRecord) async throws -> BackendContainerRecovery
@@ -299,7 +331,24 @@ public protocol ContainerBackend: Sendable {
 }
 
 public extension ContainerBackend {
+    func observeManagedStorageLoss(_ observer: @escaping @Sendable () async -> Void) async {}
+    func validateManagedStorageReplacement(_ request: StorageServiceTypes.ReplacementRequest) async throws {
+        throw EngineError(.unsupported, "managed service replacement is unavailable for this backend")
+    }
+    func validateManagedStorageAvailability(_ scope: StorageServiceTypes.Scope) async throws {
+        throw EngineError(.unsupported, "managed service availability validation is unavailable for this backend")
+    }
+    func fenceManagedStorageService() async {}
+    func replaceManagedStorageService(_ request: StorageServiceTypes.ReplacementRequest,
+        volumes: [VolumeRecord], containers: [ContainerRecord]) async throws -> BackendServiceReplacementResult {
+        throw EngineError(.unsupported, "managed service replacement is unavailable for this backend")
+    }
     func shutdown() async {}
+    func cleanupExecution(_: ContainerRecord) async throws {
+        // A backend without a nondestructive containment implementation cannot
+        // certify cleanup. Never fall back to deleting persistent user data.
+        throw EngineError(.unsupported, "non-destructive execution cleanup is unavailable for this backend")
+    }
     func deleteLogs(for _: ContainerRecord) async throws {}
     func logs(for container: ContainerRecord, options _: DockerLogOptions) async throws -> Data { try await logs(for: container) }
     func io(for _: ContainerRecord) async throws -> ContainerIOBridge {
@@ -400,7 +449,7 @@ public extension ContainerBackend {
     func resume(_: ContainerRecord) async throws { throw EngineError(.unsupported, "unpause is unavailable for this backend") }
     func restart(_ container: ContainerRecord, timeoutSeconds: Int) async throws {
         _ = try await stop(container, timeoutSeconds: timeoutSeconds)
-        try await delete(container)
+        try await cleanupExecution(container)
         try await prepare(container)
         _ = try await start(container)
     }
@@ -415,6 +464,9 @@ public extension ContainerBackend {
     func runHealthcheck(_: ContainerRecord, arguments _: [String], timeoutSeconds _: Int64) async throws -> (exitCode: Int32, output: String) {
         throw EngineError(.unsupported, "health checks are unavailable for this backend")
     }
+    func reconcileStorage(volumes _: [VolumeRecord], containers _: [ContainerRecord]) async throws {}
+    func synchronizeVolumes(_: [VolumeRecord]) async throws {}
+    func deleteVolume(_ volume: VolumeRecord) async throws { try await deleteVolume(volume.name) }
     func deleteVolume(_: String) async throws {}
     func cleanupOrphans(keeping _: Set<String>) async throws {}
     func recover(_: ContainerRecord) async throws -> BackendContainerRecovery { .unavailable }
@@ -449,5 +501,6 @@ public struct MetadataOnlyBackend: ContainerBackend {
     public func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     public func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     public func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    public func cleanupExecution(_: ContainerRecord) async throws {}
     public func delete(_: ContainerRecord) async throws {}
 }

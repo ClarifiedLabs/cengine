@@ -112,6 +112,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             openLoginItemsSettings: { settingsOpenCount += 1 }
         )
         defer { model.setActive(false) }
@@ -147,7 +148,8 @@ import CEngineCore
             helper: helper,
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
-            serviceRegistrationDefaults: defaults
+            serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in }
         )
         defer { model.setActive(false) }
 
@@ -171,7 +173,8 @@ import CEngineCore
             helper: helper,
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
-            serviceRegistrationDefaults: defaults
+            serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in }
         )
         defer { model.setActive(false) }
 
@@ -199,6 +202,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             openLoginItemsSettings: { settingsOpenCount += 1 }
         )
         defer { model.setActive(false) }
@@ -224,6 +228,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             waitForServiceUnregistration: { unregistrationWaitCount += 1 },
             stopVirtualMachinesForUpgrade: {}
         )
@@ -271,6 +276,7 @@ import CEngineCore
             client: client,
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             waitForServiceUnregistration: { await record("settled") },
             stopVirtualMachinesForUpgrade: { await record("vms") },
             restartRegisteredEngine: { Issue.record("unexpected engine restart") },
@@ -351,6 +357,7 @@ import CEngineCore
             client: client,
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             waitForServiceUnregistration: { try record("settled") },
             stopVirtualMachinesForUpgrade: { try record("vms") },
             restartRegisteredEngine: { Issue.record("retry must redo migration, not kickstart") }
@@ -408,6 +415,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             waitForServiceUnregistration: { Issue.record("no registrations to settle") },
             stopVirtualMachinesForUpgrade: { sequence.record("vms") }
         )
@@ -444,6 +452,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             waitForServiceUnregistration: { Issue.record("no registrations to settle") },
             stopVirtualMachinesForUpgrade: {
                 shutdownCount += 1
@@ -488,6 +497,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: "25",
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             waitForServiceUnregistration: { Issue.record("unexpected registration delay") },
             stopVirtualMachinesForUpgrade: { Issue.record("unexpected VM shutdown") }
         )
@@ -515,7 +525,8 @@ import CEngineCore
             helper: helper,
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
-            serviceRegistrationDefaults: defaults
+            serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in }
         )
 
         await model.disableEngineService()
@@ -533,6 +544,111 @@ import CEngineCore
         #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
     }
 
+    @MainActor @Test func ownerCheckFencesStartupAndPollingUntilExplicitSetup() async {
+        let suiteName = "AppOwnerTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("25", forKey: AppModel.serviceRegistrationRevisionKey)
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        var modes: [Bool] = []
+        let model = AppModel(agent: agent, helper: helper, client: UnavailableEngineClient(),
+            serviceRegistrationRevision: "25", serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { allow in
+                modes.append(allow)
+                if !allow { throw EngineError(.conflict, "Use explicit setup") }
+            })
+        defer { model.setActive(false) }
+        await model.refresh()
+        #expect(modes.isEmpty)
+        #expect(agent.registerCount == 0)
+        await model.start()
+        await model.refresh()
+        await model.start()
+        #expect(modes == [false])
+        #expect(agent.registerCount == 0)
+        #expect(model.error?.contains("Use explicit setup") == true)
+        await model.enableEngineService()
+        #expect(modes == [false, true])
+        #expect(agent.registerCount == 1)
+    }
+
+    @MainActor @Test func refreshRechecksOwnerAndFailureFencesRestart() async {
+        let suiteName = "AppOwnerTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        var modes: [Bool] = []
+        var reject = false
+        let model = AppModel(agent: agent, helper: helper, client: UnavailableEngineClient(),
+            serviceRegistrationRevision: nil, serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { allow in
+                modes.append(allow)
+                if reject { throw EngineError(.conflict, "Owner unavailable") }
+            }, restartRegisteredEngine: { Issue.record("must not restart after failed owner check") })
+        await model.start()
+        model.setActive(false)
+        agent.status = .notRegistered
+        reject = true
+        await model.refresh()
+        #expect(modes == [false, false])
+        #expect(agent.registerCount == 1)
+        await model.refresh()
+        await model.restartEngineService()
+        #expect(modes == [false, false, true])
+        #expect(agent.registerCount == 1)
+        #expect(model.error?.contains("Owner unavailable") == true)
+    }
+
+    @MainActor @Test func pendingHelperApprovalRequiresExplicitRetryWithoutPollingPrompt() async {
+        let suiteName = "AppOwnerTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .requiresApproval, statusAfterRegistration: .enabled)
+        var modes: [Bool] = []
+        let model = AppModel(agent: agent, helper: helper, client: UnavailableEngineClient(),
+            serviceRegistrationRevision: nil, serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { modes.append($0) })
+        defer { model.setActive(false) }
+        await model.enableEngineService()
+        helper.status = .enabled
+        await model.refresh()
+        #expect(modes.isEmpty)
+        #expect(agent.registerCount == 0)
+        await model.restartEngineService()
+        #expect(modes == [true])
+        #expect(agent.registerCount == 1)
+    }
+
+    @MainActor @Test(arguments: [false, true])
+    func ownerCheckSuspensionFencesReentrantActions(explicit: Bool) async {
+        let suiteName = "AppOwnerTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let suspension = ServiceTransitionSuspension()
+        let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        var modes: [Bool] = []
+        let model = AppModel(agent: agent, helper: helper, client: UnavailableEngineClient(),
+            serviceRegistrationRevision: nil, serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { modes.append($0); await suspension.suspend() })
+        defer { model.setActive(false) }
+        let action = Task { if explicit { await model.enableEngineService() } else { await model.start() } }
+        await suspension.waitUntilSuspended()
+        await model.start()
+        await model.refresh()
+        await model.enableEngineService()
+        await model.restartEngineService()
+        await model.completeOnboarding()
+        #expect(modes == [explicit])
+        #expect(agent.registerCount == 0)
+        suspension.resume()
+        await action.value
+        #expect(agent.registerCount == 1)
+    }
+
     @MainActor @Test func restartUsesLaunchctlController() async {
         let suiteName = "AppModelTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -546,6 +662,7 @@ import CEngineCore
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
             serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in },
             restartRegisteredEngine: { await recorder.record() }
         )
 
@@ -734,9 +851,12 @@ private actor RestartRecorder {
             helper: helper,
             client: UnavailableEngineClient(),
             serviceRegistrationRevision: nil,
-            serviceRegistrationDefaults: defaults
+            serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in }
         )
 
+        await model.start()
+        model.setActive(false)
         await model.refresh()
 
         #expect(model.engineStatus == "Failed")

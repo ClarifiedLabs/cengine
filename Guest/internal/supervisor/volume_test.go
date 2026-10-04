@@ -11,15 +11,17 @@ import (
 	"dev.cengine/guest/internal/protocol"
 )
 
-func TestSharedVolumeRequiresEngineManagedServer(t *testing.T) {
-	spec := protocol.WorkloadSpec{Mounts: []protocol.Mount{{Kind: "volume", Source: "data"}}}
-	err := validateVolumeMounts(spec)
-	if err == nil || !strings.Contains(err.Error(), "has no volume server") {
-		t.Fatalf("validateVolumeMounts error = %v, want missing volume server", err)
-	}
-	spec.VolumeServer = "100.64.0.1"
-	if err := validateVolumeMounts(spec); err != nil {
-		t.Fatalf("shared volume with server was rejected: %v", err)
+func TestVolumeRequiresBlockDeviceOrManagedAttachment(t *testing.T) {
+	for _, mount := range []protocol.Mount{
+		{Kind: "volume", Source: "data"},
+		{Kind: "volume", Source: "data", Device: "/dev/vdb"},
+		{Kind: "volume", Source: "data", ManagedAttachment: "managed"},
+	} {
+		err := validateVolumeMounts(protocol.WorkloadSpec{Mounts: []protocol.Mount{mount}})
+		valid := mount.Device != "" || mount.ManagedAttachment != ""
+		if (err == nil) != valid {
+			t.Fatalf("mount %+v: %v", mount, err)
+		}
 	}
 }
 
@@ -54,6 +56,74 @@ func TestInitializeVolumeRejectsSymlinkedCopySource(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("volume changed after rejected source: %#v", entries)
+	}
+}
+
+func TestInitializeVolumeLostFoundAuthority(t *testing.T) {
+	for _, kind := range []string{"empty-directory", "populated-directory", "file", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			rootfs, volume := t.TempDir(), t.TempDir()
+			// Go's TempDir does not promise a particular permission mode.
+			if err := os.Chmod(volume, 0700); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(rootfs, "data")
+			if err := os.Mkdir(source, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(source, "seed"), []byte("image"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			lostFound := filepath.Join(volume, "lost+found")
+			sentinel := lostFound
+			switch kind {
+			case "empty-directory", "populated-directory":
+				if err := os.Mkdir(lostFound, 0700); err != nil {
+					t.Fatal(err)
+				}
+				sentinel = filepath.Join(lostFound, "sentinel")
+				if kind == "populated-directory" {
+					if err := os.WriteFile(sentinel, []byte("keep"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "file":
+				if err := os.WriteFile(sentinel, []byte("keep"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				// Even a link to an empty directory is authoritative, not ext4's directory.
+				if err := os.Symlink(t.TempDir(), lostFound); err != nil {
+					t.Fatal(err)
+				}
+			}
+			empty, err := dockerVolumeIsEmpty(volume)
+			wantEmpty := kind == "empty-directory"
+			if err != nil || empty != wantEmpty {
+				t.Fatalf("emptiness = %v, %v; want %v", empty, err, wantEmpty)
+			}
+			if err := initializeVolumeAt(rootfs, volume, protocol.Mount{Destination: "/data"}); err != nil {
+				t.Fatal(err)
+			}
+			seed, err := os.ReadFile(filepath.Join(volume, "seed"))
+			if wantEmpty {
+				if err != nil || string(seed) != "image" {
+					t.Fatalf("fresh volume seed = %q, %v", seed, err)
+				}
+			} else {
+				if !os.IsNotExist(err) {
+					t.Fatalf("authoritative volume was seeded: %q, %v", seed, err)
+				}
+				assertVolumeRootMetadata(t, volume, uint32(os.Geteuid()), uint32(os.Getegid()), 0700)
+				if kind == "symlink" {
+					if _, err := os.Readlink(lostFound); err != nil {
+						t.Fatal(err)
+					}
+				} else if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
+					t.Fatalf("sentinel = %q, %v", data, err)
+				}
+			}
+		})
 	}
 }
 

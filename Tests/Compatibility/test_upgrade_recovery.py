@@ -34,7 +34,7 @@ BUILD_MISMATCH = "infrastructure VM belongs to a different or older cengine buil
 def _shim_request(specification: dict, operation: str, payload: dict | None = None) -> dict:
     # VMShimProtocol: length-prefixed JSON, with Codable Data encoded as base64.
     request = {
-        "version": 5, "id": str(uuid.uuid4()), "token": specification["token"],
+        "version": 7, "id": str(uuid.uuid4()), "token": specification["token"],
         "operation": operation,
     }
     if payload is not None:
@@ -95,7 +95,7 @@ def _assert_same_root_is_exclusive(daemon) -> None:
     specification = daemon.root / "infrastructure" / "shim.json"
     before = specification.read_bytes()
     commands = [
-        (["daemon", "--metadata-only"], "another cengine daemon is already running"),
+        (["daemon", "--metadata-only"], f"another cengine daemon owns data store at {daemon.root.resolve()}"),
         (["system", "shutdown", "--for-upgrade"], "engine is still running"),
     ]
     for command, expected_error in commands:
@@ -125,6 +125,43 @@ def _assert_exited(pids: set[int]) -> None:
             time.sleep(0.05)
 
 
+def _stage_upgrade_runtime(binary: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
+    directory.mkdir()
+    staged = (directory / "cengine").resolve()
+    shutil.copy2(binary, staged)
+    # Managed startup authenticates this exact signed sibling, not an arbitrary
+    # controller path. Preserve its bytes/signature when relocating the engine.
+    shutil.copy2(binary.resolve().with_name("cengine-storage-controller"),
+                 directory / "cengine-storage-controller")
+    frameworks = binary.resolve().parent / "PackageFrameworks"
+    if frameworks.is_dir():
+        (directory / "PackageFrameworks").symlink_to(frameworks, target_is_directory=True)
+    return staged
+
+
+def _assert_replacement_refuses_old_writer(daemon) -> None:
+    # Reuse the actual previous launch arguments, including managed mode/assets.
+    # Daemon.start's unexpected-failure cleanup intentionally terminates all owned
+    # peers. This expected-refusal probe must instead leave the old writers alive.
+    assert daemon.process is not None and daemon.process.poll() is not None
+    command = daemon.process.args
+    assert isinstance(command, list) and command[0] == str(daemon.binary)
+    with daemon.log_path.open("ab") as log:
+        offset = log.tell()
+        result = subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            env=compatibility_environment(), timeout=30,
+        )
+    assert result.returncode != 0, "replacement unexpectedly accepted the old writer"
+    # Keep potentially secret-bearing diagnostics private. Only the closed error
+    # classification escapes; earlier log lines cannot satisfy the current probe.
+    with daemon.log_path.open("rb") as log:
+        log.seek(offset)
+        diagnostic = log.read(65537)
+    assert len(diagnostic) <= 65536, "upgrade refusal diagnostic exceeded its bound"
+    assert BUILD_MISMATCH.encode() in diagnostic, "replacement did not report the expected build refusal; see private daemon.log"
+
+
 def _replacement_with_new_uuid(binary: pathlib.Path) -> tuple[pathlib.Path, uuid.UUID, uuid.UUID]:
     replacement = binary.with_name("cengine.next")
     shutil.copy2(binary, replacement)
@@ -148,8 +185,12 @@ def _replacement_with_new_uuid(binary: pathlib.Path) -> tuple[pathlib.Path, uuid
         offset += size
     assert original is not None and original != changed
     replacement.write_bytes(contents)
+    # Match the runner's signing mode: an ad-hoc replacement cannot authenticate
+    # to the installed Developer ID helper, even in the legacy storage suite.
+    identity = os.environ.get("CENGINE_DEVELOPER_ID_APPLICATION") or "-"
+    options = ["--options", "runtime"] if identity != "-" else []
     subprocess.run(
-        ["/usr/bin/codesign", "--force", "--timestamp=none", "--sign", "-",
+        ["/usr/bin/codesign", "--force", "--timestamp=none", *options, "--sign", identity,
          "--identifier", "dev.cengine.engine.test-compat", "--entitlements",
          str(REPO_ROOT / "Configuration/cengine.entitlements"), str(replacement)],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
@@ -182,9 +223,12 @@ def _restore_upgrade_daemon(daemon, original_binary: pathlib.Path) -> None:
                 terminate_compatibility_runtime(original_binary, roots=(daemon.root,))
                 runtime_stopped = True
     finally:
-        daemon.binary = original_binary
         if runtime_stopped:
-            daemon.start()  # Preserve autouse daemon_survived and fixture cleanup ownership.
+            # Keep the selected executable path: managed launch records pin it.
+            # Switching back to the project path is not a same-path upgrade and
+            # correctly quarantines the staged generations. The fixture retains
+            # its separate original owner for registered-process/root cleanup.
+            daemon.start()  # Preserve autouse daemon_survived without changing ownership.
 
 
 @pytest.mark.compat("RTM-056")
@@ -193,13 +237,7 @@ def test_same_path_upgrade_refuses_old_writer_then_preserves_data_and_egress(
 ):
     original_binary = daemon.binary
     original_digest = hashlib.sha256(original_binary.read_bytes()).digest()
-    staged_directory = daemon.work / "upgrade-bin"
-    staged_directory.mkdir()
-    staged_binary = (staged_directory / "cengine").resolve()
-    shutil.copy2(original_binary, staged_binary)
-    frameworks = original_binary.resolve().parent / "PackageFrameworks"
-    if frameworks.is_dir():
-        (staged_directory / "PackageFrameworks").symlink_to(frameworks, target_is_directory=True)
+    staged_binary = _stage_upgrade_runtime(original_binary, daemon.work / "upgrade-bin")
 
     register_compatibility_executable(daemon.work, original_binary, staged_binary)
     try:
@@ -253,8 +291,7 @@ def test_same_path_upgrade_refuses_old_writer_then_preserves_data_and_egress(
         os.replace(replacement, staged_binary)  # Never modify a mapped executable inode.
         assert uuid.UUID(_status(specification)["executableUUID"]) == old_uuid
         started = time.monotonic()
-        with pytest.raises(pytest.fail.Exception, match=BUILD_MISMATCH):
-            daemon.start()
+        _assert_replacement_refuses_old_writer(daemon)
         assert time.monotonic() - started < 30, "mismatch probe did not fail promptly"
         assert spec_path.read_bytes() == original_spec
         assert spec_path.stat().st_ino == spec_inode

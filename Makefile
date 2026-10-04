@@ -8,6 +8,10 @@ AUTOPUSH ?= 0
 RELEASE ?= ./tools/release.py
 XCODEBUILD ?= xcodebuild
 XCODE_PROJECT ?= cengine.xcodeproj
+ifeq ($(CENGINE_STORAGE_LIFECYCLE_QUALIFICATION),lifecycle-v2-native-v1)
+XCODE_DERIVED_DATA ?= $(CURDIR)/.build/lifecycle-v2-native-v1/xcode-derived
+CENGINE_GUEST_OUTPUT ?= $(CURDIR)/.build/lifecycle-v2-native-v1/guest
+endif
 XCODE_DERIVED_DATA ?= .build/xcode-derived
 XCODE_SOURCE_PACKAGES ?= .build/xcode-source-packages
 XCODE_DESTINATION ?= platform=macOS,arch=arm64
@@ -36,7 +40,7 @@ CENGINE_COMPAT_RESET = python3 Scripts/reset-compat-runtime.py --binary "$(XCODE
 
 export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME CENGINE_HOST_OS
 
-.PHONY: all build guest-assets guest-initramfs kernel kernel-build test test-guest test-compat test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system test-compat-doctor test-compat-helper-install test-compat-helper-uninstall dist-cli package release release-list test-release clean help
+.PHONY: all build guest-assets guest-initramfs kernel kernel-build test test-guest test-compat test-compat-images test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system test-compat-doctor test-compat-helper-install test-compat-helper-uninstall dist-cli package release release-list test-release clean help
 
 all: dist-cli
 
@@ -51,6 +55,7 @@ help:
 		'make test          Run the Xcode test suite' \
 		'make test-guest    Run Linux guest service unit tests' \
 		'make test-compat  Reset, rebuild, run Docker compatibility tests, and reset again' \
+		'make test-compat-images  Explicitly download pinned local build image fixtures' \
 		'make test-compat-soak  Run the compatibility suite three times with shuffled ordering' \
 		'make test-compat-oracle  Compare deterministic contracts with DOCKER_REFERENCE_HOST' \
 		'make test-compat-reset  Stop this worktree’s orphaned compatibility VMs and remove temporary roots' \
@@ -89,7 +94,62 @@ kernel-build:
 	./Scripts/build-kernel.sh
 
 test:
+	@python3 tools/tests/test-compat-image-fixtures.py
+	@python3 tools/tests/test-compose-local-fixtures.py
+	@python3 tools/tests/test-sole-storage-startup.py
+	@python3 tools/tests/test-helper-compatibility-policy.py
+	@python3 tools/tests/test-helper-install-preservation.py
+	@python3 tools/tests/test-network-helper-fingerprint.py
+	@python3 tools/tests/test-managed-activation.py
+	@python3 tools/tests/test-storage-lifecycle-qualification.py
+	@python3 tools/tests/test-compat-lifecycle-fault.py
+	@python3 tools/tests/test-storage-lifecycle-policy-boundaries.py
+	@python3 tools/tests/test-storage-lifecycle-v2-runtime.py
+	@python3 tools/tests/test-storage-guest-update.py
+	@python3 tools/tests/test-storage-lifecycle-v2-remount.py
+	@python3 tools/tests/test-guest-asset-provenance.py
+	@python3 tools/tests/test-managed-retained-reader.py
+	@python3 tools/tests/test-managed-root-backing.py
+	@python3 tools/tests/test-managed-original-followup-parent.py
+	@python3 tools/tests/test-managed-takeover-lifecycle-evidence.py
+	@python3 tools/tests/test-managed-original-lifecycle-evidence.py
+	@python3 tools/tests/test-managed-original-lifecycle-caller.py
+	@python3 tools/tests/test-managed-original-lifecycle-peer.py
+	@python3 tools/tests/test-rtm103-failure-diagnostic.py
 	@python3 tools/tests/test-compat-harness.py
+	@python3 tools/tests/test-compat-fixture-outcomes.py
+	@python3 tools/tests/test-helper-fixture-lifetime.py
+	@python3 tools/tests/test-tool-canonical-claims.py
+	@python3 tools/tests/test-compat-default-assets.py
+	@python3 tools/tests/test-isolated-cengine.py
+	@python3 tools/tests/test-managed-prepare-faults.py
+	@python3 tools/tests/test-managed-prepare-early.py
+	@python3 tools/tests/test-managed-prepare-full.py
+	@python3 tools/tests/test-managed-prepare-service.py
+	@python3 tools/tests/test-managed-prepare-lifecycle-evidence.py
+	@python3 tools/tests/test-managed-prepare-worker.py
+	@python3 tools/tests/test-managed-prepare-peer-refresh.py
+	@python3 tools/tests/test-managed-prepare-worker-lifecycle-evidence.py
+	@python3 tools/tests/test-managed-prepare-storage-vm.py
+	@python3 tools/tests/test-managed-prepare-active-ack.py
+	@python3 tools/tests/test-managed-prepare-vm-active-ack.py
+	@python3 tools/tests/test-managed-prepare-vm-exits.py
+	@python3 tools/tests/test-managed-prepare-vm-boundaries.py
+	@python3 tools/tests/test-managed-prepare-vm-parent.py
+	@python3 tools/tests/test-managed-prepare-vm-runner.py
+	@python3 tools/tests/test-managed-prepare-io.py
+	@python3 tools/tests/test-managed-prepare-io-runner.py
+	@python3 tools/tests/test-managed-prepare-restart-matrix.py
+	@python3 tools/tests/test-managed-prepare-matrix.py
+	@python3 tools/tests/test-managed-prepare-two-volume-drain.py
+	@python3 tools/tests/test-managed-prepare-two-volume-parent.py
+	@python3 tools/tests/test-managed-prepare-two-volume-runner.py
+	@python3 tools/tests/test-managed-prepare-two-volume-restart.py
+	@python3 tools/tests/test-managed-prepare-start-diagnostic.py
+	@python3 tools/tests/test-prepare-compatibility-assets.py
+	@python3 tools/tests/test-prepare-early-assets.py
+	@python3 tools/tests/test-prepare-full-assets.py
+	@python3 tools/tests/test-prepare-lifecycle-selection.py
 	$(XCODEBUILD) -project "$(XCODE_PROJECT)" -scheme cengine -configuration Debug -derivedDataPath "$(XCODE_DERIVED_DATA)" $(XCODE_COMMON_FLAGS) $(XCODE_METADATA_FLAGS) -destination '$(XCODE_DESTINATION)' $(XCODE_RESULT_BUNDLE_FLAGS) test
 
 ifeq ($(CENGINE_HOST_OS),Darwin)
@@ -98,6 +158,9 @@ endif
 
 test-guest:
 	./Scripts/test-guest.sh
+
+test-compat-images:
+	@python3 tools/compat_image_fixtures.py prepare python buildkit alpine
 
 test-compat:
 	@$(CENGINE_COMPAT_ENV) Scripts/run-compat-tests.sh suite $(COMPAT_ARGS)
@@ -148,6 +211,7 @@ release:
 	$(RELEASE) "$${args[@]}"
 
 test-release:
+	@python3 tools/tests/test-guest-asset-provenance.py
 	@python3 tools/tests/test-release.py
 	@python3 tools/tests/test-workflows.py
 	@python3 tools/tests/test_guest_build_scripts.py

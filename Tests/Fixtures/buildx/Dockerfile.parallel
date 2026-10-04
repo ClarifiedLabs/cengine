@@ -1,4 +1,5 @@
-FROM mirror.gcr.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS base
+ARG ALPINE_BASE=mirror.gcr.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM ${ALPINE_BASE} AS base
 RUN dd if=/dev/zero of=/payload bs=1M count=64
 
 FROM base AS branch-a

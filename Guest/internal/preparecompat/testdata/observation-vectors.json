@@ -1,0 +1,49 @@
+[
+  {
+    "name": "source-atimes-boundaries",
+    "observation": {
+      "version": 1,
+      "profile": "rtm096-normal-a7-v1",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "29e82325b9f188dc885e5e663150a1ab3661d206f5e243ac3726ce92e70810c9",
+      "stage": "first-child-published",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "copyIntent": "00000004-0000-4000-8000-000000000001",
+      "filesystemUUID": "11111111111111111111111111111111",
+      "manifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifestSize": 100,
+      "root": {
+        "inode": 1,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0100000007000000"
+      },
+      "transaction": {
+        "inode": 2,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0200000007000000"
+      },
+      "published": {
+        "inode": 3,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0300000007000000"
+      },
+      "staged": {
+        "inode": 4,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0400000007000000"
+      },
+      "sourceAtimes": {
+        "root": 0,
+        "a": 17,
+        "z": 9223372036854775807
+      }
+    },
+    "canonical": "{\"armDigest\":\"29e82325b9f188dc885e5e663150a1ab3661d206f5e243ac3726ce92e70810c9\",\"copyIntent\":\"00000004-0000-4000-8000-000000000001\",\"count\":1,\"filesystemUUID\":\"11111111111111111111111111111111\",\"manifestDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"manifestSize\":100,\"profile\":\"rtm096-normal-a7-v1\",\"published\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0300000007000000\",\"inode\":3},\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"root\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"inode\":1},\"sourceAtimes\":{\"a\":17,\"root\":0,\"z\":9223372036854775807},\"stage\":\"first-child-published\",\"staged\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0400000007000000\",\"inode\":4},\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"transaction\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"inode\":2},\"version\":1}",
+    "sha256": "f700a800eb9fe6ffa2666ef0acd036a675f9dc41ee1f0af39c74d973d02fc90b"
+  }
+]

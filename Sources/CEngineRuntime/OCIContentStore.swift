@@ -621,11 +621,17 @@ public actor OCIContentStore {
     }
 
     public func importLayout(_ directory: URL, platforms: [OCIPlatform] = []) throws -> [BackendImage] {
-        let indexData = try readLayoutFile(
-            directory: directory,
-            relativePath: "index.json",
-            maximumBytes: UInt64(transferPolicy.metadataBytes)
-        )
+        let indexData: Data
+        do {
+            indexData = try readLayoutFile(
+                directory: directory,
+                relativePath: "index.json",
+                maximumBytes: UInt64(transferPolicy.metadataBytes),
+                reportMissing: true
+            )
+        } catch LayoutFileError.missing {
+            return try importDockerArchive(directory, platforms: platforms)
+        }
         let layoutIndex = try decoder.decode(OCIIndex.self, from: indexData)
         let archiveURL = directory.appending(path: "manifest.json")
         let archiveEntries = (try? decoder.decode(
@@ -636,7 +642,6 @@ public actor OCIContentStore {
                 maximumBytes: UInt64(transferPolicy.metadataBytes)
             )
         )) ?? []
-        var references = Set<String>()
         var pendingReferences: [(String, OCIDescriptor)] = []
         for descriptor in layoutIndex.manifests {
             let leaves = try layoutLeafDescriptors(in: descriptor, directory: directory)
@@ -680,9 +685,147 @@ public actor OCIContentStore {
             for reference in Set(descriptorReferences) {
                 let normalized = ImageReference.normalized(reference)
                 pendingReferences.append((normalized, descriptor))
-                references.insert(normalized)
             }
         }
+        return try publishImportedReferences(pendingReferences)
+    }
+
+    private func importDockerArchive(_ directory: URL, platforms: [OCIPlatform]) throws -> [BackendImage] {
+        let entries = try decoder.decode([DockerArchiveEntry].self, from: readLayoutFile(
+            directory: directory,
+            relativePath: "manifest.json",
+            maximumBytes: UInt64(transferPolicy.metadataBytes)
+        ))
+        var pendingReferences: [(String, OCIDescriptor)] = []
+        var availablePlatforms: [OCIPlatform] = []
+        var budget = GraphBudget(policy: transferPolicy, errorCode: .badRequest)
+        guard entries.count <= transferPolicy.maximumGraphDescriptors else {
+            throw EngineError(.badRequest, "Docker archive exceeds its entry limit")
+        }
+        let staging = root.appending(path: ".docker-import-\(UUID().uuidString)")
+        guard Darwin.mkdir(staging.path, mode_t(0o700)) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { try? FileManager.default.removeItem(at: staging) }
+        var stagedBlobs: [(OCIDescriptor, URL)] = []
+        // Count repeated source reads too, so duplicate entries cannot amplify import work.
+        var sourceBytes: UInt64 = 0
+        func readSource(_ path: String, maximumBytes: UInt64) throws -> Data {
+            let contents = try readLayoutFile(
+                directory: directory, relativePath: path,
+                maximumBytes: min(maximumBytes, transferPolicy.maximumGraphBytes - sourceBytes)
+            )
+            sourceBytes += UInt64(contents.count)
+            return contents
+        }
+        func stageSource(_ contents: Data, mediaType: String, expectedDigest: String? = nil, depth: Int) throws -> OCIDescriptor {
+            let descriptor = OCIDescriptor(
+                mediaType: mediaType, digest: Self.digest(contents), size: Int64(contents.count)
+            )
+            let inserted = try budget.admit(descriptor, depth: depth)
+            if let expectedDigest, expectedDigest != descriptor.digest {
+                throw EngineError(.badRequest, "content digest mismatch: expected \(expectedDigest), received \(descriptor.digest)")
+            }
+            if inserted {
+                let file = staging.appending(path: String(descriptor.digest.dropFirst(7)))
+                try atomicWrite(contents, to: file)
+                stagedBlobs.append((descriptor, file))
+            }
+            return descriptor
+        }
+        for entry in entries {
+            let configData = try readSource(entry.config, maximumBytes: UInt64(transferPolicy.metadataBytes))
+            let configuration = try decoder.decode(OCIImageConfiguration.self, from: configData)
+            let platform = OCIPlatform(
+                architecture: configuration.architecture, os: configuration.os,
+                variant: configuration.variant, osVersion: configuration.osVersion
+            )
+            guard !configuration.architecture.isEmpty, !configuration.os.isEmpty else {
+                throw EngineError(.badRequest, "Docker archive image platform is empty")
+            }
+            availablePlatforms.append(platform)
+            guard platforms.isEmpty || platforms.contains(where: platform.matches) else { continue }
+            guard configuration.rootfs.type == "layers",
+                  configuration.rootfs.diffIDs.count == entry.layers.count else {
+                throw EngineError(.badRequest, "Docker archive layers do not match the image rootfs")
+            }
+            let config = try stageSource(configData, mediaType: "application/vnd.oci.image.config.v1+json", depth: 1)
+            var layers: [OCIDescriptor] = []
+            for (path, diffID) in zip(entry.layers, configuration.rootfs.diffIDs) {
+                // Docker-save stores uncompressed layer tar streams; their hashes are diff IDs.
+                let contents = try readSource(path, maximumBytes: transferPolicy.maximumBlobBytes)
+                let layer = try stageSource(
+                    contents, mediaType: "application/vnd.oci.image.layer.v1.tar",
+                    expectedDigest: diffID, depth: 1
+                )
+                layers.append(layer)
+            }
+            let manifest = try stageSource(encoder.encode(OCIManifest(
+                schemaVersion: 2, mediaType: Self.manifestMediaTypes[0],
+                config: config, layers: layers, annotations: nil
+            )), mediaType: Self.manifestMediaTypes[0], depth: 0)
+            let tags = entry.repoTags?.filter { !$0.isEmpty } ?? []
+            let references = tags.isEmpty ? [config.digest] : tags.map(ImageReference.normalized)
+            pendingReferences.append(contentsOf: references.map { ($0, manifest) })
+        }
+        for platform in platforms where !availablePlatforms.contains(where: { $0.matches(platform) }) {
+            throw EngineError(.notFound, "image archive has no \(platform.description) manifest")
+        }
+        return try publishDockerArchive(pendingReferences, stagedBlobs: stagedBlobs, staging: staging)
+    }
+
+    private func publishDockerArchive(
+        _ pendingReferences: [(String, OCIDescriptor)],
+        stagedBlobs: [(OCIDescriptor, URL)],
+        staging: URL
+    ) throws -> [BackendImage] {
+        let previousIndex = index
+        var updatedIndex = index
+        for (reference, descriptor) in pendingReferences {
+            updatedIndex.references[reference] = descriptor
+        }
+        let referenceData = try encoder.encode(updatedIndex)
+        guard referenceData.count <= transferPolicy.metadataBytes else {
+            throw EngineError(.internalError, "OCI reference index exceeds its size limit")
+        }
+        let stagedIndex = staging.appending(path: "references.json")
+        try atomicWrite(referenceData, to: stagedIndex)
+
+        // Like reference-index updates, this relies on one writer store per data root.
+        // Store mutations are actor-isolated, and this transaction never suspends.
+        // A pull/import/tag cannot adopt our new blobs before commit or rollback.
+        // Only successful exclusive renames confer ownership; existing (including
+        // shared or unreferenced) blobs are verified but never replaced or removed.
+        var published: [URL] = []
+        do {
+            for (descriptor, source) in stagedBlobs {
+                let destination = try blobURL(for: descriptor.digest)
+                if Darwin.renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 {
+                    published.append(destination)
+                } else if errno == EEXIST {
+                    try verifyBlob(descriptor, errorCode: .internalError)
+                } else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+            index = updatedIndex
+            let references = Set(pendingReferences.map { $0.0 })
+            let imported = try summaries().filter { references.contains($0.reference) }
+            // POSIX rename is the commit point: no throwing work may follow it.
+            // Unlike a multi-step replacement, a failed rename leaves old refs intact.
+            guard Darwin.rename(stagedIndex.path, indexURL.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            return imported
+        } catch {
+            index = previousIndex
+            for destination in published { try? FileManager.default.removeItem(at: destination) }
+            throw error
+        }
+    }
+
+    private func publishImportedReferences(_ pendingReferences: [(String, OCIDescriptor)]) throws -> [BackendImage] {
+        let references = Set(pendingReferences.map { $0.0 })
         let previousIndex = index
         do {
             for (reference, descriptor) in pendingReferences {
@@ -1449,15 +1592,18 @@ public actor OCIContentStore {
         return manifest.subject?.digest
     }
 
+    private enum LayoutFileError: Error { case missing }
+
     private func readLayoutFile(
         directory: URL,
         relativePath: String,
-        maximumBytes: UInt64
+        maximumBytes: UInt64,
+        reportMissing: Bool = false
     ) throws -> Data {
         let components = relativePath.split(
             separator: "/", omittingEmptySubsequences: false
         )
-        guard !components.isEmpty,
+        guard !relativePath.utf8.contains(0), !components.isEmpty,
               components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
             throw EngineError(.badRequest, "OCI layout path is unsafe")
         }
@@ -1486,6 +1632,7 @@ public actor OCIContentStore {
             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
         )
         guard fileDescriptor >= 0 else {
+            if reportMissing && errno == ENOENT { throw LayoutFileError.missing }
             throw EngineError(.badRequest, "OCI layout file is unavailable or unsafe")
         }
         let input = FileHandle(

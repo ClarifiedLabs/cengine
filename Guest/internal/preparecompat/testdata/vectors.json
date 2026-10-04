@@ -1,0 +1,170 @@
+[
+  {
+    "name": "normal",
+    "arm": {
+      "version": 1,
+      "profile": "rtm096-normal-a7-v1",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "normal",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"normal\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-normal-a7-v1\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":1}",
+    "sha256": "29e82325b9f188dc885e5e663150a1ab3661d206f5e243ac3726ce92e70810c9"
+  },
+  {
+    "name": "unicode-escapes",
+    "arm": {
+      "version": 1,
+      "profile": "rtm096-normal-a7-v1",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "first-child-published",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data/é/雪/😀/\"\\\b\f\n\r\t\u0001<&>  ",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"first-child-published\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data/é/雪/😀/\\\"\\\\\\b\\f\\n\\r\\t\\u0001<&>\\u2028\\u2029\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-normal-a7-v1\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":1}",
+    "sha256": "35e6e23a95f70bd88ac47cbbc2cad8c1db430c31b2aee67818f6cef910735bb0"
+  }
+]

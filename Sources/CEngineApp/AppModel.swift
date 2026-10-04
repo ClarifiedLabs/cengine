@@ -96,6 +96,7 @@ extension SMAppService: AppService {}
     private let serviceRegistrationDefaults: UserDefaults
     private let waitForServiceUnregistration: () async throws -> Void
     private let stopVirtualMachinesForUpgrade: () async throws -> Void
+    private let ensureStorageOwner: (_ allowAuthorization: Bool) async throws -> Void
     private var hasAttemptedServiceStartup = false
     // A failed migration remains fenced until an explicit enable/restart retry.
     private var automaticServiceRegistrationAllowed: Bool
@@ -119,6 +120,9 @@ extension SMAppService: AppService {}
         appVersion: String = CEngineVersion.shortVersion(),
         serviceRegistrationRevision: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
         serviceRegistrationDefaults: UserDefaults = .standard,
+        ensureStorageOwner: @escaping (_ allowAuthorization: Bool) async throws -> Void = {
+            try await CEngineServices.ensureStorageOwner(allowAuthorization: $0)
+        },
         waitForServiceUnregistration: @escaping () async throws -> Void = {
             try await Task.sleep(for: .seconds(2))
         },
@@ -145,8 +149,9 @@ extension SMAppService: AppService {}
         self.serviceRegistrationDefaults = serviceRegistrationDefaults
         self.waitForServiceUnregistration = waitForServiceUnregistration
         self.stopVirtualMachinesForUpgrade = stopVirtualMachinesForUpgrade
-        automaticServiceRegistrationAllowed = serviceRegistrationRevision == nil
-            || serviceRegistrationDefaults.string(forKey: Self.serviceRegistrationRevisionKey) == serviceRegistrationRevision
+        self.ensureStorageOwner = ensureStorageOwner
+        // Neither a saved build revision nor activation before start is owner approval.
+        automaticServiceRegistrationAllowed = false
         self.restartRegisteredEngine = restartRegisteredEngine
         engineServiceEnabled = serviceRegistrationDefaults.object(forKey: Self.engineServiceEnabledKey) as? Bool ?? true
         engineServiceState = try? EngineServiceState.load(from: paths.serviceState)
@@ -183,7 +188,7 @@ extension SMAppService: AppService {}
     }
 
     func start() async {
-        guard !hasAttemptedServiceStartup, !isManagingEngineService else { return }
+        guard !hasAttemptedServiceStartup, !isManagingEngineService, !isRefreshing else { return }
         isManagingEngineService = true
         do {
             try await prepareRequiredServices()
@@ -195,7 +200,7 @@ extension SMAppService: AppService {}
         startPolling()
     }
 
-    private func prepareRequiredServices() async throws {
+    private func prepareRequiredServices(allowAuthorization: Bool = false) async throws {
         // Set both fences before the first suspension, including startup invoked
         // by onboarding or Enable before the window's startup task runs.
         hasAttemptedServiceStartup = true
@@ -203,6 +208,11 @@ extension SMAppService: AppService {}
         let registrationChanged = try await unregisterOutdatedServicesIfNeeded()
         if engineServiceEnabled {
             try registerRequiredNetworking()
+            guard helper.status == .enabled else {
+                engineServiceActionStatus = "Approve the Privileged Helper, then choose Enable or Restart to finish storage setup."
+                return
+            }
+            try await ensureStorageOwner(allowAuthorization)
             try registerEngineIfNetworkingIsReady()
         }
         if registrationChanged, let serviceRegistrationRevision {
@@ -235,7 +245,7 @@ extension SMAppService: AppService {}
     }
 
     func completeOnboarding() async {
-        guard !isManagingEngineService else { return }
+        guard !isManagingEngineService, !isRefreshing else { return }
         isManagingEngineService = true
         defer { isManagingEngineService = false }
         serviceRegistrationDefaults.set(true, forKey: AppPreferenceKeys.completedOnboarding)
@@ -243,11 +253,11 @@ extension SMAppService: AppService {}
         showOnboarding = false
         engineServiceEnabled = true
         do {
-            try await prepareRequiredServices()
+            try await prepareRequiredServices(allowAuthorization: true)
             if helper.status == .requiresApproval { openLoginItemsSettings() }
             error = nil
         } catch {
-            self.error = "Could not enable required networking: \(error.localizedDescription)"
+            self.error = "Could not enable the Privileged Helper: \(error.localizedDescription)"
         }
         updateServiceStatus()
     }
@@ -257,15 +267,15 @@ extension SMAppService: AppService {}
     }
 
     func enableEngineService() async {
-        guard !isManagingEngineService else { return }
+        guard !isManagingEngineService, !isRefreshing else { return }
         isManagingEngineService = true
         engineServiceActionStatus = "Enabling…"
         engineServiceEnabled = true
         serviceRegistrationDefaults.set(true, forKey: Self.engineServiceEnabledKey)
         defer { isManagingEngineService = false }
         do {
-            try await prepareRequiredServices()
-            engineServiceActionStatus = helper.status == .enabled ? "Enabled" : "Waiting for networking approval"
+            try await prepareRequiredServices(allowAuthorization: true)
+            engineServiceActionStatus = helper.status == .enabled ? "Enabled" : "Approve the Privileged Helper, then choose Enable or Restart to finish storage setup."
             refreshError = nil
         } catch {
             engineServiceActionStatus = "Could not enable"
@@ -275,7 +285,7 @@ extension SMAppService: AppService {}
     }
 
     func disableEngineService() async {
-        guard !isManagingEngineService else { return }
+        guard !isManagingEngineService, !isRefreshing else { return }
         isManagingEngineService = true
         engineServiceActionStatus = "Disabling…"
         engineServiceEnabled = false
@@ -297,7 +307,7 @@ extension SMAppService: AppService {}
     }
 
     func restartEngineService() async {
-        guard !isManagingEngineService else { return }
+        guard !isManagingEngineService, !isRefreshing else { return }
         guard canRestartEngineService else {
             error = "Enable the cengine engine service before restarting it."
             return
@@ -309,11 +319,17 @@ extension SMAppService: AppService {}
         defer { isManagingEngineService = false }
         do {
             if automaticServiceRegistrationAllowed {
+                automaticServiceRegistrationAllowed = false
+                try await ensureStorageOwner(true)
                 try await restartRegisteredEngine()
+                automaticServiceRegistrationAllowed = true
             } else {
                 // Restart is also the explicit retry for an incomplete upgrade,
                 // even when the old agent has already been unregistered.
-                try await prepareRequiredServices()
+                let wasRegistered = agent.status == .enabled
+                try await prepareRequiredServices(allowAuthorization: true)
+                guard automaticServiceRegistrationAllowed else { return }
+                if wasRegistered { try await restartRegisteredEngine() }
             }
             engineServiceActionStatus = "Restart requested"
             engineStatus = "Starting…"
@@ -374,9 +390,16 @@ extension SMAppService: AppService {}
         isRefreshing = true
         defer { isRefreshing = false }
         do {
-            try registerEngineIfNetworkingIsReady()
+            if engineServiceEnabled, helper.status == .enabled, CEngineServices.needsRegistration(agent.status) {
+                try await ensureStorageOwner(false)
+                // Explicit actions may have run while the check was suspended.
+                guard automaticServiceRegistrationAllowed, !isManagingEngineService else { return }
+                try registerEngineIfNetworkingIsReady()
+            }
         } catch {
+            automaticServiceRegistrationAllowed = false
             self.error = "Could not enable the cengine background service: \(error.localizedDescription)"
+            return
         }
         updateServiceStatus()
         guard agent.status == .enabled else {
@@ -551,7 +574,7 @@ extension SMAppService: AppService {}
     }
 
     func uninstall(deleteData: Bool) async {
-        guard !isManagingEngineService else { return }
+        guard !isManagingEngineService, !isRefreshing else { return }
         guard let package = Bundle.main.url(forResource: "cengine-uninstall", withExtension: "pkg") else {
             error = "The signed cengine uninstaller is missing."
             return

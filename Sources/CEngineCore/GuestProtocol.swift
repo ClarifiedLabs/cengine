@@ -172,6 +172,8 @@ public enum GuestProtocol {
         public var kind: String
         public var source: String
         public var device: String?
+        /// Nonsecret stage-2 metadata; only guest PID1 may populate this field.
+        public var managedAttachment: String?
         public var destination: String
         public var readOnly: Bool
         public var options: [String]
@@ -185,9 +187,10 @@ public enum GuestProtocol {
         public var socketMode: UInt32?
         public var socketUID: UInt32?
         public var socketGID: UInt32?
-        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, propagation: String = "rprivate", nonRecursive: Bool = false, readOnlyNonRecursive: Bool = false, readOnlyForceRecursive: Bool = false, socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil) {
+        public init(kind: String, source: String, device: String? = nil, destination: String, readOnly: Bool, options: [String] = [], subpath: String? = nil, noCopy: Bool = false, propagation: String = "rprivate", nonRecursive: Bool = false, readOnlyNonRecursive: Bool = false, readOnlyForceRecursive: Bool = false, socketPort: UInt32? = nil, socketMode: UInt32? = nil, socketUID: UInt32? = nil, socketGID: UInt32? = nil, managedAttachment: String? = nil) {
             self.kind = kind; self.source = source; self.device = device; self.destination = destination; self.readOnly = readOnly; self.options = options; self.subpath = subpath; self.noCopy = noCopy
             self.socketPort = socketPort; self.socketMode = socketMode; self.socketUID = socketUID; self.socketGID = socketGID
+            self.managedAttachment = managedAttachment
             self.propagation = propagation
             self.nonRecursive = nonRecursive
             self.readOnlyNonRecursive = readOnlyNonRecursive

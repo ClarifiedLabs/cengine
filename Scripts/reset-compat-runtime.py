@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT / "Tests" / "Compatibility"))
 from harness import (  # noqa: E402
     compatibility_registered_executables,
     compatibility_root_owned_by,
+    remove_compatibility_root,
     compatibility_runtime_processes,
     terminate_compatibility_runtime,
 )
@@ -64,8 +65,10 @@ def main() -> None:
     removed = 0
     for directory in owned_roots:
         if directory.is_dir() and compatibility_root_owned_by(directory, binary):
-            shutil.rmtree(directory)
-            removed += 1
+            if remove_compatibility_root(directory, binary):
+                removed += 1
+            else:
+                print(f"retained compatibility root requires explicit investigation: {directory}", file=sys.stderr)
 
     if args.system_networking:
         production_service = f"gui/{os.getuid()}/dev.cengine.engine"
@@ -106,7 +109,7 @@ def main() -> None:
     ]
     if remaining_processes or remaining_roots:
         for process in remaining_processes:
-            print(f"compatibility runtime still running: {process.pid} {process.command}", file=sys.stderr)
+            print(f"compatibility runtime still running: PID {process.pid}", file=sys.stderr)
         for directory in remaining_roots:
             print(f"compatibility root still present: {directory}", file=sys.stderr)
         raise SystemExit("compatibility runtime reset did not reach a clean state")

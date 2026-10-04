@@ -1,0 +1,119 @@
+package reader
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestReaderChild(t *testing.T) {
+	mode := os.Getenv("CENGINE_TEST_READER")
+	if mode == "" {
+		return
+	}
+	if mode == "bad-ready" {
+		os.Stdout.WriteString("{}\n")
+		os.Exit(0)
+	}
+	os.Stdout.WriteString("{\"ready\":true}\n")
+	token := make([]byte, 1)
+	if _, err := io.ReadFull(os.Stdin, token); err != nil || token[0] != 1 {
+		os.Exit(9)
+	}
+	switch mode {
+	case "oversize":
+		os.Stdout.WriteString(strings.Repeat("x", 120001))
+	case "malformed":
+		os.Stdout.WriteString("not-json\n")
+	case "two-values":
+		os.Stdout.WriteString("{}\n{}\n")
+	default:
+		os.Stdout.WriteString("{\"actual\":true}\n")
+	}
+	if mode == "close-before-nonzero" {
+		os.Stdout.Close()
+		time.Sleep(50 * time.Millisecond)
+		os.Exit(7)
+	}
+	if mode == "signal" {
+		self, _ := os.FindProcess(os.Getpid())
+		self.Kill()
+		os.Exit(9)
+	}
+	if mode == "nonzero" {
+		os.Exit(137)
+	}
+	os.Exit(0)
+}
+
+type readyWriter struct {
+	bytes.Buffer
+	child *exec.Cmd
+	input io.WriteCloser
+	ready bool
+	t     *testing.T
+}
+
+func (w *readyWriter) Write(raw []byte) (int, error) {
+	if !w.ready {
+		var value struct {
+			Ready     bool
+			ReaderPID int
+		}
+		if err := json.Unmarshal(raw, &value); err != nil || !value.Ready || value.ReaderPID != w.child.Process.Pid {
+			w.t.Fatal("readiness did not name actual started child", err)
+		}
+		w.ready = true
+		if _, err := w.input.Write([]byte{1}); err != nil {
+			w.t.Fatal(err)
+		}
+		w.input.Close()
+	} else if w.child.ProcessState == nil || !w.child.ProcessState.Exited() || !w.child.ProcessState.Success() {
+		w.t.Fatal("result emitted before successful actual Wait")
+	}
+	return w.Buffer.Write(raw)
+}
+
+func TestReaderSupervisor(t *testing.T) {
+	for _, mode := range []string{"success", "bad-ready", "nonzero", "signal", "close-before-nonzero", "oversize", "malformed", "two-values"} {
+		t.Run(mode, func(t *testing.T) {
+			child := exec.Command(os.Args[0], "-test.run=^TestReaderChild$")
+			child.Env = append(os.Environ(), "CENGINE_TEST_READER="+mode)
+			input, err := child.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer input.Close()
+			output := &readyWriter{child: child, input: input, t: t}
+			err = superviseReader(child, output)
+			if child.ProcessState == nil {
+				t.Fatal("lost child without Wait")
+			}
+			if mode != "success" {
+				if err == nil || bytes.Contains(output.Bytes(), []byte("\"snapshot\"")) {
+					t.Fatal("failed child acknowledged", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte{'\n'})
+			if len(lines) != 2 {
+				t.Fatal("unexpected output", output.String())
+			}
+			var result struct {
+				Version, ReaderPID, ExitCode int
+				Snapshot                     map[string]bool
+			}
+			if err := json.Unmarshal(lines[1], &result); err != nil || result.Version != 1 || result.ReaderPID != child.Process.Pid || result.ExitCode != 0 || !result.Snapshot["actual"] {
+				t.Fatal("invalid joined child result", err)
+			}
+		})
+	}
+}

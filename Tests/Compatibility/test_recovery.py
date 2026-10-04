@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import pathlib
 import signal
 import subprocess
 import threading
@@ -12,6 +14,8 @@ import uuid
 import docker
 import pytest
 from docker.types import Mount
+
+from harness import _signal_runtime_process, compatibility_runtime_processes
 
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
@@ -196,19 +200,94 @@ def test_daemon_restart_honors_manually_stopped_restart_policies(
         recovered.close()
 
 
+@pytest.mark.compat("RTM-106")
+def test_kill_cancellation_survives_daemon_crash_before_exit(daemon):
+    # One compatibility ID owns both policy controls (the catalog forbids
+    # parametrizing one ID into multiple pytest items).
+    for policy in ("unless-stopped", "always"):
+        client = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+        try:
+            _kill_cancellation_crash(daemon, client, policy)
+        finally:
+            client.close()
+
+
+def _kill_cancellation_crash(daemon, client, policy):
+    """Persist manual-stop intent while PID 1 is still handling the stop signal.
+
+    Crash the API before the workload disappears: recovery must distinguish
+    unless-stopped from always using the pre-exit checkpoint, not a saved exit.
+    """
+    container = client.containers.create(
+        IMAGE,
+        command=["sh", "-c", "trap 'touch /tmp/term-seen' TERM; touch /tmp/ready; "
+                 "while :; do sleep 1; done"],
+        name=f"kill-checkpoint-{uuid.uuid4().hex[:8]}",
+        restart_policy={"Name": policy},
+    )
+    container.start()
+    deadline = time.monotonic() + 15
+    while container.exec_run(["test", "-f", "/tmp/ready"]).exit_code != 0:
+        assert time.monotonic() < deadline, "PID 1 did not install its trap"
+        time.sleep(0.1)
+    container.kill(signal="SIGTERM")
+    while container.exec_run(["test", "-f", "/tmp/term-seen"]).exit_code != 0:
+        assert time.monotonic() < deadline, "PID 1 did not handle the delivered stop signal"
+        time.sleep(0.1)
+    container.reload()
+    assert container.status == "running" and container.attrs["RestartCount"] == 0
+    saved = json.loads((daemon.root / "engine.json").read_text())["value"]
+    record = next(row for row in saved["containers"] if row["id"] == container.id)
+    assert record["phase"] == "running", "must crash before any observed exit"
+    assert saved["manuallyStoppedContainerInstances"][container.id] == record["instanceID"]
+
+    # Only the exact owned workload shim may be terminated. The infrastructure
+    # VM and unrelated runtimes are not part of this fault.
+    directory = (daemon.root / "containers" / container.id).resolve()
+    workloads = [process for process in compatibility_runtime_processes(daemon.binary, roots=(daemon.root,))
+                 if len(process.arguments) >= 4 and process.arguments[1:3] == ("vm-shim", "--spec")
+                 and pathlib.Path(process.arguments[3]).resolve().is_relative_to(directory)]
+    assert len(workloads) == 1, "one positively owned workload incarnation required"
+    daemon.stop(kill=True)
+    _signal_runtime_process(workloads[0], signal.SIGKILL)
+    deadline = time.monotonic() + 15
+    while workloads[0] in compatibility_runtime_processes(daemon.binary, roots=(daemon.root,)):
+        assert time.monotonic() < deadline, "owned workload did not exit"
+        time.sleep(0.1)
+    daemon.start()
+    recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")
+    try:
+        current = recovered.containers.get(container.id)
+        assert current.status == ("running" if policy == "always" else "exited"), current.attrs["State"]
+        if policy == "unless-stopped":
+            current.start()
+        saved = json.loads((daemon.root / "engine.json").read_text())["value"]
+        assert container.id not in (saved.get("manuallyStoppedContainerInstances") or {})
+        current.remove(force=True)
+        saved = json.loads((daemon.root / "engine.json").read_text())["value"]
+        assert container.id not in (saved.get("manuallyStoppedContainerInstances") or {})
+    finally:
+        recovered.close()
+
+
 @pytest.mark.compat("REC-005")
 def test_vmnet_reservation_is_released_when_infrastructure_shim_exits(
     daemon, client: docker.DockerClient
 ):
     suffix = uuid.uuid4().hex[:8]
     network = client.networks.create(f"compat-vmnet-owner-{suffix}")
-    pattern = str(daemon.root / "infrastructure" / "shim.json")
-    result = subprocess.run(
-        ["pgrep", "-f", pattern], text=True, stdout=subprocess.PIPE, check=True
-    )
-    shim_pids = [int(value) for value in result.stdout.split()]
-    assert len(shim_pids) == 1
-    os.kill(shim_pids[0], signal.SIGKILL)
+    # The infrastructure VM launches from an immutable generation directory
+    # beneath infrastructure/ (not the legacy infrastructure/shim.json spelling),
+    # so select it from the owned census by resolved spec location rather than
+    # a textual pgrep pattern, and signal its exact incarnation.
+    infrastructure = (daemon.root / "infrastructure").resolve()
+    shims = [
+        process for process in compatibility_runtime_processes(daemon.binary, roots=(daemon.root,))
+        if len(process.arguments) >= 4 and process.arguments[1:3] == ("vm-shim", "--spec")
+        and pathlib.Path(process.arguments[3]).resolve().is_relative_to(infrastructure)
+    ]
+    assert len(shims) == 1, [(process.pid, process.arguments[:4]) for process in shims]
+    _signal_runtime_process(shims[0], signal.SIGKILL)
 
     daemon.restart(kill=True)
     recovered = docker.DockerClient(base_url=f"unix://{daemon.socket}", timeout=60, version="auto")

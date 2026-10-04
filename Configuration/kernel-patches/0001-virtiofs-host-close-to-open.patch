@@ -1,0 +1,196 @@
+From: cengine maintainers
+Subject: [PATCH] virtiofs: opt in to host-bind close-to-open revalidation
+
+Based on Linux 6.18.44, commit 1efe5d048a391de3ead2804b2e7f86376c356cc5.
+Downstream cengine change; not an upstream Linux backport.
+SPDX-License-Identifier: GPL-2.0-only
+
+Force attributes and buffered data fresh before regular-file open completes.
+Scope the stronger policy to explicit virtiofs mounts and decline writeback
+at INIT, preserving normal FUSE and buffered read/splice/mmap paths.
+No guarantee is made for ongoing access through already-open descriptors.
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 1bc6982b5..aa613d4b8 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1390,6 +1390,13 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
+ 	return err;
+ }
+ 
++/* Do not rely on invalidation bits: another GETATTR can clear them. */
++int fuse_revalidate_file(struct inode *inode, struct file *file)
++{
++	return fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL,
++				    FUSE_STATX_MODSIZE, AT_STATX_FORCE_SYNC);
++}
++
+ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
+ {
+ 	return fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL, mask, 0);
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 585dd9036..6796ae8c3 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -215,6 +215,35 @@ int fuse_finish_open(struct inode *inode, struct file *file)
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	int err;
+ 
++	if (fc->host_close_to_open && S_ISREG(inode->i_mode)) {
++		bool truncated = (file->f_flags & O_TRUNC) && fc->atomic_o_trunc;
++
++		/* Preserve guest mmap writes before discarding cached data. An
++		 * atomic O_TRUNC already discarded the server data: do not revive it.
++		 */
++		if (!truncated) {
++			err = filemap_write_and_wait(inode->i_mapping);
++			if (err)
++				return err;
++		} else {
++			/* Server truncation must survive even a failed GETATTR. */
++			truncate_setsize(inode, 0);
++			fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
++		}
++		err = fuse_revalidate_file(inode, file);
++		if (err)
++			return err;
++		/* Invalidate even KEEP_CACHE and same-size/same-timestamp rewrites.
++		 * Existing descriptors/mappings are not continuously coherent.
++		 * Callers release the opened FUSE handle on any failure here.
++		 */
++		if (!truncated) {
++			err = invalidate_inode_pages2(inode->i_mapping);
++			if (err)
++				return err;
++		}
++	}
++
+ 	err = fuse_file_io_open(file, inode);
+ 	if (err)
+ 		return err;
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index c288f28f6..b89e64c03 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -604,6 +604,7 @@ struct fuse_fs_context {
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+ 	bool legacy_opts_show:1;
++	bool host_close_to_open:1;
+ 	enum fuse_dax_mode dax_mode;
+ 	unsigned int max_read;
+ 	unsigned int blksize;
+@@ -905,6 +906,9 @@ struct fuse_conn {
+ 	/* Is link not implemented by fs? */
+ 	unsigned int no_link:1;
+ 
++	/* Opt-in virtiofs host-bind reopen revalidation (no writeback cache). */
++	unsigned int host_close_to_open:1;
++
+ 	/* Is synchronous FUSE_INIT allowed? */
+ 	unsigned int sync_init:1;
+ 
+@@ -1384,6 +1388,7 @@ void fuse_flush_time_update(struct inode *inode);
+ void fuse_update_ctime(struct inode *inode);
+ 
+ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask);
++int fuse_revalidate_file(struct inode *inode, struct file *file);
+ 
+ void fuse_flush_writepages(struct inode *inode);
+ 
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index e9ed693fc..330a1288f 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1369,7 +1369,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 			}
+ 			if (flags & FUSE_ASYNC_DIO)
+ 				fc->async_dio = 1;
+-			if (flags & FUSE_WRITEBACK_CACHE)
++			if ((flags & FUSE_WRITEBACK_CACHE) && !fc->host_close_to_open)
+ 				fc->writeback_cache = 1;
+ 			if (flags & FUSE_PARALLEL_DIROPS)
+ 				fc->parallel_dirops = 1;
+@@ -1522,6 +1522,10 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+ 	if (fuse_uring_enabled())
+ 		flags |= FUSE_OVER_IO_URING;
+ 
++	/* Host changes must remain authoritative for size and modification times. */
++	if (fm->fc->host_close_to_open)
++		flags &= ~FUSE_WRITEBACK_CACHE;
++
+ 	ia->in.flags = flags;
+ 	ia->in.flags2 = flags >> 32;
+ 
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index b2f6486fe..218aa844c 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -110,9 +110,11 @@ static const struct constant_table dax_param_enums[] = {
+ enum {
+ 	OPT_DAX,
+ 	OPT_DAX_ENUM,
++	OPT_HOST_CLOSE_TO_OPEN,
+ };
+ 
+ static const struct fs_parameter_spec virtio_fs_parameters[] = {
++	fsparam_flag("host_close_to_open", OPT_HOST_CLOSE_TO_OPEN),
+ 	fsparam_flag("dax", OPT_DAX),
+ 	fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
+ 	{}
+@@ -130,6 +132,9 @@ static int virtio_fs_parse_param(struct fs_context *fsc,
+ 		return opt;
+ 
+ 	switch (opt) {
++	case OPT_HOST_CLOSE_TO_OPEN:
++		ctx->host_close_to_open = true;
++		break;
+ 	case OPT_DAX:
+ 		ctx->dax_mode = FUSE_DAX_ALWAYS;
+ 		break;
+@@ -1659,6 +1664,7 @@ static int virtio_fs_test_super(struct super_block *sb,
+ 
+ static int virtio_fs_get_tree(struct fs_context *fsc)
+ {
++	struct fuse_fs_context *ctx = fsc->fs_private;
+ 	struct virtio_fs *fs;
+ 	struct super_block *sb;
+ 	struct fuse_conn *fc = NULL;
+@@ -1669,6 +1675,14 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+ 	if (!fsc->source)
+ 		return invalf(fsc, "No source specified");
+ 
++	/* This policy manages the page cache, not DAX mappings. */
++	if (ctx->host_close_to_open) {
++		if (ctx->dax_mode != FUSE_DAX_INODE_DEFAULT &&
++		    ctx->dax_mode != FUSE_DAX_NEVER)
++			return invalf(fsc, "host_close_to_open is incompatible with dax");
++		ctx->dax_mode = FUSE_DAX_NEVER;
++	}
++
+ 	/* This gets a reference on virtio_fs object. This ptr gets installed
+ 	 * in fc->iq->priv. Once fuse_conn is going away, it calls ->put()
+ 	 * to drop the reference to this object.
+@@ -1698,6 +1712,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+ 	fc->auto_submounts = true;
+ 	fc->sync_fs = true;
+ 	fc->use_pages_for_kvec_io = true;
++	fc->host_close_to_open = ctx->host_close_to_open;
+ 
+ 	/* Tell FUSE to split requests that exceed the virtqueue's size */
+ 	fc->max_pages_limit = min_t(unsigned int, fc->max_pages_limit,
+@@ -1710,6 +1725,14 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+ 	if (IS_ERR(sb))
+ 		return PTR_ERR(sb);
+ 
++	/* A tag shares one connection: never silently reuse another policy. */
++	if (sb->s_root &&
++	    get_fuse_mount_super(sb)->fc->host_close_to_open !=
++	    ctx->host_close_to_open) {
++		deactivate_locked_super(sb);
++		return invalf(fsc, "conflicting host_close_to_open policy for tag");
++	}
++
+ 	if (!sb->s_root) {
+ 		err = virtio_fs_fill_super(sb, fsc);
+ 		if (err) {

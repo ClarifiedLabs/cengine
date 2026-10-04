@@ -282,6 +282,13 @@ func TestRecoverConfinedCopyTransactionRollsBackMatchingEntriesAndPreservesRepla
 	defer destination.close()
 	publishStaleConfinedCopyTransaction(t, source, destination)
 
+	// Keep the original inode alive so this tests a genuine replacement, not
+	// ambiguous inode reuse with a different handle generation.
+	original, err := os.Open(filepath.Join(destinationPath, "replaced"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer original.Close()
 	if err := os.Remove(filepath.Join(destinationPath, "replaced")); err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +367,12 @@ func publishStaleConfinedCopyTransaction(
 	destination *confinedRoot,
 ) {
 	t.Helper()
+	stageConfinedCopyTransaction(t, source, destination, "published")
+}
+
+// Build real journal states at interruption boundaries without production hooks.
+func stageConfinedCopyTransaction(t *testing.T, source, destination *confinedRoot, boundary string) {
+	t.Helper()
 	if err := unix.Mkdirat(destination.fd, confinedCopyTransactionName, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -398,6 +411,15 @@ func publishStaleConfinedCopyTransaction(
 	if err := writeConfinedCopyManifest(transactionFD, state.created, &metadata); err != nil {
 		t.Fatal(err)
 	}
+	if boundary == "manifest" {
+		return
+	}
+	if boundary == "temporary-manifest" {
+		if err := unix.Renameat(transactionFD, confinedCopyManifestName, transactionFD, confinedCopyManifestTemporary); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	entries, err := readConfinedDirectory(stagingFD)
 	if err != nil {
 		t.Fatal(err)
@@ -407,6 +429,9 @@ func publishStaleConfinedCopyTransaction(
 			stagingFD, entry.Name(), destination.fd, entry.Name(), unix.RENAME_NOREPLACE,
 		); err != nil {
 			t.Fatal(err)
+		}
+		if boundary == "first-entry" {
+			break
 		}
 	}
 	if err := syncConfinedDirectory(destination.fd); err != nil {

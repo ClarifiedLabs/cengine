@@ -53,11 +53,15 @@ private final class ChunkFailurePersistence: @unchecked Sendable {
 
     private let lock = NSLock()
     private let bridge: ContainerIOBridge
-    private let failureObserved = DispatchSemaphore(value: 0)
+    private let failureObserved: AsyncStream<Void>
+    private let failureContinuation: AsyncStream<Void>.Continuation
     private var stdoutAttempts: [Data] = []
     private var failed = false
 
-    init(bridge: ContainerIOBridge) { self.bridge = bridge }
+    init(bridge: ContainerIOBridge) {
+        self.bridge = bridge
+        (failureObserved, failureContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    }
 
     func write(_ data: Data, stream: ContainerIOBridge.OutputStream) throws {
         if stream == .stdout {
@@ -68,15 +72,19 @@ private final class ChunkFailurePersistence: @unchecked Sendable {
                 return true
             }
             if shouldFail {
-                failureObserved.signal()
+                failureContinuation.yield(())
+                failureContinuation.finish()
                 throw InjectedFailure.selectedChunk
             }
         }
         try bridge.writer(stream).write(data)
     }
 
-    func waitForFailure() -> Bool {
-        failureObserved.wait(timeout: .now() + .seconds(2)) == .success
+    func waitForFailure() async -> Bool {
+        // Suspend rather than blocking the cooperative executor that runs the
+        // monitor. Notification is buffered if the failure happened first.
+        for await _ in failureObserved { return true }
+        return false
     }
 
     var attempts: [Data] { lock.withLock { stdoutAttempts } }
@@ -289,18 +297,12 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let source = root.appending(path: "source", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
-        for name in GuestAssetInstaller.names {
-            try Data("new \(name)".utf8).write(to: source.appending(path: name))
-        }
+        try GuestAssetTestFixture.write(to: source, prefix: "new")
         let paths = EnginePaths(home: root.appending(path: "home", directoryHint: .isDirectory))
         #expect(GuestAssetInstaller.needsInstall(paths: paths, source: source))
 
         let assets = paths.kernel.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
-        for name in GuestAssetInstaller.names {
-            try Data("stale \(name)".utf8).write(to: assets.appending(path: name))
-        }
+        try GuestAssetTestFixture.write(to: assets, prefix: "stale")
         #expect(GuestAssetInstaller.isInstalled(paths: paths))
         #expect(GuestAssetInstaller.needsInstall(paths: paths, source: source))
 
@@ -313,11 +315,10 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let source = root.appending(path: "source", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try GuestAssetTestFixture.write(to: source, prefix: "asset")
         var manifest = ""
         for name in GuestAssetInstaller.names {
-            let data = Data("asset \(name)".utf8)
-            try data.write(to: source.appending(path: name))
+            let data = try Data(contentsOf: source.appending(path: name))
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             manifest += "\(digest)  \(name)\n"
         }
@@ -521,7 +522,7 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(received == [Data("stdin".utf8)])
     }
 
-    @Test func containerLogMonitorSynchronizesInputBeforePublishingEOF() throws {
+    @Test func containerLogMonitorSynchronizesInputBeforePublishingEOF() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -547,7 +548,9 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         let payload = Data("durable-before-eof".utf8)
         bridge.sendInput(payload)
 
-        try bridge.finishInput()
+        // EOF waits for the detached input consumer; do not block its executor.
+        let inputFinish = PeerFixtureWorker { try bridge.finishInput() }
+        try await inputFinish.value()
         try monitor.stop(finishOutput: false)
 
         #expect(probe.observedEvents == ["synchronize", "marker"])
@@ -555,7 +558,7 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(try Data(contentsOf: inputURL) == payload)
     }
 
-    @Test func containerLogMonitorPropagatesMarkerCreationFailure() throws {
+    @Test func containerLogMonitorPropagatesMarkerCreationFailure() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -588,10 +591,15 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         let payload = Data("input-before-marker-failure".utf8)
         bridge.sendInput(payload)
 
-        #expect(throws: POSIXError.self) { try bridge.finishInput() }
+        // Join blocking EOF on native workers, then assert in the test's scope.
+        let inputFinish = PeerFixtureWorker { Result { try bridge.finishInput() } }
+        let inputFinishResult = try await inputFinish.value()
+        #expect(throws: POSIXError.self) { try inputFinishResult.get() }
         // The terminal failure is retained: callers cannot observe a later
         // false success, and the failed marker is not retried out of order.
-        #expect(throws: POSIXError.self) { try bridge.finishInput() }
+        let repeatedFinish = PeerFixtureWorker { Result { try bridge.finishInput() } }
+        let repeatedFinishResult = try await repeatedFinish.value()
+        #expect(throws: POSIXError.self) { try repeatedFinishResult.get() }
         try monitor.stop(finishOutput: false)
 
         #expect(probe.observedEvents == ["marker"])
@@ -989,7 +997,8 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(execPersistence.data(for: .stderr) == execStderr)
     }
 
-    @Test func recoveredMonitorChunksBacklogAndRetriesOnlyFailedChunk() throws {
+    @Test(.timeLimit(.minutes(1)))
+    func recoveredMonitorChunksBacklogAndRetriesOnlyFailedChunk() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1031,7 +1040,7 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
             maximumOutputChunkSize: 4
         )
         recoveredMonitor.start(atEnd: true)
-        #expect(persistence.waitForFailure())
+        #expect(await persistence.waitForFailure())
         // The poll that observed the injected failure retained the second
         // chunk's offset. The final drain retries it, then commits the tail.
         try recoveredMonitor.stop(finishOutput: false)
@@ -1148,7 +1157,8 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         try monitor.drain(stream: .stdout)
         let input = Data("held-input".utf8)
         bridge.sendInput(input)
-        try bridge.finishInput()
+        let inputFinish = PeerFixtureWorker { try bridge.finishInput() }
+        try await inputFinish.value()
         for _ in 0..<100 {
             try stdinReader.seek(toOffset: 0)
             if try stdinReader.readToEnd() == input { break }
@@ -1164,7 +1174,8 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
         #expect(try Data(contentsOf: inputSentinel) == inputSentinelData)
     }
 
-    @Test func containerAndExecMonitorCancellationDoesNotCloseRecoveredInput() async throws {
+    @Test(.timeLimit(.minutes(1)))
+    func containerAndExecMonitorCancellationDoesNotCloseRecoveredInput() async throws {
         for prefix in ["", "exec-123-"] {
             let root = FileManager.default.temporaryDirectory.appending(
                 path: UUID().uuidString
@@ -1198,21 +1209,46 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
 
             let originalBridge = ContainerIOBridge(tty: true)
             let originalMonitor = try monitor(for: originalBridge)
+            defer { try? originalMonitor.stop(finishOutput: false) }
             originalMonitor.start()
-            originalBridge.sendInput(Data("before-".utf8))
-            for _ in 0..<100 {
-                if try Data(contentsOf: input) == Data("before-".utf8) { break }
-                try await Task.sleep(for: .milliseconds(5))
+            let firstInput = Data("before-".utf8)
+            // Observe delivery, not a scheduling deadline: a loaded full suite
+            // may not run the detached consumer within three seconds. Arm the
+            // vnode source before sending so even an immediate write is observed.
+            // The test-level time limit remains a watchdog for a stuck consumer.
+            let inputObserver = try FileHandle(forReadingFrom: input)
+            let writes = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: inputObserver.fileDescriptor,
+                eventMask: .write,
+                queue: .global()
+            )
+            let (notifications, notification) = AsyncStream<Void>.makeStream()
+            writes.setRegistrationHandler { notification.yield(()) }
+            writes.setEventHandler { notification.yield(()) }
+            writes.setCancelHandler {
+                try? inputObserver.close()
+                notification.finish()
             }
+            writes.activate()
+            defer { writes.cancel() }
+            var delivery = notifications.makeAsyncIterator()
+            try #require(await delivery.next() != nil, "input observer was not armed")
+            originalBridge.sendInput(firstInput)
+            while try Data(contentsOf: input) != firstInput {
+                try #require(await delivery.next() != nil, "input observation cancelled before delivery")
+            }
+            writes.cancel()
             try originalMonitor.stop(finishOutput: false)
             try await Task.sleep(for: .milliseconds(50))
             #expect(!FileManager.default.fileExists(atPath: closed.path))
 
             let recoveredBridge = ContainerIOBridge(tty: true)
             let recoveredMonitor = try monitor(for: recoveredBridge)
+            defer { try? recoveredMonitor.stop(finishOutput: false) }
             recoveredMonitor.start(atEnd: true)
             recoveredBridge.sendInput(Data("after".utf8))
-            try recoveredBridge.finishInput()
+            let inputFinish = PeerFixtureWorker { try recoveredBridge.finishInput() }
+            try await inputFinish.value()
             // Explicit EOF must synchronously drain prior input and publish the
             // marker before an immediately following backend shutdown cancels
             // the monitor task.
@@ -1867,6 +1903,36 @@ private final class AtomicStoreTargetSwapper: @unchecked Sendable {
             #expect(error.message.contains("missing required field 'name' at value"))
         } catch {
             Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test(arguments: ["paths", "backend", "runtime"], [false, true])
+    func dataRootCreationIsPrivateAndPreservesExistingMetadata(creator: String, existing: Bool) throws {
+        let parent = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let paths = EnginePaths(home: parent)
+        let root = creator == "paths" ? paths.data : parent.appending(path: "custom-store")
+        var before = stat()
+        if existing {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            #expect(chmod(root.path, 0o755) == 0)
+            #expect(lstat(root.path, &before) == 0)
+        }
+
+        switch creator {
+        case "paths": try paths.createDirectories()
+        case "runtime": _ = try EngineRuntime.canonicalDataRoot(root)
+        default: _ = try RawVirtualizationBackend.canonicalDataRoot(root)
+        }
+        var after = stat()
+        #expect(lstat(root.path, &after) == 0)
+        #expect(after.st_mode & 0o7777 == (existing ? 0o755 : 0o700))
+        if existing {
+            #expect(after.st_ino == before.st_ino)
+            #expect(after.st_uid == before.st_uid)
+            #expect(after.st_gid == before.st_gid)
+            #expect(after.st_ctimespec.tv_sec == before.st_ctimespec.tv_sec)
+            #expect(after.st_ctimespec.tv_nsec == before.st_ctimespec.tv_nsec)
         }
     }
 

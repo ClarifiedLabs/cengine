@@ -146,6 +146,46 @@ def test_kill_container(top):
     assert top.status in ("stopped", "exited")
 
 
+@pytest.mark.compat("CTR-049")
+def test_kill_cancels_restart_policy_until_next_start(client: docker.DockerClient):
+    """docker kill is a manual stop: moby's killWithSignal calls ExitOnNext, so the
+    restart policy skips that exit and resumes only after the next start."""
+    # busybox sh execs a lone command, which would make sleep PID 1; a PID 1
+    # ignores signals sent from inside its own PID namespace (Linux kernel
+    # rule, identical under Docker), so keep sh as PID 1 with sleep as its child.
+    container = client.containers.create(
+        IMAGE, command=["sh", "-c", "sleep 3600; exit 7"], name=f"kill-policy-{uuid.uuid4().hex[:8]}",
+        restart_policy={"Name": "always"},
+    )
+    try:
+        container.start()
+        container.kill()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            container.reload()
+            assert container.attrs["RestartCount"] == 0, container.attrs["State"]
+            time.sleep(0.25)
+        assert container.status == "exited", container.attrs["State"]
+        assert container.attrs["State"]["ExitCode"] == 137
+
+        container.start()
+        container.reload()
+        assert container.status == "running"
+        # A natural exit (sh leaves with 7 once its child dies) after the fresh
+        # start is restarted by the policy again.
+        code, output = container.exec_run(["sh", "-c", "kill -9 $(pidof sleep)"])
+        assert code == 0, output
+        deadline = time.monotonic() + 30
+        while True:
+            container.reload()
+            if container.attrs["RestartCount"] == 1 and container.status == "running":
+                break
+            assert time.monotonic() < deadline, container.attrs["State"]
+            time.sleep(0.25)
+    finally:
+        container.remove(force=True)
+
+
 @pytest.mark.compat("CTR-007")
 def test_restart_container(top):
     top.stop(); top.restart(); top.reload()

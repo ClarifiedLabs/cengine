@@ -1,0 +1,17 @@
+services:
+  dependency:
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    command: ["sleep", "infinity"]
+    labels:
+      dev.cengine.compat.dependency: ${CENGINE_CMP_DEPENDENCY_LABEL:?test-owned label required}
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+  app:
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    command: ["sleep", "infinity"]
+    depends_on:
+      dependency:
+        condition: service_healthy

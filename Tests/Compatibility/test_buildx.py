@@ -38,6 +38,18 @@ def buildx(*arguments: str, docker_host: str, timeout: int = 300) -> subprocess.
     return result
 
 
+def local_alpine_context(daemon) -> str:
+    import compat_image_fixtures
+    layout = daemon.local_images["alpine"]
+    manifest = compat_image_fixtures.manifest_digest("alpine")
+    return f"oci-layout://{layout}@{manifest}"
+
+
+def local_build_arguments(daemon) -> tuple[str, ...]:
+    return ("--network=none", "--build-arg", "ALPINE_BASE=alpine-base",
+            "--build-context", f"alpine-base={local_alpine_context(daemon)}")
+
+
 def managed_buildkit_resources(client: docker.DockerClient) -> tuple[str, str]:
     container = client.containers.get(f"buildx_buildkit_{MANAGED_BUILDER}0")
     volumes = [
@@ -52,10 +64,10 @@ def restart_compatibility_network_helper() -> None:
     binary = os.environ.get("CENGINE_BINARY")
     assert binary, "CENGINE_BINARY is required to restart the compatibility helper"
     result = subprocess.run(
-        [binary, "network-helper", "restart"], env=compatibility_environment(), text=True,
+        [binary, "helper", "restart"], env=compatibility_environment(), text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
     )
-    assert result.returncode == 0, f"could not restart compatibility networking helper:\n{result.stdout}"
+    assert result.returncode == 0, f"could not restart compatibility Privileged Helper:\n{result.stdout}"
     status = json.loads(result.stdout)
     assert status["serviceName"] == "dev.cengine.network-helper.test-compat"
     assert status["buildFingerprint"] == os.environ["CENGINE_COMPAT_NETWORK_HELPER_FINGERPRINT"]
@@ -115,7 +127,7 @@ def test_managed_docker_context_and_default_builder(
         first_container, first_volume = managed_buildkit_resources(client)
         build = managed.run(
             "--context", "cengine", "buildx", "build", "--load", "--tag", tag,
-            str(BUILD_CONTEXT), timeout=300,
+            *local_build_arguments(daemon), str(BUILD_CONTEXT), timeout=300,
         )
         assert "ERROR" not in build.stdout
         assert client.images.get(tag).attrs["Os"] == "linux"
@@ -164,7 +176,8 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
             docker_host, docker_host=docker_host,
         )
         first = buildx(
-            "build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT),
+            "build", "--builder", builder, "--load", "--tag", tag,
+            *local_build_arguments(daemon), str(BUILD_CONTEXT),
             docker_host=docker_host,
         )
         assert "ERROR" not in first.stdout
@@ -193,7 +206,8 @@ def test_buildx_load_run_cache_and_volume_copy(daemon, client: docker.DockerClie
         assert container.wait(timeout=60)["StatusCode"] == 0
 
         second = buildx(
-            "build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT),
+            "build", "--builder", builder, "--load", "--tag", tag,
+            *local_build_arguments(daemon), str(BUILD_CONTEXT),
             docker_host=docker_host,
         )
         assert "ERROR" not in second.stdout
@@ -319,6 +333,7 @@ def test_buildx_overlay_worker_has_large_state_volume(daemon, client: docker.Doc
         )
         buildx(
             "build", "--builder", builder, "--load", "--tag", tag,
+            *local_build_arguments(daemon),
             "--file", str(BUILD_CONTEXT / "Dockerfile.parallel"), str(BUILD_CONTEXT),
             docker_host=docker_host,
         )
@@ -399,7 +414,8 @@ def test_buildx_relaunches_missing_stopped_container_shim(daemon, client: docker
         assert buildkit.status == "exited"
 
         result = buildx(
-            "build", "--builder", builder, "--load", "--tag", tag, str(BUILD_CONTEXT),
+            "build", "--builder", builder, "--load", "--tag", tag,
+            *local_build_arguments(daemon), str(BUILD_CONTEXT),
             docker_host=docker_host,
         )
         assert "ERROR" not in result.stdout
@@ -429,7 +445,7 @@ def test_buildx_bake_load_immediately_publishes_every_target(
     for reference in references.values():
         managed.register_image(reference)
     (tmp_path / "Dockerfile").write_text(
-        "FROM mirror.gcr.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b\n"
+        "FROM alpine-base\n"
         "ARG TARGET\n"
         "RUN printf '%s' \"$TARGET\" >/target\n"
         "LABEL compat.cengine.bake-target=$TARGET\n"
@@ -438,6 +454,8 @@ def test_buildx_bake_load_immediately_publishes_every_target(
         f'''target "{target}" {{
   context = "{tmp_path}"
   dockerfile = "Dockerfile"
+  contexts = {{ alpine-base = "{local_alpine_context(daemon)}" }}
+  network = "none"
   args = {{ TARGET = "{target}" }}
   tags = ["{reference}"]
 }}'''
@@ -448,7 +466,8 @@ def test_buildx_bake_load_immediately_publishes_every_target(
 
     result = managed.run(
         "--context", "cengine", "buildx", "bake",
-        f"--allow=fs.read={tmp_path}", "--file", str(bake_file),
+        f"--allow=fs.read={tmp_path}",
+        f"--allow=fs.read={daemon.local_images['alpine']}", "--file", str(bake_file),
         "--load", "first", "second", timeout=300,
     )
 

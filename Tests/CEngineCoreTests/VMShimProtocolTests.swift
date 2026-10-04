@@ -30,9 +30,22 @@ private final class LockedUptimeBox: @unchecked Sendable {
     var attempts = 0
     var reportedFailures = 0
     var failuresRemaining = 0
+    private let attemptEvents = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
+
+    func waitForAttempts(_ count: Int) async throws {
+        if attempts >= count { return }
+        // Events establish readiness; the watchdog only bounds a broken retry/restart.
+        try await AsyncTimeout.run(for: .seconds(5)) { [events = attemptEvents.stream] in
+            for await attempts in events {
+                if attempts >= count { return }
+            }
+            throw CancellationError()
+        }
+    }
 
     func synchronize() async throws {
         attempts += 1
+        defer { attemptEvents.continuation.yield(attempts) }
         if failuresRemaining > 0 {
             failuresRemaining -= 1
             throw Failure.injected
@@ -223,7 +236,8 @@ private func makePreparedState(
             sourceIdentity: artifacts.ioDirectoryIdentity.shimIdentity
         )],
         socketPath: "/tmp/cengine-prepared-artifact.sock",
-        logPath: directory.url.appending(path: "shim.log").path
+        logPath: directory.url.appending(path: "shim.log").path,
+        shimLaunchUUID: UUID().uuidString.lowercased()
     )
     let state = RawVirtualizationBackend.PreparedShimState(
         directoryIdentity: directory.identity,
@@ -397,6 +411,120 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
 #endif
 
 @Suite(.serialized) struct VMShimProtocolTests {
+    @Test func workloadStorageModeIsRequiredAndRejectsLegacySharedStorage() throws {
+        let specification = VMShimProtocol.Specification(containerID: "test", generation: 1, token: "token",
+            kernelPath: "/kernel", initialRamdiskPath: "/initramfs", rootDiskPath: "/disk", cpus: 1,
+            memoryBytes: 512 << 20, macAddress: "02:00:00:00:00:01", socketPath: "/socket", logPath: "/log")
+        #expect(specification.workloadStorageMode == .none)
+        let data = try JSONEncoder().encode(specification)
+        #expect(try JSONDecoder().decode(VMShimProtocol.Specification.self, from: data) == specification)
+        var fields = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(fields["storageStartupMode"] == nil && fields["fileSystemSocketPath"] == nil)
+        for mode: String? in [nil, "legacy", "unknown"] {
+            fields["workloadStorageMode"] = mode
+            #expect(throws: (any Error).self) {
+                try JSONDecoder().decode(VMShimProtocol.Specification.self, from: JSONSerialization.data(withJSONObject: fields))
+            }
+        }
+        fields["workloadStorageMode"] = "managed"
+        #expect(try JSONDecoder().decode(VMShimProtocol.Specification.self,
+            from: JSONSerialization.data(withJSONObject: fields)).workloadStorageMode == .managed)
+    }
+
+    @Test(arguments: ["storageBoot", "storagePublicCommand", "storageControlStream", "storageAttachmentCSRStream"])
+    func v1StorageOperationsAreNotInTheShimProtocol(operation: String) {
+        #expect(VMShimProtocol.Operation(rawValue: operation) == nil)
+        #expect(throws: (any Error).self) {
+            try JSONDecoder().decode(VMShimProtocol.Operation.self, from: JSONEncoder().encode(operation))
+        }
+    }
+
+    @Test func bootstrapSpecificationFieldsAreExplicitAndLegacyStaysAbsent() throws {
+        var specification = Self.makeRosettaSpecification(rosetta: false)
+        specification.shimLaunchUUID = "11111111-1111-4111-8111-111111111111"
+        specification.diskBootstrapVersion = DiskInitializationProtocol.version
+        specification.expectedInitramfsSHA256 = String(repeating: "a", count: 64)
+        let encoder = JSONEncoder()
+        #expect(try JSONDecoder().decode(VMShimProtocol.Specification.self, from: encoder.encode(specification)) == specification)
+        var object = try #require(JSONSerialization.jsonObject(with: encoder.encode(specification)) as? [String: Any])
+        for key in ["shimLaunchUUID", "diskBootstrapVersion", "expectedInitramfsSHA256"] { object.removeValue(forKey: key) }
+        let legacy = try JSONDecoder().decode(VMShimProtocol.Specification.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(legacy.shimLaunchUUID == nil)
+        #expect(legacy.diskBootstrapVersion == nil)
+        #expect(legacy.expectedInitramfsSHA256 == nil)
+        let oldStatus = Data(#"{"containerID":"legacy","generation":1,"state":"stopped","processIdentifier":42}"#.utf8)
+        #expect(try JSONDecoder().decode(VMShimProtocol.Status.self, from: oldStatus).shimLaunchUUID == nil)
+        #expect(VMShimProtocol.version == 7)
+        for version: UInt32 in [5, 6] {
+            #expect(throws: EngineError.self) {
+                try VMShimProtocol.decode(VMShimProtocol.encode(.init(version: version, token: "old", operation: .status)))
+            }
+        }
+    }
+
+    #if os(macOS)
+    @Test func launchIdentityRejectsLegacyAndMismatchedStatus() throws {
+        var specification = Self.makeRosettaSpecification(rosetta: false)
+        specification.shimLaunchUUID = "11111111-1111-4111-8111-111111111111"
+        let client = VMShimClient(specification: specification)
+        var status = VMShimProtocol.Status(containerID: specification.containerID,
+            generation: specification.generation, state: .created, processIdentifier: 42,
+            shimLaunchUUID: specification.shimLaunchUUID)
+        try client.validateStatus(status)
+        status.shimLaunchUUID = "22222222-2222-4222-8222-222222222222"
+        #expect(throws: EngineError.self) { try client.validateStatus(status) }
+        status.shimLaunchUUID = nil
+        #expect(throws: EngineError.self) { try client.validateStatus(status) }
+        specification.shimLaunchUUID = nil
+        #expect(throws: EngineError.self) { try VMShimClient(specification: specification).validateStatus(status) }
+        #expect(VMShimClient.launchNonceMatches(specification: specification, nonce: "legacy-cleanup-nonce"))
+        specification.shimLaunchUUID = "11111111-1111-4111-8111-111111111111"
+        #expect(VMShimClient.launchNonceMatches(specification: specification, nonce: specification.shimLaunchUUID!))
+        #expect(!VMShimClient.launchNonceMatches(specification: specification, nonce: "22222222-2222-4222-8222-222222222222"))
+        #expect(VMShimClient.specificationSHA256(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        #expect(VMShimClient.specificationSHA256(Data("{}".utf8)) != VMShimClient.specificationSHA256(Data("{ }".utf8)))
+    }
+
+    @Test func persistentPreparationUsesLaunchUUIDAndRejectsAbsentIdentity() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = try PersistentStateDirectory.open(root)
+        var specification = Self.makeRosettaSpecification(rosetta: false)
+        specification.logPath = root.appending(path: "shim.log").path
+        specification.shimLaunchUUID = "11111111-1111-4111-8111-111111111111"
+        let container = ContainerRecord(id: specification.containerID, name: "nonce-test", image: "alpine")
+        let files = try VMShimClient.preparePersistentSpawn(specification: specification,
+            container: container, containerDirectory: directory, executable: URL(filePath: "/usr/bin/true"))
+        let intent = try JSONDecoder().decode(VMShimClient.PersistentLaunchIntent.self, from: Data(contentsOf: files.intentURL))
+        #expect(intent.nonce == specification.shimLaunchUUID)
+        #expect(files.directory.lastPathComponent.hasSuffix(intent.nonce))
+        #expect(intent.specification.shimLaunchUUID == intent.nonce)
+        var intentObject = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: files.intentURL)) as? [String: Any])
+        var specObject = try #require(intentObject["specification"] as? [String: Any])
+        specObject["shimLaunchUUID"] = "22222222-2222-4222-8222-222222222222"
+        intentObject["specification"] = specObject
+        try JSONSerialization.data(withJSONObject: intentObject).write(to: files.intentURL)
+        let mismatched = try VMShimClient.persistedLaunches(in: directory, expectedContainerID: container.id,
+            expectedExecutable: URL(filePath: "/usr/bin/true"), processIdentifiersProvider: { .complete([]) })
+        #expect(mismatched.isEmpty && mismatched.quarantined.count == 1)
+        #expect(FileManager.default.fileExists(atPath: files.directory.path))
+        specObject.removeValue(forKey: "shimLaunchUUID")
+        intentObject["specification"] = specObject
+        try JSONSerialization.data(withJSONObject: intentObject).write(to: files.intentURL)
+        try JSONSerialization.data(withJSONObject: specObject).write(to: files.specificationURL)
+        let legacy = try VMShimClient.persistedLaunches(in: directory, expectedContainerID: container.id,
+            expectedExecutable: URL(filePath: "/usr/bin/true"), processIdentifiersProvider: { .incomplete([]) })
+        #expect(legacy.isEmpty && legacy.quarantined.count == 1)
+        #expect(legacy.quarantined.first?.reason.contains("process enumeration") == true)
+        specification.shimLaunchUUID = nil
+        #expect(throws: EngineError.self) {
+            try VMShimClient.preparePersistentSpawn(specification: specification,
+                container: container, containerDirectory: directory, executable: URL(filePath: "/usr/bin/true"))
+        }
+    }
+    #endif
+
     @Test func envelopeRoundTrips() throws {
         let envelope = VMShimProtocol.Envelope(token: "secret", operation: .status)
 
@@ -424,7 +552,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             socketRelays: [.init(path: "/tmp/docker.sock", port: GuestProtocol.socketProxyPortBase)],
             socketPath: "/tmp/control.sock",
             logPath: "/tmp/shim.log",
-            networkNamespace: "engine-root-namespace"
+            networkNamespace: "engine-root-namespace",
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
 
         let data = try JSONEncoder().encode(specification)
@@ -446,7 +575,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             macAddress: "02:ce:00:00:00:05",
             socketPath: "/tmp/control.sock",
             logPath: "/tmp/shim.log",
-            rosetta: rosetta
+            rosetta: rosetta,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
     }
 
@@ -768,7 +898,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:23",
             socketPath: socketPath,
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let launch = Task {
             try await VMShimClient.launch(
@@ -1055,7 +1186,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 cpus: 1, memoryBytes: 268_435_456,
                 macAddress: "02:ce:00:00:00:41",
                 socketPath: "/tmp/\(name).sock",
-                logPath: containerURL.appending(path: "shim.log").path
+                logPath: containerURL.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
             let files = try VMShimClient.preparePersistentSpawn(
                 specification: specification,
@@ -1102,7 +1234,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 memoryBytes: 268_435_456,
                 macAddress: "02:ce:00:00:00:31",
                 socketPath: try RawVirtualizationBackend.makeRuntimeSocketPath(),
-                logPath: containerDirectory.appending(path: "shim.log").path
+                logPath: containerDirectory.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
         }
         let expected = VMShimClient.ProcessIdentity(
@@ -1202,7 +1335,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 512 * 1_024 * 1_024,
             macAddress: "02:ce:00:00:00:41",
             socketPath: try RawVirtualizationBackend.makeRuntimeSocketPath(),
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -1284,7 +1418,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:07",
             socketPath: try RawVirtualizationBackend.makeRuntimeSocketPath(),
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -1885,7 +2020,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:02",
             socketPath: runtimeURL.appending(path: "shim.sock").path,
-            logPath: containerURL.appending(path: "shim.log").path
+            logPath: containerURL.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let containerDirectory = try PersistentStateDirectory.open(containerURL)
         let files = try VMShimClient.preparePersistentSpawn(
@@ -2008,7 +2144,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 cpus: 1, memoryBytes: 268_435_456,
                 macAddress: String(format: "02:ce:00:00:00:%02llx", generation),
                 socketPath: "/tmp/partial-\(generation).sock",
-                logPath: containerURL.appending(path: "shim.log").path
+                logPath: containerURL.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
         }
         func prepared(_ generation: UInt64) throws -> VMShimClient.PersistentSpawnFiles {
@@ -2071,7 +2208,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             rootDiskPath: containerURL.appending(path: "root.ext4").path,
             cpus: 1, memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:31", socketPath: "/tmp/owned-partial.sock",
-            logPath: containerURL.appending(path: "shim.log").path
+            logPath: containerURL.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -2120,7 +2258,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             rootDiskPath: containerURL.appending(path: "root.ext4").path,
             cpus: 1, memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:32", socketPath: "/tmp/malformed-launch.sock",
-            logPath: containerURL.appending(path: "shim.log").path
+            logPath: containerURL.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -2192,7 +2331,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             rootDiskPath: containerDirectory.appending(path: "root.ext4").path,
             cpus: 1, memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:01", socketPath: "/tmp/a.sock",
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let foreign = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -2255,7 +2395,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             rootDiskPath: containerDirectory.appending(path: "root.ext4").path,
             cpus: 1, memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:03", socketPath: "/tmp/original.sock",
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: original,
@@ -2320,7 +2461,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 cpus: 1, memoryBytes: 268_435_456,
                 macAddress: String(format: "02:ce:00:00:00:%02llx", generation),
                 socketPath: runtimeURL.appending(path: socketName).path,
-                logPath: containerURL.appending(path: "shim.log").path
+                logPath: containerURL.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
             let files = try VMShimClient.preparePersistentSpawn(
                 specification: specification,
@@ -2652,7 +2794,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:01",
             socketPath: runtimeURL.appending(path: "shim.sock").path,
-            logPath: containerURL.appending(path: "shim.log").path
+            logPath: containerURL.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -2777,7 +2920,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                     memoryBytes: 268_435_456,
                     macAddress: "02:ce:00:00:01:0\(boundaryIndex)",
                     socketPath: socketPath,
-                    logPath: containerURL.appending(path: "shim.log").path
+                    logPath: containerURL.appending(path: "shim.log").path,
+                    shimLaunchUUID: UUID().uuidString.lowercased()
                 )
                 let files = try VMShimClient.preparePersistentSpawn(
                     specification: specification,
@@ -2907,7 +3051,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 512 * 1_024 * 1_024,
             macAddress: "02:ce:00:00:00:71",
             socketPath: try RawVirtualizationBackend.makeRuntimeSocketPath(),
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -2969,7 +3114,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             rootDiskPath: containerDirectory.appending(path: "root.ext4").path,
             cpus: 1, memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:91", socketPath: "/tmp/reused-instance.sock",
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let files = try VMShimClient.preparePersistentSpawn(
             specification: specification,
@@ -3134,6 +3280,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         var nextSpecification = state.specification
         nextSpecification.generation += 1
         nextSpecification.token = "next-log-generation"
+        nextSpecification.shimLaunchUUID = UUID().uuidString.lowercased()
         let second = try VMShimClient.preparePersistentSpawn(
             specification: nextSpecification,
             container: state.currentContainer,
@@ -4526,7 +4673,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 sourceIdentity: shareIdentity.shimIdentity
             )],
             socketPath: "/tmp/descriptor.sock",
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let attachments = try VMShimAttachmentResolver.resolve(specification)
         let retainedDiskURL = root.appending(path: "retained-root.ext4")
@@ -4586,7 +4734,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 512 * 1_024 * 1_024,
             macAddress: "02:ce:00:00:00:01",
             socketPath: "/tmp/legacy-attachment.sock",
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
 
         #expect(throws: EngineError.self) {
@@ -4629,7 +4778,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                     sourceIdentity: shareIdentity.shimIdentity
                 )],
                 socketPath: "/tmp/swap.sock",
-                logPath: root.appending(path: "shim.log").path
+                logPath: root.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
 
             var reachedBoundary = false
@@ -4683,7 +4833,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 512 * 1_024 * 1_024,
             macAddress: "02:ce:00:00:00:01",
             socketPath: "/tmp/root-size.sock",
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
 
         #expect(throws: EngineError.self) {
@@ -4721,7 +4872,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 memoryBytes: 512 * 1_024 * 1_024,
                 macAddress: "02:ce:00:00:00:01",
                 socketPath: "/tmp/storage-root.sock",
-                logPath: root.appending(path: "shim.log").path
+                logPath: root.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
         }
 
@@ -4776,7 +4928,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 512 * 1_024 * 1_024,
             macAddress: "02:ce:00:00:00:01",
             socketPath: "/tmp/volume-swap.sock",
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
 
         #expect(throws: EngineError.self) {
@@ -5441,7 +5594,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 )
             )],
             socketPath: try RawVirtualizationBackend.makeRuntimeSocketPath(),
-            logPath: containerDirectory.appending(path: "shim.log").path
+            logPath: containerDirectory.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         try JSONEncoder().encode(
             RawVirtualizationBackend.PreparedShimState(
@@ -5545,7 +5699,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                     )
                 )],
                 socketPath: "/private/var/run/cengine-canonical.sock",
-                logPath: containerDirectory.appending(path: "shim.log").path
+                logPath: containerDirectory.appending(path: "shim.log").path,
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
         }
         let capacity = specification()
@@ -7552,7 +7707,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:02",
             socketPath: socket,
-            logPath: "\(longRoot)/shim.log"
+            logPath: "\(longRoot)/shim.log",
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
 
         #expect(socket.utf8.count < 104)
@@ -7589,31 +7745,6 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(RawVirtualizationBackend.mountDestinationOrder(destinations) == [2, 3, 0, 1, 4])
     }
 
-    @Test func recoveredStorageAdministrationUsesTheAdoptedShimSocket() throws {
-        let specification = VMShimProtocol.Specification(
-            kind: .storage,
-            containerID: "cengine-storage",
-            generation: 1,
-            token: "secret",
-            kernelPath: "/kernel",
-            initialRamdiskPath: "/initramfs",
-            rootDiskPath: "/storage.ext4",
-            cpus: 1,
-            memoryBytes: 268_435_456,
-            macAddress: "02:ce:00:00:00:01",
-            socketPath: "/tmp/recovered-control.sock",
-            logPath: "/tmp/recovered-shim.log",
-            fileSystemSocketPath: "/tmp/recovered-storage.sock",
-            networkSocketPath: "/tmp/recovered-network.sock"
-        )
-        let recovered = VMShimClient(specification: specification)
-
-        #expect(
-            try RawVirtualizationBackend.storageAdministrativeSocketPath(for: recovered)
-                == "/tmp/recovered-storage.sock"
-        )
-    }
-
     @MainActor @Test func containerShutdownDoesNotOwnInfrastructureTransportSockets() {
         func specification(kind: VMShimProtocol.Specification.Kind) -> VMShimProtocol.Specification {
             VMShimProtocol.Specification(
@@ -7629,14 +7760,14 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
                 macAddress: "02:ce:00:00:00:03",
                 socketPath: "/tmp/control.sock",
                 logPath: "/tmp/shim.log",
-                fileSystemSocketPath: "/tmp/filesystem.sock",
-                networkSocketPath: "/tmp/network.sock"
+                networkSocketPath: "/tmp/network.sock",
+                shimLaunchUUID: UUID().uuidString.lowercased()
             )
         }
 
         #expect(VMShimServer.ownedSocketPaths(specification(kind: .container)) == ["/tmp/control.sock"])
         #expect(Set(VMShimServer.ownedSocketPaths(specification(kind: .storage))) == [
-            "/tmp/control.sock", "/tmp/filesystem.sock", "/tmp/network.sock",
+            "/tmp/control.sock", "/tmp/network.sock",
         ])
     }
 
@@ -7661,6 +7792,22 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(disposed == [42])
     }
 
+    @MainActor @Test func lifecycleBootTimeoutIsDistinctAndStillDisposesLateSuccess() async {
+        await #expect(throws: VirtioSocketConnectionTimeout.self) {
+            try await RawContainerVirtualMachine.awaitConnection(
+                timeout: .milliseconds(1), timeoutError: VirtioSocketConnectionTimeout()) { _ in }
+        }
+        var resolver: (@MainActor (Result<Int, Error>) -> Void)?
+        var disposed: [Int] = []
+        await #expect(throws: VirtioSocketConnectionTimeout.self) {
+            try await RawContainerVirtualMachine.awaitBoundedResult(
+                timeout: .milliseconds(1), timeoutError: VirtioSocketConnectionTimeout(),
+                start: { resolver = $0 }, disposeLateSuccess: { disposed.append($0) })
+        }
+        resolver?(.success(42))
+        #expect(disposed == [42])
+    }
+
     @MainActor @Test func guestTimeSynchronizerRetriesAndOwnsOnePeriodicTask() async throws {
         let state = GuestTimeSyncTestState()
         state.failuresRemaining = 1
@@ -7669,13 +7816,11 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             synchronize: { try await state.synchronize() },
             failureHandler: { state.report($0) }
         )
+        defer { synchronizer.cancel() }
 
         synchronizer.startPeriodic()
         synchronizer.startPeriodic()
-        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while state.attempts < 2, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(2))
-        }
+        try await state.waitForAttempts(2)
 
         #expect(state.attempts >= 2)
         #expect(state.reportedFailures == 1)
@@ -7688,10 +7833,7 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
         #expect(!synchronizer.hasPeriodicTask)
 
         synchronizer.startPeriodic()
-        let restartDeadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while state.attempts == stoppedAttempts, ContinuousClock.now < restartDeadline {
-            try await Task.sleep(for: .milliseconds(2))
-        }
+        try await state.waitForAttempts(stoppedAttempts + 1)
         #expect(state.attempts > stoppedAttempts)
         await synchronizer.stop()
     }
@@ -7852,7 +7994,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:11",
             socketPath: socketPath,
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
 
         Thread.detachNewThread {
@@ -7952,7 +8095,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:19",
             socketPath: socketPath,
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let client = VMShimClient(
             specification: specification,
@@ -8014,7 +8158,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:07",
             socketPath: socketPath,
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let status = VMShimProtocol.Status(
             containerID: specification.containerID,
@@ -8023,7 +8168,8 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             processIdentifier: process.processIdentifier,
             processStartTime: try #require(
                 VMShimClient.processStartTime(for: process.processIdentifier)
-            )
+            ),
+            shimLaunchUUID: specification.shimLaunchUUID
         )
         try JSONEncoder().encode(status).write(
             to: URL(filePath: socketPath + ".status"), options: .atomic
@@ -8118,14 +8264,16 @@ private final class ExecJournalGuestGate: @unchecked Sendable {
             memoryBytes: 268_435_456,
             macAddress: "02:ce:00:00:00:17",
             socketPath: socketPath,
-            logPath: root.appending(path: "shim.log").path
+            logPath: root.appending(path: "shim.log").path,
+            shimLaunchUUID: UUID().uuidString.lowercased()
         )
         let stale = VMShimProtocol.Status(
             containerID: specification.containerID,
             generation: specification.generation,
             state: .paused,
             processIdentifier: unrelated.processIdentifier,
-            processStartTime: actualStart &+ 1
+            processStartTime: actualStart &+ 1,
+            shimLaunchUUID: specification.shimLaunchUUID
         )
         let staleStatusData = try JSONEncoder().encode(stale)
         try staleStatusData.write(

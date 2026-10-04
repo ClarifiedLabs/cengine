@@ -92,7 +92,7 @@ private final class DaemonLogRedirection: @unchecked Sendable {
     }
 }
 
-private final class TimestampedLogWriter: @unchecked Sendable {
+final class TimestampedLogWriter: @unchecked Sendable {
     private let input: FileHandle
     private let output: FileHandle
 
@@ -111,15 +111,17 @@ private final class TimestampedLogWriter: @unchecked Sendable {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         var lines = TimestampedLineBuffer()
         var canWrite = true
+        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
 
         while true {
-            let next: Data?
-            do {
-                next = try input.read(upToCount: 16 * 1024)
-            } catch {
-                break
+            // FileHandle.read(upToCount:) can wait for the full count or EOF on
+            // macOS. A single POSIX read forwards available pipe bytes promptly.
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(input.fileDescriptor, $0.baseAddress!, $0.count)
             }
-            guard let data = next, !data.isEmpty else { break }
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { break }
+            let data = Data(buffer.prefix(count))
             let timestamped = lines.append(data) { formatter.string(from: Date()) }
             if canWrite, !timestamped.isEmpty {
                 do {

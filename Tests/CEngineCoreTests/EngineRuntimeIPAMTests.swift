@@ -111,6 +111,7 @@ import Testing
         func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
         func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
         func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+        func cleanupExecution(_: ContainerRecord) async throws {}
         func delete(_: ContainerRecord) async throws {}
         func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress] {
             Dictionary(uniqueKeysWithValues: container.networks.map {

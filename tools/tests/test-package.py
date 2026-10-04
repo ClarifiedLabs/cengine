@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import plistlib
+import subprocess
+import sys
 
 from _checks import REPO_ROOT, read, require_absent, require_contains
 
@@ -19,7 +21,9 @@ def main() -> None:
     component_plist_path = REPO_ROOT / "Configuration/cengine-component.plist"
     for needle in (
         'PAYLOAD_ROOT/Applications', 'PAYLOAD_ROOT/usr/local/bin', 'dev.cengine.app.pkg',
-        'Contents/MacOS/cengine-engine', 'Contents/MacOS/cengine-network-helper',
+        'Contents/MacOS/cengine-engine', 'Contents/MacOS/cengine-helper',
+        'Contents/MacOS/cengine-storage-controller', 'build-storage-controller.sh',
+        '--identifier dev.cengine.storage-control',
         'Contents/Library/LaunchAgents', 'Contents/Library/LaunchDaemons',
         'cengine-uninstall.pkg', 'Contents/Resources/guest', 'codesign --force',
         '--options runtime', 'productsign --sign', 'notarytool submit',
@@ -31,6 +35,10 @@ def main() -> None:
         '--resources "$ROOT_DIR/Scripts/Uninstaller/Resources"', '--package-path "$BUILD_DIR"',
     ):
         require_contains(script, needle, "package-release.sh")
+    require_contains(script, 'SOURCE_HELPER="$PRODUCTS_DIR/cengine-helper"', "package-release.sh")
+    require_contains(script, '--identifier dev.cengine.network-helper', "package-release.sh")
+    require_contains(script, 'LaunchDaemons/dev.cengine.network-helper.plist', "package-release.sh")
+    require_absent(script, "cengine-network-helper", "package-release.sh")
     for needle in (
         "<title>Uninstall cengine</title>", '<welcome file="welcome.html"',
         '<conclusion file="conclusion.html"', 'enable_localSystem="true"',
@@ -45,10 +53,11 @@ def main() -> None:
     require_contains(entitlements, "com.apple.security.virtualization", "cengine.entitlements")
     require_absent(entitlements, "com.apple.vm.networking", "cengine.entitlements")
     require_absent(entitlements, "com.apple.developer.networking.vmnet", "cengine.entitlements")
-    if (REPO_ROOT / "Configuration/cengine-network-helper.entitlements").exists():
-        raise AssertionError("the root network helper must not claim restricted vmnet entitlements")
+    for name in ("cengine-network-helper.entitlements", "cengine-helper.entitlements"):
+        if (REPO_ROOT / "Configuration" / name).exists():
+            raise AssertionError("the Privileged Helper must not claim restricted vmnet entitlements")
     require_absent(script, "NETWORK_HELPER_ENTITLEMENTS", "package-release.sh")
-    require_contains(script, 'verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-network-helper" --forbid com.apple.vm.networking', "package-release.sh")
+    require_contains(script, 'verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-helper" --forbid com.apple.vm.networking', "package-release.sh")
     require_absent(app_entitlements, "com.apple.security.virtualization", "cengine-app.entitlements")
     require_contains(component_plist, "<key>BundleIsVersionChecked</key>\n\t\t<false/>", "cengine-component.plist")
     for contents, label in ((script, "package-release.sh"), (build_script, "build-release.sh"), (makefile, "Makefile")):
@@ -61,7 +70,24 @@ def main() -> None:
     ):
         require_contains(contents, "ENABLE_CODE_COVERAGE=NO", label)
         require_contains(contents, "CLANG_COVERAGE_MAPPING=NO", label)
+    for contents, destination in (
+        (script, "$APP_PATH/Contents/Resources/guest"),
+        (build_script, "$OUTPUT_DIR/share/cengine"),
+    ):
+        require_contains(
+            contents,
+            f'ditto "$ROOT_DIR/.build/guest/disk-bootstrap.json" "{destination}/disk-bootstrap.json"',
+            "release bootstrap metadata",
+        )
     for contents, label in ((script, "package-release.sh"), (build_script, "build-release.sh")):
+        gate = 'python3 "$ROOT_DIR/Scripts/guest_asset_provenance.py" validate "$ROOT_DIR" '
+        assert contents.count(gate) == 2, label
+        assert contents.index(gate) < contents.index('xcodebuild '), label
+        assert contents.rindex(gate) > contents.index('ditto "$ROOT_DIR/.build/guest/SHA256SUMS"'), label
+        assert contents.rindex(gate) < contents.index('codesign --force'), label
+        require_contains(contents, "build-storage-controller.sh", label)
+        require_contains(contents, "dev.cengine.storage-control", label)
+        require_contains(contents, "managed_signing_verify", label)
         require_contains(contents, "require_uninstrumented", label)
         require_contains(contents, "__llvm_prf", label)
     if project.count("CLANG_COVERAGE_MAPPING = NO") != 3 or project.count("ENABLE_CODE_COVERAGE = NO") != 3:
@@ -75,7 +101,7 @@ def main() -> None:
     require_contains(project, "Configuration/network-helper-Info.plist", "project.pbxproj")
     require_contains(project, 'LD_RUNPATH_SEARCH_PATHS = ""', "project.pbxproj")
     if project.count("CREATE_INFOPLIST_SECTION_IN_BINARY = YES") != 6:
-        raise AssertionError("engine and network helper builds must embed metadata")
+        raise AssertionError("engine and Privileged Helper builds must embed metadata")
 
     with component_plist_path.open("rb") as component_plist_file:
         components = plistlib.load(component_plist_file)
@@ -85,6 +111,9 @@ def main() -> None:
     )
     if app_component.get("BundleIsRelocatable") is not False:
         raise AssertionError("cengine.app must not be relocated away from /Applications")
+    # The release gate also exercises production-vs-test child builds, signing
+    # command selection and managed asset/helper preflight with inert fixtures.
+    subprocess.run([sys.executable, str(REPO_ROOT / "tools/tests/test-managed-activation.py")], check=True)
 
 
 if __name__ == "__main__":

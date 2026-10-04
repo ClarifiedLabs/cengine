@@ -149,17 +149,17 @@ struct SettingsView: View {
     }
 
     private var networking: some View {
-        SettingsSection("Networking", systemImage: "network") {
+        SettingsSection("Privileged Helper", systemImage: "lock.shield") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("VM Networking")
+                    Text("Privileged Helper")
                     Spacer()
                     StatusBadge(
                         text: model.helperStatus,
                         color: StatusBadge.color(for: model.helperStatus)
                     )
                 }
-                Text("Required for vmnet NAT, DNS, macOS host access, and published container ports.")
+                Text("Required for VM networking, published container ports, and managed storage.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

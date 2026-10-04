@@ -1284,7 +1284,7 @@ func Top(pid int) ([]Process, error) {
 
 func mountedRoot() (string, error) {
 	root := "/run/cengine/rootfs"
-	if err := disk.EnsureExt4("/dev/vda", root, "cengine-root"); err != nil {
+	if err := disk.MountExistingExt4("/dev/vda", root); err != nil {
 		return "", err
 	}
 	return root, nil

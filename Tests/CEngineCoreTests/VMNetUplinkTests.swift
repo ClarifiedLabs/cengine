@@ -221,7 +221,16 @@ import Testing
         #expect(state.count == 0)
     }
 
-    @Test func unavailablePrivilegedNetworkingHelperHasBoundedDeadline() async throws {
+    // A concurrent Darwin spawn can temporarily retain a socket description even
+    // with CLOEXEC. Keep immediate last-reference assertions in a child process,
+    // as in VMShimDiskLockRuntimeTests; suite serialization cannot isolate other suites.
+    @Test func unavailablePrivilegedNetworkingHelperHasBoundedDeadline() async {
+        await #expect(processExitsWith: .success) {
+            try await VMNetUplinkTests().checkUnavailablePrivilegedNetworkingHelperHasBoundedDeadline()
+        }
+    }
+
+    private func checkUnavailablePrivilegedNetworkingHelperHasBoundedDeadline() async throws {
         let timeout = ManualVMNetTimeout()
         let startReached = AsyncSignal()
         let completionCount = EventState()
@@ -332,7 +341,13 @@ import Testing
         close(result.descriptor)
     }
 
-    @Test func callerCancellationWinsAndDiscardsLateUplinkSuccess() async throws {
+    @Test func callerCancellationWinsAndDiscardsLateUplinkSuccess() async {
+        await #expect(processExitsWith: .success) {
+            try await VMNetUplinkTests().checkCallerCancellationWinsAndDiscardsLateUplinkSuccess()
+        }
+    }
+
+    private func checkCallerCancellationWinsAndDiscardsLateUplinkSuccess() async throws {
         let completionCount = EventState()
         let cancellationCount = EventState()
         let timeout = ManualVMNetTimeout()
@@ -377,6 +392,41 @@ import Testing
         Self.expectDatagramPeerIsClosed(late.peer)
         #expect(cancellationCount.count == 1)
         #expect(completionCount.count == 1)
+    }
+
+    @Test func discardedUplinkPeerClosesOnlyAfterLastDescriptionReference() async {
+        await #expect(processExitsWith: .success) {
+            try VMNetUplinkTests().checkDiscardedUplinkPeerClosesOnlyAfterLastDescriptionReference()
+        }
+    }
+
+    private func checkDiscardedUplinkPeerClosesOnlyAfterLastDescriptionReference() throws {
+        let connection = Self.connection()
+        let late = try Self.transport(connection: connection)
+        defer { close(late.peer) }
+        // Deterministically model the extra description reference held during a
+        // concurrent spawn. CLOEXEC affects exec, not this reference's lifetime.
+        var duplicate = fcntl(late.transport.descriptor, F_DUPFD_CLOEXEC, 0)
+        defer { if duplicate >= 0 { close(duplicate) } }
+        try #require(duplicate >= 0)
+        let cancellations = EventState()
+        let reply = VMNetUplinkReply(connectionCancellation: {
+            cancellations.record()
+            xpc_connection_cancel($0)
+        })
+        reply.attach(connection)
+        reply.finish(.failure(CancellationError()))
+        reply.finish(.success(late.transport))
+
+        var byte: UInt8 = 0
+        #expect(Darwin.send(late.peer, &byte, 1, 0) == 1)
+        #expect(Darwin.recv(duplicate, &byte, 1, MSG_DONTWAIT) == 1)
+        close(duplicate)
+        duplicate = -1
+        // This still fails if discard leaks its own descriptor. No sleep/retry or
+        // relaxed peer assertion is needed once the extra reference is released.
+        Self.expectDatagramPeerIsClosed(late.peer)
+        #expect(cancellations.count == 1)
     }
 
     @Test func cancellationBeforeReplyInstallationCompletesExactlyOnce() async throws {

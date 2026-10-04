@@ -4,6 +4,12 @@ import Darwin
 import Foundation
 
 enum UnixSocket {
+    /// Only a successfully accepted peer's closed-socket configuration failure
+    /// is recoverable. Listener/descriptor failures must still stop the caller.
+    enum AcceptedPeerConfigurationError: Error, Equatable {
+        case peerDisconnected
+    }
+
     static func listen(path: String) throws -> Int32 {
         guard path.utf8.count < MemoryLayout<sockaddr_un>.size - 2 else {
             throw EngineError(.badRequest, "Unix socket path is too long: \(path)")
@@ -12,6 +18,7 @@ enum UnixSocket {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw systemError("create Unix socket") }
         do {
+            try protectDescriptor(descriptor)
             try suppressSIGPIPE(descriptor)
             try withAddress(path) { address, length in
                 guard Darwin.bind(descriptor, address, length) == 0 else { throw systemError("bind Unix socket") }
@@ -33,6 +40,7 @@ enum UnixSocket {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw systemError("create Unix socket") }
         do {
+            try protectDescriptor(descriptor)
             try suppressSIGPIPE(descriptor)
             let flags = fcntl(descriptor, F_GETFL)
             if timeoutMilliseconds != nil {
@@ -79,7 +87,8 @@ enum UnixSocket {
         let client = Darwin.accept(descriptor, nil, nil)
         guard client >= 0 else { throw systemError("accept Unix socket") }
         do {
-            try suppressSIGPIPE(client)
+            try protectDescriptor(client)
+            try suppressSIGPIPE(client, acceptedPeer: true)
             return client
         } catch {
             close(client)
@@ -87,17 +96,32 @@ enum UnixSocket {
         }
     }
 
-    private static func suppressSIGPIPE(_ descriptor: Int32) throws {
+    static func protectDescriptor(_ descriptor: Int32) throws {
+        let flags = fcntl(descriptor, F_GETFD)
+        guard flags >= 0, fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+            throw systemError("protect Unix socket descriptor")
+        }
+    }
+
+    private static func suppressSIGPIPE(_ descriptor: Int32, acceptedPeer: Bool = false) throws {
         var enabled: CInt = 1
         guard setsockopt(
             descriptor, SOL_SOCKET, SO_NOSIGPIPE,
             &enabled, socklen_t(MemoryLayout<CInt>.size)
         ) == 0 else {
+            // Darwin returns EINVAL when an accepted AF_UNIX peer has already
+            // closed. This says nothing about the still-valid listening socket.
+            if acceptedPeer, errno == EINVAL || errno == ENOTCONN || errno == ECONNRESET {
+                throw AcceptedPeerConfigurationError.peerDisconnected
+            }
             throw systemError("configure Unix socket")
         }
     }
 
-    private static func withAddress<T>(_ path: String, body: (UnsafePointer<sockaddr>, socklen_t) throws -> T) throws -> T {
+    static func withAddress<T>(_ path: String, body: (UnsafePointer<sockaddr>, socklen_t) throws -> T) throws -> T {
+        guard !path.utf8.contains(0), path.utf8.count < MemoryLayout<sockaddr_un>.size - 2 else {
+            throw EngineError(.badRequest, "invalid Unix socket path")
+        }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8) + [0]

@@ -36,6 +36,7 @@ jobs:
             .build/guest/vmlinux
             .build/guest/container-initramfs.cpio.gz
             .build/guest/storage-initramfs.cpio.gz
+            .build/guest/disk-bootstrap.json
             .build/guest/SHA256SUMS
           if-no-files-found: error
 

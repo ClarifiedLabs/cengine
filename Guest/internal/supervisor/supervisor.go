@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,9 @@ const stage2Argument = "cengine-workload-stage2"
 const workloadReadyFD = 5
 
 type Supervisor struct {
+	// lifecycleMu orders rootfs streaming, configuration, prepare, start and stop.
+	lifecycleMu    sync.Mutex
+	managed        managedState
 	mu             sync.Mutex
 	spec           *protocol.WorkloadSpec
 	command        *exec.Cmd
@@ -44,6 +48,9 @@ type Supervisor struct {
 	terminal       *os.File
 	execTerminals  map[string]*os.File
 	devicePolicyFD int
+	// Per-supervisor launch seams let Linux tests exercise ownership without namespaces.
+	startProcess func(*exec.Cmd) error
+	placeProcess func(*exec.Cmd, *os.File) error
 }
 
 func New() *Supervisor {
@@ -118,6 +125,38 @@ func enterDelegatedCgroupNamespace(gate io.ReadWriter, unshare func(int) error) 
 }
 
 func (s *Supervisor) Prepare(spec protocol.WorkloadSpec) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.managed.boot || s.managed.configured {
+		return errors.New("generic prepare is disabled after managed configuration")
+	}
+	if err := rejectManagedAttachments(spec); err != nil {
+		return err
+	}
+	return s.prepare(spec, false)
+}
+
+// prepare requires lifecycleMu; managed specs have already been matched to a plan.
+func (s *Supervisor) prepare(spec protocol.WorkloadSpec, managed bool) error {
+	return s.prepareContext(context.Background(), spec, managed)
+}
+
+func (s *Supervisor) prepareContext(ctx context.Context, spec protocol.WorkloadSpec, managed bool) (result error) {
+	stage := PrepareValidation
+	defer func() {
+		if managed {
+			result = WithPrepareFailureStage(stage, result)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	running := s.command != nil
+	s.mu.Unlock()
+	if running {
+		return errors.New("cannot replace a running workload")
+	}
 	if spec.ID == "" || spec.RootDevice == "" || len(spec.Arguments) == 0 {
 		return errors.New("workload requires id, rootDevice, and arguments")
 	}
@@ -134,46 +173,67 @@ func (s *Supervisor) Prepare(spec protocol.WorkloadSpec) error {
 		return err
 	}
 	for _, mount := range spec.Mounts {
-		if mount.Kind == "volume" && mount.Device == "" {
-			if err := volume.MountNFS(spec.VolumeServer); err != nil {
-				return err
-			}
-			break
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}
-	for _, mount := range spec.Mounts {
 		if mount.Kind != "volume" {
+			continue
+		}
+		if mount.ManagedAttachment != "" {
 			continue
 		}
 		if err := prepareVolume(mount); err != nil {
 			return err
 		}
 	}
-	if err := disk.EnsureExt4(spec.RootDevice, "/run/cengine/rootfs", "cengine-root"); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stage = PrepareRootMount
+	if err := disk.MountExistingExt4(spec.RootDevice, "/run/cengine/rootfs"); err != nil {
 		return err
 	}
 	for _, mount := range spec.Mounts {
-		if mount.Kind == "volume" && !mount.NoCopy {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if mount.Kind == "volume" && mount.ManagedAttachment != "" {
+			stage = PrepareManagedCopyUp
+			if err := s.initializeManagedVolume(mount); err != nil {
+				return fmt.Errorf("initialize managed volume %s: %w", mount.Source, err)
+			}
+		} else if mount.Kind == "volume" && !mount.NoCopy {
+			stage = PrepareVolume
 			if err := initializeVolume(spec, mount); err != nil {
 				return fmt.Errorf("initialize volume %s: %w", mount.Source, err)
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stage = PrepareIOMount
 	if err := os.MkdirAll("/run/cengine/io", 0755); err != nil {
 		return err
 	}
 	if err := unix.Mount("cengine-io", "/run/cengine/io", "virtiofs", 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
 		return fmt.Errorf("mount cengine I/O share: %w", err)
 	}
+	stage = PrepareIOClaim
 	processIO, err := openPinnedProcessIO(ioDirectoryPath, "", spec.IOClaim)
 	if err != nil {
 		return fmt.Errorf("pin workload I/O: %w", err)
 	}
+	stage = PrepareCommit
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.command != nil {
 		processIO.close()
 		return errors.New("cannot replace a running workload")
+	}
+	if err := ctx.Err(); err != nil {
+		processIO.close()
+		return err
 	}
 	if s.processIO != nil {
 		s.processIO.close()
@@ -186,8 +246,8 @@ func (s *Supervisor) Prepare(spec protocol.WorkloadSpec) error {
 
 func validateVolumeMounts(spec protocol.WorkloadSpec) error {
 	for _, mount := range spec.Mounts {
-		if mount.Kind == "volume" && mount.Device == "" && spec.VolumeServer == "" {
-			return fmt.Errorf("shared volume %s has no volume server", mount.Source)
+		if mount.Kind == "volume" && mount.Device == "" && mount.ManagedAttachment == "" {
+			return fmt.Errorf("volume %s requires a block device or managed attachment", mount.Source)
 		}
 	}
 	return nil
@@ -199,15 +259,44 @@ func prepareVolume(mount protocol.Mount) error {
 		return fmt.Errorf("invalid volume name %q", mount.Source)
 	}
 	if mount.Device == "" {
-		_, err := volume.Ensure(mount.Source)
+		return fmt.Errorf("volume %s requires a block device", mount.Source)
+	}
+	path, err := volume.Ensure(mount.Source)
+	if err != nil {
 		return err
 	}
-	return disk.EnsureExt4(mount.Device, filepath.Join("/run/cengine/volumes", mount.Source), "cengine-volume")
+	return disk.MountExistingExt4(mount.Device, path)
 }
 
 func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.managed.boot || s.managed.configured {
+		return s.Status(), errors.New("generic start is disabled after managed configuration")
+	}
+	s.mu.Lock()
+	var validation error
+	if s.spec != nil {
+		validation = rejectManagedAttachments(*s.spec)
+	}
+	s.mu.Unlock()
+	if validation != nil {
+		return s.Status(), validation
+	}
+	return s.start()
+}
+
+// start requires lifecycleMu and also serializes process state with mu.
+func (s *Supervisor) start() (protocol.ProcessStatus, error) {
+	return s.startContext(context.Background())
+}
+
+func (s *Supervisor) startContext(ctx context.Context) (protocol.ProcessStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return s.status, err
+	}
 	if s.spec == nil {
 		return s.status, errors.New("workload is not prepared")
 	}
@@ -327,7 +416,11 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		command.SysProcAttr.Setctty = true
 		command.SysProcAttr.Ctty = 0
 	}
-	if err := command.Start(); err != nil {
+	startProcess := s.startProcess
+	if startProcess == nil {
+		startProcess = (*exec.Cmd).Start
+	}
+	if err := startProcess(command); err != nil {
 		readyReader.Close()
 		readyWriter.Close()
 		stdout.Close()
@@ -358,6 +451,33 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		gateWriter.Close()
 		return s.status, err
 	}
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		// Every failed launch is still owned here: kill and reap it before
+		// returning, including failures before it reaches s.command.
+		_ = command.Process.Kill()
+		if stdinWriter != nil {
+			_ = stdinWriter.Close()
+		}
+		if stdinReader != nil {
+			_ = stdinReader.Close()
+		}
+		if terminalMaster != nil {
+			_ = terminalMaster.Close()
+		}
+		if terminalInput != nil {
+			_ = terminalInput.Close()
+		}
+		_ = command.Wait()
+	}()
+	// Join before either Wait or publication: the watcher only ever signals this
+	// live process object, never a recycled numeric PID. Failed startup retains
+	// lifecycleMu and command ownership until the synchronous reap completes.
+	joinCancellation := watchStartupCancellation(ctx, command.Process)
+	defer joinCancellation()
 	readyWriter.Close()
 	if terminalSlave != nil {
 		terminalSlave.Close()
@@ -376,45 +496,14 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		return s.status, err
 	}
 	writer.Close()
-	if err := s.applyCgroup(s.spec, command.Process.Pid); err != nil {
+	placeProcess := s.placeProcess
+	if placeProcess == nil {
+		placeProcess = s.placeWorkload
+	}
+	if err := placeProcess(command, gateWriter); err != nil {
 		readyReader.Close()
 		gateWriter.Close()
-		_ = command.Process.Kill()
 		return s.status, err
-	}
-	if err := guestnetwork.Attach(command.Process.Pid, s.spec.Networks); err != nil {
-		readyReader.Close()
-		gateWriter.Close()
-		_ = command.Process.Kill()
-		return s.status, err
-	}
-	if _, err := gateWriter.Write([]byte{1}); err != nil {
-		readyReader.Close()
-		gateWriter.Close()
-		_ = command.Process.Kill()
-		return s.status, err
-	}
-	var namespaceReady [1]byte
-	if _, err := io.ReadFull(gateWriter, namespaceReady[:]); err != nil {
-		readyReader.Close()
-		gateWriter.Close()
-		_ = command.Process.Kill()
-		return s.status, fmt.Errorf("wait for workload cgroup namespace: %w", err)
-	}
-	if err := delegateWorkloadCgroup(
-		filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID), command.Process.Pid,
-		hasBlockIOLimits(s.spec.Resources),
-	); err != nil {
-		readyReader.Close()
-		gateWriter.Close()
-		_ = command.Process.Kill()
-		return s.status, err
-	}
-	if _, err := gateWriter.Write([]byte{1}); err != nil {
-		readyReader.Close()
-		gateWriter.Close()
-		_ = command.Process.Kill()
-		return s.status, fmt.Errorf("release delegated workload cgroup: %w", err)
 	}
 	gateWriter.Close()
 	var ready [1]byte
@@ -429,11 +518,15 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		if terminalInput != nil {
 			terminalInput.Close()
 		}
-		_ = command.Wait()
 		return s.status, fmt.Errorf("workload failed before becoming ready: %w", err)
 	}
 	readyReader.Close()
+	joinCancellation()
+	if err := ctx.Err(); err != nil {
+		return s.status, err
+	}
 	s.command = command
+	published = true
 	s.terminal = terminalMaster
 	s.status = protocol.ProcessStatus{Status: "running", PID: command.Process.Pid}
 	go s.reap(command)
@@ -443,6 +536,48 @@ func (s *Supervisor) Start() (protocol.ProcessStatus, error) {
 		go pumpInput(processIO.stdin, processIO.stdinClosed, stdinWriter, command)
 	}
 	return s.status, nil
+}
+
+// watchStartupCancellation returns an idempotent join. It must be joined before
+// the process can be reaped or handed to the published-workload reaper.
+func watchStartupCancellation(ctx context.Context, process *os.Process) func() {
+	stop, joined := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(joined)
+		select {
+		case <-ctx.Done():
+			_ = process.Kill()
+		case <-stop:
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(stop); <-joined }) }
+}
+
+func (s *Supervisor) placeWorkload(command *exec.Cmd, gateWriter *os.File) error {
+	if err := s.applyCgroup(s.spec, command.Process.Pid); err != nil {
+		return err
+	}
+	if err := guestnetwork.Attach(command.Process.Pid, s.spec.Networks); err != nil {
+		return err
+	}
+	if _, err := gateWriter.Write([]byte{1}); err != nil {
+		return err
+	}
+	var namespaceReady [1]byte
+	if _, err := io.ReadFull(gateWriter, namespaceReady[:]); err != nil {
+		return fmt.Errorf("wait for workload cgroup namespace: %w", err)
+	}
+	if err := delegateWorkloadCgroup(
+		filepath.Join("/sys/fs/cgroup/cengine", s.spec.ID), command.Process.Pid,
+		hasBlockIOLimits(s.spec.Resources),
+	); err != nil {
+		return err
+	}
+	if _, err := gateWriter.Write([]byte{1}); err != nil {
+		return fmt.Errorf("release delegated workload cgroup: %w", err)
+	}
+	return nil
 }
 
 func cgroupDelegationSocketPair() (*os.File, *os.File, error) {
@@ -1236,7 +1371,10 @@ func enterWorkload(spec protocol.WorkloadSpec, ready io.Writer) error {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
 	root := "/run/cengine/rootfs"
-	if err := disk.EnsureExt4(spec.RootDevice, root, "cengine-root"); err != nil {
+	// PID1 mounted and verified this root before cloning our namespace. The
+	// workload device cgroup is already active: retain its raw-disk denial and
+	// verify the inherited mount using metadata-only O_PATH descriptors.
+	if err := disk.VerifyInheritedMountedExt4(spec.RootDevice, root); err != nil {
 		return err
 	}
 	if err := writeNetworkFiles(root, spec); err != nil {
@@ -1644,12 +1782,15 @@ func initializeVolume(_ protocol.WorkloadSpec, mount protocol.Mount) error {
 	)
 }
 
-func initializeVolumeAt(rootfsPath string, volumePath string, mount protocol.Mount) error {
+func initializeVolumeAt(rootfsPath string, volumePath string, mount protocol.Mount, checkpoint ...*confinedPublication) error {
 	destination, err := openConfinedRoot(volumePath)
 	if err != nil {
 		return err
 	}
 	defer destination.close()
+	if len(checkpoint) == 1 {
+		destination.publication = checkpoint[0]
+	}
 	lockFD, err := unix.Openat(
 		destination.fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0,
 	)
@@ -1664,7 +1805,10 @@ func initializeVolumeAt(rootfsPath string, volumePath string, mount protocol.Mou
 	if err := recoverConfinedCopyTransaction(destination); err != nil {
 		return fmt.Errorf("recover volume copy-up: %w", err)
 	}
-	empty, err := confinedDirectoryIsEmpty(destination, "lost+found", confinedCopyTransactionName)
+	if mount.NoCopy {
+		return nil
+	}
+	empty, err := confinedVolumeIsEmpty(destination)
 	if err != nil {
 		return err
 	}
@@ -1702,7 +1846,28 @@ func dockerVolumeIsEmpty(destination string) (bool, error) {
 		return false, err
 	}
 	defer root.close()
-	return confinedDirectoryIsEmpty(root, "lost+found", confinedCopyTransactionName)
+	return confinedVolumeIsEmpty(root)
+}
+
+func confinedVolumeIsEmpty(root *confinedRoot) (bool, error) {
+	empty, err := confinedDirectoryIsEmpty(root, "lost+found", confinedCopyTransactionName)
+	if err != nil || !empty {
+		return empty, err
+	}
+	// A fresh ext4 filesystem has an empty lost+found directory. Recovered
+	// files (or a user-created non-directory with that name) are volume data.
+	fd, err := unix.Openat(root.fd, "lost+found", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return true, nil
+	}
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer unix.Close(fd)
+	return confinedDirectoryIsEmpty(&confinedRoot{fd: fd})
 }
 
 func writeNetworkFiles(root string, spec protocol.WorkloadSpec) error {
@@ -1758,6 +1923,9 @@ func writeNetworkFiles(root string, spec protocol.WorkloadSpec) error {
 }
 
 func applyMount(root string, mount protocol.Mount) error {
+	if mount.ManagedAttachment != "" && (mount.Kind != "volume" || mount.Device != "") {
+		return errors.New("managed attachment is only valid on a named volume")
+	}
 	if _, err := absoluteMountDestinationRelative(mount.Destination); err != nil {
 		return err
 	}
@@ -1777,13 +1945,16 @@ func applyMount(root string, mount protocol.Mount) error {
 		if err := os.MkdirAll(staging, 0755); err != nil {
 			return err
 		}
-		if err := unix.Mount(mount.Source, staging, "virtiofs", 0, ""); err != nil && !errors.Is(err, unix.EBUSY) {
+		if err := mountHostBindShare(mount.Source, staging, unix.Mount); err != nil && !errors.Is(err, unix.EBUSY) {
 			return err
 		}
 		return mountConfinedBind(staging, root, mount, unix.Mount, unix.MountSetattr)
 	case "socket":
 		return nil
 	case "volume":
+		if mount.ManagedAttachment != "" {
+			return mountManagedVolume(root, mount)
+		}
 		staging := filepath.Join("/run/cengine/volumes", mount.Source)
 		return mountConfinedVolume(staging, root, mount, unix.Mount, unix.MountSetattr)
 	default:

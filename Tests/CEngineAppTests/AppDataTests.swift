@@ -159,9 +159,12 @@ import Testing
             helper: helper,
             client: client,
             serviceRegistrationRevision: nil,
-            serviceRegistrationDefaults: defaults
+            serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in }
         )
 
+        await model.start()
+        model.setActive(false)
         await model.refresh()
 
         #expect(model.snapshot?.version.Version == "0.1.0")
@@ -203,8 +206,11 @@ import Testing
             client: client,
             appVersion: "0.2.0",
             serviceRegistrationRevision: nil,
-            serviceRegistrationDefaults: defaults
+            serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in }
         )
+        await model.start()
+        model.setActive(false)
         await model.refresh()
 
         #expect(model.isRunningEngineOutdated)

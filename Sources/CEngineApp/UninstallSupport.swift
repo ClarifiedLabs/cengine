@@ -23,6 +23,18 @@ enum CEngineServices {
         try runLaunchctl(["kickstart", "-k", "gui/\(getuid())/\(engineLabel)"])
     }
 
+    /// The app intentionally has no Runtime dependency. Only the bundled, signed
+    /// engine performs the authenticated check or explicit owner enrollment.
+    static func ensureStorageOwner(allowAuthorization: Bool) async throws {
+        let executable = Bundle.main.bundleURL.appending(path: "Contents/MacOS/cengine-engine")
+        let expected = try OwnerSetupEngineProcess.preflight(executable)
+        try await Task.detached {
+            try OwnerSetupEngineProcess.run(executable.path,
+                arguments: ["helper", allowAuthorization ? "setup-storage-owner" : "check-storage-owner"],
+                authenticate: { try OwnerSetupEngineProcess.authenticate(pid: $0, expected: expected) })
+        }.value
+    }
+
     /// Quiesces the engine, stops every provably owned VM shim, and then
     /// unregisters the privileged helper. Every phase is attempted even when
     /// an earlier one fails so uninstall can still remove all services.
@@ -59,7 +71,7 @@ enum CEngineServices {
             do {
                 try await helper.unregister()
             } catch {
-                failures.append("network helper: \(EngineError.message(for: error))")
+                failures.append("Privileged Helper: \(EngineError.message(for: error))")
             }
         }
         guard failures.isEmpty else {
@@ -99,9 +111,9 @@ enum CEngineServices {
         process.standardOutput = output
         process.standardError = output
         try process.run()
-        process.waitUntilExit()
         let message = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             throw EngineError(
                 .internalError,

@@ -1,217 +1,209 @@
 # Development
 
-`cengine` is an Xcode project targeting arm64 macOS 26. The supported build
-entrypoints are:
+Development requires Apple silicon, macOS 26 or newer, and Xcode. The supported
+entry points are:
 
-```bash
-make build
-make guest-assets
-make kernel-build
-make test
-make test-guest
-make test-compat
-make test-compat-soak
-make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/docker.sock
-make test-compat-helper-install
-make test-compat-doctor
-make test-compat-reset
-make dist-cli
-make package
-make test-release
+```sh
+make build                 # debug app and CLI
+make guest-assets          # kernel and paired guest initramfs assets
+make kernel-build          # explicit kernel source build
+make test                  # compatibility-harness checks and Swift/Xcode tests
+make test-guest             # Linux guest tests
+make test-compat            # isolated Docker/Compose compatibility tests
+make test-release          # release-tooling regression checks
+make dist-cli              # tests and staged CLI/assets
+make package               # local unsigned package
 ```
 
-`make test` first checks compatibility-harness environment isolation, then runs
-`CEngineCoreTests` and `CEngineAPITests` through the shared `cengine` scheme.
-`make guest-assets` fetches the checksum-verified kernel release named by
-`Configuration/kernel-release`, builds the static Go guest services and static
-`mke2fs`, packs both deterministic initramfs files, and writes boot-asset
-checksums. Set `CENGINE_LOCAL_KERNEL=/path/to/Image` to prepare guest assets with
-a local ARM64 kernel instead.
+## Guest assets and kernels
 
-`make kernel-build` is the explicit source-build path for kernel development. It
-builds the exact Linux commit and cengine config recorded under `Configuration/`
-and leaves the result in `.build/guest/vmlinux`; a following `make guest-assets`
-reuses it because its kernel input stamp is current. Use
-`CENGINE_KERNEL_MODE=build make guest-assets` to combine those steps. On Linux
-and macOS, the kernel toolchain runs through Docker Buildx using the context and
-builder already selected by the Docker CLI. Set
-`CENGINE_TOOLCHAIN_DOCKER_CONTEXT` to use an explicit context. The Docker daemon
-and Buildx builder must be configured before the build; kernel builds never
-install a privileged cengine networking helper or request administrator access.
-The compile defaults to the CPU count visible inside the build container and
-uses the builder's configured memory. Set `CENGINE_KERNEL_BUILD_JOBS`, or set
-`CENGINE_KERNEL_BUILD_CPUS` and `CENGINE_KERNEL_BUILD_MEMORY` to apply explicit
-Buildx CPU and memory limits, for example:
+`make guest-assets` fetches the checksum-verified kernel release selected by
+`Configuration/kernel-release`, builds the static Go guest services and `mke2fs`,
+and packs deterministic initramfs files with boot-asset checksums.
+
+Local kernels are supported for development and testing:
+
+```sh
+CENGINE_LOCAL_KERNEL=/absolute/path/to/Image make guest-assets
+# Or build the configured Linux source and assets together:
+CENGINE_KERNEL_MODE=build make guest-assets
+# Or reuse an explicit source build:
+make kernel-build
+CENGINE_LOCAL_KERNEL="$PWD/.build/guest/vmlinux" make guest-assets
+```
+
+`make kernel-build` uses the exact Linux commit, configuration and patches under
+`Configuration/`. It runs through Docker Buildx on Linux or macOS using the
+selected Docker context and builder. Configure those first; kernel builds never
+install a privileged helper or request administrator access. Use
+`CENGINE_TOOLCHAIN_DOCKER_CONTEXT` for an explicit context. The default parallelism
+is the container's visible CPU count; `CENGINE_KERNEL_BUILD_JOBS` overrides it.
+To constrain builder resources:
 
 ```sh
 CENGINE_KERNEL_BUILD_CPUS=8 CENGINE_KERNEL_BUILD_MEMORY=16g make kernel-build
 ```
 
-Kernel release CI uses the same Buildx path on Linux ARM64. Normal builds fetch
-the dedicated kernel release instead of compiling from source.
-`make dist-cli` runs the tests and stages `dist/cengine` plus `dist/share/cengine`.
-`make package` creates `dist/cengine-<marketing-version>.pkg` for local
-release-artifact testing, using `MARKETING_VERSION` from the Xcode project.
+Local builds and custom kernel URLs do not establish canonical release origin.
+Application releases require the configured immutable kernel release to be
+published and fetched through the canonical path; see [Release](release.md).
+The ordinary kernel series currently includes only the host-bind patch. Shared
+managed storage also requires the request-credential patch and matching ABI; a
+plain source build alone is not sufficient. See
+[Kernel patches](../Configuration/kernel-patches/README.md) for the managed-kernel
+build procedure and required compatibility checks.
 
-`make test-compat` builds and signs the debug daemon, terminates orphaned
-compatibility daemons and VM shims owned by this worktree, removes their
-`cengine-compat-*` temporary roots, creates a cached Python virtual environment
-under `.build`, and runs the Docker API and Docker Compose 5.x compatibility
-suites. Every test gets a new daemon, temporary root, Unix socket, engine state,
-and VM set. Fixture images are fetched once into a versioned immutable seed
-content store under `.build` and APFS-cloned into each root, avoiding external registry state without
-sharing mutable engine metadata. Pytest stops all VM shims owned by that root before removing it,
-including when a test fails; it does not reuse a daemon or repair resources
-left by a preceding test. The command builds the `test-compat` Xcode scheme and
-uses a dedicated persistent `dev.cengine.network-helper.test-compat` LaunchDaemon.
-Provision that machine-level helper once with `make test-compat-helper-install`, an
-attended administrator action, then verify it with `make test-compat-doctor`. Normal
-suite, soak, oracle, and isolated-tool runs never request administrator authorization
-and never repair or replace the helper; a missing, damaged, wrong-owner, or
-protocol-incompatible installation fails with the explicit install instruction.
-Fingerprint drift from daemon/API/test changes, compatible helper edits, or Swift,
-Xcode, and SDK changes is diagnostic and does not require reinstalling. The test daemon,
-helper, authentication token, vmnet resource namespace, and automatic address pools are
-isolated from an installed cengine instance, which may remain running. Use
-`make test-compat-helper-install` deliberately when live VM-backed tests must exercise a
-change under `Sources/CEngineNetworkHelper` or after an incompatible protocol change;
-otherwise they continue to use the installed helper while local builds still compile
-its source. Use `make test-compat-helper-uninstall` to remove only the test helper. See
-[Compatibility testing](compatibility-testing.md) for lifecycle and pool overrides.
-The command uses the guest assets built under `.build/guest`; override
-them with `CENGINE_KERNEL`, `CENGINE_CONTAINER_INITRAMFS`, and
-`CENGINE_STORAGE_INITRAMFS`, or override the daemon and fixture image with
-`CENGINE_BINARY` and `CENGINE_TEST_IMAGE`.
-Set `CENGINE_TEST_IMAGE_SOURCE` when the fixture tag should be seeded from a
-private or internal mirror; the default `alpine:latest` fixture is seeded from
-`mirror.gcr.io/library/alpine:latest` to avoid Docker Hub's anonymous rate limit.
-The suite requires Docker Compose
-5.x and kind (v0.32.0 is the reference version); minor and patch releases within
-Compose major version 5 are accepted. `bash Scripts/install-compose-compat.sh`
-installs a checksum-pinned reference Compose release, not a required patch
-version. GitHub-hosted runners
-cannot execute the VM-backed suite, so compatibility tests are currently a
-local gate rather than part of `.github/workflows/test.yml`.
+## Tests
 
-The harness removes ambient Docker endpoint overrides from every subprocess,
-checks that each daemon reports the expected Git commit, and verifies Docker CLI
-access to a sentinel resource on each isolated socket before running a scenario.
-Set `CENGINE_EXPECTED_GIT_COMMIT` when testing a custom `CENGINE_BINARY`.
+`make test` checks harness isolation, then runs `CEngineCoreTests`,
+`CEngineAPITests`, and `CEngineAppTests` through the shared `cengine` scheme.
+Run focused checks first, then `make test` before review. VM-backed changes also
+require `make test-compat` locally; GitHub-hosted runners cannot run that suite.
+To retain an Xcode result bundle:
 
-Use `make test-compat-reset` to perform the worktree-scoped cleanup without
-running the suite. It deliberately does not touch `/Applications/cengine.app`,
-the installed engine service, or processes from another checkout. If a network
-helper crash left an idle reservation inside macOS `NetworkSharing`, use
-`make test-compat-reset-system` once. That exceptional recovery command requests
-administrator authorization and restarts the compatibility helper and system
-NetworkSharing daemon. It refuses to proceed while the installed cengine service is
-loaded unless explicitly overridden; normal compatibility runs do not restart system
-services.
-
-Use `make test-compat-soak` to run three fresh-daemon passes with shuffled test
-ordering. To compare normalized behavior with a real Docker Engine, run
-`make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/docker.sock`;
-the reference host is always explicit and is never inferred from the active
-Docker context.
-
-Runtime behavior changes must name their normative source in the compatibility
-ledger. Use Docker API v1.55 for wire behavior, OCI Runtime Spec v1.3.0 for
-applicable execution semantics, Linux documentation for the implementing
-syscalls, and reference Docker/Moby behavior only where those sources are silent.
-Add or update a focused `RTM-*` contract and the OCI applicability table when a
-runtime semantic changes; kind remains an integration contract, not the first
-place runtime behavior should be specified.
-
-The CLI target is ad-hoc signed for local development with
-`Configuration/cengine.entitlements`. The engine and its VM shims require
-`com.apple.security.virtualization`. The root-owned network helper deliberately
-does not claim `com.apple.vm.networking`; that restricted entitlement is for
-using vmnet without root privilege and requires a provisioning profile.
-
-The Xcode workspace owns Swift package resolution. Update and commit
-`cengine.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
-when dependency versions change.
-
-## Architecture
-
-```text
-docker / compose / buildx
-          |
-          | negotiated HTTP v1.44-v1.55 over ~/.cengine/run/docker.sock
-          v
-  SwiftNIO API router
-          |
-          v
- persisted EngineRuntime actor
-          |
-          v
- RawVirtualizationBackend actor
-          |
-          +------ authenticated Unix control ------+
-          |                                         |
-          v                                         v
- per-container VM shim                       infrastructure shim
-          |                                  /               \
-          v                                 v                 v
- Virtualization.framework VM       ext4 storage VM     VLAN/vmnet fabric
-          |
-          v
- cengine-init (workload is PID 1 in isolated Linux namespaces)
+```sh
+make test XCODE_RESULT_BUNDLE="/path/to/fresh/test-results.xcresult"
 ```
 
-State is JSON with an explicit schema envelope and atomic rename/fsync
-persistence under `~/Library/Application Support/cengine`. VM shims, rather
-than the API daemon, own every `VZVirtualMachine`, so daemon replacement only
-reconnects control sockets and does not stop workloads. Runtime sockets
-remain under `~/.cengine/run`, and daemon logs are under
-`~/Library/Logs/cengine`.
+For serial test execution, keep the standard build tool and pass test flags:
 
-To exercise pressure-aware ballooning manually, start one or more containers,
-run `sudo memory_pressure -S -l warn`, and inspect each container's
-`~/Library/Application Support/cengine/containers/<id>/shim.log`. The first
-warning or critical transition logs guest availability and the selected balloon
-target; returning to normal logs restoration to the VM maximum. Stop the
-`memory_pressure` process after observing both transitions.
+```sh
+make test XCODE_RESULT_BUNDLE_FLAGS='-resultBundlePath /path/to/fresh/test-results.xcresult -parallel-testing-enabled NO'
+```
 
-## Implementation scope
+Use a fresh result-bundle path each time. If an app test host stalls with products
+on an external volume, set `XCODE_DERIVED_DATA` to an internal path such as
+`$HOME/Library/Caches/cengine-tests`, after checking free space. Do not disable
+permissions or tests to work around a stalled host.
 
-This repository is an experimental engine rather than a complete
-implementation of every Docker API. Its focused runtime surface covers
-interactive Docker CLI use, Compose application lifecycle, Buildx container
-builds, networking, observability, and daemon recovery.
+Use Swift Testing (`@Suite`, `@Test`, `#expect`) for unit tests. Bug fixes need
+regression coverage. Each non-oracle compatibility test needs a unique
+`@pytest.mark.compat("AREA-NNN")` entry in the
+[compatibility ledger](docker-compatibility.md).
 
-Implemented API groups include server ping/version/info and filtered live events;
-authenticated, platform-aware image pull with live progress,
-import/list/inspect/history/delete and pruning; container lifecycle, health,
-stats, top, logs, attach, exec, archive copy, mounts, networking, ports, and
-pruning; and Docker-shaped network and volume lifecycle APIs. Direct
-`docker build` intentionally directs clients to Buildx. The managed Buildx
-builder pins BuildKit, stores its state on a 512 GiB sparse block-backed ext4
-volume, and uses the overlayfs snapshotter as part of cengine's tested Buildx
-contract.
+Runtime-semantic changes must cite Docker API v1.55, OCI Runtime Spec v1.3.0 or
+the applicable Linux contract in that ledger, update its OCI applicability table,
+and add a focused `RTM-*` test before relying on kind or application-level tests.
+Reference Docker/Moby behavior only where those specifications are silent.
 
-See [`docker-compatibility.md`](docker-compatibility.md) for the detailed
-compatibility ledger and test provenance.
+## Compatibility setup
+
+Provision the dedicated compatibility helper once with
+`make test-compat-helper-install` (an attended administrator action), then run
+`make test-compat-doctor`. Normal suite, soak, oracle and isolated-tool runs do
+not request authorization or repair/replace the helper. Guest-only and engine-only
+updates do not ordinarily require reinstalling it: compatibility uses authenticated
+capabilities and a security floor, not an exact local binary. Deliberately update
+it when testing changed helper behavior or an incompatible protocol.
+Qualification and fault campaigns require an exact signed pair.
+
+The helper is shared across worktrees. Before replacing it, have every consumer's
+owner quiesce their work or explicitly authorize interruption. Never stop foreign
+shims, replace the production helper, or downgrade the test helper to run old tests.
+See [Compatibility testing](compatibility-testing.md) for signing, lifecycle,
+asset overrides, network pools, cleanup and exact-helper requirements.
+
+```sh
+make test-compat COMPAT_ARGS='Tests/Compatibility/test_kind.py -x -vv'
+make test-compat-soak
+make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/authorized/docker.sock
+```
+
+Include `Tests/Compatibility` or specific test paths when overriding `COMPAT_ARGS`;
+flags alone can collect unrelated tool tests. Never invoke the VM-backed pytest
+suite directly or infer a reference endpoint from the active Docker context.
+
+## Storage setup and recovery
+
+Shared volumes use FUSE backed by ext4 in the storage VM. Unsupported store formats
+are rejected without modifying their data; cengine does not migrate or automatically
+reset them. Preserve the store and its recovery metadata.
+
+Production owner enrollment is explicit and one-time: use app onboarding,
+**Enable**/**Restart**, or `cengine helper setup-storage-owner` as your normal user
+with administrator approval. `cengine helper check-storage-owner` and background
+startup only check ownership; the first XPC caller cannot enroll itself.
+The compatibility helper install target provisions its separate test owner
+without manual root-helper enrollment.
+
+Daemon-only restart reconnects control without stopping workloads. Recovery also
+supports controlled first-start retry and installed-system reboot. These are
+separate from arbitrary helper, VM or disk failure guarantees. See
+[Managed storage](storage-adoption.md) for the lifecycle and recovery contract.
+
+## Volume campaign workflow
+
+Run one serialized compatibility runner at a time. Begin with engine-free helper
+checks, then focused VM-backed contracts before the broader compatibility suite:
+
+```sh
+python3 tools/tests/test-compat-harness.py
+python3 tools/tests/test-volume-invalid-copy.py
+make test-compat COMPAT_ARGS='Tests/Compatibility/test_volume_concurrency.py'
+make test-compat COMPAT_ARGS='Tests/Compatibility --tb=short'
+```
+
+For corpus and application fixtures, follow the build/provenance instructions in
+[volume-corpus](../Tests/Compatibility/fixtures/volume-corpus/README.md),
+[volume-workflows](../Tests/Compatibility/fixtures/volume-workflows/README.md), and
+[Compose upstream volumes](../Tests/Fixtures/compose/upstream-volumes/README.md).
+Fixture builds, cross-compilation and skipped tests are not runtime proof.
+
+Volume oracles require an explicitly authorized Linux/arm64 Docker Engine. They
+remove only run-owned resources; a normal reference is not permission for global
+prune or crash testing. Destructive campaigns require a separately provisioned,
+explicitly authorized disposable engine.
+
+To replay a trusted local plan:
+
+```sh
+CENGINE_VOLUME_PROBE_PLAN=/absolute/path/to/plan.json \
+  make test-compat-oracle DOCKER_REFERENCE_HOST=unix:///path/to/authorized/docker.sock \
+  COMPAT_ARGS='Tests/Compatibility/test_volume_oracle.py -k serial_volume'
+```
+
+Keep `plan.json`, `fixture.tar` and `fixture.json` together. The archive executes
+code on both endpoints; its hash checks only the archive/manifest pair, not the
+plan or provenance. Replay only trusted archives. Preserve failed roots and
+uncertainty markers until investigated; a timeout, process-census error or failed
+transport is not evidence of drain or process exit. Never signal an unverified
+process, delete lifecycle journals, or use global prune to clear a failed run.
+
+## Build identities
+
+Metadata-only local CLI builds are ad-hoc signed with
+`Configuration/cengine.entitlements`. VM-backed lifecycle startup requires matching
+Developer ID engine/helper/controller identities; set
+`CENGINE_DEVELOPER_ID_APPLICATION` for compatibility builds. Engines and VM shims
+require `com.apple.security.virtualization`. The root-owned helper does not claim
+`com.apple.vm.networking`: that restricted entitlement requires a provisioning
+profile for non-root vmnet access.
+
+The Xcode workspace owns Swift package resolution. Commit
+`cengine.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved` when
+changing dependency versions.
 
 ## Local installation and metadata-only development
 
-The signed app registers its bundled `dev.cengine.engine` LaunchAgent with
-`SMAppService`. The agent installs the bundled cengine guest assets, creates the
-cengine Docker context, starts the daemon, and configures the Buildx builder. The
-privileged `dev.cengine.network-helper` LaunchDaemon owns raw vmnet uplinks and
-binds privileged published ports, returning descriptors to the engine over
-authenticated XPC. The app guides the user through approving this required
-networking service during onboarding.
+The signed app registers the per-user `dev.cengine.engine` LaunchAgent and the
+privileged `dev.cengine.network-helper` LaunchDaemon. The helper authorizes storage
+ownership, owns vmnet uplinks and binds privileged ports through authenticated XPC.
+The app manages service approval, bundled guest assets, Docker context and Buildx.
 
-To develop without downloading a kernel or starting VMs:
+To develop API metadata without downloading a kernel or starting VMs:
 
 ```sh
 cengine daemon --metadata-only
 DOCKER_HOST=unix://$HOME/.cengine/run/docker.sock docker info
 ```
 
-## Releases
+A concurrent daemon needs both a distinct `--socket` and a distinct `--root`;
+metadata-only mode still writes store metadata. Store leases in
+`/private/var/tmp/dev.cengine.store-locks-<uid>` are persistent: do not remove them
+to clear a lock. Stop the daemon before administratively moving or replacing its
+root; ownership leases do not descriptor-pin path I/O or fence storage-VM writers.
 
-Public releases use one Developer ID signed, notarized, stapled `.pkg` for
-direct download and the Homebrew Cask. See
-[`release.md`](release.md) for the release process.
+State is under `~/Library/Application Support/cengine`, runtime sockets under
+`~/.cengine/run`, and daemon logs under `~/Library/Logs/cengine`. See
+[Raw runtime architecture](raw-runtime.md) for implementation details and
+[Release](release.md) for signed, notarized package requirements.

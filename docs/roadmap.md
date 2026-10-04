@@ -1,463 +1,65 @@
 # Roadmap
 
-This document tracks cengine's remaining project-level work. The detailed
-Docker API and test backlog remains in
-[Docker compatibility](docker-compatibility.md), while architectural contracts
-and limitations remain in [Raw runtime architecture](raw-runtime.md). Items are
-listed here only when they require a cross-cutting decision or sustained work.
+This page contains project-level priorities, not a development log or an endpoint
+inventory. [Docker compatibility](docker-compatibility.md) owns supported behavior
+and explicit gaps; [Raw runtime architecture](raw-runtime.md) owns runtime design.
 
-## Current state
+## Current state and delivery
 
-cengine runs each workload container in its own Virtualization.framework VM.
-The daemon, per-container VM shims, infrastructure shim, ext4 container roots,
-hybrid block/NFS volume storage, Docker networking, Compose lifecycle, managed
-Buildx builder, and daemon recovery path are implemented. The raw virtualization
-migration is complete; there is no remaining Apple Containerization migration
-phase.
+cengine runs one workload container per Virtualization.framework VM, with durable
+host shims, private ext4 roots, direct-block single-consumer volumes and FUSE shared
+volumes backed by ext4 in the storage VM. Containers survive API-daemon restarts.
+Storage recovery supports controlled first-start retry and system reboot.
 
-## Recently completed
-
-### Runtime compatibility foundation
-
-Runtime compatibility now has a normative source hierarchy beneath the Docker
-API: OCI Runtime Spec v1.3.0 for applicable execution semantics, Linux
-documentation for implementation mechanisms, and Docker/Moby behavior where the
-specifications are silent. Focused `RTM-*` contracts cover init/exec namespace,
-root, identity, security-context and descriptor parity; read-only-root behavior;
-and pinned Docker-in-Docker exec and healthchecks without kind.
-
-Default exec and healthcheck context now resolves image and container cwd, user,
-groups, and environment consistently. The guest protocol carries structured
-identity, `no_new_privs`, and built-in seccomp policy for exec. Compatibility tests normally use the
-installed, pre-approved networking helper without interactive authorization.
-
-Docker PID limits now persist across recovery and drive cgroup-v2 `pids.max` on
-create and live update. Bind mounts apply private isolation; shared/slave modes
-are rejected because virtiofs cannot form the required host/container peer or
-master mount. Unprivileged containers use Docker's default Linux capability set with
-`CapAdd`/`CapDrop` parity between init and exec. Filtered container pruning now
-fails closed on unknown inputs instead of widening deletion scope. Focused
-`RTM-004`–`RTM-008` contracts cover enforcement and recovery, explicit
-propagation gaps, capability masks, prune selection, and exec stage signal and
-status behavior. Remaining security profiles, nonnamespaced sysctls, health start intervals, and
-custom exec detach keys are decoded and rejected explicitly instead of being
-silently ignored.
-
-Docker's `SecurityOpt` no-new-privileges selection now persists, inspects, and
-applies to container init, default and privileged exec, and healthchecks through
-guest protocol v13 and is carried by current v19. Omitted policy follows
-Docker's `NoNewPrivs=0` default, while explicit true or false selections persist
-and survive container restart and daemon recovery (`RTM-021`). Seccomp
-selection remains independent: a staging process installs the filter while still
-privileged, then applies the workload's selected no-new-privileges state.
-
-Unprivileged containers now receive an arm64 adaptation of Moby's built-in
-seccomp profile by default. `seccomp=builtin` and `seccomp=unconfined` select the
-profile explicitly, while privileged containers remain unconfined unless the
-built-in profile is requested. The selection persists and applies to init, exec, and healthchecks across container
-restart and daemon recovery through guest protocol v15, carried by current v19 (`RTM-028`). Filters are
-installed after root, mount, and rlimit setup but before the staging process drops
-its administrative capability, preserving Docker's independent no-new-privileges
-semantics. The filter rejects every non-AArch64 audit architecture; AArch32
-compatibility processes are therefore unsupported while it is active. Custom
-seccomp JSON and AppArmor/SELinux-shaped profiles remain explicit gaps.
-
-Unprivileged workload cgroups now receive Docker/runc's default device allowlist
-through cgroup-v2 BPF before process placement. Standard devices retain their
-expected access, while a process with Docker's default `CAP_MKNOD` can create a
-VM-disk node but cannot read or write it. Exec leaves inherit the policy, and
-enforcement remains active across container restart and daemon recovery
-(`RTM-024`). Privileged workloads remain unrestricted.
-
-Docker `Devices` mappings and additive `DeviceCgroupRules` now persist, inspect,
-apply, and update live through functionality introduced in guest protocol v14
-and carried by current v19 (`RTM-025`). A mapping's
-`PathOnHost` names a real device in the per-container Linux VM—standard guest
-devices and attached virtio block disks are supported—and the guest recreates
-that device at a descriptor-resolved `/dev` destination with the submitted
-`rwm` access. Custom wildcard rules extend the cgroup-v2 BPF policy. Live
-replacement atomically swaps the BPF program, device nodes, and scalar/I/O
-limits, restoring the old selection on failure. Arbitrary macOS character-device
-passthrough and driver/discovery-based `DeviceRequests` remain architecture
-gaps and fail explicitly.
-
-Docker create-time ulimits now persist and apply to container init, exec, and
-healthcheck processes through capability introduced in guest protocol v7 and
-carried by the current guest protocol v19. The final exec command receives
-limits after namespace and root setup without constraining the guest supervisor
-or its signal/status proxies. `RTM-014` covers inspect, daemon recovery,
-container stop/start, and Docker's create-then-start-failure lifecycle for
-invalid limits, including anonymous-volume mutation. Live ulimit updates remain
-an explicit gap.
-
-Supported namespace selections now persist, inspect, and survive daemon
-recovery. Docker IPC `none` uses a private IPC namespace without mounting
-`/dev/shm`; the default/private cgroup and IPC selections plus the host userns
-selection introduced in guest protocol v11 reflect guest behavior through the
-current guest protocol v19 (`RTM-016`). Docker `ShmSize` now persists, inspects,
-and sizes a `nosuid,nodev,noexec` private/default IPC `/dev/shm`, using Docker's
-64 MiB default when omitted or zero and preserving an explicit mount at that
-target even under IPC `none` (`RTM-033`). Docker/runc's namespaced network,
-message-queue, IPC, and UTS sysctl allowlist also persists and applies through
-guest protocol v18, carried by current v19, after endpoint settings and across
-stop/start and daemon recovery (`RTM-034`). Docker `Config.Domainname` now
-persists and inspects exactly; non-empty values translate through that existing
-`kernel.domainname` path, with an explicit `HostConfig.Sysctls` value taking
-precedence across restart and recovery (`RTM-044`). This requires no guest-protocol
-bump. Nonnamespaced sysctls remain an explicit gap
-because they would mutate the guest-wide kernel rather than only the workload
-namespaces. The v19 guest accepts v18 request envelopes during live upgrades and
-responds at the request's version. Current shims emit v19 so older guests reject
-the generation instead of silently retaining the legacy internal-error class for
-missing named exec identities.
-
-Image configuration ingestion now preserves Docker/OCI healthcheck metadata.
-Container-create healthchecks merge with image values field-by-field, an empty
-or omitted test inherits the image command, and `Test=["NONE"]` disables it.
-The effective command, interval, timeout, retries, start period, and
-`StartInterval` persist and inspect. During a new execution's start period,
-probes use `StartInterval` and failures are ignored while status remains
-`starting`; success or grace expiry switches to the regular interval. Explicit
-restart resets health state, while daemon recovery resumes monitoring the
-adopted generation (`RTM-035`).
-
-Docker-host and cross-container cgroup, IPC, PID, UTS, and network sharing are
-explicit architecture gaps: separate per-container VM kernels cannot join one
-Linux namespace. OCI namespace paths are likewise not exposed through the
-Docker API or an OCI runtime CLI. These requests fail before container or volume
-mutation (`RTM-017`).
-
-Docker masked and read-only paths now persist, inspect, and enter the guest
-protocol (introduced in v11 and carried by current v19). Omitted lists select
-Docker's defaults, explicit empty lists disable them,
-and privileged workloads clear them. The guest applies the policy after its
-filesystems and workload root are in place: missing targets are ignored,
-directories are covered by empty read-only tmpfs mounts, files by a verified
-`/dev/null` descriptor, and recursive read-only binds retain inherited security
-flags. `RTM-018` covers file and directory masks, read-only enforcement,
-restart, and daemon recovery.
-
-Docker's structured bind recursion and read-only controls now persist and enter
-guest protocol v12 and are carried by the current v19 protocol. `NonRecursive`
-selects a single bind instead of a recursive bind; read-only binds default to
-recursive `mount_setattr`,
-`ReadOnlyNonRecursive` limits the remount to the bind root, and
-`ReadOnlyForceRecursive` forbids compatibility fallback. Contradictory modes
-fail before mutation, and `RTM-020` covers application, restart, and daemon
-recovery.
-
-Docker's API v1.46 structured tmpfs execution flags now persist and inspect with
-versioned response behavior. Tmpfs mounts use Docker's writable
-`noexec,nosuid,nodev` defaults, while explicit `exec` and `noexec` options apply
-in submitted order so the final execution selection wins. Unknown options and
-non-flag-shaped arrays fail before mutation, and `RTM-022` covers application,
-container restart, and daemon recovery.
-
-Named-volume write-policy composition now follows Docker's mount ordering.
-Parents are applied before nested children regardless of request order, and
-read-only volumes use recursive mount attributes. A read-only container root can
-therefore contain writable volumes, read-only children beneath writable volumes,
-and writable children beneath read-only volumes without one policy erasing the
-other. `RTM-023` covers init and exec across direct ext4 and shared NFS storage,
-container restart, and daemon recovery.
-
-The four Docker per-device block-I/O throttle arrays now persist and apply to
-any real guest block device, including the VM root disk `/dev/vda` and attached
-volume disks such as `/dev/vdb`, through cgroup-v2 `io.max`. API v1.55 live updates
-independently replace or clear each BPS/IOPS limit while older update APIs keep
-their historical ignore behavior. `RTM-015` covers inspect, kernel control-state
-readback, direct-I/O enforcement, rollback after a compatibility-injected guest
-failure following successful scalar and IO writes, daemon recovery, and an
-actual stop/start cycle. Updates durably journal the complete old and desired
-resource selections before backend mutation, serialize journal and metadata
-writes, and atomically publish the desired record only when the journal is
-removed. Recovery reapplies the durable old selection before accepting a live
-or stopped execution. Stopped recovery reconstructs a missing in-memory shim
-from the persisted spec and writable root, while failed replacements restore
-the original shim without deleting that root. Partially launched candidates
-are durably owned by immutable per-generation specs and PID/start identities.
-A pre-spawn intent, child-first identity publication, and argv-based recovery
-close the crash boundary immediately after process creation; every generation
-is independently enumerated until process, socket, spec, and capacity cleanup
-has succeeded. Preparation failures retain the writable root when termination
-cannot be proven, and recovered stopped preparations seed the exact old CPU,
-memory, PID, block-I/O, and VM-capacity selection before replacement. An
-unresolved journal reserves the container's stable
-ID/name/creation identity, fences lifecycle, restart-policy, and auto-remove
-work, and is removed atomically with a definitive container deletion.
-Compatibility fault markers are claimed by rename before validation so a
-replacement path cannot be consumed accidentally. `RTM-025` covers a configured
-volume device and its non-root `io.max` selection.
-
-The workload cgroup now remains the container cgroup-namespace root while init
-moves into a private child leaf. This leaves the namespace root process-free and
-delegates `cpuset`, `cpu`, `io`, `memory`, and `pids` controllers to privileged
-nested runtimes without exposing a writable cgroup mount to unprivileged
-workloads. Docker stats read workload-wide cgroup-v2 CPU usage and throttling,
-current and peak memory, file cache, PID count, and per-device I/O rather than
-init-process proxies. `RTM-026` covers nested child-controller use, aggregate
-accounting, restart, and daemon recovery; `RTM-027` covers top-down cpuset
-delegation and inherited effective CPU and memory-node masks.
-
-Docker block-I/O weights now have an explicit architecture decision. Relative
-weights arbitrate sibling container cgroups sharing one kernel block scheduler;
-a weight inside a cengine guest can affect only processes in that VM and cannot
-coordinate separate container VM disks. Virtualization.framework exposes cache
-and synchronization choices for disk attachments but no host-side relative
-weight control. Active global and per-device weight requests therefore fail
-before mutation instead of publishing cosmetic guest-only state. API v1.44–v1.54
-updates retain Docker's historical ignore behavior for `BlkioWeightDevice`, and
-inspect reports the inert defaults (`RTM-019`).
-
-The API v1.55 runtime-input baseline audit is complete (`RTM-013`). Container
-create and update resources, namespace and process configuration, structured and
-legacy mounts, and healthchecks distinguish inert defaults from active requests.
-Recognized active gaps fail before container,
-volume, or exec state is mutated; malformed and contradictory values return a
-client error. Unknown extension keys remain forward-compatible rather than
-triggering whole-object rejection.
-
-Per-container VM realtime is synchronized from the macOS host through
-functionality introduced in guest protocol v17 and carried by current v19 before
-startup returns, immediately after resume, and every 30 seconds while running. The periodic task belongs to the durable VM shim, pauses
-and stops with its exact generation, logs transient failures, and survives
-daemon adoption without duplication. Startup fails closed if the initial sync
-fails; a resume failure re-pauses the VM or durably quarantines it before
-teardown if rollback cannot be verified. `RTM-032` brackets Linux file
-timestamps across fresh boots, pause/resume, and daemon recovery.
-
-Docker terminal sizing was introduced in guest protocol v16 and is carried by
-current v19.
-Container-create and exec-create `ConsoleSize` values initialize Linux PTYs,
-exec-start may override the create value, and container/exec resize applies
-`TIOCSWINSZ` to a retained PTY master so foreground processes receive
-`SIGWINCH`. Container inspect preserves the create-time value, `[0,0]` retains
-the 24x80 default, and a real Docker CLI `run -it` contract verifies that the
-client terminal dimensions reach the workload (`RTM-030`, `CTR-031`, `CLI-009`).
-
-### Multi-platform and OCI image behavior
-
-The image store now preserves OCI graph roots and all locally available
-platform manifests instead of flattening an index to one variant. Docker API
-v1.47-v1.55 behavior includes versioned manifest/descriptor responses, platform
-selection for inspect, history, load, save, push, and delete, selected container
-manifest descriptors, trusted pull/push origin identity, and attached in-toto
-attestations. Identity intentionally omits build and signature claims because
-cengine does not have verified evidence for either.
-
-The VM-backed compatibility suite covers successful and missing platform
-selection, multi-platform archive round trips, multi-repository Docker CLI
-exports used by kind image loading, selective deletion, identity, attestations,
-and optional differential response-shape comparison.
-
-Containers created with `--platform linux/amd64` now execute through Rosetta
-for Linux: container VMs attach a `VZLinuxRosettaDirectoryShare` virtiofs
-device and guest init registers an x86-64 binfmt_misc handler with the
-mandatory `OCF` flags, so `docker run` and `docker exec` report `x86_64` on
-hosts with Rosetta installed (`RTM-045`). Hosts without Rosetta fail amd64
-container start with an actionable install error instead of `exec format
-error`; `linux/arm64` remains the default platform.
-
-### Client-visible metadata and image events
-
-Container annotations now persist from create through inspect and daemon
-recovery, enter the versioned guest runtime specification, and appear in list
-responses from API v1.46. Successful pulls
-and archive loads emit Docker-shaped image events with historical type, action,
-and image filtering; container events apply the same filter to their creating
-image reference. Default prune requests preserve tagged images and named
-volumes, while Docker's explicit widening selectors remove all unused records.
-System information counts the actual image store and
-versions discovered-device output; containerd, Moby's Linux firewall backend,
-and NRI remain omitted because cengine does not implement those subsystems.
+Release preparation requires canonical asset publication, signing and distribution
+acceptance. Local assets are usable for development but do not satisfy these
+[release requirements](release.md).
+[Managed storage](storage-adoption.md) documents owner enrollment and recovery limits.
 
 ## Compatibility priorities
 
-### 1. Establish and expand OCI/Linux runtime-semantic conformance
+1. **Maintain focused Docker/OCI/Linux contracts.** Classify runtime behavior against
+   the [OCI applicability table](docker-compatibility.md#runtime-semantics-and-oci-applicability).
+   Apply supported inputs and reject active gaps before mutation. Add a focused
+   `RTM-*` regression before relying on kind or another nested-runtime integration.
+2. **Close deliberately adopted client gaps.** Use the
+   [API assessment](docker-compatibility.md#api-version-envelope), observed Docker,
+   Compose, Buildx, kind and Testcontainers demand to prioritize work. Unsupported
+   behavior must remain explicit rather than silently accepted.
+3. **Keep sustained-use validation bounded.** Expand concurrency and differential
+   coverage where a concrete missing contract warrants it. Require owned cleanup,
+   fixed resource budgets and strict comparisons; a finite pass is not universal
+   filesystem or crash certification.
 
-Treat the OCI applicability table in
-[Docker compatibility](docker-compatibility.md#runtime-semantics-and-oci-applicability)
-as the first runtime backlog. Preserve the one-container-per-VM architecture and
-adopt only semantics that support cengine's Docker compatibility surface; do not
-claim an OCI runtime CLI merely because its execution rules are used as a
-reference.
-
-Work in this order:
-
-1. Maintain the completed API v1.55 runtime-input baseline audit as Docker's
-   request schema evolves. Apply newly supported fields, reject active gaps
-   explicitly, or classify them in the ledger (`RTM-013`).
-2. Close remaining security-profile and mount-matrix decisions for functionality
-   cengine already exposes by either implementing a deliberately adopted
-   Docker-facing behavior or retaining an explicit fail-closed rejection. This
-   priority does not override architecture decisions in the detailed ledger.
-   Docker's built-in seccomp profile and
-   explicit unconfined selection are complete (`RTM-028`). Namespace inputs, PID limits, private
-   bind isolation, and capability add/drop have explicit supported or
-   architectural-gap decisions; shared/slave bind propagation is also an
-   explicit architecture gap. Docker-relative block-I/O weights are now an
-   explicit architecture gap (`RTM-019`); configured guest devices, custom
-   access policies, non-root device throttles, nested cgroup delegation, and
-   workload-wide accounting are complete (`RTM-024`–`RTM-026`). Structured
-   tmpfs execution policy and named-volume remount
-   matrices are complete (`RTM-022`, `RTM-023`); remaining mount inputs have
-   explicit support or gap classifications in the compatibility ledger.
-3. Add bounded, curated Moby/runc test ports after focused cengine contracts have
-   stabilized the expected behavior.
-4. Consider a test-only OCI-runtime adapter as a later validation project; it is
-   not a public product surface or a prerequisite for the curated ports.
-5. Implement otherwise unexposed OCI features only when cengine adopts them as
-   explicit compatibility requirements.
-
-Completion criteria:
-
-- Each runtime change names its Docker, OCI, Linux, or observed-Moby source.
-- A focused `RTM-*` contract fails strictly for every adopted black-box semantic.
-- The applicability table classifies new discoveries as covered, partial,
-  intentional gap, undecided, or architecturally not applicable.
-- Nested-runtime regressions are reproducible without kind before kind is used as
-  the integration gate.
-
-Generated API differentials, broad upstream test imports, and self-hosted VM CI
-remain later validation work rather than prerequisites for this priority.
-
-### 2. Complete modern network endpoint and IPAM semantics
-
-The modern network endpoint and IPAM behavior that affects how clients create,
-configure, and inspect endpoints is complete:
-
-- Endpoint MAC address application: an explicit `MacAddress` is decoded,
-  validated, applied in the guest, inspected, and preserved across recovery
-  (`NET-014`, `NET-015`).
-- Endpoint gateway priority: `GwPriority` is decoded on create and connect,
-  used to select IPv4 and IPv6 default-gateway endpoints independently for
-  multi-network containers, inspected, and preserved across recovery
-  (`NET-016`, `RTM-012`).
-- SCTP has an explicit support decision: publishing an `sctp` port is rejected
-  with 400 and recorded as an intentional gap because the vmnet port forwarder
-  bridges only TCP and UDP (`NET-017`).
-- Explicit address-family controls are persisted and applied: `EnableIPv4=false`
-  suppresses IPv4 IPAM and endpoint allocation, `EnableIPv6` controls IPv6 IPAM,
-  and both flags survive inspect and daemon recovery (`NET-018`).
-- Endpoint sysctls use the API v1.46 `DriverOpts` field, validate Docker's
-  `IFNAME` grammar, and apply through the guest network namespace. Create and
-  connect accept the current request DTO for older negotiated APIs, while the
-  field round-trips only through v1.46+ inspect and remains omitted from older
-  responses. Recovery support shipped in guest protocol v7 and is carried by
-  the current guest protocol v19 (`NET-019`).
-- API v1.52+ network inspect reports per-subnet IPAM allocation status while
-  older API responses omit it; IPv4 `/31` status and allocation follow RFC 3021
-  semantics through privileged-helper gateway validation and subnet-derived
-  default gateways, and pending creates reserve static IP and explicit MAC
-  endpoints before persistence (`NET-020`).
-- IPAM and address-family configurations cengine cannot faithfully express are
-  rejected before persistence: auxiliary reservations, multiple same-family
-  subnets, asymmetric dual-stack isolation, both families disabled, and custom
-  IPv6 gateways (`NET-022`).
-
-Completion criteria:
-
-- Accepted endpoint settings are applied in the guest and survive inspect and
-  daemon recovery. *(Done for MAC address and gateway priority.)*
-- Invalid or unsupported settings fail explicitly instead of being ignored.
-  *(Done for MAC address, SCTP publishing, IPAM, and family/fabric limits.)*
-- Multi-network containers select each address family's route according to
-  gateway priority. *(Done: `NET-016`, `RTM-012`.)*
-- SCTP is either implemented and tested end to end or recorded as an intentional
-  compatibility gap. *(Done: recorded as an intentional gap, `NET-017`.)*
-- Endpoint sysctls, explicit IPv4 controls, IPAM status, and IPAM validation are
-  covered by `NET-018`–`NET-020` and `NET-022`.
-
-### 3. Close remaining client-visible API gaps
-
-Use the API v1.44-v1.55 assessment table in
-[Docker compatibility](docker-compatibility.md#api-version-envelope) as the
-endpoint-level backlog. Registry search (`IMG-004`) is complete for Docker Hub
-and legacy-v1 custom registries, including authentication, filters, limits, and
-the versioned Docker response shape. Per-device block-I/O updates are complete
-for real block devices in the guest under API v1.55, including attached volume
-disks; relative block-I/O weights remain an intentional architecture gap.
-Container annotations, pull/load image events, accurate image counts, and
-versioned native-engine information are complete. Direct-build image `create`
-events remain part of the intentional direct-builder gap. Implement accepted
-gaps in observed Docker, Compose, Buildx, kind, and Testcontainers demand order.
-
-Completion criteria for each accepted gap:
-
-- The compatibility ledger records the intended behavior.
-- A unique compatibility contract covers the behavior when black-box testing is
-  practical.
-- The implementation matches a reference Docker Engine or documented Docker API
-  semantics.
-- A deliberately unsupported behavior returns a clear error and is recorded as
-  an intentional gap rather than being silently accepted.
-
-### 4. Harden compatibility under sustained use
-
-Current black-box gaps include higher-volume concurrent container lifecycle
-stress and broader differential-oracle sampling. Use these tests to find and fix
-observable lifecycle, recovery, cleanup, and response-shape incompatibilities
-after the functional API gaps above.
-
-Completion criteria:
-
-- Repeated concurrent lifecycle tests leave no VM, shim, vmnet, or temporary
-  state behind.
-- The differential oracle covers deterministic image, network, inspect, event,
-  and error-response contracts that are likely to diverge from Docker Engine.
-- Any discovered divergence is fixed or recorded in the compatibility ledger.
+Every runtime change names its Docker, OCI, Linux or observed-Moby contract, updates
+the compatibility inventory and adds focused regression coverage. Intentional
+architecture gaps are not a queue of promised implementations.
 
 ## Deferred validation and automation
 
-These improve repeatability and release confidence but do not expand Docker
-compatibility. Continue to use the local compatibility suite while functional
-compatibility work is prioritized.
-
-### Add a VM-backed compatibility CI gate
-
-The complete compatibility suite is currently a local gate because GitHub-hosted
-runners cannot execute its Virtualization.framework scenarios. When CI
-automation becomes a priority, add a maintained self-hosted Apple-silicon runner
-for pull requests and release commits.
-
-Completion criteria:
-
-- `make test-compat` runs from a clean lifecycle on every gated commit.
-- Failure artifacts include daemon, VM-shim, and pytest diagnostics.
-- Release packaging requires a successful VM-backed run for the same commit.
-
-### Define the supported client-version envelope
-
-Docker-py and Compose are pinned for the compatibility suite, and the managed
-BuildKit image is pinned. The host Docker CLI and Buildx plugin are recorded but
-not pinned. Later, define minimum and tested Docker CLI and Buildx versions, then
-run a small version matrix or install a pinned reference Buildx plugin in the
-harness.
-
-Completion criteria:
-
-- Documentation names minimum and reference client versions.
-- Compatibility runs fail clearly outside the supported envelope.
-- At least the minimum and reference Buildx versions exercise `BLD-001` and
-  `BLD-002`.
+- **VM-backed CI:** native compatibility remains a local gate. A maintained
+  self-hosted Apple-silicon runner would allow same-commit VM-backed release checks;
+  GitHub-hosted runners cannot execute these Virtualization.framework scenarios.
+- **Client-version matrix:** Docker-py, Compose and managed BuildKit are pinned;
+  the host Docker CLI and Buildx are recorded rather than pinned. Define minimum
+  and reference versions before promising a supported client envelope.
+- **Curated upstream tests:** bounded Moby/runc ports can extend focused contracts.
+  A test-only OCI adapter is a possible validation tool, not a public runtime CLI
+  or a prerequisite for current Docker support.
 
 ## Accepted constraints and non-goals
 
-These are deliberate boundaries, not open implementation tasks:
+- Preserve one workload container per VM; do not delegate to Docker Engine inside
+  a shared Linux VM. Cross-container Linux namespace sharing cannot span kernels.
+- Use the managed Buildx builder. Docker Engine's legacy `/build` API is unsupported.
+- Select volume placement before first use. Used block-backed volumes are not
+  promoted live when a later container adds a second reference; declare the sharing
+  topology up front.
+- Shared-volume locks are client-local; distributed locking and cross-VM concurrent
+  mmap coherence are not promised.
+- Unsupported store formats are rejected without modifying their data. cengine
+  does not migrate or automatically reset them.
+- Physical power-loss certification is separate from software drain, VM/process
+  death and host reboot coverage.
 
-- Preserve the one-workload-container-per-VM model. Do not delegate execution to
-  Docker Engine inside a generic Linux VM.
-- Use the managed Buildx builder for image builds. Docker Engine's legacy
-  `/build` API is intentionally unsupported.
-- Select named-volume storage mode before first use. An already-used block-backed
-  volume is not promoted live to shared NFS storage when a later container adds a
-  second reference; callers must declare the sharing topology up front.
-- Do not add migration or backward-compatibility machinery while cengine remains
-  an experiment unless a concrete compatibility requirement is adopted.
-
-## Keeping this roadmap current
-
-Update this file when priorities or architectural boundaries change. Update
-[Docker compatibility](docker-compatibility.md) in the same change whenever an
-API status or compatibility-test disposition changes. Do not duplicate the
-endpoint inventory here.
+Update this page when priorities or boundaries change, not after each local run.

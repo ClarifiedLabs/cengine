@@ -6,10 +6,14 @@
     <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>cengine-network-helper</string>
+    <key>CFBundleName</key><string>cengine-helper</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>CEngineCompatColdL2Fault</key><string>$(CENGINE_COMPAT_COLD_L2_FAULT)</string>
+    <key>CEngineStorageLifecycleQualification</key><string>$(CENGINE_STORAGE_LIFECYCLE_QUALIFICATION)</string>
+    <key>CEngineStorageLifecycleSourcePin</key><string>$(CENGINE_STORAGE_LIFECYCLE_SOURCE_PIN)</string>
+    <key>CEngineStorageLifecycleAssetsSHA256</key><string>$(CENGINE_STORAGE_LIFECYCLE_ASSETS_SHA256)</string>
     <key>CEngineTeamIdentifier</key><string>$(CENGINE_TEAM_IDENTIFIER)</string>
     <key>CEngineNetworkHelperServiceName</key><string>$(CENGINE_NETWORK_HELPER_SERVICE_NAME)</string>
     <key>CEngineNetworkHelperClientIdentifier</key><string>$(CENGINE_NETWORK_HELPER_CLIENT_IDENTIFIER)</string>

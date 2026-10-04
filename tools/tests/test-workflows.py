@@ -18,6 +18,7 @@ def main() -> None:
         "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
         "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default", "CENGINE_KERNEL_MODE: release",
         "docker --context default buildx version",
+        ".build/guest/disk-bootstrap.json",
         "needs: [require-tests, guest-assets]",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
@@ -46,8 +47,9 @@ def main() -> None:
     require_contains(engine_entitlements, "com.apple.security.virtualization", "cengine.entitlements")
     require_absent(release, "com.apple.vm.networking", "release.yml")
     require_absent(engine_entitlements, "com.apple.vm.networking", "cengine.entitlements")
-    if (REPO_ROOT / "Configuration/cengine-network-helper.entitlements").exists():
-        raise AssertionError("the root network helper must not claim restricted vmnet entitlements")
+    for name in ("cengine-network-helper.entitlements", "cengine-helper.entitlements"):
+        if (REPO_ROOT / "Configuration" / name).exists():
+            raise AssertionError("the Privileged Helper must not claim restricted vmnet entitlements")
     for forbidden in (
         "brew install docker",
         "install-compose-compat.sh",
@@ -114,7 +116,7 @@ def main() -> None:
         '<Scheme',
         'buildConfiguration = "test-compat"',
         'BlueprintName = "cengine"',
-        'BlueprintName = "CEngineNetworkHelper"',
+        'BlueprintName = "CEngineHelper"',
     ):
         require_contains(compat_scheme, needle, "test-compat.xcscheme")
 

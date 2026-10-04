@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: none
+      additional_contexts:
+        python-base: oci-layout://${DEVELOPER_PYTHON_LAYOUT:?local Python fixture required}@${DEVELOPER_PYTHON_MANIFEST:?selected manifest required}
     image: ${DEVELOPER_IMAGE}
     platform: linux/arm64
     init: true

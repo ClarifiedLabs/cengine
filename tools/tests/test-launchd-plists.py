@@ -3,7 +3,7 @@
 
 These plists replaced the Homebrew formula's `service` block, whose values were
 asserted by test-homebrew-formula.py; a typo here would leave the engine agent
-or privileged-port helper unable to launch on end-user machines.
+or Privileged Helper unable to launch on end-user machines.
 """
 from __future__ import annotations
 
@@ -28,12 +28,20 @@ class LaunchdPlistTests(unittest.TestCase):
         self.assertEqual(plist["ThrottleInterval"], 60)
         self.assertEqual(plist["ProcessType"], "Interactive")
 
-    def test_network_helper_launch_daemon(self) -> None:
+    def test_privileged_helper_launch_daemon(self) -> None:
         plist = plistlib.loads(HELPER_PLIST.read_bytes())
         self.assertEqual(plist["Label"], "dev.cengine.network-helper")
-        self.assertEqual(plist["BundleProgram"], "Contents/MacOS/cengine-network-helper")
+        self.assertEqual(plist["BundleProgram"], "Contents/MacOS/cengine-helper")
         self.assertEqual(plist["MachServices"], {"dev.cengine.network-helper": True})
         self.assertEqual(plist["ProcessType"], "Interactive")
+
+    def test_helper_bundle_name_preserves_identity_configuration(self) -> None:
+        plist = plistlib.loads((ROOT / "Configuration/network-helper-Info.plist").read_bytes())
+        self.assertEqual(plist["CFBundleName"], "cengine-helper")
+        self.assertEqual(plist["CFBundleExecutable"], "$(EXECUTABLE_NAME)")
+        self.assertEqual(plist["CFBundleIdentifier"], "$(PRODUCT_BUNDLE_IDENTIFIER)")
+        self.assertEqual(plist["CEngineNetworkHelperServiceName"], "$(CENGINE_NETWORK_HELPER_SERVICE_NAME)")
+        self.assertEqual(plist["CEngineNetworkHelperClientIdentifier"], "$(CENGINE_NETWORK_HELPER_CLIENT_IDENTIFIER)")
 
     def test_labels_match_cask_launchctl_teardown(self) -> None:
         cask_script = (ROOT / "Scripts/homebrew-formula.sh").read_text()

@@ -18,6 +18,42 @@ private func expectCleanupPendingConflict<T>(_ operation: () async throws -> T) 
     }
 }
 
+// Match SharedVolumeRemovalGateBackend's existing bounded completion wait.
+// Scheduler yields alone do not bound asynchronous persistence or reconciliation.
+private func waitForReconciliation(
+    _ message: Comment, until completed: () async throws -> Bool
+) async throws {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    while ContinuousClock.now < deadline {
+        if try await completed() { return }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    try #require(try await completed(), message)
+}
+
+private func waitForContainerEvent(
+    _ action: String, identifier: String, runtime: EngineRuntime
+) async throws {
+    try await waitForReconciliation("container did not publish its \(action) completion") {
+        for await event in await runtime.events(until: Date()) {
+            if event.id == identifier, event.action == action { return true }
+        }
+        return false
+    }
+}
+
+private final class SynchronizedStateSaves: @unchecked Sendable {
+    private let lock = NSLock()
+    private var saves = 0
+
+    func observe(_ boundary: AtomicStoreSaveBoundary) {
+        guard boundary == .directorySynchronized else { return }
+        lock.withLock { saves += 1 }
+    }
+
+    func count() -> Int { lock.withLock { saves } }
+}
+
 private func versionMetadataBundle() throws -> (Bundle, URL) {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     let bundleURL = root.appending(path: "VersionFixture.bundle", directoryHint: .isDirectory)
@@ -153,6 +189,7 @@ private actor CompletionBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func listImages() async throws -> [BackendImage]? { images }
     func completion(_ container: ContainerRecord) async -> Int32? {
@@ -250,6 +287,7 @@ private actor SequencedImageLoadBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func loadImages(fromOCILayout _: URL) async throws -> [BackendImage] {
         guard !batches.isEmpty else {
@@ -267,6 +305,7 @@ private actor NetworkRecordingBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
 
     func createNetwork(_ network: NetworkRecord) async throws -> NetworkRecord {
@@ -294,6 +333,7 @@ private actor BlockingStartBackend: ContainerBackend {
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func hasEnteredStart() -> Bool { entered }
     func startCount() -> Int { starts }
@@ -321,6 +361,7 @@ private actor BlockingEndpointAddressBackend: ContainerBackend {
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func kill(_: ContainerRecord, signal _: String) async throws { kills += 1 }
     func endpointAddresses(for container: ContainerRecord) async -> [String: BackendEndpointAddress] {
@@ -380,6 +421,7 @@ private actor BlockingPauseResumeBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func pause(_: ContainerRecord) async throws {
         pauseBlocked = true
@@ -398,12 +440,13 @@ private actor BlockingPauseResumeBackend: ContainerBackend {
 }
 
 private actor ResumeRollbackBackend: ContainerBackend {
-    enum Failure: Error { case stop, deletion }
+    enum Failure: Error { case executionCleanup, stop, deletion }
 
     private var running = Set<String>()
     private var rejectCleanup: Bool
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
 
     init(rejectCleanup: Bool = false) {
         self.rejectCleanup = rejectCleanup
@@ -422,6 +465,11 @@ private actor ResumeRollbackBackend: ContainerBackend {
         return 137
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        if rejectCleanup { throw Failure.executionCleanup }
+        running.remove(container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         if rejectCleanup { throw Failure.deletion }
@@ -434,7 +482,7 @@ private actor ResumeRollbackBackend: ContainerBackend {
 
     func allowCleanup() { rejectCleanup = false }
     func isRunning(_ identifier: String) -> Bool { running.contains(identifier) }
-    func counts() -> (stops: Int, deletes: Int) { (stops, deletes) }
+    func counts() -> (stops: Int, deletes: Int, cleanups: Int) { (stops, deletes, cleanups) }
 }
 
 private actor PauseExitRaceBackend: ContainerBackend {
@@ -447,6 +495,7 @@ private actor PauseExitRaceBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func completion(_: ContainerRecord) async -> Int32? {
         await withCheckedContinuation { completionContinuation = $0 }
@@ -475,6 +524,7 @@ private actor BlockingNetworkUpdateBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func updateNetworkRecords(_: [ContainerRecord]) async throws {
         guard blockNextUpdate else { return }
@@ -501,6 +551,7 @@ private actor BlockingExecStartBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
         ContainerIOBridge(tty: exec.configuration.tty)
@@ -534,6 +585,7 @@ private actor BlockingRestartExecGateBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func restart(_: ContainerRecord, timeoutSeconds _: Int) async throws {
         // Model RawVirtualizationBackend after it has installed the replacement
@@ -577,6 +629,7 @@ private actor BlockingStaleExecPreparationBackend: ContainerBackend {
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func completion(_: ContainerRecord) async -> Int32? {
         completionCalls += 1
@@ -618,6 +671,7 @@ private actor BlockingPrepareBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func prepareCount() -> Int { prepares }
     func releasePreparations() {
@@ -638,6 +692,7 @@ private actor IncarnationOwnershipBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_ container: ContainerRecord) async throws {
         guard owners[container.id]?.instanceID == container.instanceID else { return }
         owners.removeValue(forKey: container.id)
@@ -658,6 +713,7 @@ private actor ConcurrentDeleteBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {
         arrivals += 1
         if arrivals == 2 {
@@ -685,6 +741,7 @@ private actor BlockingContainerDeleteBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_ container: ContainerRecord) async throws {
         guard !hasBlocked else { return }
         hasBlocked = true
@@ -706,6 +763,7 @@ private actor BlockingPruneDeleteBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {
         deleteEntered = true
         await withCheckedContinuation { continuation = $0 }
@@ -723,6 +781,7 @@ private actor BlockingResourceUpdateBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func updateResources(_: ContainerRecord) async throws {
         updateEntered = true
@@ -738,6 +797,7 @@ private actor FailingResourceUpdateBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func updateResources(_: ContainerRecord) async throws {
         throw EngineError(.internalError, "injected resource update failure")
@@ -750,10 +810,10 @@ private actor TransactionalResourceUpdateBackend: ContainerBackend {
         case failCompensation
         case blockCompensation
         case rollbackIncomplete
-        case rollbackIncompleteDeleteFailure
-        case rollbackIncompleteRecoveryAndDeleteFailure
+        case rollbackIncompleteCleanupFailure
+        case rollbackIncompleteRecoveryAndCleanupFailure
     }
-    enum Failure: Error { case compensation, recovery, deletion }
+    enum Failure: Error { case executionCleanup, compensation, recovery, deletion }
 
     private let mode: Mode
     private var prepared = Set<String>()
@@ -762,6 +822,7 @@ private actor TransactionalResourceUpdateBackend: ContainerBackend {
     private var updates: [ContainerRecord] = []
     private var starts = 0
     private var deletes = 0
+    private var cleanups = 0
     private var compensationBlocked = false
     private var compensationContinuation: CheckedContinuation<Void, Never>?
 
@@ -784,10 +845,20 @@ private actor TransactionalResourceUpdateBackend: ContainerBackend {
         return 137
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        if mode == .rollbackIncompleteCleanupFailure
+            || mode == .rollbackIncompleteRecoveryAndCleanupFailure {
+            throw Failure.executionCleanup
+        }
+        prepared.remove(container.id)
+        running.remove(container.id)
+        resources.removeValue(forKey: container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
-        if mode == .rollbackIncompleteDeleteFailure
-            || mode == .rollbackIncompleteRecoveryAndDeleteFailure {
+        if mode == .rollbackIncompleteCleanupFailure
+            || mode == .rollbackIncompleteRecoveryAndCleanupFailure {
             throw Failure.deletion
         }
         prepared.remove(container.id)
@@ -799,11 +870,11 @@ private actor TransactionalResourceUpdateBackend: ContainerBackend {
         if mode == .rollbackIncomplete, updates.count == 1 {
             throw BackendResourceRollbackIncompleteError("injected guest rollback failure")
         }
-        if (mode == .rollbackIncompleteDeleteFailure
-            || mode == .rollbackIncompleteRecoveryAndDeleteFailure), updates.count == 1 {
+        if (mode == .rollbackIncompleteCleanupFailure
+            || mode == .rollbackIncompleteRecoveryAndCleanupFailure), updates.count == 1 {
             throw BackendResourceRollbackIncompleteError("injected guest rollback failure")
         }
-        if mode == .rollbackIncompleteRecoveryAndDeleteFailure, updates.count > 1 {
+        if mode == .rollbackIncompleteRecoveryAndCleanupFailure, updates.count > 1 {
             throw Failure.recovery
         }
         if mode == .failCompensation, updates.count == 2 {
@@ -829,7 +900,7 @@ private actor TransactionalResourceUpdateBackend: ContainerBackend {
         compensationContinuation?.resume()
         compensationContinuation = nil
     }
-    func lifecycleCounts() -> (starts: Int, deletes: Int) { (starts, deletes) }
+    func lifecycleCounts() -> (starts: Int, deletes: Int, cleanups: Int) { (starts, deletes, cleanups) }
 }
 
 private actor ResourceFenceCompletionBackend: ContainerBackend {
@@ -839,6 +910,7 @@ private actor ResourceFenceCompletionBackend: ContainerBackend {
     private var prepares = 0
     private var starts = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_ container: ContainerRecord) async throws {
@@ -856,6 +928,11 @@ private actor ResourceFenceCompletionBackend: ContainerBackend {
         return 137
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        running.remove(container.id)
+        prepared.remove(container.id)
+        cleanups += 1
+    }
     func delete(_ container: ContainerRecord) async throws {
         running.remove(container.id)
         prepared.remove(container.id)
@@ -871,13 +948,13 @@ private actor ResourceFenceCompletionBackend: ContainerBackend {
     func finish(_ identifier: String, code: Int32) {
         completionContinuations.removeValue(forKey: identifier)?.resume(returning: code)
     }
-    func lifecycleCounts() -> (prepares: Int, starts: Int, deletes: Int) {
-        (prepares, starts, deletes)
+    func lifecycleCounts() -> (prepares: Int, starts: Int, deletes: Int, cleanups: Int) {
+        (prepares, starts, deletes, cleanups)
     }
 }
 
 private actor ResourceRecoveryBackend: ContainerBackend {
-    enum Failure: Error { case update, deletion }
+    enum Failure: Error { case executionCleanup, update, deletion }
 
     private var resources: [String: ContainerRecord]
     private var running: Set<String>
@@ -912,6 +989,12 @@ private actor ResourceRecoveryBackend: ContainerBackend {
         return 137
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        if failDelete { throw Failure.executionCleanup }
+        running.remove(container.id)
+        prepared.remove(container.id)
+        resources.removeValue(forKey: container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         if failDelete { throw Failure.deletion }
         running.remove(container.id)
@@ -945,6 +1028,7 @@ private actor UpdateExitRaceBackend: ContainerBackend {
     private var starts = 0
     private var prepares = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws { prepares += 1 }
@@ -954,6 +1038,7 @@ private actor UpdateExitRaceBackend: ContainerBackend {
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws { cleanups += 1 }
     func delete(_: ContainerRecord) async throws { deletes += 1 }
     func completion(_: ContainerRecord) async -> Int32? {
         await withCheckedContinuation { completionContinuation = $0 }
@@ -973,16 +1058,17 @@ private actor UpdateExitRaceBackend: ContainerBackend {
         updateContinuation?.resume()
         updateContinuation = nil
     }
-    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int, cleanups: Int) { (prepares, starts, deletes, cleanups) }
 }
 
 private actor BlockingReconciliationBackend: ContainerBackend {
     private var completionContinuations: [String: CheckedContinuation<Int32?, Never>] = [:]
-    private var deleteContinuation: CheckedContinuation<Void, Never>?
-    private var deleteBlocked = false
+    private var teardownContinuation: CheckedContinuation<Void, Never>?
+    private var teardownBlocked = false
     private var prepares = 0
     private var starts = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws { prepares += 1 }
@@ -992,12 +1078,19 @@ private actor BlockingReconciliationBackend: ContainerBackend {
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        guard container.phase == .exited else { return }
+        teardownBlocked = true
+        await withCheckedContinuation { teardownContinuation = $0 }
+        teardownBlocked = false
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         guard container.phase == .exited else { return }
-        deleteBlocked = true
-        await withCheckedContinuation { deleteContinuation = $0 }
-        deleteBlocked = false
+        teardownBlocked = true
+        await withCheckedContinuation { teardownContinuation = $0 }
+        teardownBlocked = false
     }
     func completion(_ container: ContainerRecord) async -> Int32? {
         await withCheckedContinuation { completionContinuations[container.id] = $0 }
@@ -1008,12 +1101,12 @@ private actor BlockingReconciliationBackend: ContainerBackend {
     func finish(_ identifier: String, code: Int32) {
         completionContinuations.removeValue(forKey: identifier)?.resume(returning: code)
     }
-    func hasBlockedReconciliationDelete() -> Bool { deleteBlocked }
-    func releaseReconciliationDelete() {
-        deleteContinuation?.resume()
-        deleteContinuation = nil
+    func hasBlockedReconciliationTeardown() -> Bool { teardownBlocked }
+    func releaseReconciliationTeardown() {
+        teardownContinuation?.resume()
+        teardownContinuation = nil
     }
-    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int, cleanups: Int) { (prepares, starts, deletes, cleanups) }
 }
 
 private actor AttachedExecLifecycleBackend: ContainerBackend {
@@ -1026,6 +1119,7 @@ private actor AttachedExecLifecycleBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
         ContainerIOBridge(tty: exec.configuration.tty)
@@ -1051,6 +1145,7 @@ private actor FailedAttachedExecBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func prepareExec(_ exec: ExecRecord, container _: ContainerRecord) async throws -> ContainerIOBridge {
         ContainerIOBridge(tty: exec.configuration.tty)
@@ -1070,6 +1165,7 @@ private actor ParentTeardownExecBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 137 }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func completion(_: ContainerRecord) async -> Int32? {
         await withCheckedContinuation { containerCompletions.append($0) }
@@ -1114,6 +1210,7 @@ private actor ImageStoreBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func listImages() async throws -> [BackendImage]? {
         references.map {
@@ -1131,6 +1228,39 @@ private actor ImageStoreBackend: ContainerBackend {
     }
     func deletedReferences() -> [String] { deleted }
     func exportedReferences() -> [String] { exported }
+}
+
+private actor LocalOCIImageBackend: ContainerBackend {
+    private let store: OCIContentStore
+    private var preparedImages: [String: OCIStoredImage] = [:]
+    private var pulls = 0
+
+    init(store: OCIContentStore) { self.store = store }
+
+    func pullImage(_ reference: String, platform _: String) async throws {
+        pulls += 1
+        throw EngineError(.notFound, "unexpected pull of \(reference)")
+    }
+    func prepare(_ container: ContainerRecord) async throws {
+        do {
+            preparedImages[container.id] = try await store.image(
+                reference: container.image, platform: container.platform
+            )
+        } catch {
+            try await pullImage(container.image, platform: container.platform)
+        }
+    }
+    func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
+    func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
+    func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
+    func delete(_: ContainerRecord) async throws {}
+    func listImages() async throws -> [BackendImage]? { try await store.summaries() }
+    func loadImages(fromOCILayout directory: URL) async throws -> [BackendImage] {
+        try await store.importLayout(directory)
+    }
+    func preparedImage(for id: String) -> OCIStoredImage? { preparedImages[id] }
+    func pullCount() -> Int { pulls }
 }
 
 private func healthcheckBackendImage(_ healthcheck: HealthcheckRecord) -> BackendImage {
@@ -1247,6 +1377,7 @@ private actor MultiPlatformImageBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func listImages() async throws -> [BackendImage]? { [multiPlatformBackendImage()] }
     func deleteImage(reference _: String) async throws {}
@@ -1298,6 +1429,7 @@ private actor RestartBackend: ContainerBackend {
     private var starts = 0
     private var prepares = 0
     private var deletes = 0
+    private var cleanups = 0
     private var preparedContainers = Set<String>()
     private var resourceUpdates: [ContainerRecord] = []
     init(exitCode: Int32? = nil) { self.exitCode = exitCode }
@@ -1314,6 +1446,10 @@ private actor RestartBackend: ContainerBackend {
     }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        preparedContainers.remove(container.id)
+        cleanups += 1
+    }
     func delete(_ container: ContainerRecord) async throws {
         preparedContainers.remove(container.id)
         deletes += 1
@@ -1323,6 +1459,7 @@ private actor RestartBackend: ContainerBackend {
     func startCount() -> Int { starts }
     func prepareCount() -> Int { prepares }
     func deleteCount() -> Int { deletes }
+    func cleanupCount() -> Int { cleanups }
     func lastResourceUpdate() -> ContainerRecord? { resourceUpdates.last }
 }
 
@@ -1361,6 +1498,7 @@ private final class ArmedAtomicStoreBoundaryFailure: @unchecked Sendable {
     private var armed = false
     private var successfulSavesBeforeFailure = 0
     private var failuresRemaining = 0
+    private var injectedFailures = 0
     private let target: AtomicStoreSaveBoundary
 
     init(target: AtomicStoreSaveBoundary = .replacementCompleted) {
@@ -1383,11 +1521,14 @@ private final class ArmedAtomicStoreBoundaryFailure: @unchecked Sendable {
                 return false
             }
             failuresRemaining -= 1
+            injectedFailures += 1
             armed = failuresRemaining > 0
             return true
         }
         if shouldFail { throw Failure.injected }
     }
+
+    func failureCount() -> Int { lock.withLock { injectedFailures } }
 }
 
 private final class BlockingAtomicStoreBoundaryFailure: @unchecked Sendable {
@@ -1623,6 +1764,7 @@ private actor FinalPersistenceGate {
     func isBlocked() -> Bool { blocked }
 
     func release() {
+        armed = false
         continuation?.resume()
         continuation = nil
     }
@@ -1642,6 +1784,7 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
     private var starts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_ container: ContainerRecord) async throws {
@@ -1671,6 +1814,11 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
         return code
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 137 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         if failNextDelete {
@@ -1693,26 +1841,48 @@ private actor ForceRemovalStopFailureBackend: ContainerBackend {
     }
     func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
     func isPrepared(_ identifier: String) -> Bool { preparedContainers.contains(identifier) }
-    func counts() -> (starts: Int, stops: Int, deletes: Int) { (starts, stops, deletes) }
+    func counts() -> (starts: Int, stops: Int, deletes: Int, cleanups: Int) { (starts, stops, deletes, cleanups) }
 }
 
 private actor SharedVolumeRemovalGateBackend: ContainerBackend {
-    private var volumeDeleteContinuations: [CheckedContinuation<Void, Never>] = []
+    private var deleteContinuations: [String: CheckedContinuation<Void, Never>] = [:]
+    private var gatesReleased = false
+    private var completedRemovals = Set<String>()
+    private(set) var deletedVolumes: [String] = []
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 31 }
     func wait(_: ContainerRecord) async throws -> Int32 { 31 }
-    func delete(_: ContainerRecord) async throws {}
-    func deleteVolume(_: String) async throws {
-        await withCheckedContinuation { volumeDeleteContinuations.append($0) }
+    func cleanupExecution(_: ContainerRecord) async throws {}
+    func delete(_ container: ContainerRecord) async throws {
+        guard !gatesReleased else { return }
+        await withCheckedContinuation { deleteContinuations[container.id] = $0 }
     }
+    func deleteVolume(_ name: String) async throws { deletedVolumes.append(name) }
 
-    func blockedVolumeDeleteCount() -> Int { volumeDeleteContinuations.count }
-    func releaseNextVolumeDelete() {
-        guard !volumeDeleteContinuations.isEmpty else { return }
-        volumeDeleteContinuations.removeFirst().resume()
+    func blockedDeleteCount() -> Int { deleteContinuations.count }
+    func releaseDelete(_ identifier: String) { deleteContinuations.removeValue(forKey: identifier)?.resume() }
+    func releaseAllDeletes() {
+        gatesReleased = true
+        for continuation in deleteContinuations.values { continuation.resume() }
+        deleteContinuations.removeAll()
+    }
+    func recordRemovalCompletion(_ identifier: String) { completedRemovals.insert(identifier) }
+    func waitForBlockedDeletes(_ count: Int) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while deleteContinuations.count < count, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try #require(deleteContinuations.count == count, "container cleanup did not reach its gate")
+    }
+    func waitForRemovalCompletion(_ identifier: String) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !completedRemovals.contains(identifier), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try #require(completedRemovals.contains(identifier), "container removal did not complete")
     }
 }
 
@@ -1741,6 +1911,7 @@ private actor RestartFailurePathBackend: ContainerBackend {
     private var starts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
     private var restarts = 0
     private var healthchecks = 0
     private var blockHealthcheck = false
@@ -1767,6 +1938,12 @@ private actor RestartFailurePathBackend: ContainerBackend {
         return 127
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+        completionContinuations.removeValue(forKey: container.id)?.resume(returning: nil)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         runningContainers.remove(container.id)
@@ -1828,8 +2005,8 @@ private actor RestartFailurePathBackend: ContainerBackend {
         completionContinuations[identifier] != nil
     }
     func healthcheckCount() -> Int { healthchecks }
-    func counts() -> (starts: Int, stops: Int, deletes: Int, restarts: Int) {
-        (starts, stops, deletes, restarts)
+    func counts() -> (starts: Int, stops: Int, deletes: Int, cleanups: Int, restarts: Int) {
+        (starts, stops, deletes, cleanups, restarts)
     }
 }
 
@@ -1840,6 +2017,7 @@ private actor LifecycleRaceBackend: ContainerBackend {
     private var starts = 0
     private var prepares = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws { prepares += 1 }
@@ -1856,6 +2034,7 @@ private actor LifecycleRaceBackend: ContainerBackend {
         return 0
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws { cleanups += 1 }
     func delete(_: ContainerRecord) async throws { deletes += 1 }
     func completion(_: ContainerRecord) async -> Int32? {
         await withCheckedContinuation { completionContinuation = $0 }
@@ -1863,9 +2042,11 @@ private actor LifecycleRaceBackend: ContainerBackend {
     func isWaitingForCompletion() -> Bool { completionContinuation != nil }
     func isStopBlocked() -> Bool { stopIsBlocked }
     func releaseStop() { stopContinuation?.resume(); stopContinuation = nil }
-    func counts() -> (prepares: Int, starts: Int, deletes: Int) { (prepares, starts, deletes) }
+    func counts() -> (prepares: Int, starts: Int, deletes: Int, cleanups: Int) { (prepares, starts, deletes, cleanups) }
 }
 
+// These preparation tokens represent live shim state, not persisted roots or I/O.
+// FailedStartStorageTests separately proves that the on-disk artifacts survive.
 private actor PartialStartFailureBackend: ContainerBackend {
     enum Failure: Error { case duringPrepare, afterLaunch }
 
@@ -1876,6 +2057,7 @@ private actor PartialStartFailureBackend: ContainerBackend {
     private var starts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
     private var completionRegistrations = 0
     private var healthchecks = 0
 
@@ -1906,6 +2088,11 @@ private actor PartialStartFailureBackend: ContainerBackend {
         return 127
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         runningContainers.remove(container.id)
@@ -1927,8 +2114,8 @@ private actor PartialStartFailureBackend: ContainerBackend {
     func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
     func isPrepared(_ identifier: String) -> Bool { preparedContainers.contains(identifier) }
     func failNextPrepare() { shouldFailPrepare = true }
-    func counts() -> (starts: Int, stops: Int, deletes: Int, completions: Int, healthchecks: Int) {
-        (starts, stops, deletes, completionRegistrations, healthchecks)
+    func counts() -> (starts: Int, stops: Int, deletes: Int, cleanups: Int, completions: Int, healthchecks: Int) {
+        (starts, stops, deletes, cleanups, completionRegistrations, healthchecks)
     }
 }
 
@@ -1937,7 +2124,7 @@ private actor PartialStartFailureBackend: ContainerBackend {
 /// record must drive cleanup after reload instead of hiding the execution as a
 /// safe created/exited container.
 private actor QuarantinedExecutionBackend: ContainerBackend {
-    enum Failure: Error { case partialStart, partialRestart, cleanupStop, cleanupDelete }
+    enum Failure: Error { case executionCleanup, partialStart, partialRestart, cleanupStop, cleanupDelete }
 
     private var preparedContainers = Set<String>()
     private var runningContainers = Set<String>()
@@ -1949,6 +2136,7 @@ private actor QuarantinedExecutionBackend: ContainerBackend {
     private var restarts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
     private var executionOperations = 0
     private var execBridges: [String: ContainerIOBridge] = [:]
 
@@ -1976,6 +2164,12 @@ private actor QuarantinedExecutionBackend: ContainerBackend {
         return 127
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        if rejectCleanup { throw Failure.executionCleanup }
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         if rejectCleanup { throw Failure.cleanupDelete }
@@ -2049,8 +2243,8 @@ private actor QuarantinedExecutionBackend: ContainerBackend {
     }
     func allowCleanup() { rejectCleanup = false }
     func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
-    func counts() -> (starts: Int, restarts: Int, stops: Int, deletes: Int) {
-        (starts, restarts, stops, deletes)
+    func counts() -> (starts: Int, restarts: Int, stops: Int, deletes: Int, cleanups: Int) {
+        (starts, restarts, stops, deletes, cleanups)
     }
     func executionOperationCount() -> Int { executionOperations }
 }
@@ -2058,7 +2252,7 @@ private actor QuarantinedExecutionBackend: ContainerBackend {
 /// Models an auto-remove container whose execution has completed but remains a
 /// live backend resource until definitive deletion succeeds.
 private actor AutoRemoveCleanupBackend: ContainerBackend {
-    enum Failure: Error { case cleanupStop, cleanupDelete }
+    enum Failure: Error { case executionCleanup, cleanupStop, cleanupDelete }
 
     private var completionContinuations: [String: CheckedContinuation<Int32?, Never>] = [:]
     private var backendResources = Set<String>()
@@ -2066,6 +2260,7 @@ private actor AutoRemoveCleanupBackend: ContainerBackend {
     private var starts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_: ContainerRecord) async throws {}
@@ -2081,6 +2276,11 @@ private actor AutoRemoveCleanupBackend: ContainerBackend {
         return 0
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        if rejectCleanup { throw Failure.executionCleanup }
+        backendResources.remove(container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         if rejectCleanup { throw Failure.cleanupDelete }
@@ -2099,14 +2299,14 @@ private actor AutoRemoveCleanupBackend: ContainerBackend {
     func failCleanup() { rejectCleanup = true }
     func allowCleanup() { rejectCleanup = false }
     func hasBackendResource(_ identifier: String) -> Bool { backendResources.contains(identifier) }
-    func counts() -> (starts: Int, stops: Int, deletes: Int) { (starts, stops, deletes) }
+    func counts() -> (starts: Int, stops: Int, deletes: Int, cleanups: Int) { (starts, stops, deletes, cleanups) }
 }
 
 /// Models a daemon-startup restart whose preparation leaves a backend generation
-/// before reporting failure. Cleanup may either verify deletion immediately or
+/// before reporting failure. Cleanup may either verify execution teardown immediately or
 /// remain unavailable until the next startup attempt.
 private actor PolicyPreparationFailureBackend: ContainerBackend {
-    enum Failure: Error { case partialPreparation, cleanupStop, cleanupDelete }
+    enum Failure: Error { case executionCleanup, partialPreparation, cleanupStop, cleanupDelete }
 
     private var backendResources = Set<String>()
     private var failNextPreparation = false
@@ -2115,6 +2315,7 @@ private actor PolicyPreparationFailureBackend: ContainerBackend {
     private var starts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_ container: ContainerRecord) async throws {
@@ -2137,6 +2338,11 @@ private actor PolicyPreparationFailureBackend: ContainerBackend {
         return 127
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        if rejectCleanup { throw Failure.executionCleanup }
+        backendResources.remove(container.id)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         if rejectCleanup { throw Failure.cleanupDelete }
@@ -2152,8 +2358,8 @@ private actor PolicyPreparationFailureBackend: ContainerBackend {
     func hasBackendResource(_ identifier: String) -> Bool {
         backendResources.contains(identifier)
     }
-    func counts() -> (prepares: Int, starts: Int, stops: Int, deletes: Int) {
-        (prepares, starts, stops, deletes)
+    func counts() -> (prepares: Int, starts: Int, stops: Int, deletes: Int, cleanups: Int) {
+        (prepares, starts, stops, deletes, cleanups)
     }
 }
 
@@ -2161,7 +2367,7 @@ private actor PolicyPreparationFailureBackend: ContainerBackend {
 /// start boundary, then makes compensation unverifiable until explicitly
 /// released by the test.
 private actor PolicyLaunchQuarantineBackend: ContainerBackend {
-    enum Failure: Error { case partialStart, cleanupStop, cleanupDelete }
+    enum Failure: Error { case executionCleanup, partialStart, cleanupStop, cleanupDelete }
 
     private var preparedContainers = Set<String>()
     private var runningContainers = Set<String>()
@@ -2171,6 +2377,7 @@ private actor PolicyLaunchQuarantineBackend: ContainerBackend {
     private var starts = 0
     private var stops = 0
     private var deletes = 0
+    private var cleanups = 0
 
     func pullImage(_: String, platform _: String) async throws {}
     func prepare(_ container: ContainerRecord) async throws { preparedContainers.insert(container.id) }
@@ -2192,6 +2399,13 @@ private actor PolicyLaunchQuarantineBackend: ContainerBackend {
         return 127
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        cleanups += 1
+        if rejectCleanup { throw Failure.executionCleanup }
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+        completionContinuations.removeValue(forKey: container.id)?.resume(returning: nil)
+    }
     func delete(_ container: ContainerRecord) async throws {
         deletes += 1
         if rejectCleanup { throw Failure.cleanupDelete }
@@ -2213,13 +2427,13 @@ private actor PolicyLaunchQuarantineBackend: ContainerBackend {
         completionContinuations[identifier] != nil
     }
     func isRunning(_ identifier: String) -> Bool { runningContainers.contains(identifier) }
-    func counts() -> (starts: Int, stops: Int, deletes: Int) { (starts, stops, deletes) }
+    func counts() -> (starts: Int, stops: Int, deletes: Int, cleanups: Int) { (starts, stops, deletes, cleanups) }
 }
 
 /// Suspends an explicit restart while the old completion monitor publishes a
 /// real exit, then fails the replacement launch.
 private actor RestartCompletionRaceBackend: ContainerBackend {
-    enum Failure: Error { case restartAfterCompletion, cleanupStop, cleanupDelete }
+    enum Failure: Error { case executionCleanup, restartAfterCompletion, cleanupStop, cleanupDelete }
 
     private var preparedContainers = Set<String>()
     private var runningContainers = Set<String>()
@@ -2241,6 +2455,12 @@ private actor RestartCompletionRaceBackend: ContainerBackend {
         return 127
     }
     func wait(_: ContainerRecord) async throws -> Int32 { 127 }
+    func cleanupExecution(_ container: ContainerRecord) async throws {
+        if rejectCleanup { throw Failure.executionCleanup }
+        runningContainers.remove(container.id)
+        preparedContainers.remove(container.id)
+        completionContinuations.removeValue(forKey: container.id)?.resume(returning: nil)
+    }
     func delete(_ container: ContainerRecord) async throws {
         if rejectCleanup { throw Failure.cleanupDelete }
         runningContainers.remove(container.id)
@@ -2299,6 +2519,10 @@ private actor GenerationCompletionBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {
+        completionContinuation?.resume(returning: nil)
+        completionContinuation = nil
+    }
     func delete(_: ContainerRecord) async throws {
         completionContinuation?.resume(returning: nil)
         completionContinuation = nil
@@ -2368,6 +2592,7 @@ private actor AuthImageBackend: ContainerBackend {
     func start(_ container: ContainerRecord) async throws -> [PortBinding] { container.ports }
     func stop(_: ContainerRecord, timeoutSeconds _: Int) async throws -> Int32 { 0 }
     func wait(_: ContainerRecord) async throws -> Int32 { 0 }
+    func cleanupExecution(_: ContainerRecord) async throws {}
     func delete(_: ContainerRecord) async throws {}
     func listImages() async throws -> [BackendImage]? {
         pulled ? [.init(id: "sha256:authenticated", reference: "registry.example/team/app:latest", size: 42,
@@ -2638,6 +2863,65 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(logConfig["Type"] as? String == "json-file")
         let bindings = try #require(host["PortBindings"] as? [String: [[String: String]]])
         #expect(bindings["8080/tcp"]?.first?["HostPort"] == "0")
+    }
+
+    @Test(arguments: ["v1.44", "v1.55"])
+    func containerListMountsAllowAnonymousVolumeInheritance(version: String) async throws {
+        let (router, root) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let request = Data(#"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/data","ReadOnly":true}]}}"#.utf8)
+        let created = await router.route(.init(
+            method: .POST, uri: "/\(version)/containers/create?name=original", body: request
+        ))
+        #expect(created.status == .created)
+
+        // Compose builds inherited mounts from container list, not container inspect.
+        let list = await router.route(.init(method: .GET, uri: "/\(version)/containers/json?all=1"))
+        #expect(list.status == .ok)
+        let containers = try #require(JSONSerialization.jsonObject(with: list.body) as? [[String: Any]])
+        let original = try #require(containers.first)
+        let mounts = try #require(original["Mounts"] as? [[String: Any]])
+        let mount = try #require(mounts.first)
+        #expect(mounts.count == 1)
+        #expect(mount["Type"] as? String == "volume")
+        #expect(mount["Destination"] as? String == "/data")
+        #expect(mount["RW"] as? Bool == false)
+        let name = try #require(mount["Name"] as? String)
+        #expect(!name.isEmpty)
+
+        let replacement = await router.route(.init(
+            method: .POST, uri: "/\(version)/containers/create?name=replacement",
+            body: try JSONSerialization.data(withJSONObject: [
+                "Image": "alpine",
+                "HostConfig": ["Mounts": [[
+                    "Type": try #require(mount["Type"] as? String),
+                    "Source": name,
+                    "Target": try #require(mount["Destination"] as? String),
+                    "ReadOnly": !(try #require(mount["RW"] as? Bool)),
+                ]]],
+            ])
+        ))
+        #expect(replacement.status == .created)
+        let inspect = await router.route(.init(method: .GET, uri: "/\(version)/containers/replacement/json"))
+        #expect(inspect.status == .ok)
+        let inspected = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let inherited = try #require((inspected["Mounts"] as? [[String: Any]])?.first)
+        #expect(inherited["Name"] as? String == name)
+        #expect(inherited["Destination"] as? String == "/data")
+        #expect(inherited["RW"] as? Bool == false)
+
+        // Omitting the inherited source still requests a fresh anonymous volume.
+        let renewed = await router.route(.init(
+            method: .POST, uri: "/\(version)/containers/create?name=renewed", body: request
+        ))
+        #expect(renewed.status == .created)
+        let renewalInspect = await router.route(.init(method: .GET, uri: "/\(version)/containers/renewed/json"))
+        #expect(renewalInspect.status == .ok)
+        let renewal = try #require(JSONSerialization.jsonObject(with: renewalInspect.body) as? [String: Any])
+        let renewedMount = try #require((renewal["Mounts"] as? [[String: Any]])?.first)
+        let renewedName = try #require(renewedMount["Name"] as? String)
+        #expect(!renewedName.isEmpty)
+        #expect(renewedName != name)
     }
 
     @Test func privateBindPropagationRoundTripsAndUnrealizableModesAreRejected() async throws {
@@ -4545,11 +4829,14 @@ private actor AuthImageBackend: ContainerBackend {
                 kind: .volume, source: volume.name, destination: "/data"
             )]
             let record = try await runtime.createContainer(input)
-            failure.arm(afterSuccessfulSaves: 1)
+            // The container-removal fence and exact volume-removal intent must
+            // both land before injecting ambiguity into the final commit.
+            failure.arm(afterSuccessfulSaves: 2)
 
             try await runtime.removeContainer(
                 record.id, force: false, removeVolumes: true
             )
+            #expect(failure.failureCount() == 1)
             #expect((await backend.lifecycleCounts()).deletes == 1)
             await #expect(throws: EngineError.self) {
                 _ = try await runtime.container(record.id)
@@ -4691,7 +4978,8 @@ private actor AuthImageBackend: ContainerBackend {
             #expect((await backend.resourceUpdates()).map(\.blockIOReadBps) == [[
                 .init(path: "/dev/vda", rate: 2_097_152),
             ]])
-            #expect((await backend.lifecycleCounts()).deletes == 1)
+            #expect((await backend.lifecycleCounts()).cleanups == 1)
+            #expect((await backend.lifecycleCounts()).deletes == 0)
             #expect(try await runtime.container(record.id).phase == .exited)
             let poisonedVolumeName = "must-not-overwrite-\(item.0)"
             var laterPersistenceFailed = false
@@ -4865,6 +5153,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(stopped.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
         #expect(!(await backend.isRunning(record.id)))
         #expect(await backend.currentResources(record.id) == nil)
+        #expect(await backend.lifecycleCounts().cleanups == 1)
+        #expect(await backend.lifecycleCounts().deletes == 0)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: .init())
         #expect(try #require(durable.containers.first).phase == .exited)
@@ -4898,6 +5188,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(stopped.blockIOReadBps == [.init(path: "/dev/vda", rate: 1_048_576)])
         #expect(!(await backend.isRunning(record.id)))
         #expect(await backend.currentResources(record.id) == nil)
+        #expect(await backend.lifecycleCounts().cleanups == 1)
+        #expect(await backend.lifecycleCounts().deletes == 0)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: .init())
         #expect(try #require(durable.containers.first).phase == .exited)
@@ -5299,7 +5591,7 @@ private actor AuthImageBackend: ContainerBackend {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = TransactionalResourceUpdateBackend(
-            mode: .rollbackIncompleteRecoveryAndDeleteFailure
+            mode: .rollbackIncompleteRecoveryAndCleanupFailure
         )
         let saveFailure = ArmedStateSaveFailure()
         let runtime = try await EngineRuntime(
@@ -6836,6 +7128,83 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(remove.status == .ok)
     }
 
+    @Test func createByInspectedImageIDResolvesImportedImageWithoutPull() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sourceStore = try OCIContentStore(root: root.appending(path: "source-content"))
+        let config = try await sourceStore.put(
+            Data(#"{"architecture":"arm64","os":"linux","config":{"Env":["IMAGE_ID_FIXTURE=1"]},"rootfs":{"type":"layers","diff_ids":[]}}"#.utf8),
+            mediaType: "application/vnd.oci.image.config.v1+json"
+        )
+        let manifest = try await sourceStore.put(
+            JSONEncoder().encode(OCIManifest(
+                schemaVersion: 2,
+                mediaType: "application/vnd.oci.image.manifest.v1+json",
+                config: config, layers: [], annotations: nil
+            )),
+            mediaType: "application/vnd.oci.image.manifest.v1+json"
+        )
+        let tag = "create-by-id:latest"
+        try await sourceStore.tag(manifest, as: tag)
+        let archive = try await sourceStore.exportLayout(references: [tag])
+        let store = try OCIContentStore(root: root.appending(path: "content"))
+        let backend = LocalOCIImageBackend(store: store)
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        let load = await router.route(.init(
+            method: .POST, uri: "/v1.55/images/load", body: archive
+        ))
+        #expect(load.status == .ok)
+        let inspect = await router.route(.init(
+            method: .GET, uri: "/v1.55/images/\(tag)/json"
+        ))
+        #expect(inspect.status == .ok)
+        let image = try #require(JSONSerialization.jsonObject(with: inspect.body) as? [String: Any])
+        let returnedID = try #require(image["Id"] as? String)
+        #expect(returnedID == config.digest)
+        #expect(returnedID != manifest.digest)
+
+        let references = ["create-by-id", tag, "docker.io/library/\(tag)", returnedID]
+        for (index, reference) in references.enumerated() {
+            let create = await router.route(.init(
+                method: .POST, uri: "/v1.55/containers/create?name=image-id-\(index)",
+                body: try JSONSerialization.data(withJSONObject: ["Image": reference])
+            ))
+            try #require(create.status == .created, "\(String(decoding: create.body, as: UTF8.self))")
+            let created = try #require(JSONSerialization.jsonObject(with: create.body) as? [String: Any])
+            let id = try #require(created["Id"] as? String)
+            let prepared = try #require(await backend.preparedImage(for: id))
+            #expect(prepared.manifest.config.digest == config.digest)
+            #expect(prepared.manifestDescriptor.digest == manifest.digest)
+            #expect(prepared.configuration.config?.environment == ["IMAGE_ID_FIXTURE=1"])
+            let container = try await runtime.container(id)
+            #expect(container.image == (reference == returnedID ? returnedID : ImageReference.normalized(reference)))
+            #expect(container.imageID == returnedID)
+            #expect(container.imageManifestDescriptor?.digest == manifest.digest)
+
+            let containerInspect = await router.route(.init(
+                method: .GET, uri: "/v1.55/containers/\(id)/json"
+            ))
+            #expect(containerInspect.status == .ok)
+            let inspected = try #require(JSONSerialization.jsonObject(with: containerInspect.body) as? [String: Any])
+            #expect(inspected["Image"] as? String == returnedID)
+            #expect((inspected["ImageManifestDescriptor"] as? [String: Any])?["digest"] as? String == manifest.digest)
+        }
+        #expect(await backend.pullCount() == 0)
+        #expect(try await store.summaries().count == 1)
+
+        // Familiar names must retain their existing image accounting, too.
+        let usage = await router.route(.init(method: .GET, uri: "/v1.55/system/df"))
+        #expect(usage.status == .ok)
+        let diskUsage = try #require(JSONSerialization.jsonObject(with: usage.body) as? [String: Any])
+        let images = try #require(diskUsage["Images"] as? [[String: Any]])
+        #expect(images.first?["Containers"] as? Int == references.count)
+        let containers = try #require(diskUsage["Containers"] as? [[String: Any]])
+        #expect(containers.count == references.count)
+        #expect(containers.allSatisfy { $0["ImageID"] as? String == returnedID })
+    }
+
     @Test func multiPlatformImageMetadataIsVersionedAndPlatformSelectable() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -7427,10 +7796,10 @@ private actor AuthImageBackend: ContainerBackend {
         )
 
         #expect(try await runtime.startAttachedExec(exec.id) == 123)
+        while !(await backend.isWaitingForExecCompletion()) { await Task.yield() }
         let running = try await runtime.inspectExec(exec.id)
         #expect(running.running)
         #expect(running.pid == 73)
-        while !(await backend.isWaitingForExecCompletion()) { await Task.yield() }
 
         await backend.finishExec(code: 23)
         for _ in 0..<100 {
@@ -8036,6 +8405,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(restarted.restartCount == 1)
         #expect(restarted.healthStatus == "starting")
         #expect(restarted.healthFailingStreak == 0)
+        await runtime.shutdown()
     }
 
     @Test func canceledCompletionMonitorCannotRegisterAgainstRestartedGeneration() async throws {
@@ -8171,6 +8541,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(failed.restartCount == 0)
         #expect(!(await backend.isRunning(record.id)))
         #expect(!(await backend.isPrepared(record.id)))
+        #expect(await backend.counts().cleanups == 1)
+        #expect(await backend.counts().deletes == 0)
         #expect(!(await backend.isWaitingForCompletion(record.id)))
         #expect(try await runtime.inspectExec(exec.id).exitCode == 137)
         #expect(await waitIterator.next() == 127)
@@ -8217,6 +8589,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(recovered.phase == .running)
         #expect(recovered.restartCount == 1)
         #expect(await backend.isRunning(policy.id))
+        #expect(await backend.counts().deletes == 0)
 
         var removeInput = ContainerRecord(name: "restart-failure-remove", image: "debian")
         removeInput.autoRemove = true
@@ -8229,6 +8602,7 @@ private actor AuthImageBackend: ContainerBackend {
         await #expect(throws: EngineError.self) { try await runtime.container(removed.id) }
         #expect(!(await backend.isRunning(removed.id)))
         #expect(!(await backend.isPrepared(removed.id)))
+        #expect(await backend.counts().deletes == 1)
     }
 
     @Test func startPersistenceFailureRollsBackBackendAndDurableState() async throws {
@@ -8253,6 +8627,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(try await runtime.container(record.id).phase == .created)
         #expect(!(await backend.isRunning(record.id)))
         #expect(!(await backend.isPrepared(record.id)))
+        #expect(await backend.counts().cleanups == 1)
+        #expect(await backend.counts().deletes == 0)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: EngineSnapshot())
         #expect(durable.containers.first(where: { $0.id == record.id })?.phase == .created)
@@ -8292,7 +8668,8 @@ private actor AuthImageBackend: ContainerBackend {
         let failedCounts = await backend.counts()
         #expect(failedCounts.starts == 1)
         #expect(failedCounts.stops == 1)
-        #expect(failedCounts.deletes == 1)
+        #expect(failedCounts.cleanups == 1)
+        #expect(failedCounts.deletes == 0)
         #expect(failedCounts.completions == 0)
         #expect(failedCounts.healthchecks == 0)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
@@ -8353,7 +8730,8 @@ private actor AuthImageBackend: ContainerBackend {
         let failedCounts = await backend.counts()
         #expect(failedCounts.starts == 1)
         #expect(failedCounts.stops == 1)
-        #expect(failedCounts.deletes == 1)
+        #expect(failedCounts.cleanups == 1)
+        #expect(failedCounts.deletes == 0)
 
         await expectCleanupPendingConflict { try await runtime.containerIO(record.id) }
         await expectCleanupPendingConflict {
@@ -8371,13 +8749,14 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(await backend.executionOperationCount() == 0)
 
         // A same-daemon retry cannot cross the quarantine while definitive
-        // backend deletion is still failing.
+        // backend execution cleanup is still failing.
         await #expect(throws: EngineError.self) {
             try await runtime.startContainer(record.id)
         }
         #expect(try await runtime.container(record.id).phase == .dead)
         #expect(await backend.isRunning(record.id))
-        #expect(await backend.counts().deletes == failedCounts.deletes)
+        #expect(await backend.counts().cleanups == failedCounts.cleanups)
+        #expect(await backend.counts().deletes == 0)
         #expect(await saveFailure.failureCount() == 2)
 
         await runtime.shutdown()
@@ -8392,7 +8771,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(try await reloaded.container(record.id).phase == .created)
         let recoveredCounts = await backend.counts()
         #expect(recoveredCounts.stops == beforeRecovery.stops + 1)
-        #expect(recoveredCounts.deletes == beforeRecovery.deletes + 1)
+        #expect(recoveredCounts.cleanups == beforeRecovery.cleanups + 1)
+        #expect(recoveredCounts.deletes == 0)
 
         try await reloaded.startContainer(record.id)
         #expect(await backend.isRunning(record.id))
@@ -8400,13 +8780,13 @@ private actor AuthImageBackend: ContainerBackend {
         await reloaded.shutdown()
     }
 
-    @Test func successfulDeleteVerifiesFailedStartCleanupAfterStopFailure() async throws {
+    @Test func successfulExecutionCleanupVerifiesFailedStartAfterStopFailure() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = QuarantinedExecutionBackend()
         let runtime = try await EngineRuntime(root: root, backend: backend)
         let record = try await runtime.createContainer(
-            ContainerRecord(name: "delete-verifies-cleanup", image: "debian")
+            ContainerRecord(name: "execution-cleanup-verifies-stop-failure", image: "debian")
         )
         await backend.failStartAndStopOnly()
 
@@ -8418,7 +8798,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(!(await backend.isRunning(record.id)))
         let counts = await backend.counts()
         #expect(counts.stops == 1)
-        #expect(counts.deletes == 1)
+        #expect(counts.cleanups == 1)
+        #expect(counts.deletes == 0)
         await runtime.shutdown()
     }
 
@@ -8548,7 +8929,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(counts.prepares == 1)
         #expect(counts.starts == 0)
         #expect(counts.stops == 1)
-        #expect(counts.deletes == 1)
+        #expect(counts.cleanups == 1)
+        #expect(counts.deletes == 0)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: EngineSnapshot())
         #expect(durable.containers.first?.phase == .exited)
@@ -8583,6 +8965,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(counts.prepares == 0)
         #expect(counts.starts == 0)
         #expect(counts.stops == 0)
+        #expect(counts.cleanups == 0)
         #expect(counts.deletes == 0)
         #expect(await saveFailure.failureCount() == 1)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
@@ -8630,7 +9013,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(counts.prepares == 2)
         #expect(counts.starts == 1)
         #expect(counts.stops == 2)
-        #expect(counts.deletes == 2)
+        #expect(counts.cleanups == 2)
+        #expect(counts.deletes == 0)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: EngineSnapshot())
         #expect(durable.cleanupPendingContainerIDs == nil)
@@ -8683,7 +9067,7 @@ private actor AuthImageBackend: ContainerBackend {
         await recovered.shutdown()
     }
 
-    @Test func cleanupPendingRecoveryRejectsMissingRecordsAndDoesNotDoubleDeleteDeadRecords() async throws {
+    @Test func cleanupPendingRecoveryRejectsMissingRecordsAndDoesNotDoubleCleanDeadRecords() async throws {
         let missingRoot = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: missingRoot) }
         try await AtomicStore<EngineSnapshot>(url: missingRoot.appending(path: "engine.json"))
@@ -8706,7 +9090,8 @@ private actor AuthImageBackend: ContainerBackend {
         let recovered = try await EngineRuntime(root: deadRoot, backend: backend)
 
         #expect(try await recovered.container(dead.id).phase == .created)
-        #expect(await backend.counts().deletes == 1)
+        #expect(await backend.counts().cleanups == 1)
+        #expect(await backend.counts().deletes == 0)
         let deadDurable = try await AtomicStore<EngineSnapshot>(url: deadRoot.appending(path: "engine.json"))
             .load(default: EngineSnapshot())
         #expect(deadDurable.cleanupPendingContainerIDs == nil)
@@ -8737,8 +9122,8 @@ private actor AuthImageBackend: ContainerBackend {
         await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
         await #expect(throws: EngineError.self) { try await recovered.container(preexisting.id) }
         #expect(await backend.counts().starts == 0)
-        // The pending record was already definitively deleted during marker
-        // recovery; the pre-existing terminal record is verified separately.
+        // Execution cleanup during marker recovery must not count as deletion.
+        // Both auto-remove records still require their own destructive removal.
         #expect(await backend.counts().deletes == 2)
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: EngineSnapshot())
@@ -8830,34 +9215,99 @@ private actor AuthImageBackend: ContainerBackend {
         await recovered.shutdown()
     }
 
+    @Test(arguments: [false, true], [false, true])
+    func explicitRemovalOfAutoRemoveContainerRetainsVolumeChoiceDuringQuarantinedRecovery(
+        removeVolumes: Bool, pendingResourceUpdate: Bool
+    ) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = AutoRemoveCleanupBackend()
+        let runtime = try await EngineRuntime(root: root, backend: backend)
+        let volume = try await runtime.createVolume(name: "explicit-auto-remove-volume", anonymous: true)
+        var input = ContainerRecord(name: "explicit-auto-remove", image: "debian")
+        input.autoRemove = true
+        input.mounts = [.init(kind: .volume, source: volume.name, destination: "/data")]
+        let record = try await runtime.createContainer(input)
+        let unrelated = try await runtime.createContainer(ContainerRecord(name: "unrelated", image: "debian"))
+        await backend.failCleanup()
+        await #expect(throws: EngineError.self) {
+            try await runtime.removeContainer(record.id, force: false, removeVolumes: removeVolumes)
+        }
+        await runtime.shutdown()
+
+        let store = AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+        if pendingResourceUpdate {
+            var saved = try await store.loadRequired()
+            var desired = record
+            desired.memoryBytes = record.memoryBytes + 1_048_576
+            saved.resourceUpdateIntents = [ResourceUpdateIntentRecord(
+                containerID: record.id, originalPhase: record.phase,
+                old: record, desired: desired, phase: .backendApplied
+            )]
+            try await store.save(saved)
+        }
+        let quarantined = try await EngineRuntime(root: root, backend: backend)
+        #expect(try await quarantined.container(record.id).phase == .dead)
+        #expect(try await quarantined.container(unrelated.id).phase == .created)
+        #expect(await backend.counts().deletes == 2)
+        #expect(await backend.counts().starts == 0)
+        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json")).loadRequired()
+        #expect(durable.removalPendingContainerIDs == [record.id])
+        #expect(durable.cleanupPendingContainerIDs == [record.id])
+        #expect((durable.removalVolumesPendingContainerIDs?.contains(record.id) == true) == removeVolumes)
+        #expect((durable.resourceUpdateIntents?.first?.containerID == record.id) == pendingResourceUpdate)
+        if removeVolumes {
+            await #expect(throws: EngineError.self) { try await quarantined.createVolume(name: volume.name) }
+            var peer = ContainerRecord(name: "quarantine-volume-peer", image: "debian")
+            peer.mounts = input.mounts
+            let candidate = peer
+            await #expect(throws: EngineError.self) { try await quarantined.createContainer(candidate) }
+        }
+        await #expect(throws: EngineError.self) { try await quarantined.startContainer(record.id) }
+        let created = try await quarantined.createContainer(ContainerRecord(name: "still-available", image: "debian"))
+        #expect(try await quarantined.container(created.id).phase == .created)
+        await quarantined.shutdown()
+
+        await backend.allowCleanup()
+        let recovered = try await EngineRuntime(root: root, backend: backend)
+        await #expect(throws: EngineError.self) { try await recovered.container(record.id) }
+        #expect(try await recovered.container(unrelated.id).phase == .created)
+        #expect(await recovered.listVolumes().contains { $0.instanceID == volume.instanceID } == !removeVolumes)
+        #expect(try await store.loadRequired().resourceUpdateIntents == nil)
+        #expect(await backend.counts().deletes == 3)
+        #expect(await backend.counts().starts == 0)
+        await recovered.shutdown()
+    }
+
     @Test func liveAutoRemoveDoesNotDeleteBeforeCleanupMarkerIsDurable() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = AutoRemoveCleanupBackend()
         let saveFailure = ArmedStateSaveFailure()
+        let synchronizedSaves = SynchronizedStateSaves()
         let runtime = try await EngineRuntime(
             root: root,
             backend: backend,
-            beforePersistence: { try await saveFailure.failWhenArmed() }
+            beforePersistence: { try await saveFailure.failWhenArmed() },
+            atomicStoreSaveBoundaryHook: { synchronizedSaves.observe($0) }
         )
         var input = ContainerRecord(name: "auto-remove-marker-failure", image: "debian")
         input.autoRemove = true
         let record = try await runtime.createContainer(input)
         try await runtime.startContainer(record.id)
         let startedAt = try await runtime.container(record.id).startedAt
-        while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
+        try await waitForReconciliation("completion monitor did not reach its gate") {
+            await backend.isWaitingForCompletion(record.id)
+        }
 
+        let savesBeforeFailure = synchronizedSaves.count()
         await saveFailure.arm()
         await backend.complete(record.id, code: 0)
         let store = AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
-        for _ in 0..<1_000 {
-            if await saveFailure.failureCount() == 1,
-               try await runtime.container(record.id).phase == .dead {
-                let durable = try await store.load(default: EngineSnapshot())
-                if durable.containers.first(where: { $0.id == record.id })?.phase == .dead,
-                   durable.cleanupPendingContainerIDs?.contains(record.id) == true { break }
-            }
-            await Task.yield()
+        // The memory fence precedes the retry's rename. Do not race an independent
+        // AtomicStore load against that replacement: wait for its durability hook.
+        try await waitForReconciliation("cleanup fence retry was not synchronized") {
+            synchronizedSaves.count() == savesBeforeFailure + 1
         }
 
         #expect(await saveFailure.failureCount() == 1)
@@ -8875,23 +9325,7 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(quarantinedCounts.starts == 1)
         #expect(quarantinedCounts.deletes == 0)
 
-        var startWasFenced = false
-        for _ in 0..<1_000 {
-            do {
-                try await runtime.startContainer(record.id)
-                Issue.record("start bypassed auto-remove cleanup quarantine")
-                break
-            } catch let error as EngineError where error.message.contains("backend cleanup pending") {
-                startWasFenced = true
-                break
-            } catch let error as EngineError where error.message.contains("lifecycle operation in progress") {
-                await Task.yield()
-            } catch {
-                Issue.record("unexpected auto-remove quarantine error: \(error)")
-                break
-            }
-        }
-        #expect(startWasFenced)
+        await expectCleanupPendingConflict { try await runtime.startContainer(record.id) }
         await expectCleanupPendingConflict {
             try await runtime.restartContainer(record.id, timeoutSeconds: 0)
         }
@@ -9133,7 +9567,8 @@ private actor AuthImageBackend: ContainerBackend {
         let failedCounts = await backend.counts()
         #expect(failedCounts.starts == 0)
         #expect(failedCounts.stops == 1)
-        #expect(failedCounts.deletes == 1)
+        #expect(failedCounts.cleanups == 1)
+        #expect(failedCounts.deletes == 0)
         #expect(!(await backend.isPrepared(record.id)))
         #expect(try await runtime.container(record.id).phase == .created)
 
@@ -9171,6 +9606,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(failed.restartCount == 0)
         #expect(!(await backend.isRunning(record.id)))
         #expect(!(await backend.isPrepared(record.id)))
+        #expect(await backend.counts().cleanups == 1)
+        #expect(await backend.counts().deletes == 0)
         #expect(!(await backend.isWaitingForCompletion(record.id)))
         let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
             .load(default: EngineSnapshot())
@@ -9440,7 +9877,8 @@ private actor AuthImageBackend: ContainerBackend {
             var iterator = subscription.stream.makeAsyncIterator()
             await observation.record(await iterator.next())
         }
-        await saveFailure.arm(afterSuccessfulSaves: 1)
+        // Fail only after both durable removal fences, at the final commit.
+        await saveFailure.arm(afterSuccessfulSaves: 2)
 
         let response = await router.route(.init(
             method: .DELETE,
@@ -9750,55 +10188,83 @@ private actor AuthImageBackend: ContainerBackend {
         let renameCandidate = try await runtime.createContainer(
             ContainerRecord(name: "rename-removal-candidate", image: "debian")
         )
-        await persistenceGate.arm(afterSuccessfulSaves: 1)
+        // Skip the container fence AND the exact anonymous-volume intent.
+        // Blocking the latter holds the storage publication lane, so awaiting
+        // createVolume before releasing that gate would deadlock the fixture.
+        await persistenceGate.arm(afterSuccessfulSaves: 2)
 
         let removal = Task {
             try await runtime.removeContainer(removed.id, force: false, removeVolumes: true)
         }
-        while !(await persistenceGate.isBlocked()) { await Task.yield() }
+        var unrelatedCreation: Task<ContainerRecord, Error>?
+        do {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !(await persistenceGate.isBlocked()), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            try #require(await persistenceGate.isBlocked(), "final removal save did not reach its gate")
+            // Prove the selected boundary before any call that needs the storage
+            // lane. A shifted save count must fail, not strand the test process.
+            let beforeCommit = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+                .loadRequired()
+            let volumeInstanceID = try #require(volume.instanceID)
+            let intents = try #require(beforeCommit.volumeRemovalIntents)
+            try #require(intents.count == 1)
+            try #require(intents.first?.name == volume.name)
+            try #require(intents.first?.instanceID == volumeInstanceID)
+            try #require(beforeCommit.containers.contains { $0.id == removed.id })
+            try #require(beforeCommit.volumes.contains { $0.instanceID == volume.instanceID })
 
-        await #expect(throws: EngineError.self) {
-            try await runtime.createContainer(
-                ContainerRecord(name: removed.name, image: "replacement-by-name")
-            )
-        }
-        await #expect(throws: EngineError.self) {
-            try await runtime.createContainer(
-                ContainerRecord(
-                    id: removed.id,
-                    name: "replacement-by-id",
-                    image: "debian"
+            await #expect(throws: EngineError.self) {
+                try await runtime.createContainer(
+                    ContainerRecord(name: removed.name, image: "replacement-by-name")
                 )
-            )
-        }
-        await #expect(throws: EngineError.self) {
-            try await runtime.renameContainer(renameCandidate.id, name: removed.name)
-        }
-        await #expect(throws: EngineError.self) {
-            try await runtime.createVolume(name: volume.name)
-        }
-        let unrelatedCreation = Task {
-            try await runtime.createContainer(
-                ContainerRecord(name: "unrelated-final-save-create", image: "debian")
-            )
-        }
-        // Snapshot persistence now has one total order. The unrelated create
-        // may enter the actor while removal is suspended, but its save waits
-        // behind the already-started final removal publication.
-        for _ in 0..<100 { await Task.yield() }
+            }
+            await #expect(throws: EngineError.self) {
+                try await runtime.createContainer(
+                    ContainerRecord(
+                        id: removed.id,
+                        name: "replacement-by-id",
+                        image: "debian"
+                    )
+                )
+            }
+            await #expect(throws: EngineError.self) {
+                try await runtime.renameContainer(renameCandidate.id, name: removed.name)
+            }
+            await #expect(throws: EngineError.self) {
+                try await runtime.createVolume(name: volume.name)
+            }
+            let creation = Task {
+                try await runtime.createContainer(
+                    ContainerRecord(name: "unrelated-final-save-create", image: "debian")
+                )
+            }
+            unrelatedCreation = creation
+            // Snapshot persistence now has one total order. The unrelated create
+            // may enter the actor while removal is suspended, but its save waits
+            // behind the already-started final removal publication.
+            for _ in 0..<100 { await Task.yield() }
 
-        await persistenceGate.release()
-        try await removal.value
-        let unrelated = try await unrelatedCreation.value
-        await #expect(throws: EngineError.self) { try await runtime.container(removed.id) }
-        #expect(try await runtime.container(renameCandidate.id).name == renameCandidate.name)
-        #expect(try await runtime.container(unrelated.id).name == unrelated.name)
-        #expect(!(await runtime.listVolumes().contains(where: { $0.name == volume.name })))
-        let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
-            .load(default: EngineSnapshot())
-        #expect(!durable.containers.contains(where: { $0.id == removed.id }))
-        #expect(durable.containers.contains(where: { $0.id == unrelated.id }))
-        #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
+            await persistenceGate.release()
+            try await removal.value
+            let unrelated = try await creation.value
+            await #expect(throws: EngineError.self) { try await runtime.container(removed.id) }
+            #expect(try await runtime.container(renameCandidate.id).name == renameCandidate.name)
+            #expect(try await runtime.container(unrelated.id).name == unrelated.name)
+            #expect(!(await runtime.listVolumes().contains(where: { $0.name == volume.name })))
+            let durable = try await AtomicStore<EngineSnapshot>(url: root.appending(path: "engine.json"))
+                .load(default: EngineSnapshot())
+            #expect(!durable.containers.contains(where: { $0.id == removed.id }))
+            #expect(durable.containers.contains(where: { $0.id == unrelated.id }))
+            #expect(!durable.volumes.contains(where: { $0.name == volume.name }))
+        } catch {
+            await persistenceGate.release()
+            _ = await removal.result
+            _ = await unrelatedCreation?.result
+            await runtime.shutdown()
+            throw error
+        }
         await runtime.shutdown()
     }
 
@@ -9816,29 +10282,57 @@ private actor AuthImageBackend: ContainerBackend {
         let second = try await runtime.createContainer(secondInput)
 
         let firstRemoval = Task {
-            try await runtime.removeContainer(first.id, force: false, removeVolumes: true)
+            do {
+                try await runtime.removeContainer(first.id, force: false, removeVolumes: true)
+                await backend.recordRemovalCompletion(first.id)
+            } catch {
+                await backend.recordRemovalCompletion(first.id)
+                throw error
+            }
         }
-        while await backend.blockedVolumeDeleteCount() < 1 { await Task.yield() }
         let secondRemoval = Task {
-            try await runtime.removeContainer(second.id, force: false, removeVolumes: true)
+            do {
+                try await runtime.removeContainer(second.id, force: false, removeVolumes: true)
+                await backend.recordRemovalCompletion(second.id)
+            } catch {
+                await backend.recordRemovalCompletion(second.id)
+                throw error
+            }
         }
-        while await backend.blockedVolumeDeleteCount() < 2 { await Task.yield() }
+        do {
+            // Both consumers reserve publication before backend container cleanup.
+            // Volume deletion must wait for the last consumer, not gate twice.
+            try await backend.waitForBlockedDeletes(2)
+            #expect(await backend.deletedVolumes.isEmpty)
+            await #expect(throws: EngineError.self) {
+                try await runtime.createVolume(name: volume.name)
+            }
+            await backend.releaseDelete(first.id)
+            try await backend.waitForRemovalCompletion(first.id)
+            try await firstRemoval.value
+            #expect(await backend.blockedDeleteCount() == 1)
+            #expect(await backend.deletedVolumes.isEmpty)
+            #expect(await runtime.listVolumes().contains { $0.name == volume.name })
+            await #expect(throws: EngineError.self) {
+                try await runtime.createVolume(name: volume.name)
+            }
 
-        await #expect(throws: EngineError.self) {
-            try await runtime.createVolume(name: volume.name)
+            await backend.releaseDelete(second.id)
+            try await backend.waitForRemovalCompletion(second.id)
+            try await secondRemoval.value
+            #expect(await backend.deletedVolumes == [volume.name])
+            #expect(await runtime.listVolumes().isEmpty)
+            let replacement = try await runtime.createVolume(name: volume.name)
+            #expect(replacement.name == volume.name)
+            #expect(replacement.instanceID != volume.instanceID)
+            #expect(await runtime.listContainers(all: true).isEmpty)
+        } catch {
+            firstRemoval.cancel()
+            secondRemoval.cancel()
+            await backend.releaseAllDeletes()
+            await runtime.shutdown()
+            throw error
         }
-        await backend.releaseNextVolumeDelete()
-        try await firstRemoval.value
-        #expect(await backend.blockedVolumeDeleteCount() == 1)
-        await #expect(throws: EngineError.self) {
-            try await runtime.createVolume(name: volume.name)
-        }
-
-        await backend.releaseNextVolumeDelete()
-        try await secondRemoval.value
-        let replacement = try await runtime.createVolume(name: volume.name)
-        #expect(replacement.name == volume.name)
-        #expect(await runtime.listContainers(all: true).isEmpty)
         await runtime.shutdown()
     }
 
@@ -9953,7 +10447,7 @@ private actor AuthImageBackend: ContainerBackend {
         while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
 
         await backend.finish(record.id, code: 17)
-        while !(await backend.hasBlockedReconciliationDelete()) { await Task.yield() }
+        while !(await backend.hasBlockedReconciliationTeardown()) { await Task.yield() }
 
         #expect(try await runtime.pruneContainers(ids: [record.id]).isEmpty)
         do {
@@ -9972,7 +10466,7 @@ private actor AuthImageBackend: ContainerBackend {
             #expect(error.code == .conflict)
         }
 
-        await backend.releaseReconciliationDelete()
+        await backend.releaseReconciliationTeardown()
         for _ in 0..<100 {
             if try await runtime.container(record.id).phase == .running,
                try await runtime.container(record.id).restartCount == 1 { break }
@@ -9996,7 +10490,8 @@ private actor AuthImageBackend: ContainerBackend {
         let counts = await backend.counts()
         #expect(counts.prepares == 3)
         #expect(counts.starts == 2)
-        #expect(counts.deletes == 1)
+        #expect(counts.cleanups == 1)
+        #expect(counts.deletes == 0)
     }
 
     @Test func automaticRestartReservesContainerAgainstNetworkMutation() async throws {
@@ -10015,7 +10510,7 @@ private actor AuthImageBackend: ContainerBackend {
         while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
 
         await backend.finish(record.id, code: 17)
-        while !(await backend.hasBlockedReconciliationDelete()) { await Task.yield() }
+        while !(await backend.hasBlockedReconciliationTeardown()) { await Task.yield() }
         do {
             try await runtime.connectNetwork(extra.id, container: record.id)
             Issue.record("network connection overlapped automatic restart")
@@ -10029,7 +10524,7 @@ private actor AuthImageBackend: ContainerBackend {
             #expect(error.code == .conflict)
         }
 
-        await backend.releaseReconciliationDelete()
+        await backend.releaseReconciliationTeardown()
         for _ in 0..<100 {
             if try await runtime.container(record.id).phase == .running { break }
             await Task.yield()
@@ -10051,7 +10546,7 @@ private actor AuthImageBackend: ContainerBackend {
         while !(await backend.isWaitingForCompletion(record.id)) { await Task.yield() }
 
         await backend.finish(record.id, code: 0)
-        while !(await backend.hasBlockedReconciliationDelete()) { await Task.yield() }
+        while !(await backend.hasBlockedReconciliationTeardown()) { await Task.yield() }
 
         #expect(try await runtime.pruneContainers(ids: [record.id]).isEmpty)
         do {
@@ -10070,11 +10565,8 @@ private actor AuthImageBackend: ContainerBackend {
             #expect(error.code == .conflict)
         }
 
-        await backend.releaseReconciliationDelete()
-        for _ in 0..<100 {
-            if (try? await runtime.container(record.id)) == nil { break }
-            await Task.yield()
-        }
+        await backend.releaseReconciliationTeardown()
+        try await waitForContainerEvent("destroy", identifier: record.id, runtime: runtime)
         do {
             _ = try await runtime.container(record.id)
             Issue.record("auto-remove reconciliation did not remove its container")
@@ -10186,7 +10678,8 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(!(await backend.isRunning(record.id)))
         let counts = await backend.counts()
         #expect(counts.stops == 1)
-        #expect(counts.deletes == 1)
+        #expect(counts.cleanups == 1)
+        #expect(counts.deletes == 0)
         let durable = try await AtomicStore<EngineSnapshot>(
             url: root.appending(path: "engine.json")
         ).load(default: EngineSnapshot())
@@ -10818,10 +11311,7 @@ private actor AuthImageBackend: ContainerBackend {
         record.restartPolicy = .init(name: "on-failure", maximumRetryCount: 1)
         record = try await runtime.createContainer(record)
         try await runtime.startContainer(record.id)
-        for _ in 0..<100 {
-            if try await runtime.container(record.id).restartCount == 1 { break }
-            await Task.yield()
-        }
+        try await waitForContainerEvent("restart", identifier: record.id, runtime: runtime)
         #expect(try await runtime.container(record.id).phase == .running)
         #expect(try await runtime.container(record.id).restartCount == 1)
         #expect(await processBackend.startCount() == 2)

@@ -12,24 +12,37 @@ JOBS=${CENGINE_KERNEL_BUILD_JOBS:-${CENGINE_KERNEL_BUILD_CPUS:-auto}}
 HOST_OS=${CENGINE_HOST_OS:-$(uname -s)}
 
 mkdir -p "$CACHE" "$OUTPUT"
-if [ -f "$SOURCE/Makefile" ] && [ "$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)" != "$COMMIT" ]; then
-    rm -rf "$SOURCE"
+EXPECTED_INPUT=$("$ROOT/Scripts/kernel-input-sha256.sh")
+# Never reset, clean, patch or remove a developer's cached/source checkout.
+# Export only the pinned committed tree into a disposable build directory.
+work=$(mktemp -d "$CACHE/kernel-build.XXXXXX")
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+if git -C "$SOURCE" cat-file -e "$COMMIT^{commit}" 2>/dev/null; then
+    repository=$SOURCE
+else
+    repository="$work/repository"
+    git init -q "$repository"
+    git -C "$repository" remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+    git -C "$repository" fetch -q --depth 1 origin "$COMMIT"
 fi
-if [ ! -f "$SOURCE/Makefile" ]; then
-    rm -rf "$SOURCE"
-    git init -q "$SOURCE"
-    git -C "$SOURCE" remote add origin https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-    git -C "$SOURCE" fetch -q --depth 1 origin "$COMMIT"
-    git -C "$SOURCE" checkout -q --detach FETCH_HEAD
-fi
-test "$(git -C "$SOURCE" rev-parse HEAD)" = "$COMMIT" || {
+test "$(git -C "$repository" rev-parse "$COMMIT^{commit}")" = "$COMMIT" || {
     echo "kernel source is not pinned Linux $VERSION commit $COMMIT" >&2
     exit 2
 }
+git -C "$repository" archive --format=tar "$COMMIT" > "$work/source.tar"
+mkdir "$work/source"
+tar -xf "$work/source.tar" -C "$work/source"
+rm "$work/source.tar"
+printf '%s\n' cengine-kernel-build-v1 > "$work/source/.cengine-disposable-kernel"
+"$ROOT/Scripts/apply-kernel-patches.sh" "$work/source"
+rm "$work/source/.cengine-disposable-kernel"
 
 case "$HOST_OS" in
     Linux|Darwin)
-        KERNEL_SOURCE="$SOURCE" \
+        KERNEL_SOURCE="$work/source" \
         CENGINE_GUEST_OUTPUT="$OUTPUT" \
         CENGINE_KERNEL_BUILD_IMAGE="$IMAGE" \
         CENGINE_KERNEL_BUILD_JOBS="$JOBS" \
@@ -41,5 +54,10 @@ case "$HOST_OS" in
         ;;
 esac
 
-"$ROOT/Scripts/kernel-input-sha256.sh" > "$OUTPUT/kernel-input.sha256"
+test "$("$ROOT/Scripts/kernel-input-sha256.sh")" = "$EXPECTED_INPUT" || {
+    echo "kernel inputs changed during build; refusing to stamp output" >&2
+    exit 2
+}
+printf '%s\n' "$EXPECTED_INPUT" > "$OUTPUT/kernel-input.sha256.next"
+mv "$OUTPUT/kernel-input.sha256.next" "$OUTPUT/kernel-input.sha256"
 echo "Built pinned Linux $VERSION ($COMMIT) at $OUTPUT/vmlinux"

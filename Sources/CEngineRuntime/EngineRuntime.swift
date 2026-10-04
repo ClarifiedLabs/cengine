@@ -29,6 +29,11 @@ public struct ResourceUpdateIntentRecord: Codable, Sendable {
     }
 }
 
+public struct VolumeRemovalIntentRecord: Codable, Sendable {
+    public let name: String
+    public let instanceID: UUID
+}
+
 public struct EngineSnapshot: Codable, Sendable {
     public var containers: [ContainerRecord]
     public var networks: [NetworkRecord]
@@ -51,6 +56,12 @@ public struct EngineSnapshot: Codable, Sendable {
     /// unresolved entry is a durable recovery fence: startup must reapply the
     /// old resources or contain the execution before accepting it.
     public var resourceUpdateIntents: [ResourceUpdateIntentRecord]?
+    /// Exact volume generations reserved before destructive storage operations.
+    public var volumeRemovalIntents: [VolumeRemovalIntentRecord]?
+    /// Docker's durable manual-stop bit, scoped to the exact container instance.
+    /// Missing on older snapshots. Unlike the process-local restart-manager
+    /// cancellation, this prevents `unless-stopped` recovery after daemon death.
+    public var manuallyStoppedContainerInstances: [String: UUID]?
 
     public init(
         containers: [ContainerRecord] = [], networks: [NetworkRecord] = [], volumes: [VolumeRecord] = [],
@@ -58,7 +69,9 @@ public struct EngineSnapshot: Codable, Sendable {
         removalPendingContainerIDs: Set<String>? = nil,
         removalVolumesPendingContainerIDs: Set<String>? = nil,
         containerFenceInstanceIDs: [String: UUID]? = nil,
-        resourceUpdateIntents: [ResourceUpdateIntentRecord]? = nil
+        resourceUpdateIntents: [ResourceUpdateIntentRecord]? = nil,
+        volumeRemovalIntents: [VolumeRemovalIntentRecord]? = nil,
+        manuallyStoppedContainerInstances: [String: UUID]? = nil
     ) {
         self.containers = containers
         self.networks = networks
@@ -75,6 +88,8 @@ public struct EngineSnapshot: Codable, Sendable {
         })
         self.containerFenceInstanceIDs = containerFenceInstanceIDs ?? (derived.isEmpty ? nil : derived)
         self.resourceUpdateIntents = resourceUpdateIntents
+        self.volumeRemovalIntents = volumeRemovalIntents
+        self.manuallyStoppedContainerInstances = manuallyStoppedContainerInstances
     }
 }
 
@@ -150,10 +165,12 @@ public actor EngineRuntime {
         enum Operation: Equatable { case start, stop, restart, remove, update, pause, resume, rename, network }
 
         let operation: Operation
+        let generation: UUID
         let token = UUID()
     }
 
     private struct RemovalPublicationReservation {
+        let generation: UUID
         let containerID: String
         let containerInstanceID: UUID
         let containerName: String
@@ -179,12 +196,26 @@ public actor EngineRuntime {
     private var exitWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var removalWaiters: [String: [UUID: AsyncStream<Int32>.Continuation]] = [:]
     private var lifecycleIntents: [String: LifecycleIntent] = [:]
+    private var storageMaintenance = false
+    private var storageWorkerUnavailable = false
+    private var storageGeneration = UUID()
+    private var serviceReplacements: [String: (StorageServiceTypes.ReplacementRequest, Task<BackendServiceReplacementResult, Error>, UUID)] = [:]
+    private var serviceReplacementRetries: [String: ManagedStorageLifecycleOwner.RetryableReplacementTimeout] = [:]
     private var pendingContainerNames: [String: String] = [:]
     private var pendingContainerIDs = Set<String>()
     private var pendingContainerInstances: [String: UUID] = [:]
     private var pendingVolumeNames: [String: Int] = [:]
+    // One order for canonical volume publication, backend synchronization, and
+    // typed deletion. Capture snapshots only after acquiring this lane.
+    private var storagePublicationActive = false
+    private var storagePublicationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var anonymousRemovalCommitActive = false
+    private var anonymousRemovalCommitWaiters: [CheckedContinuation<Void, Never>] = []
     private var pendingContainers: [String: ContainerRecord] = [:]
     private var startingContainerIDs = Set<String>()
+    /// Docker's `ExitOnNext`: a kill with SIGKILL or the container's stop signal
+    /// cancels the restart policy for the next exit, until the next start.
+    private var restartCancelledContainerIDs = Set<String>()
     private var startingExecIDs = Set<String>()
     private var activeExecOperations: [String: Int] = [:]
     /// `EngineRuntime` is reentrant across the persistence hook and atomic-store
@@ -196,6 +227,9 @@ public actor EngineRuntime {
     /// actor may continue containing already-started backend work but must
     /// never publish another snapshot from its stale in-memory selection.
     private var canonicalSnapshotUnavailableDetail: String?
+    /// Test synchronization after an attached exec's monitor has consumed its
+    /// final backend result; does not retain or manage monitor tasks.
+    private let afterAttachedExecMonitoring: (@Sendable () async -> Void)?
 
     public init(root: URL, backend: any ContainerBackend = MetadataOnlyBackend()) async throws {
         try await self.init(
@@ -214,7 +248,8 @@ public actor EngineRuntime {
         beforePersistence: (@Sendable () async throws -> Void)? = nil,
         beforeEndpointAllocationPersistence: (@Sendable () async throws -> Void)? = nil,
         beforeCompletionMonitoring: (@Sendable () async -> Void)? = nil,
-        atomicStoreSaveBoundaryHook: (@Sendable (AtomicStoreSaveBoundary) throws -> Void)? = nil
+        atomicStoreSaveBoundaryHook: (@Sendable (AtomicStoreSaveBoundary) throws -> Void)? = nil,
+        afterAttachedExecMonitoring: (@Sendable () async -> Void)? = nil
     ) async throws {
         let root = try Self.canonicalDataRoot(root)
         self.store = AtomicStore(
@@ -225,10 +260,28 @@ public actor EngineRuntime {
         self.beforePersistence = beforePersistence
         self.beforeEndpointAllocationPersistence = beforeEndpointAllocationPersistence
         self.beforeCompletionMonitoring = beforeCompletionMonitoring
+        self.afterAttachedExecMonitoring = afterAttachedExecMonitoring
         self.backend = backend
         self.endpointAllocationCursors = [:]
         self.snapshot = try await store.load(default: EngineSnapshot())
         try Self.validateEngineSnapshotInvariants(snapshot)
+        // Missing metadata for an existing consumer is ambiguous legacy storage,
+        // not permission to assign a fresh V to a possibly populated name.
+        let recordedVolumeNames = Set(snapshot.volumes.map(\.name))
+        guard snapshot.containers.flatMap(\.mounts).filter({ $0.kind == .volume })
+            .allSatisfy({ recordedVolumeNames.contains($0.source) }) else {
+            throw EngineError(.internalError, "container volume metadata is missing; explicit storage repair required")
+        }
+        var migratedVolumes = false
+        for index in snapshot.volumes.indices {
+            if snapshot.volumes[index].ensureInstanceID() { migratedVolumes = true }
+        }
+        try Self.validateEngineSnapshotInvariants(snapshot)
+        // One canonical atomic save for ALL legacy identities, before even a
+        // cleanup, orphan, or recovery hook can cross into the backend.
+        if migratedVolumes { try await persist() }
+        try await backend.reconcileStorage(volumes: snapshot.volumes, containers: snapshot.containers)
+        try await resolvePendingVolumeRemovals()
         // Explicit remove/prune publishes this intent before crossing backend
         // teardown. Resolve it before generic cleanup or restart policy so a
         // container whose backend was already deleted can never be resurrected.
@@ -241,9 +294,13 @@ public actor EngineRuntime {
         // boundary. It is the first recovered state: no other backend await may
         // trust or mutate the persisted execution until teardown is verified.
         let pendingCleanup = snapshot.cleanupPendingContainerIDs ?? []
-        var verifiedCleanupIDs = Set<String>()
+        var verifiedRemovalIDs = Set<String>()
         if !pendingCleanup.isEmpty {
             for identifier in pendingCleanup {
+                // Removal recovery already attempted these records. In particular,
+                // a failed auto-remove must stay quarantined, not retry teardown
+                // or become restartable through generic execution recovery.
+                guard snapshot.removalPendingContainerIDs?.contains(identifier) != true else { continue }
                 guard let index = try? containerIndex(identifier) else {
                     throw EngineError(
                         .internalError,
@@ -258,7 +315,6 @@ public actor EngineRuntime {
                     try await persist()
                     continue
                 }
-                verifiedCleanupIDs.insert(identifier)
                 switch pending.phase {
                 case .running, .paused:
                     snapshot.containers[index].phase = .exited
@@ -334,7 +390,6 @@ public actor EngineRuntime {
                 try await persist()
                 continue
             }
-            verifiedCleanupIDs.insert(quarantined.id)
             if quarantined.startedAt == nil {
                 snapshot.containers[index].phase = .created
                 snapshot.containers[index].finishedAt = nil
@@ -347,8 +402,8 @@ public actor EngineRuntime {
         }
         // Remove records that were already terminal before recovery before
         // considering restart policy. Cleanup itself publishes a durable fence.
-        verifiedCleanupIDs = try await removeRecoveredAutoRemoveContainers(
-            verifiedCleanupIDs: verifiedCleanupIDs
+        verifiedRemovalIDs = try await removeRecoveredAutoRemoveContainers(
+            verifiedRemovalIDs: verifiedRemovalIDs
         )
         var recovered: [(String, Date)] = []
         for index in snapshot.containers.indices {
@@ -370,12 +425,14 @@ public actor EngineRuntime {
                 snapshot.containers[index].phase = .exited
                 snapshot.containers[index].finishedAt = Date()
                 guard !stale.autoRemove else { continue }
-                guard Self.shouldRestart(stale, exitCode: snapshot.containers[index].exitCode ?? 137) else { continue }
+                guard !manualStopSuppressesRecovery(stale),
+                      Self.shouldRestart(stale, exitCode: snapshot.containers[index].exitCode ?? 137) else { continue }
             } else {
                 guard stale.phase == .exited, stale.restartPolicy.name == "always" else { continue }
             }
             var restarted = snapshot.containers[index]
             restarted.restartCount += 1
+            Self.clearManualStop(restarted.id, from: &snapshot)
             // Preparation may launch or rediscover backend state. Fence that
             // boundary durably before entering it, just as start is fenced.
             markCleanupPending(restarted.id)
@@ -428,8 +485,8 @@ public actor EngineRuntime {
         // A running auto-remove record can become terminal only after backend
         // recovery. Remove it now, before any later startup work can publish or
         // restart that generation.
-        verifiedCleanupIDs = try await removeRecoveredAutoRemoveContainers(
-            verifiedCleanupIDs: verifiedCleanupIDs
+        verifiedRemovalIDs = try await removeRecoveredAutoRemoveContainers(
+            verifiedRemovalIDs: verifiedRemovalIDs
         )
         if let backendImages = try await backend.listImages() {
             snapshot.images = Self.imageRecords(from: backendImages)
@@ -455,18 +512,185 @@ public actor EngineRuntime {
             }
         }
         try await persist()
+        await backend.observeManagedStorageLoss { [weak self] in await self?.managedStorageLost() }
         for (id, startedAt) in recovered {
             startCompletionMonitor(id, startedAt: startedAt)
             startHealthMonitor(id)
         }
     }
 
-    private static func canonicalDataRoot(_ requested: URL) throws -> URL {
+    static func canonicalDataRoot(_ requested: URL) throws -> URL {
         let standardized = requested.standardizedFileURL
         try FileManager.default.createDirectory(
-            at: standardized, withIntermediateDirectories: true
+            at: standardized, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
         )
         return standardized.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    /// Private daemon control, deliberately not an HTTP operation. Fence before
+    /// capturing canonical inventory; requester cancellation cannot abandon it.
+    public func replaceManagedStorageService(operationUUID: String,
+        predecessor: StorageServiceTypes.Scope) async throws -> BackendServiceReplacementResult {
+        guard StorageServiceTypes.validID(operationUUID),
+              StorageServiceTypes.validID(predecessor.serviceEpoch),
+              StorageServiceTypes.validID(predecessor.workerUUID) else {
+            throw EngineError(.badRequest, "invalid replacement operation or predecessor UUID")
+        }
+        let request: StorageServiceTypes.ReplacementRequest
+        let replacementEpoch: UUID
+        if let (original, task, epoch) = serviceReplacements[operationUUID] {
+            guard original.predecessor == predecessor else { throw EngineError(.conflict, "replacement request changed") }
+            guard let retry = serviceReplacementRetries[operationUUID], retry.request == original else {
+                return try await task.value
+            }
+            // Do not mint another request time or generation for an expired poll.
+            try requireReplacementGeneration(epoch)
+            request = original; replacementEpoch = epoch
+            serviceReplacementRetries.removeValue(forKey: operationUUID)
+        } else {
+            if storageWorkerUnavailable {
+                if let detail = canonicalSnapshotUnavailableDetail { throw CanonicalSnapshotPersistenceUnavailable(detail: detail) }
+            } else { try requireCanonicalSnapshotWritable() }
+            request = StorageServiceTypes.ReplacementRequest(operationUUID: operationUUID,
+                predecessor: predecessor, nowUnixSeconds: UInt64(Date().timeIntervalSince1970))
+            let epoch = storageGeneration
+            try await backend.validateManagedStorageReplacement(request)
+            guard epoch == storageGeneration, !storageMaintenance || storageWorkerUnavailable else {
+                throw EngineError(.conflict, "managed storage replacement preflight was superseded")
+            }
+            if let detail = canonicalSnapshotUnavailableDetail { throw CanonicalSnapshotPersistenceUnavailable(detail: detail) }
+            storageWorkerUnavailable = false
+            fenceStorageWork()
+            replacementEpoch = storageGeneration
+        }
+        let task = Task {
+            try self.requireReplacementGeneration(replacementEpoch)
+            await self.backend.fenceManagedStorageService()
+            try self.requireReplacementGeneration(replacementEpoch)
+            // Join only canonical persistence, never HTTP requests or ambiguous
+            // PREPARE. Reload durable selection after old queued writers reject.
+            try await self.acquirePersistence()
+            var canonical: EngineSnapshot
+            do {
+                try self.requireReplacementGeneration(replacementEpoch)
+                canonical = try await self.store.loadRequired()
+                try self.requireReplacementGeneration(replacementEpoch)
+                try Self.validateEngineSnapshotInvariants(canonical)
+                self.releasePersistence()
+            } catch { self.releasePersistence(); throw error }
+            self.snapshot = canonical
+            let result: BackendServiceReplacementResult
+            do {
+                result = try await self.backend.replaceManagedStorageService(request, volumes: canonical.volumes, containers: canonical.containers)
+            } catch let retry as ManagedStorageLifecycleOwner.RetryableReplacementTimeout {
+                if retry.request == request, replacementEpoch == self.storageGeneration {
+                    self.serviceReplacementRetries[operationUUID] = retry
+                }
+                throw retry
+            }
+            try self.requireReplacementGeneration(replacementEpoch)
+            guard result.request == request else { throw EngineError(.conflict, "replacement result changed") }
+            let liveIDs = Set(canonical.containers.filter { $0.phase == .running || $0.phase == .paused }.map(\.id))
+            guard liveIDs.isSubset(of: result.containedContainerIDs) else {
+                throw EngineError(.conflict, "replacement did not account for every live container execution")
+            }
+            for index in canonical.containers.indices where result.containedContainerIDs.contains(canonical.containers[index].id) {
+                let id = canonical.containers[index].id
+                let removing = canonical.removalPendingContainerIDs?.contains(id) == true
+                    || canonical.removalVolumesPendingContainerIDs?.contains(id) == true
+                // The census proves containment, not a fresh death for every directory.
+                if canonical.containers[index].phase == .running || canonical.containers[index].phase == .paused {
+                    canonical.containers[index].phase = .exited
+                    canonical.containers[index].exitCode = 137
+                    canonical.containers[index].finishedAt = Date()
+                    self.resumeExitWaiters(id, code: 137)
+                }
+                // Removal/quarantine still owns persistent state even after the VM dies.
+                if !removing, canonical.containers[index].phase != .dead {
+                    if let intent = canonical.resourceUpdateIntents?.first(where: { $0.containerID == id }) {
+                        canonical.containers[index] = Self.mergingResourceFields(from: intent.old, into: canonical.containers[index])
+                        Self.removeResourceIntent(id, from: &canonical)
+                    }
+                    canonical.cleanupPendingContainerIDs?.remove(id)
+                }
+            }
+            if canonical.cleanupPendingContainerIDs?.isEmpty == true { canonical.cleanupPendingContainerIDs = nil }
+            let fenced = (canonical.cleanupPendingContainerIDs ?? [])
+                .union(canonical.removalPendingContainerIDs ?? [])
+                .union(canonical.removalVolumesPendingContainerIDs ?? [])
+            canonical.containerFenceInstanceIDs = canonical.containerFenceInstanceIDs?.filter { fenced.contains($0.key) }
+            if canonical.containerFenceInstanceIDs?.isEmpty == true { canonical.containerFenceInstanceIDs = nil }
+            try Self.validateEngineSnapshotInvariants(canonical)
+            self.snapshot = canonical
+            try await self.acquirePersistence()
+            do {
+                try self.requireReplacementGeneration(replacementEpoch)
+                try await self.beforePersistence?()
+                try self.requireReplacementGeneration(replacementEpoch)
+                try await self.saveEngineSnapshot(canonical, maintenance: true)
+                self.releasePersistence()
+            } catch { self.releasePersistence(); throw error }
+            try self.requireReplacementGeneration(replacementEpoch)
+            // Require fresh readiness for this exact successor after the final store
+            // await. Replacement admission permits dead predecessors and may be full;
+            // neither condition determines whether the successor is available.
+            do {
+                try await self.backend.validateManagedStorageAvailability(result.successor)
+            } catch ManagedStorageControlFailure.serviceUnavailable {
+                // A fresh worker-lost result is authoritative even if the asynchronous
+                // loss observer has not run. Permit explicit retry, but never reopen
+                // ordinary work or transfer this failure into a newer replacement.
+                if replacementEpoch == self.storageGeneration {
+                    self.storageWorkerUnavailable = true
+                }
+                throw ManagedStorageControlFailure.serviceUnavailable
+            }
+            try self.requireReplacementGeneration(replacementEpoch)
+            guard !self.storageWorkerUnavailable else {
+                throw EngineError(.conflict, "replacement storage worker was lost before publication completed")
+            }
+            self.storageMaintenance = false
+            return result
+        }
+        serviceReplacements[operationUUID] = (request, task, replacementEpoch)
+        return try await task.value
+    }
+
+    private func requireReplacementGeneration(_ generation: UUID) throws {
+        guard storageMaintenance, generation == storageGeneration else {
+            throw EngineError(.conflict, "managed storage replacement was superseded")
+        }
+    }
+
+    private func managedStorageLost() {
+        storageWorkerUnavailable = true
+        if !storageMaintenance { fenceStorageWork() }
+    }
+
+    private func fenceStorageWork() {
+        storageMaintenance = true; storageGeneration = UUID()
+        lifecycleIntents.removeAll()
+        pendingContainerNames.removeAll(); pendingContainerIDs.removeAll()
+        pendingContainerInstances.removeAll(); pendingContainers.removeAll(); pendingVolumeNames.removeAll()
+        startingContainerIDs.removeAll(); startingExecIDs.removeAll(); activeExecOperations.removeAll()
+        storagePublicationActive = false
+        let publications = storagePublicationWaiters; storagePublicationWaiters.removeAll()
+        publications.forEach { $0.resume() }
+        anonymousRemovalCommitActive = false
+        let removals = anonymousRemovalCommitWaiters; anonymousRemovalCommitWaiters.removeAll()
+        removals.forEach { $0.resume() }
+        healthTasks.values.forEach { $0.cancel() }; healthTasks.removeAll()
+        completionMonitorTasks.values.forEach { $0.task.cancel() }; completionMonitorTasks.removeAll()
+        for id in execs.keys {
+            execs[id]?.running = false
+            if execs[id]?.exitCode == nil { execs[id]?.exitCode = 137 }
+        }
+    }
+
+    private func requireStorageGeneration(_ generation: UUID) throws {
+        guard !storageMaintenance, generation == storageGeneration else {
+            throw EngineError(.conflict, "managed storage service execution was replaced")
+        }
     }
 
     public func shutdown() async {
@@ -495,7 +719,11 @@ public actor EngineRuntime {
     }
 
     @discardableResult
-    public func createContainer(_ input: ContainerRecord) async throws -> ContainerRecord {
+    /// Callers that create anonymous volumes separately must retain their exact V
+    /// here; a deleted/recreated name must not be silently adopted by this request.
+    public func createContainer(_ input: ContainerRecord, expectedVolumeInstances: [String: UUID] = [:]) async throws -> ContainerRecord {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try requireCanonicalSnapshotWritable()
         var record = input.withFreshInstanceID()
         guard Identifier.validateName(record.name) else { throw EngineError(.badRequest, "invalid container name: \(record.name)") }
@@ -505,13 +733,20 @@ public actor EngineRuntime {
             ?? (pendingContainerIDs.contains(record.id) ? record.id : nil) {
             throw Self.containerNameConflict(name: record.name, conflictingID: conflictingID)
         }
+        for mount in record.mounts where mount.kind == .volume {
+            guard !volumeRemovalIsPending(mount.source) else {
+                throw EngineError(.conflict, "volume \(mount.source) is being removed")
+            }
+        }
         try Self.validatePortProtocols(record.ports)
         pendingContainerNames[record.name] = record.id
         pendingContainerIDs.insert(record.id)
         defer {
-            pendingContainerNames.removeValue(forKey: record.name)
-            pendingContainerIDs.remove(record.id)
-            pendingContainers.removeValue(forKey: record.id)
+            if epoch == storageGeneration {
+                pendingContainerNames.removeValue(forKey: record.name)
+                pendingContainerIDs.remove(record.id)
+                pendingContainers.removeValue(forKey: record.id)
+            }
         }
         if record.networks.isEmpty, record.networkDisabled != true,
            let network = snapshot.networks.first(where: { $0.name == "default" }) {
@@ -521,11 +756,19 @@ public actor EngineRuntime {
         try validateEndpoints(record)
         record = try allocatingEndpointAddresses(to: record)
         pendingContainers[record.id] = record
+        let volumeInstances = try await resolveContainerVolumes(record, expected: expectedVolumeInstances)
+        try requireStorageGeneration(epoch)
         try await persistEndpointAllocationCursors()
+        try requireStorageGeneration(epoch)
+        try validateContainerVolumes(volumeInstances)
         try await backend.prepare(record)
+        try requireStorageGeneration(epoch)
+        try validateContainerVolumes(volumeInstances)
         if let backendImages = try await backend.listImages() {
+            try requireStorageGeneration(epoch)
             snapshot.images = Self.imageRecords(from: backendImages)
         }
+        try requireStorageGeneration(epoch)
         var imageHealthcheck: HealthcheckRecord?
         if let image = try? image(record.image) {
             if let platform = try? OCIPlatform(record.platform) {
@@ -543,7 +786,9 @@ public actor EngineRuntime {
         Self.resetHealthState(&record)
         snapshot.containers.append(record)
         try await backend.updateNetworkRecords(snapshot.containers)
+        try requireStorageGeneration(epoch)
         try await persist()
+        try requireStorageGeneration(epoch)
         emit(containerEvent("create", record))
         return record
     }
@@ -573,20 +818,18 @@ public actor EngineRuntime {
             endLifecycleIntent(intent, for: record.id)
             throw EngineError(.conflict, "container \(identifier) is already starting")
         }
+        restartCancelledContainerIDs.remove(record.id)
+        Self.clearManualStop(record.id, from: &snapshot)
         do {
-            if record.phase == .dead {
-                try await backend.delete(record)
-                guard ownsLifecycleExecution(intent, record: record) else {
-                    throw EngineError(.conflict, "container was removed or changed while it was starting")
-                }
-            }
             markCleanupPending(record.id)
             do {
                 try await persist()
             } catch {
+                try requireLifecycleIntent(intent, for: record.id)
                 clearCleanupPending(record.id)
                 throw error
             }
+            try requireLifecycleIntent(intent, for: record.id)
             guard ownsLifecycleExecution(intent, record: record) else {
                 clearCleanupPending(record.id)
                 try await persist()
@@ -594,21 +837,39 @@ public actor EngineRuntime {
             }
             let resolvedPorts: [PortBinding]
             do {
+                if record.phase == .dead {
+                    try await backend.cleanupExecution(record)
+                    try requireLifecycleIntent(intent, for: record.id)
+                    guard ownsLifecycleExecution(intent, record: record) else {
+                        throw EngineError(.conflict, "container was removed or changed while it was starting")
+                    }
+                }
                 try await backend.prepare(record)
+                try requireLifecycleIntent(intent, for: record.id)
                 guard ownsLifecycleExecution(intent, record: record) else {
                     throw EngineError(.conflict, "container was removed or changed while it was starting")
                 }
                 resolvedPorts = try await backend.start(record)
             } catch {
+                try requireLifecycleIntent(intent, for: record.id)
                 // Both preparation and start may leave backend generations.
                 // Their shared durable fence remains until teardown is verified.
                 let launchError = error
-                try await rollbackFailedStart(original: record, started: record)
+                do {
+                    try await rollbackFailedStart(original: record, started: record, intent: intent)
+                } catch let cleanupError as EngineError where cleanupError.code == .internalError {
+                    throw EngineError(
+                        cleanupError.code,
+                        "container launch failed (\(String(reflecting: type(of: launchError)))): \(EngineError.message(for: launchError)); "
+                            + "rollback failed (\(String(reflecting: type(of: cleanupError)))): \(cleanupError.message)"
+                    )
+                }
                 throw launchError
             }
+            try requireLifecycleIntent(intent, for: record.id)
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
-                try await rollbackFailedStart(original: record, started: record)
+                try await rollbackFailedStart(original: record, started: record, intent: intent)
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
 
@@ -621,9 +882,10 @@ public actor EngineRuntime {
             started.exitCode = nil
             Self.resetHealthState(&started)
             started = await applyingEndpointAddresses(to: started)
+            try requireLifecycleIntent(intent, for: record.id)
             guard ownsLifecycleExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
-                try await rollbackFailedStart(original: record, started: started)
+                try await rollbackFailedStart(original: record, started: started, intent: intent)
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
             snapshot.containers[current] = started
@@ -631,27 +893,29 @@ public actor EngineRuntime {
             do {
                 try await persist()
             } catch {
+                try requireLifecycleIntent(intent, for: record.id)
                 let persistenceError = error
-                try await rollbackFailedStart(original: record, started: started)
+                try await rollbackFailedStart(original: record, started: started, intent: intent)
                 throw persistenceError
             }
             guard lifecycleIntents[record.id] == intent,
                   let published = try? container(record.id),
                   published.phase == .running,
                   published.startedAt == startedAt else {
-                try await rollbackFailedStart(original: record, started: started)
+                try await rollbackFailedStart(original: record, started: started, intent: intent)
                 throw EngineError(.conflict, "container was removed or changed while it was starting")
             }
             emit(containerEvent("start", published))
             startHealthMonitor(record.id)
             startCompletionMonitor(record.id, startedAt: startedAt)
-            startingContainerIDs.remove(record.id)
+            if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch {
-            startingContainerIDs.remove(record.id)
+            try requireLifecycleIntent(intent, for: record.id)
+            if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw error
         }
     }
@@ -663,6 +927,8 @@ public actor EngineRuntime {
     }
 
     public func resizeContainer(_ identifier: String, width: UInt16, height: UInt16) async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try requireCanonicalSnapshotWritable()
         let record = try container(identifier)
         try requireBackendExecutionAvailable(record)
@@ -673,6 +939,7 @@ public actor EngineRuntime {
             throw EngineError(.badRequest, "container does not have a TTY")
         }
         try await backend.resize(record, width: width, height: height)
+        try requireStorageGeneration(epoch)
         emit(containerEvent(
             "resize", record,
             extra: ["height": String(height), "width": String(width)]
@@ -746,21 +1013,26 @@ public actor EngineRuntime {
                 // The old public record and the full reconciliation intent are
                 // durable before the backend can observe the desired resources.
                 try await persistInstallingResourceIntent(resourceIntent)
+                try requireLifecycleIntent(intent, for: old.id)
                 do {
                     try await backend.updateResources(updated)
+                    try requireLifecycleIntent(intent, for: old.id)
                 } catch let error as BackendResourceRollbackIncompleteError {
-                    let containmentFailure = await containTaintedResourceUpdate(old)
+                    try requireLifecycleIntent(intent, for: old.id)
+                    let containmentFailure = await containTaintedResourceUpdate(old, generation: intent.generation)
                     throw Self.taintedResourceUpdateError(
                         cause: error, containmentFailure: containmentFailure
                     )
                 } catch {
+                    try requireLifecycleIntent(intent, for: old.id)
                     let updateError = error
                     do {
                         // A non-structured backend failure promises its own
                         // rollback completed. Clear the journal only through a
                         // durable old-state transition.
-                        try await persistResourceRollback(containerID: old.id, old: old)
+                        try await persistResourceRollback(containerID: old.id, old: old, generation: intent.generation)
                     } catch {
+                        try requireLifecycleIntent(intent, for: old.id)
                         throw EngineError(
                             .internalError,
                             "resource update failed: \(EngineError.message(for: updateError)); "
@@ -772,12 +1044,14 @@ public actor EngineRuntime {
                 do {
                     try await persistResourceIntentPhase(.backendApplied, containerID: old.id)
                 } catch {
+                    try requireLifecycleIntent(intent, for: old.id)
                     try await rollbackResourceUpdateAfterPersistenceFailure(
-                        old: old,
+                        old: old, intent: intent,
                         persistenceError: error
                     )
                 }
             }
+            try requireLifecycleIntent(intent, for: old.id)
             guard let current = try? containerIndex(old.id) else {
                 throw EngineError(.conflict, "container \(identifier) was removed while it was being updated")
             }
@@ -807,17 +1081,19 @@ public actor EngineRuntime {
                         desired: merged
                     )
                 }
+                try requireLifecycleIntent(intent, for: old.id)
                 emit(containerEvent("update", publishedRecord))
                 endLifecycleIntent(intent, for: old.id)
-                await reconcileDeferredCompletion(old.id)
+                await reconcileDeferredCompletion(old.id, generation: intent.generation)
                 return publishedRecord
             } catch {
+                try requireLifecycleIntent(intent, for: old.id)
                 if resourcesChanged {
                     if let uncertain = error as? LandedResourceCommitCouldNotBeReconfirmed {
                         throw uncertain.underlying
                     }
                     if let unclassified = error as? ResourceCommitStateCouldNotBeClassified {
-                        let containmentFailure = await containUnclassifiedResourceUpdate(old)
+                        let containmentFailure = await containUnclassifiedResourceUpdate(old, generation: intent.generation)
                         let outcome = containmentFailure.map {
                             "containment failed: \($0)"
                         } ?? "workload was contained"
@@ -828,14 +1104,15 @@ public actor EngineRuntime {
                         )
                     }
                     try await rollbackResourceUpdateAfterPersistenceFailure(
-                        old: old, persistenceError: error
+                        old: old, intent: intent, persistenceError: error
                     )
                 }
                 throw error
             }
         } catch {
+            try requireLifecycleIntent(intent, for: old.id)
             endLifecycleIntent(intent, for: old.id)
-            await reconcileDeferredCompletion(old.id)
+            await reconcileDeferredCompletion(old.id, generation: intent.generation)
             throw error
         }
     }
@@ -848,12 +1125,28 @@ public actor EngineRuntime {
             throw EngineError(.conflict, "container \(identifier) is starting")
         }
         guard record.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
+        if Self.killCancelsRestartPolicy(signal, stopSignal: record.stopSignal) {
+            restartCancelledContainerIDs.insert(record.id)
+            var stopped = snapshot.manuallyStoppedContainerInstances ?? [:]
+            stopped[record.id] = record.instanceID
+            snapshot.manuallyStoppedContainerInstances = stopped
+            // Persist before signal delivery: the daemon may die while PID 1
+            // handles a non-SIGKILL stop signal, before any exit is observed.
+            // A failed/ambiguous save is not permission to signal the backend.
+            try await persist()
+            let current = try container(record.id)
+            guard current.instanceID == record.instanceID, current.startedAt == record.startedAt,
+                  current.phase == .running, !startingContainerIDs.contains(record.id) else {
+                throw EngineError(.conflict, "container changed while recording manual kill")
+            }
+        }
         try await backend.kill(record, signal: signal)
         emit(containerEvent("kill", record, extra: ["signal": signal]))
         let normalized = signal.uppercased()
         if normalized == "KILL" || normalized == "SIGKILL", let startedAt = record.startedAt {
             let code = try await backend.wait(record)
             await recordCompletion(record.id, startedAt: startedAt, code: code)
+            try await persistManualStop(record.id)
         }
     }
 
@@ -880,10 +1173,10 @@ public actor EngineRuntime {
             try await persist()
             emit(containerEvent("pause", paused))
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch {
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw error
         }
     }
@@ -911,13 +1204,14 @@ public actor EngineRuntime {
             try await persist()
             emit(containerEvent("unpause", resumed))
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch let error as BackendResourceRollbackIncompleteError {
+            try requireLifecycleIntent(intent, for: record.id)
             let containmentFailure = await containTaintedExecution(
-                record, clearingResourceIntent: false, quarantineExitCode: 137
+                record, clearingResourceIntent: false, quarantineExitCode: 137, generation: intent.generation
             )
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             let outcome = containmentFailure.map { "workload remains quarantined: \($0)" }
                 ?? "workload was stopped and removed from the backend execution"
             throw EngineError(
@@ -925,8 +1219,9 @@ public actor EngineRuntime {
                 "resume rollback was incomplete: \(EngineError.message(for: error)); \(outcome)"
             )
         } catch {
+            try requireLifecycleIntent(intent, for: record.id)
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw error
         }
     }
@@ -947,6 +1242,8 @@ public actor EngineRuntime {
             return
         }
         let intent = try beginLifecycleIntent(.restart, for: record.id)
+        restartCancelledContainerIDs.remove(record.id)
+        Self.clearManualStop(record.id, from: &snapshot)
         guard startingContainerIDs.insert(record.id).inserted else {
             endLifecycleIntent(intent, for: record.id)
             throw EngineError(.conflict, "container \(identifier) is already starting")
@@ -955,26 +1252,30 @@ public actor EngineRuntime {
         do {
             try await persist()
         } catch {
+            try requireLifecycleIntent(intent, for: record.id)
             clearCleanupPending(record.id)
-            startingContainerIDs.remove(record.id)
+            if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
             endLifecycleIntent(intent, for: record.id)
             throw error
         }
+        try requireLifecycleIntent(intent, for: record.id)
         guard ownsRestartExecution(intent, record: record) else {
             clearCleanupPending(record.id)
             do {
                 try await persist()
             } catch {
-                startingContainerIDs.remove(record.id)
+                try requireLifecycleIntent(intent, for: record.id)
+                if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
                 endLifecycleIntent(intent, for: record.id)
                 throw error
             }
-            startingContainerIDs.remove(record.id)
+            if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
             endLifecycleIntent(intent, for: record.id)
             throw EngineError(.conflict, "container was removed or changed while it was restarting")
         }
         do {
             try await backend.restart(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+            try requireLifecycleIntent(intent, for: record.id)
             guard ownsRestartExecution(intent, record: record) else {
                 throw EngineError(.conflict, "container was removed or changed while it was restarting")
             }
@@ -988,6 +1289,7 @@ public actor EngineRuntime {
             // every child of the old generation before publishing the new start
             // time; its completion monitor may still be suspended in the backend.
             await reconcileExecs(for: record.id)
+            try requireLifecycleIntent(intent, for: record.id)
             guard ownsRestartExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
                 throw EngineError(.conflict, "container was removed or changed while it was restarting")
@@ -1001,6 +1303,7 @@ public actor EngineRuntime {
             restarted.exitCode = nil
             restarted.restartCount += 1
             let addresses = await backend.endpointAddresses(for: restarted)
+            try requireLifecycleIntent(intent, for: record.id)
             guard ownsRestartExecution(intent, record: record),
                   let current = try? containerIndex(record.id) else {
                 throw EngineError(.conflict, "container was removed or changed while it was restarting")
@@ -1033,34 +1336,38 @@ public actor EngineRuntime {
             emit(containerEvent("restart", published))
             startHealthMonitor(record.id)
             startCompletionMonitor(record.id, startedAt: startedAt)
-            startingContainerIDs.remove(record.id)
+            if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch {
+            try requireLifecycleIntent(intent, for: record.id)
             let restartError = error
             do {
                 try await terminalizeFailedRestart(record, intent: intent)
             } catch {
-                startingContainerIDs.remove(record.id)
+                try requireLifecycleIntent(intent, for: record.id)
+                if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
                 endLifecycleIntent(intent, for: record.id)
-                await reconcileDeferredCompletion(record.id)
+                await reconcileDeferredCompletion(record.id, generation: intent.generation)
                 throw error
             }
-            startingContainerIDs.remove(record.id)
+            if intent.generation == storageGeneration { startingContainerIDs.remove(record.id) }
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw restartError
         }
     }
 
     public func createExec(container identifier: String, configuration: ExecConfiguration) async throws -> ExecRecord {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try requireCanonicalSnapshotWritable()
         let container = try container(identifier)
         try requireBackendExecutionAvailable(container)
         guard container.phase == .running else { throw EngineError(.conflict, "Container \(identifier) is not running") }
         guard !configuration.arguments.isEmpty else { throw EngineError(.badRequest, "exec command cannot be empty") }
         try beginExecOperation(for: container.id)
-        defer { endExecOperation(for: container.id) }
+        defer { endExecOperation(for: container.id, generation: epoch) }
         let exec = ExecRecord(
             containerID: container.id,
             containerInstanceID: container.instanceID,
@@ -1068,6 +1375,7 @@ public actor EngineRuntime {
         )
         do {
             _ = try await backend.prepareExec(exec, container: container)
+            try requireStorageGeneration(epoch)
             guard let current = try? self.container(container.id),
                   current.phase == .running,
                   current.startedAt == container.startedAt else {
@@ -1079,7 +1387,9 @@ public actor EngineRuntime {
             execs[exec.id] = exec
             return exec
         } catch {
+            try requireStorageGeneration(epoch)
             await backend.discardExec(exec)
+            try requireStorageGeneration(epoch)
             throw error
         }
     }
@@ -1090,11 +1400,14 @@ public actor EngineRuntime {
     }
 
     public func inspectExec(_ identifier: String) async throws -> ExecRecord {
+        let epoch = storageGeneration
         var value = try exec(identifier)
         if value.running {
             try requireBackendExecutionAvailable(container(value.containerID))
             if let code = await backend.execStatus(value) {
+                try requireStorageGeneration(epoch)
                 let refreshedPID = await backend.execPID(value)
+                try requireStorageGeneration(epoch)
                 if var current = execs[identifier], current.exitCode == nil {
                     current.running = false
                     current.exitCode = code
@@ -1105,6 +1418,7 @@ public actor EngineRuntime {
                 value = try exec(identifier)
             }
         }
+        if value.running { try requireStorageGeneration(epoch) }
         return value
     }
 
@@ -1117,18 +1431,20 @@ public actor EngineRuntime {
     public func startExec(
         _ identifier: String, consoleSize: TerminalSize? = nil
     ) async throws {
+        let epoch = storageGeneration
         try requireCanonicalSnapshotWritable()
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else { throw EngineError(.conflict, "exec instance has already run") }
         try beginExecOperation(for: exec.containerID)
-        defer { endExecOperation(for: exec.containerID) }
+        defer { endExecOperation(for: exec.containerID, generation: epoch) }
         guard startingExecIDs.insert(identifier).inserted else {
             throw EngineError(.conflict, "exec instance is already starting")
         }
-        defer { startingExecIDs.remove(identifier) }
+        defer { if epoch == storageGeneration { startingExecIDs.remove(identifier) } }
         do {
             try await backend.startExec(exec, consoleSize: consoleSize)
         } catch let contained as BackendExecStartContainedError {
+            try requireStorageGeneration(epoch)
             // A crossed start boundary is never retryable. The backend has
             // selected a terminal result and retired (or durably quarantined)
             // the exact guest resources, so publish that result before
@@ -1139,13 +1455,16 @@ public actor EngineRuntime {
                 execs[identifier] = current
             }
             if contained.containerTerminated,
-               let owner = try? container(exec.containerID) {
+               let owner = snapshot.containers.first(where: {
+                   $0.id == exec.containerID && $0.instanceID == exec.containerInstanceID
+               }) {
                 await recordCompletion(
                     owner.id, startedAt: owner.startedAt, code: 137
                 )
             }
             throw contained
         } catch let quarantined as BackendExecStartQuarantinedError {
+            try requireStorageGeneration(epoch)
             if var current = execs[identifier], current.exitCode == nil {
                 current.running = false
                 current.exitCode = quarantined.exitCode
@@ -1153,44 +1472,66 @@ public actor EngineRuntime {
             }
             throw quarantined
         }
-        guard execs[identifier]?.exitCode == nil,
-              let container = try? container(exec.containerID), container.phase == .running else {
+        // Force removal may erase the exec while the backend is suspended.
+        // Resolve its immutable owner exactly, never through ID/name lookup.
+        guard epoch == storageGeneration, !storageMaintenance,
+              let current = execs[identifier], current.exitCode == nil,
+              current.containerID == exec.containerID,
+              current.containerInstanceID == exec.containerInstanceID,
+              snapshot.containers.contains(where: {
+                  $0.id == exec.containerID && $0.instanceID == exec.containerInstanceID
+                      && $0.phase == .running
+              }) else {
             throw EngineError(.conflict, "container stopped while exec instance was starting")
         }
         exec.running = true
         execs[identifier] = exec
         let pid = await backend.execPID(exec)
+        try requireStorageGeneration(epoch)
         if pid > 0 { execs[identifier]?.pid = pid }
-        Task { [weak self] in await self?.monitorExec(identifier) }
+        Task { [weak self] in await self?.monitorExec(identifier, generation: epoch) }
     }
 
     public func startAttachedExec(
         _ identifier: String, consoleSize: TerminalSize? = nil
     ) async throws -> CInt? {
+        let epoch = storageGeneration
         try requireCanonicalSnapshotWritable()
         var exec = try exec(identifier)
         guard !exec.running, exec.exitCode == nil else {
             throw EngineError(.conflict, "exec instance has already run")
         }
         try beginExecOperation(for: exec.containerID)
-        defer { endExecOperation(for: exec.containerID) }
+        defer { endExecOperation(for: exec.containerID, generation: epoch) }
         guard startingExecIDs.insert(identifier).inserted else {
             throw EngineError(.conflict, "exec instance is already starting")
         }
-        defer { startingExecIDs.remove(identifier) }
+        defer { if epoch == storageGeneration { startingExecIDs.remove(identifier) } }
         guard let descriptor = try await backend.startAttachedExec(
             exec, consoleSize: consoleSize
         ) else { return nil }
-        guard execs[identifier]?.exitCode == nil,
-              let container = try? container(exec.containerID), container.phase == .running else {
+        // Force removal may erase the exec while the backend is suspended.
+        // Resolve its immutable owner exactly, never through ID/name lookup.
+        guard epoch == storageGeneration, !storageMaintenance,
+              let current = execs[identifier], current.exitCode == nil,
+              current.containerID == exec.containerID,
+              current.containerInstanceID == exec.containerInstanceID,
+              snapshot.containers.contains(where: {
+                  $0.id == exec.containerID && $0.instanceID == exec.containerInstanceID
+                      && $0.phase == .running
+              }) else {
             Darwin.close(descriptor)
             throw EngineError(.conflict, "container stopped while exec instance was starting")
         }
         exec.running = true
         execs[identifier] = exec
-        let pid = await backend.execPID(exec)
-        if pid > 0 { execs[identifier]?.pid = pid }
-        Task { [weak self] in await self?.monitorExec(identifier) }
+        // The caller must activate/drain the stream before metadata RPCs can
+        // safely wait on a guest that may already be blocked writing output.
+        let afterMonitoring = afterAttachedExecMonitoring
+        Task { [weak self] in
+            await self?.monitorExec(identifier, generation: epoch, refreshPID: true)
+            await afterMonitoring?()
+        }
         return descriptor
     }
 
@@ -1220,7 +1561,20 @@ public actor EngineRuntime {
         defer { endLifecycleIntent(intent, for: record.id) }
         guard record.phase == .running || record.phase == .paused else { return }
         let code = try await backend.stop(record, timeoutSeconds: timeoutSeconds ?? record.stopTimeoutSeconds)
+        try requireLifecycleIntent(intent, for: record.id)
         await recordCompletion(record.id, startedAt: record.startedAt, code: code)
+        try await persistManualStop(record.id)
+    }
+
+    /// The completion monitor may observe the exit first and still be persisting
+    /// it when the backend stop returns. Docker's stop/kill reply promises a
+    /// durable stopped state: a daemon crash right after the reply must not
+    /// resurrect an `unless-stopped` container through its restart policy. Join
+    /// canonical persistence before replying; the recorded phase is reused.
+    private func persistManualStop(_ identifier: String) async throws {
+        guard let index = try? containerIndex(identifier),
+              snapshot.containers[index].phase == .exited else { return }
+        try await persist()
     }
 
     public func waitContainer(_ identifier: String, condition: String? = nil) async throws -> Int32 {
@@ -1292,6 +1646,8 @@ public actor EngineRuntime {
         removeVolumes: Bool,
         intent: LifecycleIntent
     ) async throws {
+        let epoch = intent.generation
+        try requireLifecycleIntent(intent, for: identifier)
         guard lifecycleIntents[identifier] == intent else {
             throw EngineError(.conflict, "container \(identifier) removal reservation was lost")
         }
@@ -1314,25 +1670,34 @@ public actor EngineRuntime {
         do {
             try await persist()
         } catch {
+            try requireLifecycleIntent(intent, for: identifier)
             // Never cross the backend boundary without a durable fence. Keep a
             // live-daemon quarantine and make one bounded durability retry.
             try? await persist()
             throw error
         }
 
+        try requireLifecycleIntent(intent, for: identifier)
         if let exitCode = removed.exitCode {
             resumeExitWaiters(identifier, code: exitCode)
         }
         healthTasks.removeValue(forKey: identifier)?.cancel()
         cancelCompletionMonitor(identifier)
-        let removedVolumeMetadata = effectiveRemoveVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+        var removedVolumeMetadata = effectiveRemoveVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+        var removedVolumeIntents: [VolumeRemovalIntentRecord] = []
+        let mountedNames = Set(removed.mounts.filter { $0.kind == .volume }.map(\.source))
         let publicationReservation = reserveRemovalPublication(
-            removed, removedVolumes: removedVolumeMetadata.map(\.element)
+            removed, removedVolumes: effectiveRemoveVolumes ? snapshot.volumes.filter {
+                $0.anonymous == true && mountedNames.contains($0.name)
+            } : []
         )
+        var ownsAnonymousCommit = false
+        defer { if ownsAnonymousCommit { releaseAnonymousRemovalCommit(generation: epoch) } }
         do {
             let cleanupCode = try await cleanupBackendExecution(
-                removed, publishRemovalStopResult: true
+                removed, removingContainer: true, publishRemovalStopResult: true
             )
+            try requireLifecycleIntent(intent, for: identifier)
             if let current = try? containerIndex(identifier),
                snapshot.containers[current].exitCode == nil {
                 // A failed stop followed by a successful definitive delete has
@@ -1344,8 +1709,19 @@ public actor EngineRuntime {
                 resumeExitWaiters(identifier, code: exitCode)
             }
             try await backend.deleteLogs(for: removed)
-            if effectiveRemoveVolumes { try await removeAnonymousVolumes(usedBy: removed) }
+            try requireLifecycleIntent(intent, for: identifier)
+            if effectiveRemoveVolumes {
+                // Cleanup may run concurrently, but last-consumer selection and
+                // container publication must have one order. Reserve every owned
+                // anonymous name above, then re-evaluate after the previous commit.
+                await acquireAnonymousRemovalCommit(generation: epoch)
+                try requireLifecycleIntent(intent, for: identifier)
+                ownsAnonymousCommit = true
+                removedVolumeMetadata = anonymousVolumeMetadata(usedBy: removed)
+                removedVolumeIntents = try await removeAnonymousVolumes(removedVolumeMetadata.map(\.element), usedBy: removed)
+            }
         } catch {
+            try requireLifecycleIntent(intent, for: identifier)
             quarantineRemovalPendingContainer(
                 identifier, record: removed, removeVolumes: effectiveRemoveVolumes
             )
@@ -1354,6 +1730,7 @@ public actor EngineRuntime {
             throw error
         }
 
+        try requireLifecycleIntent(intent, for: identifier)
         guard lifecycleIntents[identifier] == intent,
               let current = try? containerIndex(identifier) else {
             restoreRemovalQuarantine(
@@ -1365,18 +1742,21 @@ public actor EngineRuntime {
         }
         do {
             let durableRemovalRecord = try await persistContainerRemovalCommit(
-                expected: snapshot.containers[current]
+                expected: snapshot.containers[current], removedVolumes: removedVolumeIntents
             )
+            try requireLifecycleIntent(intent, for: identifier)
             releaseRemovalPublication(publicationReservation)
             resumeRemovalWaiters(identifier, code: durableRemovalRecord.exitCode ?? 0)
             emit(containerEvent("destroy", durableRemovalRecord))
         } catch let uncertain as LandedRemovalCommitCouldNotBeReconfirmed {
+            try requireLifecycleIntent(intent, for: identifier)
             // Backend teardown and the selected snapshot both say removed.
             // Do not resurrect stale metadata merely because the independent
             // durability reconfirmation also failed.
             releaseRemovalPublication(publicationReservation)
             throw uncertain.underlying
         } catch let unclassified as RemovalCommitStateCouldNotBeClassified {
+            try requireLifecycleIntent(intent, for: identifier)
             // Canonical state is unknown. Backend deletion is already final;
             // hide the stale record and retain the in-memory publication
             // reservation for this actor's lifetime. The poisoned persistence
@@ -1389,6 +1769,7 @@ public actor EngineRuntime {
             }
             throw unclassified.underlying
         } catch {
+            try requireLifecycleIntent(intent, for: identifier)
             restoreRemovedVolumeMetadata(removedVolumeMetadata)
             quarantineRemovalPendingContainer(
                 identifier, record: removed, removeVolumes: effectiveRemoveVolumes
@@ -1423,10 +1804,10 @@ public actor EngineRuntime {
             let current = try containerIndex(record.id)
             emit(containerEvent("rename", snapshot.containers[current]))
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch {
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw error
         }
     }
@@ -1750,7 +2131,7 @@ public actor EngineRuntime {
             }
             try await persist()
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch {
             if let attemptedNetworks,
                lifecycleIntents[record.id] == intent,
@@ -1760,7 +2141,7 @@ public actor EngineRuntime {
                 try? await backend.updateNetworkRecords(snapshot.containers)
             }
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw error
         }
     }
@@ -1795,7 +2176,7 @@ public actor EngineRuntime {
             }
             try await persist()
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
         } catch {
             if let attemptedNetworks,
                lifecycleIntents[record.id] == intent,
@@ -1805,7 +2186,7 @@ public actor EngineRuntime {
                 try? await backend.updateNetworkRecords(snapshot.containers)
             }
             endLifecycleIntent(intent, for: record.id)
-            await reconcileDeferredCompletion(record.id)
+            await reconcileDeferredCompletion(record.id, generation: intent.generation)
             throw error
         }
     }
@@ -1875,40 +2256,230 @@ public actor EngineRuntime {
     }
 
     public func pruneVolumes(scope: VolumePruneScope = .anonymous) async throws -> [String] {
+        let epoch = storageGeneration
         try requireCanonicalSnapshotWritable()
-        let used = Set(snapshot.containers.flatMap(\.mounts).filter { $0.kind == .volume }.map(\.source))
+        let used = Set((snapshot.containers + Array(pendingContainers.values))
+            .flatMap(\.mounts).filter { $0.kind == .volume }.map(\.source))
         let removed = snapshot.volumes.filter {
-            !used.contains($0.name) && (scope == .allUnused || $0.anonymous == true)
+            !used.contains($0.name) && !volumeRemovalIsPending($0.name)
+                && (scope == .allUnused || $0.anonymous == true)
         }
-        for volume in removed { try await backend.deleteVolume(volume.name) }
         let names = Set(removed.map(\.name))
-        snapshot.volumes.removeAll { names.contains($0.name) }
-        try await persist(); return removed.map(\.name)
+        for name in names { pendingVolumeNames[name, default: 0] += 1 }
+        var unfinished = names
+        defer { releasePendingVolumes(unfinished, generation: epoch) }
+        for volume in removed {
+            // Each completed generation is committed independently. A later
+            // failure cannot republish metadata for already destroyed storage.
+            try requireStorageGeneration(epoch)
+            unfinished.remove(volume.name)
+            try await removeReservedVolume(volume.name)
+        }
+        return removed.map(\.name)
     }
 
     public func createVolume(name: String, sizeBytes: UInt64 = VolumeRecord.defaultSizeBytes, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) async throws -> VolumeRecord {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
+        await acquireStoragePublication(generation: epoch)
+        defer { releaseStoragePublication(generation: epoch) }
+        try requireStorageGeneration(epoch)
         try requireCanonicalSnapshotWritable()
         guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
-        guard pendingVolumeNames[name, default: 0] == 0 else {
+        guard !volumeRemovalIsPending(name) else {
             throw EngineError(.conflict, "volume \(name) is being removed")
         }
-        if let existing = snapshot.volumes.first(where: { $0.name == name }) { return existing }
-        let record = VolumeRecord(name: name, createdAt: Date(), sizeBytes: sizeBytes, labels: labels, options: options, anonymous: anonymous)
-        snapshot.volumes.append(record)
+        let record: VolumeRecord
+        if let existing = snapshot.volumes.first(where: { $0.name == name }) {
+            record = existing
+        } else {
+            record = VolumeRecord(name: name, createdAt: Date(), sizeBytes: sizeBytes, labels: labels, options: options, anonymous: anonymous)
+            snapshot.volumes.append(record)
+        }
+        // Retry also persists and resynchronizes: the prior call may have lost
+        // either the canonical save or the backend reply. Never allocate a new V.
         try await persist()
+        try requireStorageGeneration(epoch)
+        try await backend.synchronizeVolumes(snapshot.volumes.filter { !volumeRemovalIsPending($0.name) })
+        try requireStorageGeneration(epoch)
+        guard !volumeRemovalIsPending(name), snapshot.volumes.contains(where: {
+            $0.name == name && $0.instanceID == record.instanceID
+        }) else { throw EngineError(.conflict, "volume \(name) changed during synchronization") }
         return record
     }
 
     public func removeVolume(_ name: String, force: Bool) async throws {
         try requireCanonicalSnapshotWritable()
-        guard let index = snapshot.volumes.firstIndex(where: { $0.name == name }) else {
+        guard snapshot.volumes.contains(where: { $0.name == name }) else {
             throw EngineError(.notFound, "get \(name): no such volume")
         }
-        let inUse = snapshot.containers.contains { container in container.mounts.contains { $0.kind == .volume && $0.source == name } }
-        guard force || !inUse else { throw EngineError(.conflict, "remove \(name): volume is in use") }
-        try await backend.deleteVolume(name)
-        snapshot.volumes.remove(at: index)
+        guard !volumeRemovalIsPending(name) else {
+            throw EngineError(.conflict, "volume \(name) is being removed")
+        }
+        let inUse = (snapshot.containers + Array(pendingContainers.values)).contains { container in
+            container.mounts.contains { $0.kind == .volume && $0.source == name }
+        }
+        // Docker's force option does not authorize deleting a referenced volume,
+        // including a stopped or not-yet-published container's storage.
+        guard !inUse else { throw EngineError(.conflict, "remove \(name): volume is in use") }
+        pendingVolumeNames[name, default: 0] += 1
+        try await removeReservedVolume(name)
+    }
+
+    /// The caller owns the name reservation. On ANY error retain it for this
+    /// actor's lifetime: storage errors may follow successful destruction and
+    /// snapshot errors may follow publication. Restart retries only the exact
+    /// durable generation, never a replacement sharing its public name.
+    private func removeReservedVolume(_ name: String) async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
+        await acquireStoragePublication(generation: epoch)
+        var ownsPublication = true
+        defer { if ownsPublication { releaseStoragePublication(generation: epoch) } }
+        try requireStorageGeneration(epoch)
+        guard let index = snapshot.volumes.firstIndex(where: { $0.name == name }) else {
+            throw EngineError(.conflict, "volume \(name) disappeared during removal")
+        }
+        let volume = snapshot.volumes[index]
+        guard let instanceID = volume.instanceID else {
+            throw EngineError(.internalError, "volume \(name) has no durable identity")
+        }
+        let intent = VolumeRemovalIntentRecord(name: name, instanceID: instanceID)
+        if let existing = snapshot.volumeRemovalIntents?.first(where: { $0.name == name }),
+           existing.instanceID != instanceID {
+            throw EngineError(.conflict, "volume \(name) removal identity changed")
+        }
+        if snapshot.volumeRemovalIntents?.contains(where: { $0.name == name }) != true {
+            snapshot.volumeRemovalIntents = (snapshot.volumeRemovalIntents ?? []) + [intent]
+        }
         try await persist()
+        try requireStorageGeneration(epoch)
+        // Prior syncs have joined; future syncs omit this durable fenced V.
+        // Do not hold the publication lane while remote deletion blocks: other
+        // volume names may still be used or created independently.
+        releaseStoragePublication(generation: epoch)
+        ownsPublication = false
+        try await backend.deleteVolume(volume)
+        try requireStorageGeneration(epoch)
+        try await persistVolumeRemovalCommit(intent)
+        try requireStorageGeneration(epoch)
+        releasePendingVolumes([name], generation: epoch)
+    }
+
+    private func persistVolumeRemovalCommit(_ intent: VolumeRemovalIntentRecord) async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
+        try await acquirePersistence()
+        defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
+        try await beforePersistence?()
+        try requireStorageGeneration(epoch)
+        guard snapshot.volumes.contains(where: {
+            $0.name == intent.name && $0.instanceID == intent.instanceID
+        }), snapshot.volumeRemovalIntents?.contains(where: {
+            $0.name == intent.name && $0.instanceID == intent.instanceID
+        }) == true else {
+            throw EngineError(.conflict, "volume \(intent.name) removal generation changed")
+        }
+        var value = snapshot
+        Self.clearRemovedVolume(intent, from: &value)
+        try await saveEngineSnapshot(value)
+        try requireStorageGeneration(epoch)
+        Self.clearRemovedVolume(intent, from: &snapshot)
+    }
+
+    private static func clearRemovedVolume(_ intent: VolumeRemovalIntentRecord, from value: inout EngineSnapshot) {
+        value.volumes.removeAll { $0.name == intent.name && $0.instanceID == intent.instanceID }
+        value.volumeRemovalIntents?.removeAll { $0.name == intent.name && $0.instanceID == intent.instanceID }
+        if value.volumeRemovalIntents?.isEmpty == true { value.volumeRemovalIntents = nil }
+    }
+
+    private func resolvePendingVolumeRemovals() async throws {
+        for intent in snapshot.volumeRemovalIntents ?? [] {
+            // Anonymous deletion belongs to its container's durable removal
+            // fence; contain that execution before retrying its volume deletion.
+            if snapshot.containers.contains(where: { container in
+                container.mounts.contains { $0.kind == .volume && $0.source == intent.name }
+            }) { continue }
+            pendingVolumeNames[intent.name, default: 0] += 1
+            try await removeReservedVolume(intent.name)
+        }
+    }
+
+    private func acquireStoragePublication(generation: UUID) async {
+        guard generation == storageGeneration else { return }
+        if storagePublicationActive {
+            await withCheckedContinuation { storagePublicationWaiters.append($0) }
+        } else { storagePublicationActive = true }
+    }
+
+    private func releaseStoragePublication(generation: UUID) {
+        guard generation == storageGeneration else { return }
+        if storagePublicationWaiters.isEmpty { storagePublicationActive = false }
+        else { storagePublicationWaiters.removeFirst().resume() }
+    }
+
+    private func resolveContainerVolumes(_ record: ContainerRecord, expected: [String: UUID]) async throws -> [String: UUID] {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
+        let names = Set(record.mounts.filter { $0.kind == .volume }.map(\.source))
+        guard Set(expected.keys).isSubset(of: names) else { throw EngineError(.badRequest, "unexpected volume identity") }
+        if names.isEmpty { return [:] }
+        await acquireStoragePublication(generation: epoch)
+        defer { releaseStoragePublication(generation: epoch) }
+        try requireStorageGeneration(epoch)
+        try requireCanonicalSnapshotWritable()
+        try Task.checkCancellation()
+        // Validate the entire set before adding any records. Pending container
+        // membership already pins these names against deletion across all awaits.
+        for name in names {
+            guard Identifier.validateName(name) else { throw EngineError(.badRequest, "invalid volume name: \(name)") }
+            guard !volumeRemovalIsPending(name) else { throw EngineError(.conflict, "volume \(name) is being removed") }
+            if let identity = expected[name] {
+                guard snapshot.volumes.contains(where: { $0.name == name && $0.instanceID == identity }) else {
+                    throw EngineError(.conflict, "volume \(name) generation changed before container creation")
+                }
+            }
+        }
+        for name in names.sorted() where !snapshot.volumes.contains(where: { $0.name == name }) {
+            snapshot.volumes.append(VolumeRecord(name: name, sizeBytes: VolumeRecord.defaultSizeBytes))
+        }
+        let instances = try Dictionary(uniqueKeysWithValues: names.map { name in
+            guard let identity = snapshot.volumes.first(where: { $0.name == name })?.instanceID else {
+                throw EngineError(.internalError, "volume \(name) has no durable identity")
+            }
+            return (name, identity)
+        })
+        // Save the whole set before any backend volume or PREPARE work. A failed
+        // save leaves the same in-memory IDs for exact retry, never new authority.
+        try await persist()
+        try requireStorageGeneration(epoch)
+        try await backend.synchronizeVolumes(snapshot.volumes.filter { !volumeRemovalIsPending($0.name) })
+        try requireStorageGeneration(epoch)
+        try validateContainerVolumes(instances)
+        return instances
+    }
+
+    private func validateContainerVolumes(_ instances: [String: UUID]) throws {
+        try requireCanonicalSnapshotWritable()
+        for (name, identity) in instances {
+            guard !volumeRemovalIsPending(name), snapshot.volumes.contains(where: {
+                $0.name == name && $0.instanceID == identity
+            }) else { throw EngineError(.conflict, "volume \(name) changed during container creation") }
+        }
+    }
+
+    private func acquireAnonymousRemovalCommit(generation: UUID) async {
+        guard generation == storageGeneration else { return }
+        if anonymousRemovalCommitActive {
+            await withCheckedContinuation { anonymousRemovalCommitWaiters.append($0) }
+        } else { anonymousRemovalCommitActive = true }
+    }
+
+    private func releaseAnonymousRemovalCommit(generation: UUID) {
+        guard generation == storageGeneration else { return }
+        if anonymousRemovalCommitWaiters.isEmpty { anonymousRemovalCommitActive = false }
+        else { anonymousRemovalCommitWaiters.removeFirst().resume() }
     }
 
     private func containerIndex(_ identifier: String) throws -> Int {
@@ -2343,13 +2914,19 @@ public actor EngineRuntime {
     }
 
     func persist() async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         try await saveEngineSnapshot(snapshot)
+        try requireStorageGeneration(epoch)
     }
 
     func requireCanonicalSnapshotWritable() throws {
+        guard !storageMaintenance else { throw EngineError(.conflict, "managed storage service maintenance is in progress") }
         if let detail = canonicalSnapshotUnavailableDetail {
             throw CanonicalSnapshotPersistenceUnavailable(detail: detail)
         }
@@ -2359,13 +2936,18 @@ public actor EngineRuntime {
     /// Re-read the selected old/new state before returning the error so later
     /// operations cannot overwrite a newly durable teardown/resource fence with
     /// the actor's pre-save snapshot.
-    private func saveEngineSnapshot(_ value: EngineSnapshot) async throws {
-        try requireCanonicalSnapshotWritable()
+    private func saveEngineSnapshot(_ value: EngineSnapshot, maintenance: Bool = false) async throws {
+        let epoch = storageGeneration
+        if !maintenance { try requireCanonicalSnapshotWritable() }
+        else if let detail = canonicalSnapshotUnavailableDetail { throw CanonicalSnapshotPersistenceUnavailable(detail: detail) }
+        try Self.validateEngineSnapshotInvariants(value)
         let base = snapshot
         let revision = snapshotRevision
         do {
             try await store.save(value)
+            if !maintenance { try requireStorageGeneration(epoch) }
         } catch let ambiguity as AtomicStorePersistenceAmbiguousError {
+            if !maintenance { try requireStorageGeneration(epoch) }
             do {
                 let saved = try await store.loadRequired()
                 try Self.validateEngineSnapshotInvariants(saved)
@@ -2417,6 +2999,14 @@ public actor EngineRuntime {
             collection: "volumes",
             key: { $0.name }
         )
+        merged.volumeRemovalIntents = try reconcileRecords(
+            base: base.volumeRemovalIntents ?? [],
+            saved: saved.volumeRemovalIntents ?? [],
+            current: current.volumeRemovalIntents ?? [],
+            collection: "volume removal intents",
+            key: { $0.name }
+        )
+        if merged.volumeRemovalIntents?.isEmpty == true { merged.volumeRemovalIntents = nil }
         merged.images = try reconcileRecords(
             base: base.images,
             saved: saved.images,
@@ -2444,6 +3034,12 @@ public actor EngineRuntime {
             saved: saved.containerFenceInstanceIDs,
             current: current.containerFenceInstanceIDs,
             collection: "container fence identities"
+        )
+        merged.manuallyStoppedContainerInstances = try reconcileDictionary(
+            base: base.manuallyStoppedContainerInstances,
+            saved: saved.manuallyStoppedContainerInstances,
+            current: current.manuallyStoppedContainerInstances,
+            collection: "manual stop identities"
         )
         merged.resourceUpdateIntents = try reconcileRecords(
             base: base.resourceUpdateIntents ?? [],
@@ -2575,9 +3171,13 @@ public actor EngineRuntime {
     }
 
     private func persistInstallingResourceIntent(_ intent: ResourceUpdateIntentRecord) async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         var value = snapshot
         var intents = value.resourceUpdateIntents ?? []
         guard !intents.contains(where: { $0.containerID == intent.containerID }) else {
@@ -2591,6 +3191,7 @@ public actor EngineRuntime {
         intents.append(intent)
         value.resourceUpdateIntents = intents
         try await saveEngineSnapshot(value)
+        try requireStorageGeneration(epoch)
         snapshot.resourceUpdateIntents = intents
     }
 
@@ -2598,9 +3199,13 @@ public actor EngineRuntime {
         _ phase: ResourceUpdateIntentRecord.TransactionPhase,
         containerID: String
     ) async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         var value = snapshot
         guard var intents = value.resourceUpdateIntents,
               let index = intents.firstIndex(where: { $0.containerID == containerID }),
@@ -2611,6 +3216,7 @@ public actor EngineRuntime {
         intents[index].phase = phase
         value.resourceUpdateIntents = intents
         try await saveEngineSnapshot(value)
+        try requireStorageGeneration(epoch)
         snapshot.resourceUpdateIntents = intents
     }
 
@@ -2621,9 +3227,13 @@ public actor EngineRuntime {
         containerID: String,
         desired: ContainerRecord
     ) async throws -> ContainerRecord {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         var value = snapshot
         guard let index = value.containers.firstIndex(where: { $0.id == containerID }),
               let intent = value.resourceUpdateIntents?.first(where: { $0.containerID == containerID }),
@@ -2636,6 +3246,7 @@ public actor EngineRuntime {
         Self.removeResourceIntent(containerID, from: &value)
         do {
             try await saveEngineSnapshot(value)
+            try requireStorageGeneration(epoch)
         } catch let ambiguity as AtomicStorePersistenceAmbiguousError {
             switch classifyResourceCommit(
                 containerID: containerID, desired: desired
@@ -2647,6 +3258,7 @@ public actor EngineRuntime {
                 // API reports success.
                 do {
                     try await saveEngineSnapshot(snapshot)
+                    try requireStorageGeneration(epoch)
                 } catch let repeated as AtomicStorePersistenceAmbiguousError {
                     switch classifyResourceCommit(
                         containerID: containerID, desired: desired
@@ -2726,9 +3338,13 @@ public actor EngineRuntime {
         containerID: String,
         desired: ContainerRecord
     ) async throws -> ContainerRecord {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         var value = snapshot
         guard let index = value.containers.firstIndex(where: { $0.id == containerID }),
               Self.resourceUpdateIdentityMatches(value.containers[index], desired),
@@ -2738,6 +3354,7 @@ public actor EngineRuntime {
         let committed = Self.mergingResourceFields(from: desired, into: value.containers[index])
         value.containers[index] = committed
         try await saveEngineSnapshot(value)
+        try requireStorageGeneration(epoch)
         guard let current = snapshot.containers.firstIndex(where: { $0.id == containerID }),
               Self.resourceUpdateIdentityMatches(snapshot.containers[current], desired) else {
             throw EngineError(.conflict, "container \(containerID) changed during its update")
@@ -2751,11 +3368,16 @@ public actor EngineRuntime {
     /// journal after the backend has been successfully restored.
     private func persistResourceRollback(
         containerID: String,
-        old: ContainerRecord
+        old: ContainerRecord,
+        generation: UUID? = nil
     ) async throws {
+        let epoch = generation ?? storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         var value = snapshot
         guard let index = value.containers.firstIndex(where: { $0.id == containerID }),
               let intent = value.resourceUpdateIntents?.first(where: { $0.containerID == containerID }),
@@ -2766,6 +3388,7 @@ public actor EngineRuntime {
         value.containers[index] = Self.mergingResourceFields(from: old, into: value.containers[index])
         Self.removeResourceIntent(containerID, from: &value)
         try await saveEngineSnapshot(value)
+        try requireStorageGeneration(epoch)
         guard let current = snapshot.containers.firstIndex(where: { $0.id == containerID }) else { return }
         snapshot.containers[current] = Self.mergingResourceFields(from: old, into: snapshot.containers[current])
         Self.removeResourceIntent(containerID, from: &snapshot)
@@ -2775,9 +3398,13 @@ public actor EngineRuntime {
         _ stopped: ContainerRecord,
         clearingResourceIntent: Bool
     ) async throws {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
         var value = snapshot
         guard let index = value.containers.firstIndex(where: { $0.id == stopped.id }) else {
             throw EngineError(.conflict, "container \(stopped.id) disappeared during execution containment")
@@ -2803,6 +3430,7 @@ public actor EngineRuntime {
             Self.removeResourceIntent(stopped.id, from: &value)
         }
         try await saveEngineSnapshot(value)
+        try requireStorageGeneration(epoch)
         guard let current = snapshot.containers.firstIndex(where: { $0.id == stopped.id }) else { return }
         snapshot.containers[current] = stopped
         clearCleanupPending(stopped.id)
@@ -2839,8 +3467,31 @@ public actor EngineRuntime {
         try validateUnique(snapshot.networks.map(\.id), collection: "network IDs")
         try validateUnique(snapshot.networks.map(\.name), collection: "network names")
         try validateUnique(snapshot.volumes.map(\.name), collection: "volume names")
+        let volumeIDs = snapshot.volumes.compactMap(\.instanceID)
+        try validateUnique(volumeIDs, collection: "volume instance IDs")
+        guard !volumeIDs.contains(UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))) else {
+            throw EngineError(.internalError, "zero volume instance identity")
+        }
         try validateUnique(snapshot.images.map(\.id), collection: "image IDs")
+        let volumeIntents = snapshot.volumeRemovalIntents ?? []
+        try validateUnique(volumeIntents.map(\.name), collection: "volume removal intent names")
+        for intent in volumeIntents {
+            guard snapshot.volumes.contains(where: {
+                $0.name == intent.name && $0.instanceID == intent.instanceID
+            }), !snapshot.containers.contains(where: { container in
+                container.mounts.contains { $0.kind == .volume && $0.source == intent.name }
+                    && !(snapshot.removalVolumesPendingContainerIDs?.contains(container.id) == true
+                         && snapshot.volumes.first(where: { $0.name == intent.name })?.anonymous == true)
+            }) else {
+                throw EngineError(.internalError, "volume removal intent \(intent.name) has mismatched generation or a consumer")
+            }
+        }
 
+        for (identifier, instance) in snapshot.manuallyStoppedContainerInstances ?? [:] {
+            guard snapshot.containers.contains(where: { $0.id == identifier && $0.instanceID == instance }) else {
+                throw EngineError(.internalError, "manual stop has missing or mismatched container instance")
+            }
+        }
         let identifiers = (snapshot.cleanupPendingContainerIDs ?? [])
             .union(snapshot.removalPendingContainerIDs ?? [])
             .union(snapshot.removalVolumesPendingContainerIDs ?? [])
@@ -2933,13 +3584,17 @@ public actor EngineRuntime {
 
     private func rollbackResourceUpdateAfterPersistenceFailure(
         old: ContainerRecord,
+        intent: LifecycleIntent,
         persistenceError: Error
     ) async throws -> Never {
+        try requireLifecycleIntent(intent, for: old.id)
         do {
             try await backend.updateResources(old)
+            try requireLifecycleIntent(intent, for: old.id)
         } catch {
+            try requireLifecycleIntent(intent, for: old.id)
             let compensationError = error
-            let containmentFailure = await containTaintedResourceUpdate(old)
+            let containmentFailure = await containTaintedResourceUpdate(old, generation: intent.generation)
             let details = [
                 "resource update persistence failed: \(EngineError.message(for: persistenceError))",
                 "backend compensation failed: \(EngineError.message(for: compensationError))",
@@ -2948,8 +3603,9 @@ public actor EngineRuntime {
             throw EngineError(.internalError, details)
         }
         do {
-            try await persistResourceRollback(containerID: old.id, old: old)
+            try await persistResourceRollback(containerID: old.id, old: old, generation: intent.generation)
         } catch {
+            try requireLifecycleIntent(intent, for: old.id)
             throw EngineError(
                 .internalError,
                 "resource update persistence failed: \(EngineError.message(for: persistenceError)); "
@@ -2975,6 +3631,10 @@ public actor EngineRuntime {
                   ) else {
                 throw EngineError(.internalError, "invalid durable resource update intent")
             }
+            // Removal owns every backend boundary for this record. A failed
+            // auto-remove must retain its resource journal without retrying
+            // containment or clearing the removal quarantine.
+            guard snapshot.removalPendingContainerIDs?.contains(intent.containerID) != true else { continue }
             let current = snapshot.containers[index]
             let chosen = Self.mergingResourceFields(from: intent.old, into: current)
             if current.phase == .dead || cleanupIsPending(current.id) {
@@ -3027,8 +3687,10 @@ public actor EngineRuntime {
     /// backend execution and retain only an in-memory fence; writing any
     /// snapshot here could overwrite an unknown canonical selection.
     private func containUnclassifiedResourceUpdate(
-        _ record: ContainerRecord
+        _ record: ContainerRecord, generation: UUID? = nil
     ) async -> String? {
+        let epoch = generation ?? storageGeneration
+        guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
         healthTasks.removeValue(forKey: record.id)?.cancel()
         cancelCompletionMonitor(record.id)
         if let index = try? containerIndex(record.id),
@@ -3038,6 +3700,7 @@ public actor EngineRuntime {
         }
         do {
             _ = try await cleanupBackendExecution(record)
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
             if let index = try? containerIndex(record.id),
                Self.resourceUpdateIdentityMatches(snapshot.containers[index], record) {
                 snapshot.containers[index].phase = .exited
@@ -3047,29 +3710,35 @@ public actor EngineRuntime {
             }
             return nil
         } catch {
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
             return EngineError.message(for: error)
         }
     }
 
     /// Fail closed when live cgroup state can no longer be proven to match the
     /// old durable record. The public record is quarantined before teardown;
-    /// only verified backend deletion permits an exited publication.
-    private func containTaintedResourceUpdate(_ record: ContainerRecord) async -> String? {
-        await containTaintedExecution(record, clearingResourceIntent: true)
+    /// only verified execution containment permits an exited publication.
+    private func containTaintedResourceUpdate(_ record: ContainerRecord, generation: UUID? = nil) async -> String? {
+        await containTaintedExecution(record, clearingResourceIntent: true, generation: generation)
     }
 
     private func containTaintedExecution(
         _ record: ContainerRecord,
         clearingResourceIntent: Bool,
-        quarantineExitCode: Int32? = nil
+        quarantineExitCode: Int32? = nil,
+        generation: UUID? = nil
     ) async -> String? {
+        let epoch = generation ?? storageGeneration
+        guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
         healthTasks.removeValue(forKey: record.id)?.cancel()
         cancelCompletionMonitor(record.id)
         guard let index = try? containerIndex(record.id) else {
             do {
                 try await cleanupBackendExecution(record)
+                guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
                 return nil
             } catch {
+                guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
                 return EngineError.message(for: error)
             }
         }
@@ -3085,23 +3754,29 @@ public actor EngineRuntime {
         let fenceFailure: Error?
         do {
             try await persist()
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
             fenceFailure = nil
         } catch {
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
             fenceFailure = error
         }
 
         let stopCode: Int32?
         do {
             stopCode = try await cleanupBackendExecution(record)
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
         } catch {
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
             let cleanupFailure = error
             quarantineCleanupPendingContainer(record.id)
             markCleanupPending(record.id)
             let retryFailure: Error?
             do {
                 try await persist()
+                guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
                 retryFailure = nil
             } catch {
+                guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
                 retryFailure = error
             }
             return [
@@ -3112,12 +3787,15 @@ public actor EngineRuntime {
         }
 
         await reconcileExecs(for: record.id)
+        guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
         guard let current = try? containerIndex(record.id) else {
             clearCleanupPending(record.id)
             do {
                 try await persist()
+                guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
                 return nil
             } catch {
+                guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
                 return EngineError.message(for: error)
             }
         }
@@ -3130,6 +3808,7 @@ public actor EngineRuntime {
                 stopped, clearingResourceIntent: clearingResourceIntent
             )
         } catch {
+            guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
             guard let quarantined = try? containerIndex(record.id) else {
                 return "backend teardown succeeded but the safe terminal state could not be persisted: \(EngineError.message(for: error))"
             }
@@ -3137,6 +3816,7 @@ public actor EngineRuntime {
             markCleanupPending(record.id)
             return "backend teardown succeeded but the safe terminal state could not be persisted: \(EngineError.message(for: error))"
         }
+        guard epoch == storageGeneration, !storageMaintenance else { return "execution was fenced by service maintenance" }
         resumeExitWaiters(record.id, code: stopped.exitCode ?? 137)
         emit(containerEvent("die", stopped, extra: ["exitCode": String(stopped.exitCode ?? 137)]))
         return nil
@@ -3205,11 +3885,15 @@ public actor EngineRuntime {
     /// removed together. Until the save succeeds the live snapshot continues
     /// to reserve the original ID/name and retains the recovery journal.
     private func persistContainerRemovalCommit(
-        expected: ContainerRecord
+        expected: ContainerRecord, removedVolumes: [VolumeRemovalIntentRecord] = []
     ) async throws -> ContainerRecord {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         try await acquirePersistence()
         defer { releasePersistence() }
+        try requireStorageGeneration(epoch)
         try await beforePersistence?()
+        try requireStorageGeneration(epoch)
 
         var value = snapshot
         guard let valueIndex = value.containers.firstIndex(where: {
@@ -3223,15 +3907,26 @@ public actor EngineRuntime {
             throw EngineError(.internalError, "resource update intent does not belong to removed container \(expected.id)")
         }
         value.containers.remove(at: valueIndex)
+        for volume in removedVolumes {
+            guard value.volumes.contains(where: { $0.name == volume.name && $0.instanceID == volume.instanceID }),
+                  value.volumeRemovalIntents?.contains(where: { $0.name == volume.name && $0.instanceID == volume.instanceID }) == true,
+                  !value.containers.contains(where: { $0.mounts.contains { $0.kind == .volume && $0.source == volume.name } }) else {
+                throw EngineError(.conflict, "anonymous volume changed during container removal")
+            }
+            Self.clearRemovedVolume(volume, from: &value)
+        }
         Self.clearContainerFences(expected.id, from: &value)
+        Self.clearManualStop(expected.id, from: &value)
         Self.removeResourceIntent(expected.id, from: &value)
         do {
             try await saveEngineSnapshot(value)
+            try requireStorageGeneration(epoch)
         } catch let ambiguity as AtomicStorePersistenceAmbiguousError {
             switch classifyRemovalCommit(expected: expected) {
             case .absent:
                 do {
                     try await saveEngineSnapshot(snapshot)
+                    try requireStorageGeneration(epoch)
                 } catch let repeated as AtomicStorePersistenceAmbiguousError {
                     switch classifyRemovalCommit(expected: expected) {
                     case .absent:
@@ -3278,6 +3973,7 @@ public actor EngineRuntime {
             return expected
         }
         let removed = snapshot.containers.remove(at: current)
+        for volume in removedVolumes { Self.clearRemovedVolume(volume, from: &snapshot) }
         Self.clearContainerFences(expected.id, from: &snapshot)
         Self.removeResourceIntent(expected.id, from: &snapshot)
         purgeExecRecords(ownedBy: removed)
@@ -3285,6 +3981,8 @@ public actor EngineRuntime {
     }
 
     private func purgeExecRecords(ownedBy container: ContainerRecord) {
+        restartCancelledContainerIDs.remove(container.id)
+        Self.clearManualStop(container.id, from: &snapshot)
         let identifiers = Self.execIdentifiersOwned(by: container, in: execs)
         for identifier in identifiers {
             execs.removeValue(forKey: identifier)
@@ -3329,6 +4027,18 @@ public actor EngineRuntime {
         return .unknown
     }
 
+    private static func clearManualStop(_ identifier: String, from snapshot: inout EngineSnapshot) {
+        snapshot.manuallyStoppedContainerInstances?.removeValue(forKey: identifier)
+        if snapshot.manuallyStoppedContainerInstances?.isEmpty == true { snapshot.manuallyStoppedContainerInstances = nil }
+    }
+
+    private func manualStopSuppressesRecovery(_ record: ContainerRecord) -> Bool {
+        // `always` deliberately restarts when the daemon restarts, even after a
+        // manual stop. Only `unless-stopped` carries this bit across lifetimes.
+        record.restartPolicy.name == "unless-stopped"
+            && snapshot.manuallyStoppedContainerInstances?[record.id] == record.instanceID
+    }
+
     private static func clearContainerFences(
         _ identifier: String,
         from snapshot: inout EngineSnapshot
@@ -3363,6 +4073,7 @@ public actor EngineRuntime {
             pendingVolumeNames[name, default: 0] += 1
         }
         return RemovalPublicationReservation(
+            generation: storageGeneration,
             containerID: record.id,
             containerInstanceID: record.instanceID,
             containerName: record.name,
@@ -3371,6 +4082,7 @@ public actor EngineRuntime {
     }
 
     private func releaseRemovalPublication(_ reservation: RemovalPublicationReservation) {
+        guard reservation.generation == storageGeneration else { return }
         if pendingContainerNames[reservation.containerName] == reservation.containerID {
             pendingContainerNames.removeValue(forKey: reservation.containerName)
         }
@@ -3379,7 +4091,26 @@ public actor EngineRuntime {
             pendingContainerInstances.removeValue(forKey: reservation.containerID)
             pendingContainerIDs.remove(reservation.containerID)
         }
-        for name in reservation.volumeNames {
+        releasePendingVolumes(reservation.volumeNames, generation: reservation.generation)
+    }
+
+    private func volumeRemovalIsPending(_ name: String) -> Bool {
+        if pendingVolumeNames[name, default: 0] > 0 { return true }
+        if snapshot.volumeRemovalIntents?.contains(where: { $0.name == name }) == true { return true }
+        // A failed `rm -v`/auto-remove may already have destroyed part of the
+        // storage. Its durable quarantine must fence reuse after the temporary
+        // publication reservation is released, until a retry commits removal.
+        guard snapshot.volumes.contains(where: { $0.name == name && $0.anonymous == true }),
+              let pending = snapshot.removalVolumesPendingContainerIDs else { return false }
+        return snapshot.containers.contains { container in
+            pending.contains(container.id)
+                && container.mounts.contains { $0.kind == .volume && $0.source == name }
+        }
+    }
+
+    private func releasePendingVolumes(_ names: Set<String>, generation: UUID) {
+        guard generation == storageGeneration else { return }
+        for name in names {
             guard let count = pendingVolumeNames[name] else { continue }
             if count == 1 { pendingVolumeNames.removeValue(forKey: name) }
             else { pendingVolumeNames[name] = count - 1 }
@@ -3409,7 +4140,15 @@ public actor EngineRuntime {
     /// primary fence during actor reentrancy; `.dead` keeps the public record in
     /// quarantine after cleanup returns an error.
     func requireBackendExecutionAvailable(_ record: ContainerRecord) throws {
-        guard !cleanupIsPending(record.id), !resourceUpdateIsPending(record.id), record.phase != .dead else {
+        try requireCanonicalSnapshotWritable()
+        guard !record.mounts.contains(where: {
+            $0.kind == .volume && volumeRemovalIsPending($0.source)
+        }) else {
+            throw EngineError(.conflict, "container \(record.id) has volume removal pending")
+        }
+        guard !cleanupIsPending(record.id), !resourceUpdateIsPending(record.id),
+              snapshot.removalPendingContainerIDs?.contains(record.id) != true,
+              snapshot.removalVolumesPendingContainerIDs?.contains(record.id) != true, record.phase != .dead else {
             throw EngineError(.conflict, "container \(record.id) has backend cleanup pending")
         }
     }
@@ -3475,7 +4214,10 @@ public actor EngineRuntime {
     /// Backend preparation or start can partially launch before throwing, or
     /// succeed before publishing the running record fails. The cleanup marker stays
     /// set until definitive teardown and restoration are both durable.
-    private func rollbackFailedStart(original: ContainerRecord, started: ContainerRecord) async throws {
+    private func rollbackFailedStart(original: ContainerRecord, started: ContainerRecord, intent: LifecycleIntent) async throws {
+        try requireLifecycleIntent(intent, for: original.id)
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         healthTasks.removeValue(forKey: original.id)?.cancel()
         cancelCompletionMonitor(original.id)
         markCleanupPending(original.id)
@@ -3483,6 +4225,7 @@ public actor EngineRuntime {
         // Best-effort persistence also covers a failure detected after a
         // successful running publication.
         try? await persist()
+        try requireLifecycleIntent(intent, for: original.id)
         guard (try? containerIndex(original.id)) != nil else {
             try await cleanupBackendExecution(started)
             clearCleanupPending(original.id)
@@ -3492,13 +4235,16 @@ public actor EngineRuntime {
         do {
             try await cleanupBackendExecution(started)
         } catch {
+            try requireLifecycleIntent(intent, for: original.id)
             quarantineCleanupPendingContainer(original.id)
             // The original pre-launch save is the safety boundary. These
             // bounded retries improve diagnostics/durability when storage
             // transiently recovers, but correctness does not depend on them.
             try? await persist()
+            try requireLifecycleIntent(intent, for: original.id)
             throw error
         }
+        try requireStorageGeneration(epoch)
         guard let restored = try? containerIndex(original.id) else {
             clearCleanupPending(original.id)
             try await persist()
@@ -3509,6 +4255,7 @@ public actor EngineRuntime {
         do {
             try await persist()
         } catch {
+            try requireLifecycleIntent(intent, for: original.id)
             markCleanupPending(original.id)
             throw error
         }
@@ -3520,10 +4267,12 @@ public actor EngineRuntime {
     /// execution. Restart-policy and auto-remove reconciliation runs only after
     /// the caller releases that claim.
     private func terminalizeFailedRestart(_ original: ContainerRecord, intent: LifecycleIntent) async throws {
+        try requireLifecycleIntent(intent, for: original.id)
         healthTasks.removeValue(forKey: original.id)?.cancel()
         cancelCompletionMonitor(original.id)
         markCleanupPending(original.id)
         try? await persist()
+        try requireLifecycleIntent(intent, for: original.id)
 
         guard lifecycleIntents[original.id] == intent,
               (try? containerIndex(original.id)) != nil else {
@@ -3535,12 +4284,15 @@ public actor EngineRuntime {
         do {
             try await cleanupBackendExecution(original)
         } catch {
+            try requireLifecycleIntent(intent, for: original.id)
             quarantineCleanupPendingContainer(original.id)
             try? await persist()
+            try requireLifecycleIntent(intent, for: original.id)
             throw error
         }
 
         await reconcileExecs(for: original.id)
+        try requireLifecycleIntent(intent, for: original.id)
         guard let terminal = try? containerIndex(original.id) else {
             clearCleanupPending(original.id)
             try await persist()
@@ -3562,6 +4314,7 @@ public actor EngineRuntime {
         do {
             try await persist()
         } catch {
+            try requireLifecycleIntent(intent, for: original.id)
             markCleanupPending(original.id)
             throw error
         }
@@ -3571,19 +4324,22 @@ public actor EngineRuntime {
         }
     }
 
-    /// `delete` is the backend's definitive teardown operation. Always attempt
-    /// it after a stop failure; a successful delete verifies cleanup on its own,
-    /// while a delete failure retains the quarantine and includes any preceding
-    /// stop failure as diagnostic context.
+    /// Execution containment preserves persistent user data. Destructive delete
+    /// is reserved for an intentional removal; neither operation may infer
+    /// successful teardown from a failed stop or an unavailable guest socket.
     @discardableResult
     private func cleanupBackendExecution(
         _ record: ContainerRecord,
+        removingContainer: Bool = false,
         publishRemovalStopResult: Bool = false
     ) async throws -> Int32? {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
         var stopFailure: String?
         var stopCode: Int32?
         do {
             stopCode = try await backend.stop(record, timeoutSeconds: 0)
+            try requireStorageGeneration(epoch)
             if publishRemovalStopResult, let stopCode,
                let current = try? containerIndex(record.id),
                snapshot.containers[current].exitCode == nil {
@@ -3596,13 +4352,22 @@ public actor EngineRuntime {
                 resumeExitWaiters(record.id, code: stopCode)
             }
         } catch {
+            try requireStorageGeneration(epoch)
             stopFailure = EngineError.message(for: error)
         }
+        try requireStorageGeneration(epoch)
         do {
-            try await backend.delete(record)
+            if removingContainer {
+                try await backend.delete(record)
+            } else {
+                try await backend.cleanupExecution(record)
+            }
+            try requireStorageGeneration(epoch)
             return stopCode
         } catch {
-            let failures = [stopFailure.map { "stop: \($0)" }, "delete: \(EngineError.message(for: error))"]
+            try requireStorageGeneration(epoch)
+            let operation = removingContainer ? "delete" : "execution cleanup"
+            let failures = [stopFailure.map { "stop: \($0)" }, "\(operation): \(EngineError.message(for: error))"]
                 .compactMap { $0 }
             throw EngineError(
                 .internalError,
@@ -3611,8 +4376,9 @@ public actor EngineRuntime {
         }
     }
 
-    /// Drain explicit remove/prune intents before any generic execution
-    /// recovery. The record and both fences remain durable until backend,
+    /// Drain removal intents before any generic execution recovery. Failed
+    /// auto-remove execution cleanup remains isolated in its quarantine.
+    /// The record and both fences remain durable until backend,
     /// logs, requested anonymous volumes, and metadata have all been removed.
     private func resolvePendingContainerRemovals() async throws {
         let pendingRemovalIDs = snapshot.removalPendingContainerIDs ?? []
@@ -3626,6 +4392,7 @@ public actor EngineRuntime {
             let removed = snapshot.containers[fencedIndex]
             let removeVolumes = snapshot.removalVolumesPendingContainerIDs?.contains(identifier) == true
             let removedVolumeMetadata = removeVolumes ? anonymousVolumeMetadata(usedBy: removed) : []
+            var removedVolumeIntents: [VolumeRemovalIntentRecord] = []
 
             // Normalize partially written/corrupt intent state before teardown.
             // A failed save here must leave the backend completely untouched.
@@ -3635,9 +4402,26 @@ public actor EngineRuntime {
             try await persist()
 
             do {
-                try await cleanupBackendExecution(removed)
+                try await cleanupBackendExecution(removed, removingContainer: true)
+            } catch {
+                quarantineRemovalPendingContainer(identifier, record: removed, removeVolumes: removeVolumes)
+                if removed.autoRemove {
+                    // Auto-remove cleanup has always allowed unrelated workloads
+                    // to recover. The record flag is sufficient even for an
+                    // explicit rm of an auto-remove container: the original
+                    // removeVolumes intent stays intact and direct rm still
+                    // reports failures to its caller.
+                    try await persist()
+                    continue
+                }
+                try? await persist()
+                throw error
+            }
+            do {
                 try await backend.deleteLogs(for: removed)
-                if removeVolumes { try await removeAnonymousVolumes(usedBy: removed) }
+                if removeVolumes {
+                    removedVolumeIntents = try await removeAnonymousVolumes(removedVolumeMetadata.map(\.element), usedBy: removed)
+                }
             } catch {
                 quarantineRemovalPendingContainer(identifier, record: removed, removeVolumes: removeVolumes)
                 try? await persist()
@@ -3649,7 +4433,7 @@ public actor EngineRuntime {
             }
             do {
                 _ = try await persistContainerRemovalCommit(
-                    expected: snapshot.containers[current]
+                    expected: snapshot.containers[current], removedVolumes: removedVolumeIntents
                 )
             } catch let uncertain as LandedRemovalCommitCouldNotBeReconfirmed {
                 throw uncertain.underlying
@@ -3670,8 +4454,12 @@ public actor EngineRuntime {
         usedBy record: ContainerRecord
     ) -> [(offset: Int, element: VolumeRecord)] {
         let names = Set(record.mounts.filter { $0.kind == .volume }.map(\.source))
+        let peerNames = Set((snapshot.containers + Array(pendingContainers.values))
+            .filter { $0.id != record.id }.flatMap(\.mounts)
+            .filter { $0.kind == .volume }.map(\.source))
         return snapshot.volumes.enumerated().filter {
             names.contains($0.element.name) && $0.element.anonymous == true
+                && !peerNames.contains($0.element.name)
         }
     }
 
@@ -3694,10 +4482,7 @@ public actor EngineRuntime {
             quarantined.phase = .dead
             snapshot.containers.insert(quarantined, at: min(index, snapshot.containers.endIndex))
         }
-        for volume in removedVolumes.sorted(by: { $0.offset < $1.offset })
-            where !snapshot.volumes.contains(where: { $0.name == volume.element.name }) {
-            snapshot.volumes.insert(volume.element, at: min(volume.offset, snapshot.volumes.endIndex))
-        }
+        restoreRemovedVolumeMetadata(removedVolumes)
         markCleanupPending(record.id)
         markRemovalPending(record.id, removeVolumes: removeVolumes)
     }
@@ -3705,21 +4490,30 @@ public actor EngineRuntime {
     private func restoreRemovedVolumeMetadata(
         _ removedVolumes: [(offset: Int, element: VolumeRecord)]
     ) {
-        for volume in removedVolumes.sorted(by: { $0.offset < $1.offset })
-            where !snapshot.volumes.contains(where: { $0.name == volume.element.name }) {
-            snapshot.volumes.insert(
-                volume.element, at: min(volume.offset, snapshot.volumes.endIndex)
-            )
+        for volume in removedVolumes.sorted(by: { $0.offset < $1.offset }) {
+            if !snapshot.volumes.contains(where: { $0.name == volume.element.name }) {
+                snapshot.volumes.insert(
+                    volume.element, at: min(volume.offset, snapshot.volumes.endIndex)
+                )
+            }
+            // Rollback must retain the exact durable deletion record, not just
+            // a name fence from which a later daemon could re-derive it.
+            if let instanceID = volume.element.instanceID,
+               snapshot.volumes.contains(where: { $0.name == volume.element.name && $0.instanceID == instanceID }),
+               snapshot.volumeRemovalIntents?.contains(where: { $0.name == volume.element.name }) != true {
+                snapshot.volumeRemovalIntents = (snapshot.volumeRemovalIntents ?? [])
+                    + [.init(name: volume.element.name, instanceID: instanceID)]
+            }
         }
     }
 
     /// Finish startup reconciliation for terminal auto-remove records. A fresh
-    /// record is fenced before teardown; one already cleaned through a pending
-    /// marker reuses that proof so recovery never issues a duplicate delete.
+    /// record is fenced before removal. Execution-only cleanup is not a deletion
+    /// proof: roots must still be removed for recovered auto-remove containers.
     private func removeRecoveredAutoRemoveContainers(
-        verifiedCleanupIDs input: Set<String>
+        verifiedRemovalIDs input: Set<String>
     ) async throws -> Set<String> {
-        var verifiedCleanupIDs = input
+        var verifiedRemovalIDs = input
         let recoveredAutoRemoveIDs = snapshot.containers.compactMap { record in
             record.autoRemove && record.phase == .exited ? record.id : nil
         }
@@ -3728,24 +4522,26 @@ public actor EngineRuntime {
             let removed = snapshot.containers[index]
             guard !resourceUpdateIsPending(identifier) else { continue }
             let removedVolumeMetadata = anonymousVolumeMetadata(usedBy: removed)
-            if !verifiedCleanupIDs.contains(identifier) {
+            var removedVolumeIntents: [VolumeRemovalIntentRecord] = []
+            if !verifiedRemovalIDs.contains(identifier) {
                 markCleanupPending(identifier)
+                markRemovalPending(identifier, removeVolumes: true)
                 try await persist()
                 do {
-                    try await cleanupBackendExecution(removed)
+                    try await cleanupBackendExecution(removed, removingContainer: true)
                 } catch {
                     quarantineCleanupPendingContainer(identifier)
                     try await persist()
                     continue
                 }
-                verifiedCleanupIDs.insert(identifier)
+                verifiedRemovalIDs.insert(identifier)
             }
             try await backend.deleteLogs(for: removed)
-            try await removeAnonymousVolumes(usedBy: removed)
+            removedVolumeIntents = try await removeAnonymousVolumes(removedVolumeMetadata.map(\.element), usedBy: removed)
             guard let current = try? containerIndex(identifier) else { continue }
             do {
                 _ = try await persistContainerRemovalCommit(
-                    expected: snapshot.containers[current]
+                    expected: snapshot.containers[current], removedVolumes: removedVolumeIntents
                 )
             } catch let uncertain as LandedRemovalCommitCouldNotBeReconfirmed {
                 throw uncertain.underlying
@@ -3759,7 +4555,7 @@ public actor EngineRuntime {
                 throw error
             }
         }
-        return verifiedCleanupIDs
+        return verifiedRemovalIDs
     }
 
     public func events(since: Date? = nil, until: Date? = nil) -> AsyncStream<RuntimeEvent> {
@@ -3829,12 +4625,45 @@ public actor EngineRuntime {
         healthTasks[identifier] = Task { [weak self] in await self?.runHealthMonitor(identifier) }
     }
 
-    private func removeAnonymousVolumes(usedBy record: ContainerRecord) async throws {
-        let names = Set(record.mounts.filter { $0.kind == .volume }.map(\.source))
-        let removable = snapshot.volumes.filter { names.contains($0.name) && $0.anonymous == true }
-        for volume in removable { try await backend.deleteVolume(volume.name) }
-        let removedNames = Set(removable.map(\.name))
-        snapshot.volumes.removeAll { removedNames.contains($0.name) }
+    private func removeAnonymousVolumes(
+        _ reservedVolumes: [VolumeRecord], usedBy record: ContainerRecord
+    ) async throws -> [VolumeRemovalIntentRecord] {
+        let epoch = storageGeneration
+        try requireStorageGeneration(epoch)
+        await acquireStoragePublication(generation: epoch)
+        try requireStorageGeneration(epoch)
+        var ownsPublication = true
+        defer { if ownsPublication { releaseStoragePublication(generation: epoch) } }
+        // Never expand the captured set or substitute a new generation by name.
+        let eligible = anonymousVolumeMetadata(usedBy: record).map(\.element)
+        let removable = reservedVolumes.filter { volume in
+            eligible.contains { $0.name == volume.name && $0.instanceID == volume.instanceID }
+        }
+        guard !removable.isEmpty else { return [] }
+        for volume in removable {
+            guard let instanceID = volume.instanceID else {
+                throw EngineError(.internalError, "anonymous volume has no durable identity")
+            }
+            if let existing = snapshot.volumeRemovalIntents?.first(where: { $0.name == volume.name }) {
+                guard existing.instanceID == instanceID else {
+                    throw EngineError(.conflict, "anonymous volume removal identity changed")
+                }
+            } else {
+                snapshot.volumeRemovalIntents = (snapshot.volumeRemovalIntents ?? [])
+                    + [.init(name: volume.name, instanceID: instanceID)]
+            }
+        }
+        try await persist()
+        try requireStorageGeneration(epoch)
+        releaseStoragePublication(generation: epoch)
+        ownsPublication = false
+        for volume in removable {
+            try await backend.deleteVolume(volume)
+            try requireStorageGeneration(epoch)
+        }
+        // Every intervening save retains metadata and exact deletion intents.
+        // Only the atomic container-removal commit may clear this union.
+        return removable.map { .init(name: $0.name, instanceID: $0.instanceID!) }
     }
 
     private func runHealthMonitor(_ identifier: String) async {
@@ -4028,6 +4857,8 @@ public actor EngineRuntime {
         code: Int32,
         monitorToken: UUID? = nil
     ) async {
+        let epoch = storageGeneration
+        guard !storageMaintenance else { return }
         guard let index = try? containerIndex(identifier),
               snapshot.containers[index].phase == .running || snapshot.containers[index].phase == .paused,
               snapshot.containers[index].startedAt == startedAt else { return }
@@ -4041,10 +4872,12 @@ public actor EngineRuntime {
         healthTasks.removeValue(forKey: record.id)?.cancel()
         emit(containerEvent("die", record, extra: ["exitCode": String(code)]))
         await reconcileExecs(for: identifier)
+        guard epoch == storageGeneration, !storageMaintenance else { return }
         await reconcileCompletedContainer(identifier, code: code, suppressing: intent)
     }
 
-    private func reconcileDeferredCompletion(_ identifier: String) async {
+    private func reconcileDeferredCompletion(_ identifier: String, generation: UUID) async {
+        guard generation == storageGeneration, !storageMaintenance else { return }
         guard lifecycleIntents[identifier] == nil,
               !cleanupIsPending(identifier),
               !resourceUpdateIsPending(identifier),
@@ -4059,6 +4892,8 @@ public actor EngineRuntime {
         code: Int32,
         suppressing intent: LifecycleIntent?
     ) async {
+        let epoch = storageGeneration
+        guard !storageMaintenance else { return }
         guard let index = try? containerIndex(identifier),
               snapshot.containers[index].phase == .exited else { return }
         guard !resourceUpdateIsPending(identifier) else {
@@ -4069,7 +4904,10 @@ public actor EngineRuntime {
         }
         let autoRemove = snapshot.containers[index].autoRemove
         let record = snapshot.containers[index]
-        if intent == nil, !autoRemove, !cleanupIsPending(identifier), Self.shouldRestart(record, exitCode: code) {
+        // A `docker kill` with SIGKILL or the stop signal is a manual stop: the
+        // policy stays cancelled until the next start, exactly like a stop intent.
+        let restartCancelled = restartCancelledContainerIDs.contains(identifier) || manualStopSuppressesRecovery(record)
+        if intent == nil, !restartCancelled, !autoRemove, !cleanupIsPending(identifier), Self.shouldRestart(record, exitCode: code) {
             let restartIntent: LifecycleIntent
             do {
                 restartIntent = try beginLifecycleIntent(.restart, for: identifier)
@@ -4081,27 +4919,31 @@ public actor EngineRuntime {
                 return
             }
             defer {
-                startingContainerIDs.remove(identifier)
+                if epoch == storageGeneration { startingContainerIDs.remove(identifier) }
                 endLifecycleIntent(restartIntent, for: identifier)
             }
             var cleanupFencePersisted = false
             do {
                 var restarted = record; restarted.restartCount += 1
-                try await backend.delete(record)
-                guard ownsReconciliation(restartIntent, record: record) else { return }
                 markCleanupPending(identifier)
                 do {
                     try await persist()
                 } catch {
+                    guard epoch == storageGeneration, !storageMaintenance else { return }
                     clearCleanupPending(identifier)
                     throw error
                 }
                 guard ownsReconciliation(restartIntent, record: record) else {
+                    guard epoch == storageGeneration, !storageMaintenance else { return }
                     clearCleanupPending(identifier)
                     try await persist()
                     return
                 }
                 cleanupFencePersisted = true
+                try await backend.cleanupExecution(record)
+                guard ownsReconciliation(restartIntent, record: record) else {
+                    throw EngineError(.conflict, "container changed while restart policy was containing it")
+                }
                 try await backend.prepare(restarted)
                 guard ownsReconciliation(restartIntent, record: record) else {
                     throw EngineError(.conflict, "container changed while restart policy was preparing it")
@@ -4124,10 +4966,12 @@ public actor EngineRuntime {
                 startCompletionMonitor(identifier, startedAt: restartedAt)
                 return
             } catch {
+                guard epoch == storageGeneration, !storageMaintenance else { return }
                 guard cleanupFencePersisted else { return }
                 markCleanupPending(identifier)
                 do {
                     try await cleanupBackendExecution(record)
+                    guard epoch == storageGeneration, !storageMaintenance else { return }
                     if let current = try? containerIndex(identifier) {
                         snapshot.containers[current].phase = .exited
                         snapshot.containers[current].startedAt = record.startedAt
@@ -4139,9 +4983,11 @@ public actor EngineRuntime {
                     do {
                         try await persist()
                     } catch {
+                        guard epoch == storageGeneration, !storageMaintenance else { return }
                         markCleanupPending(identifier)
                     }
                 } catch {
+                    guard epoch == storageGeneration, !storageMaintenance else { return }
                     // The pre-launch marker is already durable. Recovery must
                     // verify teardown before this record can launch again.
                     quarantineCleanupPendingContainer(identifier)
@@ -4171,65 +5017,17 @@ public actor EngineRuntime {
             }
             guard ownsReconciliation(removeIntent, record: record) else { return }
             guard !resourceUpdateIsPending(identifier) else { return }
-            if !cleanupIsPending(identifier) {
-                // Publish the cleanup fence before crossing the backend
-                // teardown boundary. If the save fails, leave the terminal
-                // record intact and do not risk losing track of its execution.
-                markCleanupPending(identifier)
-                do {
-                    try await persist()
-                } catch {
-                    // Keep the live daemon fenced even when the first durable
-                    // cleanup marker cannot be published. The terminal result
-                    // remains intact while `.dead` prevents any backend
-                    // operation from trusting the residual execution. If this
-                    // bounded retry also fails, startup recovery still sees the
-                    // durable running auto-remove record and must reconcile it.
-                    quarantineCleanupPendingContainer(identifier)
-                    try? await persist()
-                    return
-                }
-            }
-            guard ownsReconciliation(removeIntent, record: record) else { return }
             do {
-                try await cleanupBackendExecution(record)
+                // Auto-remove has the same durable removal contract as `rm -v`:
+                // reserve anonymous volume names before backend teardown, hold
+                // them through commit, and quarantine any log/volume failure.
+                try await removeClaimedContainer(identifier, removeVolumes: true, intent: removeIntent)
             } catch {
-                // Delete is the definitive cleanup proof. Retain both the
-                // record and marker when it fails so reload must retry before
-                // any restart policy or backend operation can proceed.
-                quarantineCleanupPendingContainer(identifier)
-                try? await persist()
+                // The shared removal path retains the retryable quarantine (or
+                // reconciles an ambiguous commit). Never publish partial cleanup
+                // as a successful auto-remove.
                 return
             }
-            guard ownsReconciliation(removeIntent, record: record) else { return }
-            try? await backend.deleteLogs(for: record)
-            guard ownsReconciliation(removeIntent, record: record) else { return }
-            let removedVolumeMetadata = anonymousVolumeMetadata(usedBy: record)
-            try? await removeAnonymousVolumes(usedBy: record)
-            guard ownsReconciliation(removeIntent, record: record),
-                  let current = try? containerIndex(identifier) else { return }
-            do {
-                _ = try await persistContainerRemovalCommit(
-                    expected: snapshot.containers[current]
-                )
-            } catch is LandedRemovalCommitCouldNotBeReconfirmed {
-                // The container remains absent and the backend has already
-                // been deleted. A later reload will select the canonical side;
-                // never recreate the removed object in this daemon.
-                return
-            } catch is RemovalCommitStateCouldNotBeClassified {
-                return
-            } catch {
-                // Backend deletion succeeded, but keep the cleanup fence in
-                // memory when its metadata removal could not be committed.
-                // The durable pending record will finish removal on reload.
-                restoreRemovedVolumeMetadata(removedVolumeMetadata)
-                quarantineCleanupPendingContainer(identifier)
-                markCleanupPending(identifier)
-                return
-            }
-            resumeRemovalWaiters(identifier, code: code)
-            emit(containerEvent("destroy", record))
             return
         }
         try? await persist()
@@ -4277,12 +5075,20 @@ public actor EngineRuntime {
     }
 
     private func beginLifecycleIntent(_ operation: LifecycleIntent.Operation, for identifier: String) throws -> LifecycleIntent {
+        try requireCanonicalSnapshotWritable()
         guard lifecycleIntents[identifier] == nil else {
             throw EngineError(.conflict, "container \(identifier) already has a lifecycle operation in progress")
         }
-        let intent = LifecycleIntent(operation: operation)
+        let intent = LifecycleIntent(operation: operation, generation: storageGeneration)
         lifecycleIntents[identifier] = intent
         return intent
+    }
+
+    private func requireLifecycleIntent(_ intent: LifecycleIntent, for identifier: String) throws {
+        try requireStorageGeneration(intent.generation)
+        guard lifecycleIntents[identifier] == intent else {
+            throw EngineError(.conflict, "container lifecycle operation was superseded")
+        }
     }
 
     private func endLifecycleIntent(_ intent: LifecycleIntent, for identifier: String) {
@@ -4301,7 +5107,8 @@ public actor EngineRuntime {
         activeExecOperations[containerID, default: 0] += 1
     }
 
-    private func endExecOperation(for containerID: String) {
+    private func endExecOperation(for containerID: String, generation: UUID) {
+        guard generation == storageGeneration else { return }
         guard let count = activeExecOperations[containerID] else { return }
         if count == 1 { activeExecOperations.removeValue(forKey: containerID) }
         else { activeExecOperations[containerID] = count - 1 }
@@ -4353,6 +5160,22 @@ public actor EngineRuntime {
         }
     }
 
+    /// moby `killWithSignal`: SIGKILL or the container's configured stop signal
+    /// calls `ExitOnNext`, cancelling the restart policy for the coming exit.
+    /// Other signals are ordinary deliveries and leave the policy in force.
+    static func killCancelsRestartPolicy(_ signal: String, stopSignal: String) -> Bool {
+        let requested = normalizedSignalName(signal)
+        return requested == "KILL" || requested == normalizedSignalName(stopSignal)
+    }
+
+    private static func normalizedSignalName(_ value: String) -> String {
+        let names = [1: "HUP", 2: "INT", 3: "QUIT", 9: "KILL", 10: "USR1", 12: "USR2", 13: "PIPE", 14: "ALRM",
+                     15: "TERM", 17: "CHLD", 18: "CONT", 19: "STOP", 20: "TSTP"]
+        let normalized = value.trimmingCharacters(in: .whitespaces).uppercased()
+        if let number = Int(normalized) { return names[number] ?? "SIG\(number)" }
+        return normalized.hasPrefix("SIG") ? String(normalized.dropFirst(3)) : normalized
+    }
+
     private static func shouldRestart(_ record: ContainerRecord, exitCode: Int32) -> Bool {
         switch record.restartPolicy.name {
         case "always", "unless-stopped": return true
@@ -4362,8 +5185,17 @@ public actor EngineRuntime {
         }
     }
 
-    private func monitorExec(_ identifier: String) async {
-        while !Task.isCancelled {
+    private func monitorExec(_ identifier: String, generation epoch: UUID, refreshPID: Bool = false) async {
+        guard epoch == storageGeneration, !storageMaintenance else { return }
+        if refreshPID {
+            guard let exec = execs[identifier], exec.running, exec.exitCode == nil else { return }
+            // Refresh before the completion wait so long-running attached execs
+            // publish their PID too, but never hold up the descriptor handoff.
+            let pid = await backend.execPID(exec)
+            guard epoch == storageGeneration, !storageMaintenance else { return }
+            if pid > 0 { execs[identifier]?.pid = pid }
+        }
+        while !Task.isCancelled, epoch == storageGeneration, !storageMaintenance {
             guard let exec = try? exec(identifier), exec.running, exec.exitCode == nil else {
                 return
             }
@@ -4371,7 +5203,9 @@ public actor EngineRuntime {
                 try? await Task.sleep(for: .milliseconds(25))
                 continue
             }
+            guard epoch == storageGeneration, !storageMaintenance else { return }
             let refreshedPID = await backend.execPID(exec)
+            guard epoch == storageGeneration, !storageMaintenance else { return }
             guard var current = execs[identifier], current.exitCode == nil else { return }
             current.running = false
             current.exitCode = code
@@ -4383,12 +5217,16 @@ public actor EngineRuntime {
     }
 
     private func reconcileExecs(for containerID: String) async {
+        let epoch = storageGeneration
+        guard !storageMaintenance else { return }
         let identifiers = execs.values.filter {
             $0.containerID == containerID && $0.exitCode == nil
         }.map(\.id)
         for identifier in identifiers {
             guard let candidate = execs[identifier], candidate.exitCode == nil else { continue }
+            guard epoch == storageGeneration, !storageMaintenance else { return }
             let code = candidate.running ? await backend.execStatus(candidate) : nil
+            guard epoch == storageGeneration, !storageMaintenance else { return }
             guard var current = execs[identifier], current.exitCode == nil else { continue }
             current.running = false
             current.exitCode = code ?? 137

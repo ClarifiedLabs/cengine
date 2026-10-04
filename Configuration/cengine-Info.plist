@@ -22,6 +22,14 @@
 	<string>$(CENGINE_BUILD_TIME)</string>
 	<key>CEngineGitCommit</key>
 	<string>$(CENGINE_GIT_COMMIT)</string>
+	<key>CEngineCompatLifecycleFault</key>
+	<string>$(CENGINE_COMPAT_LIFECYCLE_FAULT)</string>
+	<key>CEngineStorageLifecycleQualification</key>
+	<string>$(CENGINE_STORAGE_LIFECYCLE_QUALIFICATION)</string>
+	<key>CEngineStorageLifecycleSourcePin</key>
+	<string>$(CENGINE_STORAGE_LIFECYCLE_SOURCE_PIN)</string>
+	<key>CEngineStorageLifecycleAssetsSHA256</key>
+	<string>$(CENGINE_STORAGE_LIFECYCLE_ASSETS_SHA256)</string>
 	<key>CEngineTeamIdentifier</key>
 	<string>$(CENGINE_TEAM_IDENTIFIER)</string>
 	<key>CEngineNetworkHelperServiceName</key>

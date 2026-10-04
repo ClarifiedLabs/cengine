@@ -1,0 +1,69 @@
+{
+  "version": "storage-lifecycle-service-result.v2",
+  "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "root_public_key": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+  "vectors": [
+    {
+      "value": {
+        "identity": {
+          "store": "bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb",
+          "generation": 9007199254740993,
+          "binding": "ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63"
+        },
+        "grant": {
+          "operation": "initialize",
+          "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "identity": {
+            "store": "bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb",
+            "generation": 9007199254740993,
+            "binding": "ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63"
+          },
+          "serial": 1,
+          "expected_epoch": 0,
+          "new_key": "abababababababababababababababababababababababababababababababab"
+        },
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        "service_epoch": "cccccccc-cccc-4ccc-accc-cccccccccccc",
+        "controller_epoch": 1,
+        "controller_key": "abababababababababababababababababababababababababababababababab",
+        "open_revision": 18446744073709551615
+      },
+      "signing_bytes": "Y2VuZ2luZS5zdG9yYWdlYXV0aG9yaXR5LmxpZmVjeWNsZS1zZXJ2aWNlLXJlc3VsdC52MgB7ImlkZW50aXR5Ijp7InN0b3JlIjoiYmJiYmJiYmItYmJiYi00YmJiLTliYmItYmJiYmJiYmJiYmJiIiwiZ2VuZXJhdGlvbiI6OTAwNzE5OTI1NDc0MDk5MywiYmluZGluZyI6ImFjODM4ZmE1OWFmODZiYjI4ZmU4ZTEzNWFhZDZlYjY5MmNiZDk3NmE1ZjFmNmRhZmMxMGYwMDNhMDZhMWFlNjMifSwiZ3JhbnQiOnsib3BlcmF0aW9uIjoiaW5pdGlhbGl6ZSIsImlkIjoiYWFhYWFhYWEtYWFhYS00YWFhLThhYWEtYWFhYWFhYWFhYWFhIiwiaWRlbnRpdHkiOnsic3RvcmUiOiJiYmJiYmJiYi1iYmJiLTRiYmItOWJiYi1iYmJiYmJiYmJiYmIiLCJnZW5lcmF0aW9uIjo5MDA3MTk5MjU0NzQwOTkzLCJiaW5kaW5nIjoiYWM4MzhmYTU5YWY4NmJiMjhmZThlMTM1YWFkNmViNjkyY2JkOTc2YTVmMWY2ZGFmYzEwZjAwM2EwNmExYWU2MyJ9LCJzZXJpYWwiOjEsImV4cGVjdGVkX2Vwb2NoIjowLCJuZXdfa2V5IjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiJ9LCJub25jZSI6IkFBRUNBd1FGQmdjSUNRb0xEQTBPRHhBUkVoTVVGUllYR0JrYUd4d2RIaDg9Iiwic2VydmljZV9lcG9jaCI6ImNjY2NjY2NjLWNjY2MtNGNjYy1hY2NjLWNjY2NjY2NjY2NjYyIsImNvbnRyb2xsZXJfZXBvY2giOjEsImNvbnRyb2xsZXJfa2V5IjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiIsIm9wZW5fcmV2aXNpb24iOjE4NDQ2NzQ0MDczNzA5NTUxNjE1fQ==",
+      "signature": "t1WsZ9ETnvkkr2A3Bzik8c0A8pkCnpAYF3vhiv5cc4G+ql+dAmSRaz7INoHvyNPqAFShNylhHTyzj/t5PQyGBA==",
+      "canonical_json": "{\"controller_epoch\":1,\"controller_key\":\"abababababababababababababababababababababababababababababababab\",\"grant\":{\"expected_epoch\":0,\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"new_key\":\"abababababababababababababababababababababababababababababababab\",\"operation\":\"initialize\",\"serial\":1},\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"open_revision\":18446744073709551615,\"service_epoch\":\"cccccccc-cccc-4ccc-accc-cccccccccccc\"}",
+      "request_json": "{\"id\":1,\"service_result\":{\"grant\":{\"expected_epoch\":0,\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"new_key\":\"abababababababababababababababababababababababababababababababab\",\"operation\":\"initialize\",\"serial\":1},\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"}}",
+      "response_json": "{\"id\":1,\"service_result\":{\"controller_epoch\":1,\"controller_key\":\"abababababababababababababababababababababababababababababababab\",\"grant\":{\"expected_epoch\":0,\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"new_key\":\"abababababababababababababababababababababababababababababababab\",\"operation\":\"initialize\",\"serial\":1},\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"open_revision\":18446744073709551615,\"service_epoch\":\"cccccccc-cccc-4ccc-accc-cccccccccccc\"}}"
+    },
+    {
+      "value": {
+        "identity": {
+          "store": "bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb",
+          "generation": 9007199254740993,
+          "binding": "ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63"
+        },
+        "grant": {
+          "operation": "takeover",
+          "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "identity": {
+            "store": "bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb",
+            "generation": 9007199254740993,
+            "binding": "ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63"
+          },
+          "serial": 9007199254740993,
+          "expected_epoch": 9007199254740993,
+          "new_key": "abababababababababababababababababababababababababababababababab"
+        },
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        "service_epoch": "cccccccc-cccc-4ccc-accc-cccccccccccc",
+        "controller_epoch": 9007199254740994,
+        "controller_key": "abababababababababababababababababababababababababababababababab",
+        "open_revision": 18446744073709551615
+      },
+      "signing_bytes": "Y2VuZ2luZS5zdG9yYWdlYXV0aG9yaXR5LmxpZmVjeWNsZS1zZXJ2aWNlLXJlc3VsdC52MgB7ImlkZW50aXR5Ijp7InN0b3JlIjoiYmJiYmJiYmItYmJiYi00YmJiLTliYmItYmJiYmJiYmJiYmJiIiwiZ2VuZXJhdGlvbiI6OTAwNzE5OTI1NDc0MDk5MywiYmluZGluZyI6ImFjODM4ZmE1OWFmODZiYjI4ZmU4ZTEzNWFhZDZlYjY5MmNiZDk3NmE1ZjFmNmRhZmMxMGYwMDNhMDZhMWFlNjMifSwiZ3JhbnQiOnsib3BlcmF0aW9uIjoidGFrZW92ZXIiLCJpZCI6ImFhYWFhYWFhLWFhYWEtNGFhYS04YWFhLWFhYWFhYWFhYWFhYSIsImlkZW50aXR5Ijp7InN0b3JlIjoiYmJiYmJiYmItYmJiYi00YmJiLTliYmItYmJiYmJiYmJiYmJiIiwiZ2VuZXJhdGlvbiI6OTAwNzE5OTI1NDc0MDk5MywiYmluZGluZyI6ImFjODM4ZmE1OWFmODZiYjI4ZmU4ZTEzNWFhZDZlYjY5MmNiZDk3NmE1ZjFmNmRhZmMxMGYwMDNhMDZhMWFlNjMifSwic2VyaWFsIjo5MDA3MTk5MjU0NzQwOTkzLCJleHBlY3RlZF9lcG9jaCI6OTAwNzE5OTI1NDc0MDk5MywibmV3X2tleSI6ImFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIifSwibm9uY2UiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R4QVJFaE1VRlJZWEdCa2FHeHdkSGg4PSIsInNlcnZpY2VfZXBvY2giOiJjY2NjY2NjYy1jY2NjLTRjY2MtYWNjYy1jY2NjY2NjY2NjY2MiLCJjb250cm9sbGVyX2Vwb2NoIjo5MDA3MTk5MjU0NzQwOTk0LCJjb250cm9sbGVyX2tleSI6ImFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIiLCJvcGVuX3JldmlzaW9uIjoxODQ0Njc0NDA3MzcwOTU1MTYxNX0=",
+      "signature": "k09OGDcrKTM9ckmmWmkmXySoZZ7ZqQKW8SCrPhZRv/2g7c4+O8iDCfTZuKBYZxaqohykr2zf+NKp94W3U2odAg==",
+      "canonical_json": "{\"controller_epoch\":9007199254740994,\"controller_key\":\"abababababababababababababababababababababababababababababababab\",\"grant\":{\"expected_epoch\":9007199254740993,\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"new_key\":\"abababababababababababababababababababababababababababababababab\",\"operation\":\"takeover\",\"serial\":9007199254740993},\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"open_revision\":18446744073709551615,\"service_epoch\":\"cccccccc-cccc-4ccc-accc-cccccccccccc\"}",
+      "request_json": "{\"id\":1,\"service_result\":{\"grant\":{\"expected_epoch\":9007199254740993,\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"new_key\":\"abababababababababababababababababababababababababababababababab\",\"operation\":\"takeover\",\"serial\":9007199254740993},\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"}}",
+      "response_json": "{\"id\":1,\"service_result\":{\"controller_epoch\":9007199254740994,\"controller_key\":\"abababababababababababababababababababababababababababababababab\",\"grant\":{\"expected_epoch\":9007199254740993,\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"new_key\":\"abababababababababababababababababababababababababababababababab\",\"operation\":\"takeover\",\"serial\":9007199254740993},\"identity\":{\"binding\":\"ac838fa59af86bb28fe8e135aad6eb692cbd976a5f1f6dafc10f003a06a1ae63\",\"generation\":9007199254740993,\"store\":\"bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb\"},\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"open_revision\":18446744073709551615,\"service_epoch\":\"cccccccc-cccc-4ccc-accc-cccccccccccc\"}}"
+    }
+  ]
+}

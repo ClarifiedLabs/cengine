@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
 import pathlib
 import json
 import os
@@ -23,6 +26,7 @@ COMPOSE_VOLUMES_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-volumes.yaml"
 COMPOSE_HEALTH_FILE = REPO_ROOT / "Tests/Fixtures/compose/compose-health.yaml"
 DEVELOPER_FIXTURE = REPO_ROOT / "Tests/Fixtures/compose/developer-loop"
 COMPOSE_MAJOR_VERSION = "5"
+UPSTREAM_VOLUMES_FIXTURE = REPO_ROOT / "Tests/Fixtures/compose/upstream-volumes"
 
 
 def compose(daemon, project: str, *arguments: str, compose_file=COMPOSE_FILE) -> subprocess.CompletedProcess[str]:
@@ -150,7 +154,14 @@ def developer_project(daemon, client, managed_docker_integration, request):
         "image_input": root / "image-version.txt",
         "image": f"compat-developer-loop:{uuid.uuid4().hex[:8]}",
     }
-    managed_docker_integration.environment["DEVELOPER_IMAGE"] = project["image"]
+    # The named OCI context is transferred through the normal Buildx session;
+    # it does not replace the shipped default builder or add a registry.
+    import compat_image_fixtures
+    managed_docker_integration.environment.update({
+        "DEVELOPER_IMAGE": project["image"],
+        "DEVELOPER_PYTHON_LAYOUT": str(daemon.local_images["python"]),
+        "DEVELOPER_PYTHON_MANIFEST": compat_image_fixtures.manifest_digest("python"),
+    })
     managed_docker_integration.register_image(project["image"])
     try:
         yield project
@@ -467,3 +478,283 @@ def test_compose_waits_for_healthy_dependency(daemon, compose_project, client):
             daemon, compose_project, "down", "--volumes", "--remove-orphans",
             compose_file=COMPOSE_HEALTH_FILE,
         )
+
+
+@dataclass(frozen=True)
+class VolumeComposeEndpoint:
+    """Explicit oracle endpoint; environment and work paths belong to the runner.
+
+    daemon=None is Docker's local-volume control, not block/shared proof.
+    A cengine endpoint must carry its real daemon for backend assertions.
+    """
+
+    host: str
+    work: pathlib.Path
+    environment: dict[str, str]
+    daemon: Any | None
+
+
+def volume_compose(daemon, project: dict, *arguments: str, check: bool = True):
+    if isinstance(daemon, VolumeComposeEndpoint):
+        host = daemon.host
+        environment = docker_environment(host, base=daemon.environment)
+    else:
+        host = f"unix://{daemon['socket']}"
+        environment = docker_environment(host)
+    for key in tuple(environment):
+        if key.startswith("COMPOSE_"):
+            environment.pop(key)
+    environment.update(project["environment"])
+    result = subprocess.run(
+        [
+            "docker", "--host", host, "compose",
+            "--env-file", os.devnull, "-f", str(project["root"] / project["file"]),
+            "--project-name", project["name"], *arguments,
+        ],
+        cwd=project["root"], env=environment, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300,
+    )
+    if check and result.returncode != 0:
+        pytest.fail(f"Volume pilot Compose {' '.join(arguments)} failed:\n{result.stdout}")
+    return result
+
+
+def volume_service(daemon, project: dict, client, service: str = "app"):
+    ids = volume_compose(daemon, project, "ps", "-q", service).stdout.split()
+    assert len(ids) == 1, ids
+    container = client.containers.get(ids[0])
+    assert container.status == "running", container.attrs["State"]
+    if isinstance(daemon, VolumeComposeEndpoint) and daemon.daemon is not None:
+        modes = json.loads((daemon.daemon.root / "volume-storage.json").read_text())
+        # Curated volume services each have one active consumer, hence block.
+        for mount in container.attrs["Mounts"]:
+            if mount["Type"] == "volume":
+                assert modes[mount["Name"]] == "block", (mount, modes)
+    return container
+
+
+def volume_mount(project: dict, container) -> dict:
+    mounts = [mount for mount in container.attrs["Mounts"] if mount["Destination"] == "/data"]
+    assert len(mounts) == 1, container.attrs["Mounts"]
+    mount = mounts[0]
+    assert mount["Type"] == "volume", mount
+    assert mount["Name"], mount
+    project["volumes"].add(mount["Name"])
+    return mount
+
+
+def volume_exec(container, *arguments: str) -> str:
+    result = container.exec_run(list(arguments))
+    assert result.exit_code == 0, result.output.decode(errors="replace")
+    return result.output.decode()
+
+
+@pytest.fixture
+def upstream_volume_project(daemon, client, request):
+    with upstream_volume_project_context(daemon, client, request) as project:
+        yield project
+
+
+@contextmanager
+def upstream_volume_project_context(daemon, client, request):
+    """Reuse the same owned project lifecycle, without invoking pytest fixtures."""
+    name = f"cenginevolumes{uuid.uuid4().hex}"
+    root = daemon.work / name
+    shutil.copytree(UPSTREAM_VOLUMES_FIXTURE, root)
+    (root / "bind-data").mkdir()
+    project = {
+        "name": name, "root": root, "file": "anonymous.yaml", "volumes": set(),
+        "owned_external": {},
+        "environment": {
+            "CENGINE_CMP_EXTERNAL_VOLUME": f"{name}-external-first",
+            "CENGINE_CMP_VOLUME_LABEL": "first",
+            "CENGINE_CMP_DEPENDENCY_LABEL": "first",
+        },
+    }
+    try:
+        yield project
+    finally:
+        failures = []
+        try:
+            # Include any mount created before a test assertion failed. Explicitly
+            # tracked names also cover anonymous volumes orphaned by renewal.
+            for container in client.containers.list(
+                all=True, filters={"label": f"com.docker.compose.project={name}"},
+            ):
+                try:
+                    container.reload()
+                except errors.NotFound:
+                    continue
+                project["volumes"].update(
+                    mount["Name"] for mount in container.attrs["Mounts"]
+                    if mount["Type"] == "volume"
+                )
+        except Exception as error:
+            failures.append(f"volume discovery failed: {error}")
+        try:
+            down = volume_compose(
+                daemon, project, "down", "--volumes", "--remove-orphans", check=False,
+            )
+            if down.returncode != 0:
+                failures.append(f"Compose down failed: {down.stdout}")
+        except Exception as error:
+            failures.append(f"Compose down failed: {error}")
+        try:
+            assert_developer_project_removed(client, project)
+        except Exception as error:
+            failures.append(f"project cleanup failed: {error}")
+        for name in sorted(project["volumes"]):
+            try:
+                volume = client.volumes.get(name)
+                if name in project["owned_external"]:
+                    assert volume.attrs.get("Labels", {}).get("dev.cengine.compat.owner") == project["owned_external"][name]
+                volume.remove()
+            except errors.NotFound:
+                pass
+            except Exception as error:
+                failures.append(f"volume {name} cleanup failed: {error}")
+        shutil.rmtree(root, ignore_errors=True)
+        if failures:
+            message = "\n".join(failures)
+            report = getattr(request.node, "report_call", None)
+            if report is not None and report.failed:
+                print(f"\nVolume pilot cleanup failed:\n{message}")
+            else:
+                pytest.fail(message)
+
+
+# Observable scenarios selected from docker/compose at
+# e9491499f116984e00b89a39b53a8b28d33ad4c7; see the fixture README for provenance.
+@pytest.mark.compat("CMP-040")
+def test_compose_anonymous_volume_inheritance_and_renewal(daemon, upstream_volume_project, client):
+    project = upstream_volume_project
+    volume_compose(daemon, project, "up", "-d")
+    first = volume_service(daemon, project, client)
+    original_volume = volume_mount(project, first)["Name"]
+    volume_exec(first, "sh", "-c", "printf inherited >/data/sentinel")
+
+    volume_compose(daemon, project, "up", "-d", "--force-recreate")
+    inherited = volume_service(daemon, project, client)
+    assert inherited.id != first.id
+    assert volume_mount(project, inherited)["Name"] == original_volume
+    assert volume_exec(inherited, "cat", "/data/sentinel") == "inherited"
+
+    volume_compose(daemon, project, "up", "-d", "--force-recreate", "--renew-anon-volumes")
+    renewed = volume_service(daemon, project, client)
+    assert renewed.id not in {first.id, inherited.id}
+    assert volume_mount(project, renewed)["Name"] != original_volume
+    volume_exec(renewed, "test", "!", "-e", "/data/sentinel")
+    volume_exec(renewed, "sh", "-c", "printf renewed >/data/sentinel")
+    assert volume_exec(renewed, "cat", "/data/sentinel") == "renewed"
+
+
+@pytest.mark.compat("CMP-041")
+def test_compose_external_volume_switches_identity_and_content(daemon, upstream_volume_project, client):
+    project = upstream_volume_project
+    project["file"] = "external.yaml"
+    first_name = project["environment"]["CENGINE_CMP_EXTERNAL_VOLUME"]
+    second_name = f"{project['name']}-external-second"
+    for name in (first_name, second_name):
+        token = uuid.uuid4().hex
+        volume = client.volumes.create(name, labels={"dev.cengine.compat.owner": token})
+        assert volume.attrs.get("Labels", {}).get("dev.cengine.compat.owner") == token
+        project["owned_external"][name] = token
+        project["volumes"].add(name)
+
+    volume_compose(daemon, project, "up", "-d")
+    first = volume_service(daemon, project, client)
+    assert volume_mount(project, first)["Name"] == first_name
+    volume_exec(first, "sh", "-c", "printf first-volume >/data/sentinel")
+
+    project["environment"]["CENGINE_CMP_EXTERNAL_VOLUME"] = second_name
+    volume_compose(daemon, project, "up", "-d")
+    second = volume_service(daemon, project, client)
+    assert second.id != first.id
+    assert volume_mount(project, second)["Name"] == second_name
+    volume_exec(second, "test", "!", "-e", "/data/sentinel")
+    volume_exec(second, "sh", "-c", "printf second-volume >/data/sentinel")
+    assert volume_exec(second, "cat", "/data/sentinel") == "second-volume"
+
+    project["environment"]["CENGINE_CMP_EXTERNAL_VOLUME"] = first_name
+    volume_compose(daemon, project, "up", "-d")
+    returned = volume_service(daemon, project, client)
+    assert returned.id not in {first.id, second.id}
+    assert volume_mount(project, returned)["Name"] == first_name
+    assert volume_exec(returned, "cat", "/data/sentinel") == "first-volume"
+    volume_compose(daemon, project, "down", "--volumes")
+    # External volumes remain caller-owned even when Compose removes its volumes.
+    assert client.volumes.get(first_name).name == first_name
+    assert client.volumes.get(second_name).name == second_name
+
+
+@pytest.mark.compat("CMP-042")
+def test_compose_approved_volume_definition_change_recreates_data(daemon, upstream_volume_project, client):
+    project = upstream_volume_project
+    project["file"] = "definition.yaml"
+    volume_compose(daemon, project, "up", "-d")
+    first = volume_service(daemon, project, client)
+    name = volume_mount(project, first)["Name"]
+    label = "dev.cengine.compat.definition"
+    assert client.volumes.get(name).attrs["Labels"][label] == "first"
+    volume_exec(first, "sh", "-c", "printf obsolete >/data/sentinel")
+
+    project["environment"]["CENGINE_CMP_VOLUME_LABEL"] = "second"
+    volume_compose(daemon, project, "up", "-d", "--yes")
+    recreated = volume_service(daemon, project, client)
+    assert recreated.id != first.id
+    assert volume_mount(project, recreated)["Name"] == name
+    assert client.volumes.get(name).attrs["Labels"][label] == "second"
+    volume_exec(recreated, "test", "!", "-e", "/data/sentinel")
+    volume_exec(recreated, "sh", "-c", "printf replacement >/data/sentinel")
+    assert volume_exec(recreated, "cat", "/data/sentinel") == "replacement"
+
+
+@pytest.mark.compat("CMP-043")
+def test_compose_unchanged_bind_does_not_recreate_container(daemon, upstream_volume_project, client):
+    project = upstream_volume_project
+    project["file"] = "bind.yaml"
+    source = project["root"] / "bind-data"
+    (source / "sentinel").write_text("before-up")
+    volume_compose(daemon, project, "up", "-d")
+    first = volume_service(daemon, project, client)
+    mount = [value for value in first.attrs["Mounts"] if value["Destination"] == "/data"]
+    assert len(mount) == 1, first.attrs["Mounts"]
+    assert mount[0]["Type"] == "bind"
+    assert pathlib.Path(mount[0]["Source"]).resolve() == source.resolve()
+    assert volume_exec(first, "cat", "/data/sentinel") == "before-up"
+    started = first.attrs["State"]["StartedAt"]
+
+    (source / "sentinel").write_text("changed-content-not-definition")
+    volume_compose(daemon, project, "up", "-d")
+    unchanged = volume_service(daemon, project, client)
+    assert unchanged.id == first.id
+    assert unchanged.attrs["State"]["StartedAt"] == started
+    assert volume_exec(unchanged, "cat", "/data/sentinel") == "changed-content-not-definition"
+
+
+@pytest.mark.compat("CMP-044")
+def test_compose_no_deps_recreates_only_selected_service(daemon, upstream_volume_project, client):
+    project = upstream_volume_project
+    project["file"] = "no-deps.yaml"
+    volume_compose(daemon, project, "up", "-d", "--wait", "--wait-timeout", "60")
+    first = volume_service(daemon, project, client)
+    dependency = volume_service(daemon, project, client, "dependency")
+    assert dependency.attrs["State"]["Health"]["Status"] == "healthy"
+    label = "dev.cengine.compat.dependency"
+    assert dependency.attrs["Config"]["Labels"][label] == "first"
+    started = dependency.attrs["State"]["StartedAt"]
+    boot_id = container_boot_id(dependency)
+    volume_exec(dependency, "sh", "-c", "printf untouched >/tmp/sentinel")
+
+    # Make dependency reconciliation observable: ignoring --no-deps would now
+    # apply this changed definition and replace the otherwise healthy dependency.
+    project["environment"]["CENGINE_CMP_DEPENDENCY_LABEL"] = "second"
+    volume_compose(daemon, project, "up", "-d", "--force-recreate", "--no-deps", "app")
+    assert volume_service(daemon, project, client).id != first.id
+    untouched = volume_service(daemon, project, client, "dependency")
+    assert untouched.id == dependency.id
+    assert untouched.attrs["Config"]["Labels"][label] == "first"
+    assert untouched.attrs["State"]["StartedAt"] == started
+    assert untouched.attrs["State"]["Health"]["Status"] == "healthy"
+    assert container_boot_id(untouched) == boot_id
+    assert volume_exec(untouched, "cat", "/tmp/sentinel") == "untouched"

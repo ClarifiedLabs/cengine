@@ -54,23 +54,39 @@ func Listen(port uint32) (net.Listener, error) {
 		_ = unix.Close(fd)
 		return nil, err
 	}
+	file, err := newSocketFile(fd, "cengine-vsock-listener")
+	if err != nil {
+		return nil, err
+	}
 	return &listener{
-		file:    os.NewFile(uintptr(fd), "cengine-vsock-listener"),
+		file:    file,
 		address: Addr{CID: unix.VMADDR_CID_ANY, Port: port},
 	}, nil
 }
 
 func (value *listener) Accept() (net.Conn, error) {
-	for {
-		fd, remote, err := unix.Accept4(int(value.file.Fd()), unix.SOCK_CLOEXEC)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		return newConn(fd, value.address, addressFromSockaddr(remote)), nil
+	raw, err := value.file.SyscallConn()
+	if err != nil {
+		return nil, err
 	}
+	var fd int
+	var remote unix.Sockaddr
+	var acceptErr error
+	if err := raw.Read(func(listenerFD uintptr) bool {
+		for {
+			fd, remote, acceptErr = unix.Accept4(int(listenerFD), unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
+			if acceptErr == unix.EINTR {
+				continue
+			}
+			return acceptErr != unix.EAGAIN
+		}
+	}); err != nil {
+		return nil, err
+	}
+	if acceptErr != nil {
+		return nil, acceptErr
+	}
+	return newConn(fd, value.address, addressFromSockaddr(remote))
 }
 
 func (value *listener) Close() error   { return value.file.Close() }
@@ -86,7 +102,7 @@ func Dial(port uint32) (net.Conn, error) {
 		_ = unix.Close(fd)
 		return nil, err
 	}
-	return newConn(fd, Addr{CID: unix.VMADDR_CID_ANY}, remote), nil
+	return newConn(fd, Addr{CID: unix.VMADDR_CID_ANY}, remote)
 }
 
 type conn struct {
@@ -95,18 +111,39 @@ type conn struct {
 	remote Addr
 }
 
-func newConn(fd int, local, remote Addr) net.Conn {
+// newSocketFile takes ownership of fd, including on setup failure.
+func newSocketFile(fd int, name string) (*os.File, error) {
+	// NewFile only registers already-nonblocking sockets with the Go poller.
+	// Without it, deadlines and Close cannot interrupt a blocked operation.
+	if err := unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	// NewFile can silently fall back to an unpollable file. Reject that rather
+	// than returning a connection whose deadlines cannot be enforced.
+	if err := file.SetDeadline(time.Time{}); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func newConn(fd int, local, remote Addr) (net.Conn, error) {
+	file, err := newSocketFile(fd, "cengine-vsock-connection")
+	if err != nil {
+		return nil, err
+	}
 	return &conn{
-		file:   os.NewFile(uintptr(fd), "cengine-vsock-connection"),
+		file:   file,
 		local:  local,
 		remote: remote,
-	}
+	}, nil
 }
 
 func (value *conn) Read(data []byte) (int, error)        { return value.file.Read(data) }
 func (value *conn) Write(data []byte) (int, error)       { return value.file.Write(data) }
 func (value *conn) Close() error                         { return value.file.Close() }
-func (value *conn) CloseRead() error                     { return unix.Shutdown(int(value.file.Fd()), unix.SHUT_RD) }
 func (value *conn) LocalAddr() net.Addr                  { return value.local }
 func (value *conn) RemoteAddr() net.Addr                 { return value.remote }
 func (value *conn) SetDeadline(deadline time.Time) error { return value.file.SetDeadline(deadline) }
@@ -115,6 +152,22 @@ func (value *conn) SetReadDeadline(deadline time.Time) error {
 }
 func (value *conn) SetWriteDeadline(deadline time.Time) error {
 	return value.file.SetWriteDeadline(deadline)
+}
+
+func (value *conn) CloseRead() error {
+	// File.Fd switches a pollable socket back to blocking mode. Control also
+	// keeps Close from releasing/reusing the descriptor during shutdown.
+	raw, err := value.file.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var shutdownErr error
+	if err := raw.Control(func(fd uintptr) {
+		shutdownErr = unix.Shutdown(int(fd), unix.SHUT_RD)
+	}); err != nil {
+		return err
+	}
+	return shutdownErr
 }
 
 func addressFromSockaddr(value unix.Sockaddr) Addr {

@@ -1,0 +1,48 @@
+{
+  "version": "lifecycle-resume-open.v1",
+  "root_seed": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "root_public_key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "request": {
+    "operation_id": "99999999-9999-4999-8999-999999999999",
+    "original": {
+      "operation": "initialize",
+      "id": "dddddddd-dddd-4ddd-bddd-dddddddddddd",
+      "identity": {
+        "store": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "generation": 9007199254740993,
+        "binding": "506ef1879d748ce0713b0dd01da32ad2a4b1ce97b5a852ff18800c1e52982376"
+      },
+      "serial": 18446744073709551614,
+      "expected_epoch": 0,
+      "new_key": "c5b940ed3f65c391965de8295fc5d25f474fa57b48d36eb10ad363b8539c1b79"
+    },
+    "takeover": {
+      "grant": {
+        "operation": "takeover",
+        "id": "99999999-9999-4999-8999-999999999999",
+        "identity": {
+          "store": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          "generation": 9007199254740993,
+          "binding": "506ef1879d748ce0713b0dd01da32ad2a4b1ce97b5a852ff18800c1e52982376"
+        },
+        "serial": 18446744073709551615,
+        "expected_epoch": 1,
+        "new_key": "7599776c3085e3f9da0d13071eb0b4ab50fd2bf64c06dd92c2365af3a328eca3"
+      },
+      "signature": "DF+k1n73ADVdeCysDkCNztQX6QvMCcl0OSplDRCxZYZQsMj8RqbsT8CcFslQJBtqac2uFPEVcYImWrq84FAwAg=="
+    },
+    "launch": {
+      "shim_launch_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "initramfs_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "ext4_uuid": "cccccccc-cccc-1ccc-accc-cccccccccccc",
+      "bytes": 9223372036854775807
+    },
+    "now_unix_seconds": 1800000000,
+    "lifetime_seconds": 3600
+  },
+  "signing_bytes": "Y2VuZ2luZS5zdG9yYWdlYXV0aG9yaXR5LmxpZmVjeWNsZS1yZXN1bWUtb3Blbi52MQB7Im9wZXJhdGlvbl9pZCI6Ijk5OTk5OTk5LTk5OTktNDk5OS04OTk5LTk5OTk5OTk5OTk5OSIsIm9yaWdpbmFsIjp7Im9wZXJhdGlvbiI6ImluaXRpYWxpemUiLCJpZCI6ImRkZGRkZGRkLWRkZGQtNGRkZC1iZGRkLWRkZGRkZGRkZGRkZCIsImlkZW50aXR5Ijp7InN0b3JlIjoiZWVlZWVlZWUtZWVlZS00ZWVlLThlZWUtZWVlZWVlZWVlZWVlIiwiZ2VuZXJhdGlvbiI6OTAwNzE5OTI1NDc0MDk5MywiYmluZGluZyI6IjUwNmVmMTg3OWQ3NDhjZTA3MTNiMGRkMDFkYTMyYWQyYTRiMWNlOTdiNWE4NTJmZjE4ODAwYzFlNTI5ODIzNzYifSwic2VyaWFsIjoxODQ0Njc0NDA3MzcwOTU1MTYxNCwiZXhwZWN0ZWRfZXBvY2giOjAsIm5ld19rZXkiOiJjNWI5NDBlZDNmNjVjMzkxOTY1ZGU4Mjk1ZmM1ZDI1ZjQ3NGZhNTdiNDhkMzZlYjEwYWQzNjNiODUzOWMxYjc5In0sInRha2VvdmVyIjp7ImdyYW50Ijp7Im9wZXJhdGlvbiI6InRha2VvdmVyIiwiaWQiOiI5OTk5OTk5OS05OTk5LTQ5OTktODk5OS05OTk5OTk5OTk5OTkiLCJpZGVudGl0eSI6eyJzdG9yZSI6ImVlZWVlZWVlLWVlZWUtNGVlZS04ZWVlLWVlZWVlZWVlZWVlZSIsImdlbmVyYXRpb24iOjkwMDcxOTkyNTQ3NDA5OTMsImJpbmRpbmciOiI1MDZlZjE4NzlkNzQ4Y2UwNzEzYjBkZDAxZGEzMmFkMmE0YjFjZTk3YjVhODUyZmYxODgwMGMxZTUyOTgyMzc2In0sInNlcmlhbCI6MTg0NDY3NDQwNzM3MDk1NTE2MTUsImV4cGVjdGVkX2Vwb2NoIjoxLCJuZXdfa2V5IjoiNzU5OTc3NmMzMDg1ZTNmOWRhMGQxMzA3MWViMGI0YWI1MGZkMmJmNjRjMDZkZDkyYzIzNjVhZjNhMzI4ZWNhMyJ9LCJzaWduYXR1cmUiOiJERitrMW43M0FEVmRlQ3lzRGtDTnp0UVg2UXZNQ2NsME9TcGxEUkN4WllaUXNNajhScWJzVDhDY0ZzbFFKQnRxYWMydUZQRVZjWUltV3JxODRGQXdBZz09In0sImxhdW5jaCI6eyJzaGltX2xhdW5jaF91dWlkIjoiYWFhYWFhYWEtYWFhYS00YWFhLThhYWEtYWFhYWFhYWFhYWFhIiwic3BlY19zaGEyNTYiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwiaW5pdHJhbWZzX3NoYTI1NiI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MiLCJleHQ0X3V1aWQiOiJjY2NjY2NjYy1jY2NjLTFjY2MtYWNjYy1jY2NjY2NjY2NjY2MiLCJieXRlcyI6OTIyMzM3MjAzNjg1NDc3NTgwN30sIm5vd191bml4X3NlY29uZHMiOjE4MDAwMDAwMDAsImxpZmV0aW1lX3NlY29uZHMiOjM2MDB9",
+  "takeover_signing_bytes": "Y2VuZ2luZS5zdG9yYWdlYXV0aG9yaXR5LmxpZmVjeWNsZS52MgB7Im9wZXJhdGlvbiI6InRha2VvdmVyIiwiaWQiOiI5OTk5OTk5OS05OTk5LTQ5OTktODk5OS05OTk5OTk5OTk5OTkiLCJpZGVudGl0eSI6eyJzdG9yZSI6ImVlZWVlZWVlLWVlZWUtNGVlZS04ZWVlLWVlZWVlZWVlZWVlZSIsImdlbmVyYXRpb24iOjkwMDcxOTkyNTQ3NDA5OTMsImJpbmRpbmciOiI1MDZlZjE4NzlkNzQ4Y2UwNzEzYjBkZDAxZGEzMmFkMmE0YjFjZTk3YjVhODUyZmYxODgwMGMxZTUyOTgyMzc2In0sInNlcmlhbCI6MTg0NDY3NDQwNzM3MDk1NTE2MTUsImV4cGVjdGVkX2Vwb2NoIjoxLCJuZXdfa2V5IjoiNzU5OTc3NmMzMDg1ZTNmOWRhMGQxMzA3MWViMGI0YWI1MGZkMmJmNjRjMDZkZDkyYzIzNjVhZjNhMzI4ZWNhMyJ9",
+  "request_sha256": "f64c476f68d3503c702cc1ea78dac95ec1df1b5a0b66c0623cd2f9c6315233cf",
+  "signature": "UYtXJjAqxPAxW5L348xWYYYQCw9X8maLSbylmB22sAvgt7u25ibPpFxyS4rJycgd8HszVQad8/40ggckpD4NCw=="
+}

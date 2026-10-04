@@ -1,0 +1,427 @@
+[
+  {
+    "name": "normal",
+    "arm": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "normal",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        },
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        }
+      ],
+      "slots": [
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"normal\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "sha256": "ed6a591672c2eff3fc53a1e3d7c328023445f8776f81ae8ffb31442c81ba3bc1",
+    "observation": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "ed6a591672c2eff3fc53a1e3d7c328023445f8776f81ae8ffb31442c81ba3bc1",
+      "stage": "first-child-published",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "copyIntent": "00000004-0000-4000-8000-000000000001",
+      "filesystemUUID": "11111111111111111111111111111111",
+      "manifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifestSize": 100,
+      "root": {
+        "inode": 1,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0100000007000000"
+      },
+      "transaction": {
+        "inode": 2,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0200000007000000"
+      },
+      "published": {
+        "inode": 3,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0300000007000000"
+      },
+      "staged": {
+        "inode": 4,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0400000007000000"
+      },
+      "sourceAtimes": {
+        "root": 0,
+        "a": 17,
+        "z": 9223372036854775807
+      }
+    },
+    "observationCanonical": "{\"armDigest\":\"ed6a591672c2eff3fc53a1e3d7c328023445f8776f81ae8ffb31442c81ba3bc1\",\"copyIntent\":\"00000004-0000-4000-8000-000000000001\",\"count\":1,\"filesystemUUID\":\"11111111111111111111111111111111\",\"manifestDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"manifestSize\":100,\"profile\":\"rtm096-early-a1-a3-v2\",\"published\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0300000007000000\",\"inode\":3},\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"root\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"inode\":1},\"sourceAtimes\":{\"a\":17,\"root\":0,\"z\":9223372036854775807},\"stage\":\"first-child-published\",\"staged\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0400000007000000\",\"inode\":4},\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"transaction\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"inode\":2},\"version\":2}",
+    "observationSHA256": "49f294f659e1ce1a01898ec790b6787f3116eda11caac9e7253d3d8c230b40c9"
+  },
+  {
+    "name": "before-prepare-send",
+    "arm": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "before-prepare-send",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        },
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        }
+      ],
+      "slots": [
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"before-prepare-send\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "sha256": "a29688e3fc33ca7a7955571d70bb547d1a69f8e19dff108a8b40ca8e42f8daa2",
+    "observation": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "a29688e3fc33ca7a7955571d70bb547d1a69f8e19dff108a8b40ca8e42f8daa2",
+      "stage": "before-prepare-send",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "requestSequence": 7,
+      "prepareCommandsSent": 0,
+      "prepareCommandsAccepted": 0,
+      "dataBytesWritten": 0
+    },
+    "observationCanonical": "{\"armDigest\":\"a29688e3fc33ca7a7955571d70bb547d1a69f8e19dff108a8b40ca8e42f8daa2\",\"count\":1,\"dataBytesWritten\":0,\"prepareCommandsAccepted\":0,\"prepareCommandsSent\":0,\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"requestSequence\":7,\"stage\":\"before-prepare-send\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "observationSHA256": "3ae1bd370d300b9c8f8437a7ba88e71b69bbfb9c0d7e53702eebd7a5039404db"
+  },
+  {
+    "name": "guest-accepted-before-prepare",
+    "arm": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "guest-accepted-before-prepare",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        },
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        }
+      ],
+      "slots": [
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"guest-accepted-before-prepare\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "sha256": "3336fb89aeb12ffe50d414ac80384c582a865e15197fcdd4689f152e64e817c0",
+    "observation": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "3336fb89aeb12ffe50d414ac80384c582a865e15197fcdd4689f152e64e817c0",
+      "stage": "guest-accepted-before-prepare",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "requestSequence": 8,
+      "prepareCommandsSent": 1,
+      "prepareCommandsAccepted": 1,
+      "dataBytesWritten": 0
+    },
+    "observationCanonical": "{\"armDigest\":\"3336fb89aeb12ffe50d414ac80384c582a865e15197fcdd4689f152e64e817c0\",\"count\":1,\"dataBytesWritten\":0,\"prepareCommandsAccepted\":1,\"prepareCommandsSent\":1,\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"requestSequence\":8,\"stage\":\"guest-accepted-before-prepare\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "observationSHA256": "f951f4121478accfb511ff9cc70167a21577f3fdabe623c9f551391513cf4abe"
+  },
+  {
+    "name": "data-partial-frame",
+    "arm": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "data-partial-frame",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        },
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        }
+      ],
+      "slots": [
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"data-partial-frame\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "sha256": "1fec87818534ae1eb91cd533d3222995ebe29d4e3f7332355693d6a616b61309",
+    "observation": {
+      "version": 2,
+      "profile": "rtm096-early-a1-a3-v2",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "1fec87818534ae1eb91cd533d3222995ebe29d4e3f7332355693d6a616b61309",
+      "stage": "data-partial-frame",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "requestSequence": 9,
+      "prepareCommandsSent": 1,
+      "prepareCommandsAccepted": 1,
+      "dataBytesWritten": 5
+    },
+    "observationCanonical": "{\"armDigest\":\"1fec87818534ae1eb91cd533d3222995ebe29d4e3f7332355693d6a616b61309\",\"count\":1,\"dataBytesWritten\":5,\"prepareCommandsAccepted\":1,\"prepareCommandsSent\":1,\"profile\":\"rtm096-early-a1-a3-v2\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"requestSequence\":9,\"stage\":\"data-partial-frame\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":2}",
+    "observationSHA256": "c11b94d2c91edc3dfc5c80f0116367755fc6a83726d055096870f8b199ca498b"
+  }
+]

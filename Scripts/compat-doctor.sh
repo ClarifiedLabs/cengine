@@ -4,6 +4,10 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=Scripts/compat-network-helper.sh
 . "$ROOT/Scripts/compat-network-helper.sh"
+if [ "${CENGINE_COMPAT_SHARED_STORAGE+x}${CENGINE_COMPAT_MANAGED_STORAGE+x}" != '' ]; then
+    echo 'retired compatibility storage selector; lifecycle is the default' >&2
+    exit 2
+fi
 BINARY=${CENGINE_BINARY:-"$ROOT/.build/xcode-derived/Build/Products/test-compat/cengine"}
 HELPER=$(compat_network_helper_local_for_binary "$BINARY")
 LOCAL_FINGERPRINT=$("$ROOT/Scripts/network-helper-fingerprint.sh")
@@ -35,4 +39,4 @@ for path in "$BINARY" "$HELPER"; do
     /usr/bin/codesign --verify --strict "$path"
 done
 compat_network_helper_require "$BINARY" "$LOCAL_FINGERPRINT"
-echo "compatibility networking helper is healthy"
+echo "compatibility Privileged Helper is healthy"

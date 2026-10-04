@@ -1,0 +1,50 @@
+# Redis 7.4.2-alpine linux/arm64 manifest; docker-library-redis revision
+# 8338d86bc3f7b195046138f8c31bf9a839cdedd3 (resolved from Docker Hub).
+services:
+  server:
+    image: redis@sha256:90cac51530a49aaa42eaf65712e84005677a0c44191e721e2de756927031fb9d
+    platform: linux/arm64
+    user: "0:0"
+    working_dir: /data
+    environment:
+      RESTORE_BACKUP: ${CENGINE_APP_RESTORE:-0}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        test "$$(id -u)" = 0
+        if [ "$$RESTORE_BACKUP" = 1 ]; then
+          # Preserve the failing restore step in pre-cleanup container logs.
+          set -x
+          test ! -e /data/dump.rdb
+          cp /backup/dump.rdb /data/dump.rdb
+          cmp /backup/dump.rdb /data/dump.rdb
+          sha256sum /data/dump.rdb
+        fi
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - redis-volume-init
+    command: ["redis-server", "--appendonly", "no", "--save", "", "--dir", "/data", "--dbfilename", "dump.rdb"]
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - data:/data
+      - backup:/backup:ro
+  backup:
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    platform: linux/arm64
+    command: ["sleep", "1800"]
+    volumes:
+      - data:/source:ro
+      - backup:/backup
+volumes:
+  data:
+    name: ${CENGINE_APP_DATA:?runner-owned data volume required}
+    labels:
+      dev.cengine.compat.owner: ${CENGINE_APP_OWNER:?runner owner required}
+  backup:
+    external: true
+    name: ${CENGINE_APP_BACKUP:?runner-owned external backup required}

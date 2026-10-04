@@ -1,0 +1,415 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "architectures": [
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept",
+        "accept4",
+        "adjtimex",
+        "bind",
+        "brk",
+        "cachestat",
+        "capget",
+        "capset",
+        "chdir",
+        "clock_adjtime",
+        "clock_getres",
+        "clock_gettime",
+        "clock_nanosleep",
+        "close",
+        "close_range",
+        "connect",
+        "copy_file_range",
+        "dup",
+        "dup3",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "eventfd2",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "faccessat",
+        "faccessat2",
+        "fadvise64",
+        "fallocate",
+        "fanotify_mark",
+        "fchdir",
+        "fchmod",
+        "fchmodat",
+        "fchmodat2",
+        "fchown",
+        "fchownat",
+        "fcntl",
+        "fdatasync",
+        "fgetxattr",
+        "flistxattr",
+        "flock",
+        "fremovexattr",
+        "fsetxattr",
+        "fstat",
+        "fstatfs",
+        "fsync",
+        "ftruncate",
+        "futex",
+        "futex_requeue",
+        "futex_wait",
+        "futex_waitv",
+        "futex_wake",
+        "get_robust_list",
+        "getcpu",
+        "getcwd",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getgroups",
+        "getitimer",
+        "getpeername",
+        "getpgid",
+        "getpid",
+        "getppid",
+        "getpriority",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getrusage",
+        "getsid",
+        "getsockname",
+        "getsockopt",
+        "gettid",
+        "gettimeofday",
+        "getuid",
+        "getxattr",
+        "getxattrat",
+        "inotify_add_watch",
+        "inotify_init1",
+        "inotify_rm_watch",
+        "io_cancel",
+        "io_destroy",
+        "io_getevents",
+        "io_pgetevents",
+        "io_setup",
+        "io_submit",
+        "ioctl",
+        "ioprio_get",
+        "ioprio_set",
+        "kill",
+        "landlock_add_rule",
+        "landlock_create_ruleset",
+        "landlock_restrict_self",
+        "lgetxattr",
+        "linkat",
+        "listen",
+        "listmount",
+        "listxattr",
+        "listxattrat",
+        "llistxattr",
+        "lremovexattr",
+        "lseek",
+        "lsetxattr",
+        "madvise",
+        "map_shadow_stack",
+        "membarrier",
+        "memfd_create",
+        "memfd_secret",
+        "mincore",
+        "mkdirat",
+        "mknodat",
+        "mlock",
+        "mlock2",
+        "mlockall",
+        "mmap",
+        "mprotect",
+        "mq_getsetattr",
+        "mq_notify",
+        "mq_open",
+        "mq_timedreceive",
+        "mq_timedsend",
+        "mq_unlink",
+        "mremap",
+        "mseal",
+        "msgctl",
+        "msgget",
+        "msgrcv",
+        "msgsnd",
+        "msync",
+        "munlock",
+        "munlockall",
+        "munmap",
+        "name_to_handle_at",
+        "nanosleep",
+        "newfstatat",
+        "openat",
+        "openat2",
+        "pidfd_open",
+        "pidfd_send_signal",
+        "pipe2",
+        "pkey_alloc",
+        "pkey_free",
+        "pkey_mprotect",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "preadv",
+        "preadv2",
+        "prlimit64",
+        "process_mrelease",
+        "process_vm_readv",
+        "process_vm_writev",
+        "pselect6",
+        "ptrace",
+        "pwrite64",
+        "pwritev",
+        "pwritev2",
+        "read",
+        "readahead",
+        "readlinkat",
+        "readv",
+        "recvfrom",
+        "recvmmsg",
+        "recvmsg",
+        "remap_file_pages",
+        "removexattr",
+        "removexattrat",
+        "renameat",
+        "renameat2",
+        "restart_syscall",
+        "rseq",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigreturn",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "rt_tgsigqueueinfo",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "sched_getaffinity",
+        "sched_getattr",
+        "sched_getparam",
+        "sched_getscheduler",
+        "sched_rr_get_interval",
+        "sched_setaffinity",
+        "sched_setattr",
+        "sched_setparam",
+        "sched_setscheduler",
+        "sched_yield",
+        "seccomp",
+        "semctl",
+        "semget",
+        "semop",
+        "semtimedop",
+        "sendfile",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "set_robust_list",
+        "set_tid_address",
+        "setfsgid",
+        "setfsuid",
+        "setgid",
+        "setgroups",
+        "setitimer",
+        "setpgid",
+        "setpriority",
+        "setregid",
+        "setresgid",
+        "setresuid",
+        "setreuid",
+        "setrlimit",
+        "setsid",
+        "setsockopt",
+        "setuid",
+        "setxattr",
+        "setxattrat",
+        "shmat",
+        "shmctl",
+        "shmdt",
+        "shmget",
+        "shutdown",
+        "sigaltstack",
+        "signalfd4",
+        "socketpair",
+        "splice",
+        "statfs",
+        "statmount",
+        "statx",
+        "symlinkat",
+        "sync",
+        "sync_file_range",
+        "syncfs",
+        "sysinfo",
+        "tee",
+        "tgkill",
+        "timer_create",
+        "timer_delete",
+        "timer_getoverrun",
+        "timer_gettime",
+        "timer_settime",
+        "timerfd_create",
+        "timerfd_gettime",
+        "timerfd_settime",
+        "times",
+        "tkill",
+        "truncate",
+        "umask",
+        "uname",
+        "unlinkat",
+        "utimensat",
+        "vmsplice",
+        "wait4",
+        "waitid",
+        "write",
+        "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "clone"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 2114060288,
+          "valueTwo": 0,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 38,
+          "op": "SCMP_CMP_LT"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 39,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 40,
+          "op": "SCMP_CMP_GT"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 0,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 8,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 131072,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 131080,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 4294967295,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "unshare"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 512,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    }
+  ]
+}

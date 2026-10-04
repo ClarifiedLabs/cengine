@@ -1,14 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
+identity=-
+if [[ $# -eq 3 && $1 == --sign ]]; then identity=$2; shift 2; fi
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 PATH-TO-CENGINE" >&2
+    echo "usage: $0 [--sign DEVELOPER-ID-APPLICATION] PATH-TO-CENGINE" >&2
     exit 64
 fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=Scripts/compat-network-helper.sh
 . "$ROOT_DIR/Scripts/compat-network-helper.sh"
+. "$ROOT_DIR/Scripts/managed-signing.sh"
+if [[ ${CENGINE_COMPAT_MANAGED_STORAGE+x}${CENGINE_COMPAT_SHARED_STORAGE+x} != '' ]]; then
+    echo 'retired compatibility storage selector; lifecycle is the default' >&2
+    exit 64
+fi
+team=$(managed_signing_team "$identity")
 
 binary="$1"
 helper="$(compat_network_helper_local_for_binary "$binary")"
@@ -23,7 +31,11 @@ done
 sign_path() {
     local path="$1"
     shift
-    codesign --force --timestamp=none "$@" --sign - "$path"
+    if [[ $identity != - ]]; then
+        codesign --force --timestamp=none --options runtime "$@" --sign "$identity" "$path"
+    else
+        codesign --force --timestamp=none "$@" --sign - "$path"
+    fi
 }
 
 frameworks_dir="$(dirname "$binary")/PackageFrameworks"
@@ -39,6 +51,15 @@ sign_path "$helper" --identifier dev.cengine.network-helper.test-compat
 sign_path "$binary" \
     --identifier dev.cengine.engine.test-compat \
     --entitlements "$ROOT_DIR/Configuration/cengine.entitlements"
+
+if [[ $identity != - ]]; then
+    controller="$(dirname "$binary")/cengine-storage-controller"
+    [[ -x $controller ]] || { echo "managed controller is missing: $controller" >&2; exit 1; }
+    sign_path "$controller" --identifier dev.cengine.storage-control.test-compat
+    managed_signing_verify "$controller" dev.cengine.storage-control.test-compat "$team"
+    managed_signing_verify "$helper" dev.cengine.network-helper.test-compat "$team"
+    managed_signing_verify "$binary" dev.cengine.engine.test-compat "$team"
+fi
 
 codesign --verify --strict --verbose=2 "$helper"
 codesign --verify --strict --verbose=2 "$binary"

@@ -442,6 +442,9 @@ public struct NetworkRecord: Codable, Sendable {
 }
 
 public struct VolumeRecord: Codable, Sendable {
+    /// Immutable storage generation. Only legacy snapshots may omit it; runtime
+    /// startup persists every missing identity before any backend operation.
+    public private(set) var instanceID: UUID?
     public static let defaultSizeBytes: UInt64 = 512 * 1_024 * 1_024 * 1_024
 
     public var name: String
@@ -454,6 +457,15 @@ public struct VolumeRecord: Codable, Sendable {
     public init(name: String, createdAt: Date = Date(), sizeBytes: UInt64, labels: [String: String] = [:], options: [String: String] = [:], anonymous: Bool = false) {
         self.name = name; self.createdAt = createdAt; self.sizeBytes = sizeBytes; self.labels = labels; self.options = options
         self.anonymous = anonymous
+        self.instanceID = UUID()
+    }
+
+    /// Migration only: never replace an existing generation or accept a caller's ID.
+    @discardableResult
+    public mutating func ensureInstanceID() -> Bool {
+        guard instanceID == nil else { return false }
+        instanceID = UUID()
+        return true
     }
 }
 

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"dev.cengine/guest/internal/copycontract"
 	"dev.cengine/guest/internal/protocol"
 	"golang.org/x/sys/unix"
 )
@@ -31,7 +32,8 @@ const (
 type openat2Operation func(dirfd int, path string, how *unix.OpenHow) (int, error)
 
 type confinedRoot struct {
-	fd int
+	fd          int
+	publication *confinedPublication
 }
 
 func openConfinedRoot(path string) (*confinedRoot, error) {
@@ -504,14 +506,7 @@ type confinedCopyManifestEntry struct {
 	Handle     []byte `json:"handle"`
 }
 
-type confinedCopyRootMetadata struct {
-	Filesystem [2]int32 `json:"filesystem"`
-	Device     uint64   `json:"device"`
-	Inode      uint64   `json:"inode"`
-	UID        uint32   `json:"uid"`
-	GID        uint32   `json:"gid"`
-	Mode       uint32   `json:"mode"`
-}
+type confinedCopyRootMetadata = copycontract.RootMetadata
 
 type confinedCopyManifest struct {
 	Version uint32                      `json:"version"`
@@ -520,6 +515,26 @@ type confinedCopyManifest struct {
 }
 
 func confinedRootMetadata(fd int) (confinedCopyRootMetadata, error) {
+	return confinedRootMetadataWithXattrs(fd, confinedXattrSyscalls())
+}
+
+func confinedRootMetadataWithXattrs(fd int, operations confinedXattrOperations) (confinedCopyRootMetadata, error) {
+	// O_PATH roots cannot use f*xattr. Reopen only the pinned directory itself,
+	// never its original pathname (which may have been replaced).
+	readFD, err := unix.Openat(fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return confinedCopyRootMetadata{}, err
+	}
+	defer unix.Close(readFD)
+	metadata, err := confinedRootStat(readFD)
+	if err != nil {
+		return metadata, err
+	}
+	metadata.Xattrs, err = snapshotConfinedXattrsWith(readFD, operations)
+	return metadata, err
+}
+
+func confinedRootStat(fd int) (confinedCopyRootMetadata, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return confinedCopyRootMetadata{}, err
@@ -538,24 +553,64 @@ func confinedRootMetadata(fd int) (confinedCopyRootMetadata, error) {
 }
 
 func applyConfinedRootMetadata(fd int, metadata confinedCopyRootMetadata) error {
-	// Ownership changes may clear set-ID bits. Apply the final mode last.
+	return applyConfinedRootMetadataWithXattrs(fd, metadata, confinedXattrSyscalls())
+}
+
+func applyConfinedRootMetadataWithXattrs(fd int, metadata confinedCopyRootMetadata, operations confinedXattrOperations) error {
+	return applyConfinedRootMetadataBeforeChown(fd, metadata, operations, nil)
+}
+
+func applyConfinedRootMetadataBeforeChown(fd int, metadata confinedCopyRootMetadata, operations confinedXattrOperations, before func() error) error {
+	if metadata.Xattrs != nil {
+		if err := validateConfinedXattrs(metadata.Xattrs); err != nil {
+			return err
+		}
+	}
+	// chown can clear set-ID bits and capabilities; chmod can rewrite the ACL
+	// mask. Restore ACLs and capabilities only after ownership and mode.
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	if err := unix.Fchown(fd, int(metadata.UID), int(metadata.GID)); err != nil {
 		return err
 	}
-	return unix.Fchmod(fd, metadata.Mode)
+	if err := unix.Fchmod(fd, metadata.Mode); err != nil {
+		return err
+	}
+	// nil is reserved for legacy v1/v2 journals, which did not record xattrs.
+	if metadata.Xattrs == nil {
+		return nil
+	}
+	return restoreConfinedXattrsWith(fd, metadata.Xattrs, operations)
 }
 
 type confinedCopyState struct {
-	hardlinks map[confinedInode]confinedHardlink
-	created   []confinedCreatedEntry
+	// Bound only by the selected managed copy; never installed globally.
+	beforeRegularSync func(string) error
+	hardlinks         map[confinedInode]confinedHardlink
+	created           []confinedCreatedEntry
 }
 
 func copyConfinedDirectory(source *confinedRoot, destination *confinedRoot) error {
-	sourceMetadata, err := confinedRootMetadata(source.fd)
+	return copyConfinedDirectoryWithRootXattrs(source, destination, confinedXattrSyscalls())
+}
+
+// Keep root-xattr operations local to one transaction, including its rollback.
+// Child copying and all non-xattr filesystem operations always use real syscalls.
+func copyConfinedDirectoryWithRootXattrs(source *confinedRoot, destination *confinedRoot, operations confinedXattrOperations) error {
+	// Snapshot times before source enumeration can update atime. They are copy
+	// output, not rollback identity; keep the existing journal schema unchanged.
+	var sourceStat unix.Stat_t
+	if err := unix.Fstat(source.fd, &sourceStat); err != nil {
+		return fmt.Errorf("stat copy-up source root times: %w", err)
+	}
+	sourceMetadata, err := confinedRootMetadataWithXattrs(source.fd, operations)
 	if err != nil {
 		return fmt.Errorf("stat copy-up source root: %w", err)
 	}
-	originalMetadata, err := confinedRootMetadata(destination.fd)
+	originalMetadata, err := confinedRootMetadataWithXattrs(destination.fd, operations)
 	if err != nil {
 		return fmt.Errorf("stat copy-up destination root: %w", err)
 	}
@@ -603,7 +658,7 @@ func copyConfinedDirectory(source *confinedRoot, destination *confinedRoot) erro
 	state := &confinedCopyState{hardlinks: make(map[confinedInode]confinedHardlink)}
 	defer state.close()
 	rollback := func(copyErr error) error {
-		if rollbackErr := recoverConfinedCopyTransaction(destination); rollbackErr != nil {
+		if rollbackErr := recoverConfinedCopyTransactionWithRootXattrs(destination, operations); rollbackErr != nil {
 			return fmt.Errorf("%w (copy-up rollback: %v)", copyErr, rollbackErr)
 		}
 		return copyErr
@@ -642,22 +697,23 @@ func copyConfinedDirectory(source *confinedRoot, destination *confinedRoot) erro
 		); err != nil {
 			return rollback(fmt.Errorf("publish copy-up entry %q: %w", name, err))
 		}
+		if err := destination.publication.afterPublication(destination.fd); err != nil {
+			return rollback(err)
+		}
 	}
 	// The durable manifest covers root metadata as well as published entries,
 	// including an empty source. Keep the destination writable until publication.
-	if err := applyConfinedRootMetadata(metadataFD, sourceMetadata); err != nil {
+	if err := applyConfinedRootMetadataWithXattrs(metadataFD, sourceMetadata, operations); err != nil {
 		return rollback(fmt.Errorf("apply copy-up root metadata: %w", err))
 	}
-	if err := unix.Fsync(metadataFD); err != nil {
-		return rollback(fmt.Errorf("sync published copy-up entries and metadata: %w", err))
-	}
-	if err := removeConfinedTreeAt(destination.fd, confinedCopyTransactionName); err != nil {
-		return fmt.Errorf("remove committed copy-up transaction: %w", err)
-	}
-	if err := syncConfinedDirectory(destination.fd); err != nil {
-		return fmt.Errorf("sync committed copy-up transaction: %w", err)
-	}
-	return nil
+	return finalizeConfinedCopy(
+		func() error {
+			return unix.UtimesNanoAt(metadataFD, "", []unix.Timespec{sourceStat.Atim, sourceStat.Mtim}, unix.AT_EMPTY_PATH)
+		},
+		func() error { return unix.Fsync(metadataFD) },
+		func() error { return removeConfinedTreeAt(destination.fd, confinedCopyTransactionName) },
+		rollback,
+	)
 }
 
 func renameConfinedNoReplace(oldDirectory int, oldName string, newDirectory int, newName string) error {
@@ -691,7 +747,10 @@ func writeConfinedCopyManifest(transactionFD int, created []confinedCreatedEntry
 	if len(created) > maxConfinedCopyManifestEntries {
 		return fmt.Errorf("copy-up manifest exceeds %d entries", maxConfinedCopyManifestEntries)
 	}
-	manifest := confinedCopyManifest{Version: 2, Root: root}
+	manifest := confinedCopyManifest{Version: 3, Root: root}
+	if err := validateConfinedCopyRootMetadata(manifest); err != nil {
+		return err
+	}
 	manifest.Entries = make([]confinedCopyManifestEntry, 0, len(created))
 	for _, entry := range created {
 		var stat unix.Stat_t
@@ -720,6 +779,10 @@ func writeConfinedCopyManifest(transactionFD int, created []confinedCreatedEntry
 			Handle:     append([]byte(nil), handleBytes...),
 		})
 	}
+	return writeConfinedManifestValue(transactionFD, manifest)
+}
+
+func writeConfinedManifestValue(transactionFD int, manifest any) error {
 	fd, err := unix.Openat(
 		transactionFD,
 		confinedCopyManifestTemporary,
@@ -799,6 +862,7 @@ func readConfinedCopyManifest(transactionFD int) (confinedCopyManifest, error) {
 		return manifest, errors.New("copy-up manifest is not a bounded regular file")
 	}
 	decoder := json.NewDecoder(io.LimitReader(file, maxConfinedCopyManifestBytes+1))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
 		return manifest, err
 	}
@@ -809,11 +873,11 @@ func readConfinedCopyManifest(transactionFD int) (confinedCopyManifest, error) {
 		}
 		return manifest, err
 	}
-	if (manifest.Version != 1 && manifest.Version != 2) || len(manifest.Entries) > maxConfinedCopyManifestEntries {
+	if (manifest.Version < 1 || manifest.Version > 3) || manifest.Entries == nil || len(manifest.Entries) > maxConfinedCopyManifestEntries {
 		return manifest, errors.New("copy-up manifest has an unsupported version or entry count")
 	}
-	if manifest.Version == 2 && (manifest.Root == nil || manifest.Root.Mode & ^uint32(07777) != 0 || manifest.Root.UID == ^uint32(0) || manifest.Root.GID == ^uint32(0)) {
-		return manifest, errors.New("copy-up manifest has invalid root metadata")
+	if err := validateConfinedCopyRootMetadata(manifest); err != nil {
+		return manifest, err
 	}
 	seen := make(map[string]uint32, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
@@ -843,7 +907,34 @@ func readConfinedCopyManifest(transactionFD int) (confinedCopyManifest, error) {
 	return manifest, nil
 }
 
+func validateConfinedCopyRootMetadata(manifest confinedCopyManifest) error {
+	root := manifest.Root
+	if manifest.Version == 1 {
+		if root != nil {
+			return errors.New("v1 copy-up manifest contains root metadata")
+		}
+		return nil
+	}
+	if root == nil || root.Mode & ^uint32(07777) != 0 || root.UID == ^uint32(0) || root.GID == ^uint32(0) {
+		return errors.New("copy-up manifest has invalid root metadata")
+	}
+	if manifest.Version == 2 {
+		if root.Xattrs != nil {
+			return errors.New("v2 copy-up manifest contains xattrs")
+		}
+		return nil
+	}
+	return validateConfinedXattrs(root.Xattrs)
+}
+
+// recoverConfinedCopyTransaction requires the caller to exclude every active
+// initializer. A missing manifest identifies staging, not whether its owner is
+// alive; recovery must not run concurrently with that owner.
 func recoverConfinedCopyTransaction(destination *confinedRoot) error {
+	return recoverConfinedCopyTransactionWithRootXattrs(destination, confinedXattrSyscalls())
+}
+
+func recoverConfinedCopyTransactionWithRootXattrs(destination *confinedRoot, operations confinedXattrOperations) error {
 	transactionFD, err := unix.Openat(
 		destination.fd,
 		confinedCopyTransactionName,
@@ -884,7 +975,7 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 	_ = transaction.close()
 
 	if manifest.Root != nil {
-		current, err := confinedRootMetadata(destination.fd)
+		current, err := confinedRootStat(destination.fd)
 		if err != nil {
 			return err
 		}
@@ -899,14 +990,44 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 			}
 			manifest.Entries[index].Device = current.Device
 		}
+	}
+	matching := make([]bool, len(manifest.Entries))
+	var first error
+	for index, entry := range manifest.Entries {
+		state, err := confinedManifestEntryIdentity(destination, entry)
+		if err != nil && first == nil {
+			first = fmt.Errorf("preflight copy-up entry %q: %w", entry.Path, err)
+		}
+		matching[index] = state == confinedManifestMatching
+	}
+	// Identity uncertainty must leave the entire transaction and root metadata
+	// intact. In particular, do not roll back earlier matching entries when a
+	// later entry cannot be identified. This is containment, not a durable
+	// identity solution for filesystems whose handles change across lookups.
+	if first != nil {
+		return first
+	}
+	if manifest.Root != nil {
 		fd, err := unix.Openat(destination.fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
 			return err
 		}
+		// An unsupported snapshot is authoritative only on a filesystem that
+		// still reports no xattr support. Never accept that downgrade on ext4.
+		if manifest.Root.Xattrs != nil {
+			_, supported, supportErr := listConfinedXattrs(fd, operations)
+			if supportErr == nil && supported != (manifest.Root.Xattrs.State == "supported") {
+				supportErr = errors.New("copy-up root xattr support changed before recovery")
+			}
+			if supportErr != nil {
+				_ = unix.Close(fd)
+				return supportErr
+			}
+		}
 		// Rollback always restores the pre-transaction ownership and mode, even
 		// if only chown completed before interruption. Preserve the journal on
 		// failure so the next initialization cannot accept a partial rollback.
-		err = applyConfinedRootMetadata(fd, *manifest.Root)
+		err = applyConfinedRootMetadataWithXattrs(fd, *manifest.Root, operations)
 		if err == nil {
 			err = unix.Fsync(fd)
 		}
@@ -914,15 +1035,6 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 		if err != nil {
 			return fmt.Errorf("restore copy-up root metadata: %w", err)
 		}
-	}
-	matching := make([]bool, len(manifest.Entries))
-	var first error
-	for index, entry := range manifest.Entries {
-		matches, err := confinedManifestEntryMatches(destination, entry)
-		if err != nil && first == nil {
-			first = err
-		}
-		matching[index] = matches
 	}
 	for index := len(manifest.Entries) - 1; index >= 0; index-- {
 		if !matching[index] {
@@ -944,35 +1056,55 @@ func recoverConfinedCopyTransaction(destination *confinedRoot) error {
 	return first
 }
 
-func confinedManifestEntryMatches(
+// Equal stat identity with a different handle is ambiguous: it can mean inode
+// reuse, or a filesystem exposing a non-durable handle for the same object.
+// Neither interpretation permits destructive recovery without stronger proof.
+var errConfinedCopyIdentityUncertain = errors.New("copy-up entry identity uncertain")
+
+type confinedManifestIdentity uint8
+
+const (
+	confinedManifestUncertain confinedManifestIdentity = iota
+	confinedManifestAbsent
+	confinedManifestReplacement
+	confinedManifestMatching
+)
+
+func confinedManifestEntryIdentity(
 	destination *confinedRoot,
 	entry confinedCopyManifestEntry,
-) (bool, error) {
+) (confinedManifestIdentity, error) {
 	parentFD, name, err := openConfinedManifestParent(destination, entry.Path)
-	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
-		return false, nil
+	if errors.Is(err, unix.ENOENT) {
+		return confinedManifestAbsent, nil
+	}
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+		return confinedManifestReplacement, nil
 	}
 	if err != nil {
-		return false, err
+		return confinedManifestUncertain, err
 	}
 	defer unix.Close(parentFD)
 	var stat unix.Stat_t
 	if err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
-		return false, nil
+		return confinedManifestAbsent, nil
 	} else if err != nil {
-		return false, err
+		return confinedManifestUncertain, err
 	}
 	if stat.Dev != entry.Device || stat.Ino != entry.Inode || stat.Mode&unix.S_IFMT != entry.Mode {
-		return false, nil
+		return confinedManifestReplacement, nil
 	}
 	handle, _, err := unix.NameToHandleAt(parentFD, name, 0)
 	if errors.Is(err, unix.ENOENT) {
-		return false, nil
+		return confinedManifestAbsent, nil
 	}
 	if err != nil {
-		return false, err
+		return confinedManifestUncertain, err
 	}
-	return handle.Type() == entry.HandleType && bytes.Equal(handle.Bytes(), entry.Handle), nil
+	if handle.Type() != entry.HandleType || !bytes.Equal(handle.Bytes(), entry.Handle) {
+		return confinedManifestUncertain, errConfinedCopyIdentityUncertain
+	}
+	return confinedManifestMatching, nil
 }
 
 func rollbackConfinedManifestEntry(
@@ -1166,6 +1298,10 @@ func (state *confinedCopyState) copyDirectoryContents(
 	if err != nil {
 		return err
 	}
+	if state.beforeRegularSync != nil {
+		// The selected fixture cuts the first top-level child, a.
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	}
 	for _, entry := range entries {
 		name := entry.Name()
 		components, err := validateConfinedRelativePath(name)
@@ -1322,6 +1458,9 @@ func (state *confinedCopyState) copyRegular(
 	if copyErr == nil {
 		copyErr = copyConfinedFDMetadata(sourceFD, destinationFD, sourceStat)
 	}
+	if copyErr == nil && state.beforeRegularSync != nil {
+		copyErr = state.beforeRegularSync(relativePath)
+	}
 	if copyErr == nil {
 		copyErr = unix.Fsync(destinationFD)
 	}
@@ -1351,16 +1490,23 @@ func (state *confinedCopyState) copySymlink(
 	relativePath string,
 	initial unix.Stat_t,
 ) error {
-	target, err := readlinkat(sourceDirectoryFD, name)
+	sourceFD, err := unix.Openat(sourceDirectoryFD, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	var afterRead unix.Stat_t
-	if err := unix.Fstatat(sourceDirectoryFD, name, &afterRead, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	defer unix.Close(sourceFD)
+	var sourceStat unix.Stat_t
+	if err := unix.Fstat(sourceFD, &sourceStat); err != nil {
 		return err
 	}
-	if !sameConfinedEntry(initial, afterRead) || afterRead.Mode&unix.S_IFMT != unix.S_IFLNK {
+	if !sameConfinedEntry(initial, sourceStat) || sourceStat.Mode&unix.S_IFMT != unix.S_IFLNK {
 		return errors.New("source symlink changed during copy")
+	}
+	// Read the literal from the same inode that supplies metadata, including
+	// when the source name is concurrently renamed, unlinked, or replaced.
+	target, err := readlinkat(sourceFD, "")
+	if err != nil {
+		return err
 	}
 	if err := unix.Symlinkat(target, destinationDirectoryFD, name); err != nil {
 		return err
@@ -1369,23 +1515,41 @@ func (state *confinedCopyState) copySymlink(
 		_ = unix.Unlinkat(destinationDirectoryFD, name, 0)
 		return err
 	}
-	// Symlink ownership and timestamps are best-effort. Some shared-volume
-	// filesystems create and read literal symlinks correctly but reject no-follow
-	// metadata updates (including with EIO). Docker copy-up must not reject an
-	// otherwise valid volume for metadata that does not affect link traversal.
-	_ = unix.Fchownat(
-		destinationDirectoryFD,
-		name,
-		int(afterRead.Uid),
-		int(afterRead.Gid),
-		unix.AT_SYMLINK_NOFOLLOW,
-	)
-	_ = unix.UtimesNanoAt(
-		destinationDirectoryFD,
-		name,
-		[]unix.Timespec{afterRead.Atim, afterRead.Mtim},
-		unix.AT_SYMLINK_NOFOLLOW,
-	)
+	// Creation occurs in private staging. Pin and verify the recorded inode
+	// before any metadata mutation; never reopen through the symlink target.
+	destinationFD, err := unix.Openat(destinationDirectoryFD, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(destinationFD)
+	var destinationStat unix.Stat_t
+	if err := unix.Fstat(destinationFD, &destinationStat); err != nil {
+		return err
+	}
+	created := state.created[len(state.created)-1]
+	if destinationStat.Mode&unix.S_IFMT != unix.S_IFLNK || destinationStat.Dev != created.identity.device || destinationStat.Ino != created.identity.inode {
+		return errors.New("destination symlink changed during copy")
+	}
+	return copyConfinedSymlinkMetadata(sourceFD, destinationFD, sourceStat)
+}
+
+func copyConfinedSymlinkMetadata(sourceFD, destinationFD int, stat unix.Stat_t) error {
+	operations := confinedSymlinkXattrSyscalls()
+	snapshot, err := snapshotConfinedXattrsWith(sourceFD, operations)
+	if err != nil {
+		return err
+	}
+	// chown can clear capabilities. Restore attrs afterwards, and propagate
+	// every failure so the enclosing copy-up transaction rolls back.
+	if err := unix.Fchownat(destinationFD, "", int(stat.Uid), int(stat.Gid), unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("chown copy-up symlink: %w", err)
+	}
+	if err := restoreConfinedXattrsWith(destinationFD, snapshot, operations); err != nil {
+		return err
+	}
+	if err := unix.UtimesNanoAt(destinationFD, "", []unix.Timespec{stat.Atim, stat.Mtim}, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("set copy-up symlink times: %w", err)
+	}
 	return nil
 }
 
@@ -1428,31 +1592,9 @@ func copyConfinedFDMetadata(sourceFD int, destinationFD int, stat unix.Stat_t) e
 }
 
 func copyConfinedXattrs(sourceFD int, destinationFD int) error {
-	size, err := unix.Flistxattr(sourceFD, nil)
-	if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
-		return nil
-	}
-	if err != nil || size == 0 {
-		return err
-	}
-	names := make([]byte, size)
-	size, err = unix.Flistxattr(sourceFD, names)
+	snapshot, err := snapshotConfinedXattrs(sourceFD)
 	if err != nil {
 		return err
 	}
-	for _, name := range strings.Split(strings.TrimSuffix(string(names[:size]), "\x00"), "\x00") {
-		valueSize, err := unix.Fgetxattr(sourceFD, name, nil)
-		if err != nil {
-			return err
-		}
-		value := make([]byte, valueSize)
-		valueSize, err = unix.Fgetxattr(sourceFD, name, value)
-		if err != nil {
-			return err
-		}
-		if err := unix.Fsetxattr(destinationFD, name, value[:valueSize], 0); err != nil {
-			return err
-		}
-	}
-	return nil
+	return restoreConfinedXattrs(destinationFD, snapshot)
 }

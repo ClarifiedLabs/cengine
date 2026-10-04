@@ -1,0 +1,588 @@
+// Host composition test overlay. Actual Session/clients/TLS/server/registry/
+// recorder; host pread and file executor stand in for Linux FUSE only. NOT native.
+package workloadstorage
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	cc "dev.cengine/guest/internal/consumercompat"
+	a "dev.cengine/guest/internal/storageauthority"
+	c "dev.cengine/guest/internal/storageclient"
+	sc "dev.cengine/guest/internal/storagecontrol"
+	p "dev.cengine/guest/internal/storagepki"
+	ss "dev.cengine/guest/internal/storageserver"
+	w "dev.cengine/guest/internal/storagewire"
+	"golang.org/x/sys/unix"
+)
+
+func joinedMust(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+func joinedID(t *testing.T) a.ID { t.Helper(); id, err := a.NewID(); joinedMust(t, err); return id }
+
+type joinedRootAttachment struct {
+	sessionAttachmentFake
+	*c.Client
+	omitRead bool
+}
+
+func (m *joinedRootAttachment) Err() error   { return m.Client.Err() }
+func (m *joinedRootAttachment) Close() error { return m.Client.Close() }
+func (m *joinedRootAttachment) CloseGracefully(ctx context.Context) error {
+	return m.Client.CloseGracefully(ctx)
+}
+func (m *joinedRootAttachment) Done() <-chan struct{} { return m.sessionAttachmentFake.Done() }
+func (m *joinedRootAttachment) BeginOriginalConsumerRead(h a.DataHello) error {
+	if err := m.Client.BeginOriginalConsumerRead(h); err != nil {
+		return err
+	}
+	// Host bridge: real FIFO READ using this client's already-issued OPEN grant.
+	// The subsequent owner pread is independently compared by production Arm.
+	if !m.omitRead {
+		_, err := m.RTM103HostDo(false, w.OpenGrantAuth, w.ReadRequest{Node: 2, Handle: 1, Size: 4096})
+		return err
+	}
+	return nil
+}
+
+type joinedRootFixture struct {
+	session       *Session
+	arm           OriginalConsumerArm
+	factory       *rootSessionFactory
+	entries       [2]*sessionAttachment
+	attachments   [2]*joinedRootAttachment
+	authority     *a.Authority
+	control       *a.ControllerPrincipal
+	controlClient *sc.Client
+	registrations [2]a.RegisterRequest
+	fresh         func(*testing.T) (*c.Client, a.DataHello)
+	recorder      *ss.ConsumerObservation
+	files         [2]string
+}
+
+func newJoinedRootFixture(t *testing.T, name string) *joinedRootFixture {
+	t.Helper()
+	f := &joinedRootFixture{arm: originalTestArm(), recorder: ss.NewConsumerObservation()}
+	f.arm.Version = 6
+	f.arm.CaseName = name
+	issuer := originalIssuer(t)
+	controllerKey, err := p.NewControllerKey()
+	joinedMust(t, err)
+	controllerPin, err := controllerKey.Fingerprint()
+	joinedMust(t, err)
+	rootPath := t.TempDir()
+	joinedMust(t, os.Mkdir(filepath.Join(rootPath, "volumes"), 0700))
+	root, err := os.Open(rootPath)
+	joinedMust(t, err)
+	t.Cleanup(func() { root.Close() })
+	bootstrap, _, err := ed25519.GenerateKey(rand.Reader)
+	joinedMust(t, err)
+	// Host executor is read-only. Its barrier closes this attachment's actual
+	// owned server descriptor after Authority joins guards, then syncs the root.
+	var hostRegistry *ss.RTM103HostRegistry
+	f.authority, err = a.Initialize(a.Config{Root: root, DeviceID: "rtm103-host-composition", BootstrapKey: bootstrap, Barrier: func(b a.Binding, r *os.File) error {
+		if hostRegistry == nil {
+			return a.ErrInvalid
+		}
+		return hostRegistry.Barrier(b, r)
+	}}, a.Initial{Store: a.ID(f.arm.Scope.Store), Controller: a.Controller{Epoch: 1, Key: a.Fingerprint(controllerPin.String())}})
+	joinedMust(t, err)
+	t.Cleanup(func() { joinedMust(t, f.authority.Close()) })
+	t.Cleanup(f.recorder.Close)
+	f.arm.Scope.ServiceEpoch = string(f.authority.Epoch())
+	f.arm.Scope.ControllerKey = controllerPin.String()
+	serverBinding, err := p.NewServerBinding(p.StoreID(f.arm.Scope.Store), p.ServiceEpoch(f.arm.Scope.ServiceEpoch))
+	joinedMust(t, err)
+	serverKey, err := p.NewServerKey()
+	joinedMust(t, err)
+	csr, err := serverKey.CSR(serverBinding)
+	joinedMust(t, err)
+	serverCert, err := issuer.IssueServer(csr, serverBinding, time.Now().Add(-time.Second), time.Minute)
+	joinedMust(t, err)
+	serverIdentity, err := serverCert.WithKey(serverKey)
+	joinedMust(t, err)
+	serverPin, err := serverKey.Fingerprint()
+	joinedMust(t, err)
+	tlsConfig, err := p.ServerTLSConfig(serverIdentity, issuer.Root())
+	joinedMust(t, err)
+	controllerBinding, err := p.NewControllerBinding(p.StoreID(f.arm.Scope.Store), 1)
+	joinedMust(t, err)
+	csr, err = controllerKey.CSR(controllerBinding)
+	joinedMust(t, err)
+	controllerCert, err := issuer.IssueController(csr, controllerBinding, time.Now().Add(-time.Second), time.Minute)
+	joinedMust(t, err)
+	controllerIdentity, err := controllerCert.WithKey(controllerKey)
+	joinedMust(t, err)
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	joinedMust(t, left.SetDeadline(time.Now().Add(3*time.Second)))
+	joinedMust(t, right.SetDeadline(time.Now().Add(3*time.Second)))
+	controllerTLS, err := p.NewControllerTLSClient(right, controllerIdentity, issuer.Root(), serverBinding, serverPin)
+	joinedMust(t, err)
+	handshake := make(chan error, 1)
+	go func() { handshake <- controllerTLS.Handshake() }()
+	f.control, err = f.authority.AuthenticateController(context.Background(), tls.Server(left, tlsConfig), 1)
+	joinedMust(t, err)
+	joinedMust(t, <-handshake)
+	controlServer, err := sc.NewPKIServer(f.authority, sc.PKIServerConfig{Identity: serverIdentity, ClientRoot: issuer.Root(), Store: a.ID(f.arm.Scope.Store), ServiceEpoch: f.authority.Epoch(), Server: serverBinding, Controller: controllerBinding, ControllerEpoch: 1, ControllerKey: controllerPin})
+	joinedMust(t, err)
+	controlLeft, controlRight := net.Pipe()
+	controlDone := make(chan error, 1)
+	go func() { controlDone <- controlServer.Serve(context.Background(), controlLeft) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	f.controlClient, err = sc.NewPKIClient(ctx, controlRight, sc.PKIClientConfig{Identity: controllerIdentity, ServerRoot: issuer.Root(), Server: serverBinding, ServerKey: serverPin, Controller: controllerBinding, ControllerEpoch: 1, Hello: sc.Hello{Version: sc.Version, Role: sc.Controller, ControllerEpoch: 1, Store: a.ID(f.arm.Scope.Store), ServiceEpoch: f.authority.Epoch()}})
+	cancel()
+	joinedMust(t, err)
+	t.Cleanup(func() {
+		f.controlClient.Close()
+		controlLeft.Close()
+		controlRight.Close()
+		select {
+		case <-controlDone:
+		case <-time.After(3 * time.Second):
+			t.Error("control server not joined")
+		}
+	})
+	resources, err := ss.NewResources()
+	joinedMust(t, err)
+	server, err := ss.NewPKIWithResources(resources, f.authority, ss.PKIConfig{Identity: serverIdentity, ClientRoot: issuer.Root(), Store: a.ID(f.arm.Scope.Store), ServiceEpoch: f.authority.Epoch(), RequestRetirement: func(a.DataHello, error) {}})
+	joinedMust(t, err)
+	f.factory = &rootSessionFactory{originalFactoryFake: &originalFactoryFake{observer: &originalConsumer{}}, roots: map[Attachment]string{}}
+	f.session = &Session{binding: f.arm.Binding, scope: f.arm.Scope, root: issuer.Root(), phase: "running", activeRole: "runtime", factory: f.factory, entries: map[string]*sessionAttachment{}, peer: Peer{TLSRootDER: issuer.Root().DER(), ServerDER: serverCert.DER(), ServerKey: serverPin.String(), DataAddress: "192.0.2.2"}}
+	opened := map[a.ID]*os.File{}
+	for i, slot := range []Slot{{Attachment: f.arm.TargetAttachment, Volume: f.arm.TargetAttachment, Role: "runtime", Mode: "read-only"}, {Attachment: "33333333-3333-4333-8333-333333333333", Volume: "44444444-4444-4444-8444-444444444444", Role: "runtime", Mode: "read-only"}} {
+		dir := filepath.Join(rootPath, "volumes", string(rune('a'+i)))
+		joinedMust(t, os.Mkdir(dir, 0700))
+		f.files[i] = filepath.Join(dir, retainedReadName)
+		joinedMust(t, os.WriteFile(f.files[i], bytes.Repeat([]byte{byte('A' + i)}, 32), 0400))
+		var stat unix.Stat_t
+		joinedMust(t, unix.Stat(dir, &stat))
+		joinedMust(t, f.authority.AddVolume(f.control, a.VolumeRequest{Operation: joinedID(t), Volume: a.Volume{ID: a.ID(slot.Volume), Name: string(rune('a' + i)), Root: a.RootIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}}}))
+		key, err := p.NewAttachmentKey(p.RuntimeRole)
+		joinedMust(t, err)
+		binding, err := sessionBinding(f.session.scope, slot)
+		joinedMust(t, err)
+		csr, err := key.CSR(binding)
+		joinedMust(t, err)
+		cert, err := issuer.IssueAttachment(csr, binding, time.Now().Add(-time.Second), time.Minute)
+		joinedMust(t, err)
+		identity, err := cert.WithKey(key)
+		joinedMust(t, err)
+		entry := &sessionAttachment{slot: slot, binding: binding, key: key, identity: identity, installed: true, mounted: true}
+		f.entries[i] = entry
+		f.session.entries[slot.Attachment] = entry
+		f.registrations[i] = a.RegisterRequest{Operation: joinedID(t), Binding: rootSourceHello(f.session, entry).Binding}
+		f.wire(t, sc.Request{RegisterAttachment: &f.registrations[i]})
+		file, err := os.Open(f.files[i])
+		joinedMust(t, err)
+		t.Cleanup(func() { file.Close() })
+		opened[a.ID(slot.Volume)] = file
+	}
+	hostRegistry = server.RTM103HostFiles(opened)
+	t.Cleanup(func() { joinedMust(t, hostRegistry.Close()) })
+	for i, entry := range f.entries {
+		rawServer, rawClient := net.Pipe()
+		joinedMust(t, rawServer.SetDeadline(time.Now().Add(8*time.Second)))
+		joinedMust(t, rawClient.SetDeadline(time.Now().Add(8*time.Second)))
+		done := make(chan error, 1)
+		go func() { done <- server.Serve(f.recorder.Context(context.Background()), f.authority, rawServer) }()
+		cfg, err := p.ClientTLSConfig(entry.identity, issuer.Root(), serverBinding, serverPin)
+		joinedMust(t, err)
+		conn := tls.Client(rawClient, cfg)
+		joinedMust(t, conn.Handshake())
+		client, err := c.New(c.Config{Conn: conn, TLSConfig: cfg, ServerPin: a.Fingerprint(serverPin.String()), Authority: rootSourceHello(f.session, entry), Version: w.Version, Profile: w.RequiredProfile(), SupportedCaps: 1, Limits: c.DefaultLimits(), Timeout: 3 * time.Second, Invalidate: func(context.Context, c.Notification) error { return nil }})
+		joinedMust(t, err)
+		m := &joinedRootAttachment{sessionAttachmentFake: sessionAttachmentFake{done: make(chan struct{})}, Client: client}
+		f.attachments[i] = m
+		entry.attachment = m
+		f.factory.roots[m] = filepath.Dir(f.files[i])
+		_, err = client.RTM103HostDo(true, 0, w.LookupRequest{Parent: 1, Name: []byte(retainedReadName)})
+		joinedMust(t, err)
+		_, err = client.RTM103HostDo(true, 0, w.OpenRequest{Node: 2, Flags: w.OpenReadOnly})
+		joinedMust(t, err)
+		t.Cleanup(func() {
+			rawServer.Close()
+			rawClient.Close()
+			client.Close()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("server not joined")
+			}
+			close(m.done)
+		})
+	}
+	f.fresh = func(t *testing.T) (*c.Client, a.DataHello) {
+		slot := f.entries[0].slot
+		slot.Attachment = string(joinedID(t))
+		key, err := p.NewAttachmentKey(p.RuntimeRole)
+		joinedMust(t, err)
+		binding, err := sessionBinding(f.session.scope, slot)
+		joinedMust(t, err)
+		csr, err := key.CSR(binding)
+		joinedMust(t, err)
+		cert, err := issuer.IssueAttachment(csr, binding, time.Now().Add(-time.Second), time.Minute)
+		joinedMust(t, err)
+		identity, err := cert.WithKey(key)
+		joinedMust(t, err)
+		entry := &sessionAttachment{slot: slot, binding: binding, key: key, identity: identity}
+		hello := rootSourceHello(f.session, entry)
+		f.wire(t, sc.Request{RegisterAttachment: &a.RegisterRequest{Operation: joinedID(t), Binding: hello.Binding}})
+		left, right := net.Pipe()
+		done := make(chan error, 1)
+		go func() { done <- server.Serve(context.Background(), f.authority, left) }()
+		cfg, err := p.ClientTLSConfig(identity, issuer.Root(), serverBinding, serverPin)
+		joinedMust(t, err)
+		conn := tls.Client(right, cfg)
+		joinedMust(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
+		joinedMust(t, conn.Handshake())
+		client, err := c.New(c.Config{Conn: conn, TLSConfig: cfg, ServerPin: a.Fingerprint(serverPin.String()), Authority: hello, Version: w.Version, Profile: w.RequiredProfile(), SupportedCaps: 1, Limits: c.DefaultLimits(), Timeout: 3 * time.Second, Invalidate: func(context.Context, c.Notification) error { return nil }})
+		joinedMust(t, err)
+		t.Cleanup(func() {
+			client.Close()
+			left.Close()
+			right.Close()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("fresh server not joined")
+			}
+		})
+		return client, hello
+	}
+	f.arm.LeafSHA256 = SpecificationDigest(f.entries[0].identity.Certificate().DER())
+	t.Cleanup(func() { f.factory.observer.stop() })
+	return f
+}
+func (f *joinedRootFixture) controlCall(t *testing.T, operation string, value any) (OriginalConsumerEvidence, error) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	joinedMust(t, err)
+	reply, err := f.session.originalConsumerControl(operation, raw)
+	if err != nil {
+		return OriginalConsumerEvidence{}, err
+	}
+	var out OriginalConsumerEvidence
+	err = json.Unmarshal(reply, &out)
+	return out, err
+}
+func TestOriginalRootJoinedSession(t *testing.T) {
+	for _, name := range []string{"cross-mount-root-grant", "retired-root-grant-replay", "missing-retirement", "wrong-retirement", "target-extra-traffic", "cache-only", "different-backing", "changed-peer"} {
+		t.Run(name, func(t *testing.T) {
+			caseName := "retired-root-grant-replay"
+			if name == "cross-mount-root-grant" {
+				caseName = name
+			}
+			f := newJoinedRootFixture(t, caseName)
+			if name == "cache-only" {
+				f.attachments[0].omitRead = true
+			}
+			if name == "different-backing" { // authentic READ of A but owner's independent descriptor points at B
+				f.factory.roots[f.attachments[0]] = filepath.Dir(f.files[1])
+			}
+			if !f.arm.valid() {
+				t.Fatal("fixture arm invalid")
+			}
+			if _, err := f.session.originalRootTarget(rootSourceHello(f.session, f.entries[0])); err != nil {
+				t.Fatal("fixture target invalid", err)
+			}
+			arm, err := f.controlCall(t, "original-consumer-arm", f.arm)
+			if name == "cache-only" || name == "different-backing" {
+				if err == nil {
+					t.Fatal("nonmatching wire/FD positive accepted")
+				}
+				return
+			}
+			joinedMust(t, err)
+			if arm.Roots == nil || arm.Roots.Source.Read.RequestSequence == 0 || arm.Roots.Target.Read.ContentSHA256 == arm.Roots.Source.Read.ContentSHA256 {
+				t.Fatal("not two genuine READ grants")
+			}
+			begun, err := f.controlCall(t, "original-consumer-begin", f.arm)
+			joinedMust(t, err)
+			if begun.Stage != "begun" {
+				t.Fatal(begun)
+			}
+			before, err := f.authority.Query(f.control)
+			joinedMust(t, err)
+			query := cc.Arm{Version: cc.SameERootVersion, Profile: cc.Profile, RequestID: f.arm.RequestID, ArmDigest: strings.Repeat("e", 64), OperationUUID: f.arm.OperationUUID, CaseName: cc.SameE, OriginalBootBinding: cc.BootBinding{ShimLaunchUUID: f.arm.Binding.ShimLaunchUUID, GuestBootNonce: f.arm.Binding.GuestBootNonce}, Original: cc.OriginalFor(rootSourceHello(f.session, f.entries[0])), OriginalLeafSHA256: f.arm.LeafSHA256, WorkerScope: cc.WorkerScope{StoreUUID: f.arm.Scope.Store, ServiceEpoch: f.arm.Scope.ServiceEpoch, WorkerUUID: string(joinedID(t))}}
+			if caseName == "retired-root-grant-replay" {
+				_, err = f.recorder.Arm(query)
+				joinedMust(t, err)
+			}
+			var retirement *a.Receipt
+			var retirementOperation a.ID
+			if caseName == "retired-root-grant-replay" && name != "missing-retirement" {
+				index := 0
+				if name == "wrong-retirement" {
+					index = 1
+				}
+				binding := rootSourceHello(f.session, f.entries[index]).Binding
+				retirementOperation = joinedID(t)
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				receipt, err := f.authority.Retire(ctx, f.control, a.RetireRequest{Operation: retirementOperation, Store: binding.Store, Volume: binding.Volume, Attachment: binding.Attachment})
+				cancel()
+				joinedMust(t, err)
+				retirement = &receipt
+				if receipt.Revision <= before.Revision {
+					t.Fatal("retirement not durable/advancing")
+				}
+			}
+			atProbe, err := f.authority.Query(f.control)
+			joinedMust(t, err)
+			if retirement != nil {
+				remote := atProbe.Attachments[retirement.Attachment]
+				if remote.Phase != a.Drained || remote.Retirement != retirementOperation || remote.Receipt == nil || *remote.Receipt != *retirement {
+					t.Fatal("receipt not independently published")
+				}
+				expected := before
+				expected.Revision = atProbe.Revision
+				expected.Attachments = make(map[a.ID]a.Attachment, len(before.Attachments))
+				for id, entry := range before.Attachments {
+					expected.Attachments[id] = entry
+				}
+				expected.Attachments[retirement.Attachment] = remote
+				if !reflect.DeepEqual(expected, atProbe) {
+					t.Fatal("retirement changed unrelated authority")
+				}
+			}
+			if name == "target-extra-traffic" {
+				_, err = f.attachments[1].OriginalConsumerRootAttempt(context.Background(), rootSourceHello(f.session, f.entries[1]))
+				joinedMust(t, err)
+			}
+			probe := OriginalConsumerProbe{Arm: f.arm, Scope: f.session.scope, Peer: f.session.peer}
+			if name == "changed-peer" {
+				probe.Peer.ServerKey = strings.Repeat("f", 64)
+			}
+			result, err := f.controlCall(t, "original-consumer-probe", probe)
+			positive := name == "cross-mount-root-grant" || name == "retired-root-grant-replay"
+			if !positive {
+				if err == nil {
+					t.Fatal("invalid composition accepted", result)
+				}
+				if name == "missing-retirement" || name == "wrong-retirement" {
+					if status, e := f.recorder.Finalize(query); e == nil || status.State == "finalized" {
+						t.Fatal("wrong retirement sealed a denial")
+					}
+				}
+				return
+			}
+			joinedMust(t, err)
+			if result.Stage != "original-root-scope-replay" || result.Roots.Replay.ContentSHA256 != arm.Roots.Target.Read.ContentSHA256 || result.Roots.Replay.ContentSHA256 == arm.Roots.Source.Read.ContentSHA256 {
+				t.Fatal("A data exposed via B", result)
+			}
+			if caseName == "retired-root-grant-replay" {
+				status, err := f.recorder.Query(query)
+				joinedMust(t, err)
+				joinedMust(t, cc.ValidateStatus(status))
+				if status.State != "observed" || status.Evidence.Admission.RequestSequence != result.RootRequest.RequestSequence || uint64(status.Evidence.Admission.Node) != result.RootRequest.Node || status.Evidence.Admission.Operation != w.OpGetAttr || status.Evidence.Admission.Original != query.Original {
+					t.Fatal("missing exact real Admit", status)
+				}
+				terminal, err := f.recorder.Finalize(query)
+				joinedMust(t, err)
+				if terminal.State != "finalized" || !reflect.DeepEqual(terminal.Evidence, status.Evidence) {
+					t.Fatal("not sealed")
+				}
+			} else if !reflect.DeepEqual(before, atProbe) {
+				t.Fatal("cross-mount mutated registry")
+			}
+			after, err := f.authority.Query(f.control)
+			joinedMust(t, err)
+			if !reflect.DeepEqual(atProbe, after) {
+				t.Fatal("probe changed registry")
+			}
+			for i, path := range f.files {
+				data, err := os.ReadFile(path)
+				joinedMust(t, err)
+				if !bytes.Equal(data, bytes.Repeat([]byte{byte('A' + i)}, 32)) {
+					t.Fatal("backing changed")
+				}
+			}
+			raw, _ := json.Marshal(f.arm)
+			reply, err := f.session.originalConsumerControl("original-consumer-release", raw)
+			joinedMust(t, err)
+			if !bytes.Contains(reply, []byte(`"stage":"released"`)) {
+				t.Fatal("missing release")
+			}
+			if f.factory.observer.roots != nil {
+				t.Fatal("pair retained after successful join")
+			}
+			for _, owner := range f.factory.owners {
+				select {
+				case <-owner.done:
+				default:
+					t.Fatal("FD worker not joined")
+				}
+			}
+			if _, err = f.controlCall(t, "original-consumer-probe", probe); err == nil {
+				t.Fatal("reused released observer")
+			}
+		})
+	}
+}
+
+// Host adapter opens the exact already-installed original directory. No native
+// mount identity claim: all client FIFO/TLS/authority observations stay real.
+func (f *rootSessionFactory) openOriginalMount(attachment Attachment) (*os.File, string, error) {
+	file, err := os.Open(f.roots[attachment])
+	return file, SpecificationDigest([]byte(f.roots[attachment])), err
+}
+func (f *joinedRootFixture) wire(t *testing.T, request sc.Request) sc.Response {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reply, err := f.controlClient.Call(ctx, request)
+	joinedMust(t, err)
+	return reply
+}
+func TestOriginalRegistrationJoinedSession(t *testing.T) {
+	for _, caseName := range []string{"attachment-key-reuse", "delayed-registration"} {
+		for _, fault := range []string{"positive", "missing-retirement", "wrong-retirement", "local-preclose", "changed-peer", "wrong-key", "wrong-operation"} {
+			t.Run(caseName+"/"+fault, func(t *testing.T) {
+				f := newJoinedRootFixture(t, caseName)
+				f.arm.Version = 4
+				arm, err := f.controlCall(t, "original-consumer-arm", f.arm)
+				joinedMust(t, err)
+				if arm.RootRequest == nil || arm.RootRequest.RequestSequence == 0 || arm.OriginalOperation.ErrorClass != "ok" {
+					t.Fatal("no genuine original positive")
+				}
+				begun, err := f.controlCall(t, "original-consumer-begin", f.arm)
+				joinedMust(t, err)
+				if begun.RootRequest == nil || *begun.RootRequest != *arm.RootRequest {
+					t.Fatal("positive changed")
+				}
+				before := f.wire(t, sc.Request{Query: &sc.Empty{}}).Snapshot
+				f.wire(t, sc.Request{RegisterAttachment: &f.registrations[0]})
+				if !reflect.DeepEqual(before, f.wire(t, sc.Request{Query: &sc.Empty{}}).Snapshot) {
+					t.Fatal("active retry changed state")
+				}
+				query := cc.Arm{Version: cc.SameERootVersion, Profile: cc.Profile, RequestID: f.arm.RequestID, ArmDigest: strings.Repeat("e", 64), OperationUUID: f.arm.OperationUUID, CaseName: cc.SameE, OriginalBootBinding: cc.BootBinding{ShimLaunchUUID: f.arm.Binding.ShimLaunchUUID, GuestBootNonce: f.arm.Binding.GuestBootNonce}, Original: cc.OriginalFor(rootSourceHello(f.session, f.entries[0])), OriginalLeafSHA256: f.arm.LeafSHA256, WorkerScope: cc.WorkerScope{StoreUUID: f.arm.Scope.Store, ServiceEpoch: f.arm.Scope.ServiceEpoch, WorkerUUID: string(joinedID(t))}}
+				_, err = f.recorder.Arm(query)
+				joinedMust(t, err)
+				index := 0
+				if fault == "wrong-retirement" {
+					index = 1
+				}
+				if fault != "missing-retirement" {
+					b := f.registrations[index].Binding
+					request := a.RetireRequest{Operation: joinedID(t), Store: b.Store, Volume: b.Volume, Attachment: b.Attachment}
+					receipt := f.wire(t, sc.Request{Retire: &request}).Receipt
+					snap := f.wire(t, sc.Request{Query: &sc.Empty{}}).Snapshot
+					remote := snap.Attachments[b.Attachment]
+					if receipt == nil || receipt.Revision <= before.Revision || remote.Receipt == nil || *remote.Receipt != *receipt || remote.Retirement != request.Operation || remote.Phase != a.Drained {
+						t.Fatal("no real independently reconciled retirement")
+					}
+				}
+				atProbe := f.wire(t, sc.Request{Query: &sc.Empty{}}).Snapshot
+				attempt := f.registrations[0]
+				expected := sc.Blocked
+				if caseName == "attachment-key-reuse" {
+					attempt.Operation = joinedID(t)
+					attempt.Binding.Attachment = joinedID(t)
+					expected = sc.Conflict
+				}
+				if fault == "wrong-key" {
+					attempt.Binding.Key = a.Fingerprint(strings.Repeat("f", 64))
+				}
+				if fault == "wrong-operation" {
+					attempt.Operation = f.registrations[1].Operation
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_, denial := f.controlClient.Call(ctx, sc.Request{RegisterAttachment: &attempt})
+				cancel()
+				var remote *sc.RemoteError
+				exactDenial := errors.As(denial, &remote) && remote.Code == expected
+				if fault == "positive" && !exactDenial {
+					t.Fatalf("wrong real control denial: %v", denial)
+				}
+				if fault == "wrong-key" || fault == "wrong-operation" {
+					if fault == "wrong-key" && caseName == "attachment-key-reuse" {
+						if denial != nil {
+							t.Fatalf("genuinely fresh key unexpectedly denied: %v", denial)
+						}
+					} else if !errors.As(denial, &remote) || remote.Code != sc.Conflict {
+						t.Fatalf("expected actual conflicting authority/op, got %v", denial)
+					}
+					// A coincident CONFLICT is never sufficient: the exact attempted tuple/op
+					// must also match. Do not manufacture a root denial for this substitute.
+					if reflect.DeepEqual(attempt, f.registrations[0]) {
+						t.Fatal("fault not applied")
+					}
+					return
+				}
+				if !reflect.DeepEqual(atProbe, f.wire(t, sc.Request{Query: &sc.Empty{}}).Snapshot) {
+					t.Fatal("registration mutated registry")
+				}
+				if fault == "local-preclose" {
+					f.attachments[0].Client.Close()
+				}
+				probe := OriginalConsumerProbe{Arm: f.arm, Scope: f.session.scope, Peer: f.session.peer}
+				if fault == "changed-peer" {
+					probe.Peer.ServerKey = strings.Repeat("f", 64)
+				}
+				result, err := f.controlCall(t, "original-consumer-probe", probe)
+				if fault != "positive" {
+					if err == nil {
+						t.Fatal("invalid original-client composition accepted")
+					}
+					if status, e := f.recorder.Finalize(query); e == nil || status.State == "finalized" {
+						t.Fatal("invalid attempt sealed denial")
+					}
+					return
+				}
+				joinedMust(t, err)
+				status, err := f.recorder.Query(query)
+				joinedMust(t, err)
+				joinedMust(t, cc.ValidateStatus(status))
+				if status.State != "observed" || status.Evidence.Admission == nil || result.RootRequest == nil || status.Evidence.Admission.RequestSequence != result.RootRequest.RequestSequence || uint64(status.Evidence.Admission.Node) != result.RootRequest.Node || status.Evidence.Admission.Original != query.Original || result.RootRequest.RequestSequence <= arm.RootRequest.RequestSequence {
+					t.Fatal("unjoined real Admit")
+				}
+				final, err := f.recorder.Finalize(query)
+				joinedMust(t, err)
+				if final.State != "finalized" || !reflect.DeepEqual(final.Evidence, status.Evidence) {
+					t.Fatal("not sealed")
+				}
+				if !reflect.DeepEqual(atProbe, f.wire(t, sc.Request{Query: &sc.Empty{}}).Snapshot) {
+					t.Fatal("probe changed registry")
+				}
+				raw, _ := json.Marshal(f.arm)
+				reply, err := f.session.originalConsumerControl("original-consumer-release", raw)
+				joinedMust(t, err)
+				if !bytes.Contains(reply, []byte(`"stage":"released"`)) || f.factory.observer.file != nil {
+					t.Fatal("original not released")
+				}
+				for i, path := range f.files {
+					data, err := os.ReadFile(path)
+					joinedMust(t, err)
+					if !bytes.Equal(data, bytes.Repeat([]byte{byte('A' + i)}, 32)) {
+						t.Fatal("independent backing changed")
+					}
+				}
+				fresh, hello := f.fresh(t)
+				ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+				request, err := fresh.OriginalConsumerRootAttempt(ctx, hello)
+				cancel()
+				joinedMust(t, err)
+				if request.Node == 0 || request.RequestSequence == 0 || string(hello.Binding.Key) == query.Original.Binding.Key || string(hello.Binding.Attachment) == query.Original.Binding.Attachment || string(hello.Binding.Volume) != query.Original.Binding.Volume {
+					t.Fatal("no genuine fresh matching GETATTR")
+				}
+			})
+		}
+	}
+}

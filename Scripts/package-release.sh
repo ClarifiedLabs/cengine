@@ -15,6 +15,7 @@ ENGINE_ENTITLEMENTS="$ROOT_DIR/Configuration/cengine.entitlements"
 APP_ENTITLEMENTS="$ROOT_DIR/Configuration/cengine-app.entitlements"
 COMPONENT_PLIST="$ROOT_DIR/Configuration/cengine-component.plist"
 export COPYFILE_DISABLE=1
+. "$ROOT_DIR/Scripts/managed-signing.sh"
 
 enabled() { case "${1:-0}" in 1|true|TRUE|yes|YES) return 0;; *) return 1;; esac; }
 require_file() { [[ -e "$1" ]] || { echo "Missing $2: $1" >&2; exit 2; }; }
@@ -56,7 +57,7 @@ require_file "$ENGINE_ENTITLEMENTS" "engine entitlements"
 require_file "$APP_ENTITLEMENTS" "app entitlements"
 require_file "$COMPONENT_PLIST" "package component plist"
 require_file "$ROOT_DIR/Configuration/dev.cengine.engine.plist" "engine launch agent plist"
-require_file "$ROOT_DIR/Configuration/dev.cengine.network-helper.plist" "network helper launch daemon plist"
+require_file "$ROOT_DIR/Configuration/dev.cengine.network-helper.plist" "Privileged Helper launch daemon plist"
 
 developer_id_application=""
 installer_identity=""
@@ -66,9 +67,13 @@ if enabled "$SIGN_RELEASE"; then
   installer_identity="${CENGINE_DEVELOPER_ID_INSTALLER:-${DEVELOPER_ID_INSTALLER:-}}"
   require_nonempty "$developer_id_application" CENGINE_DEVELOPER_ID_APPLICATION
   require_nonempty "$installer_identity" CENGINE_DEVELOPER_ID_INSTALLER
-  team_identifier="${CENGINE_TEAM_IDENTIFIER:-$(print -r -- "$developer_id_application" | sed -nE 's/.*\(([A-Z0-9]+)\)$/\1/p')}"
-  require_nonempty "$team_identifier" CENGINE_TEAM_IDENTIFIER
+  team_identifier=$(managed_signing_team "$developer_id_application")
+  if [[ -n ${CENGINE_TEAM_IDENTIFIER:-} && $CENGINE_TEAM_IDENTIFIER != $team_identifier ]]; then
+    echo 'CENGINE_TEAM_IDENTIFIER must match the Developer ID signing identity' >&2; exit 2
+  fi
 fi
+
+python3 "$ROOT_DIR/Scripts/guest_asset_provenance.py" validate "$ROOT_DIR" "$ROOT_DIR/.build/guest"
 
 xcodebuild -project "$PROJECT_PATH" -scheme cengine -configuration Release \
   -derivedDataPath "$DERIVED_DATA_PATH" -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
@@ -80,10 +85,12 @@ xcodebuild -project "$PROJECT_PATH" -scheme cengine -configuration Release \
 
 SOURCE_APP="$PRODUCTS_DIR/cengine.app"
 SOURCE_ENGINE="$PRODUCTS_DIR/cengine"
-SOURCE_HELPER="$PRODUCTS_DIR/cengine-network-helper"
+SOURCE_HELPER="$PRODUCTS_DIR/cengine-helper"
+SOURCE_CONTROLLER="$PRODUCTS_DIR/cengine-storage-controller"
+"$ROOT_DIR/Scripts/build-storage-controller.sh" "$SOURCE_CONTROLLER"
 require_file "$SOURCE_APP" "cengine app"
 require_file "$SOURCE_ENGINE" "cengine engine"
-require_file "$SOURCE_HELPER" "network helper"
+require_file "$SOURCE_HELPER" "Privileged Helper"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$OUTPUT_DIR" "$PAYLOAD_ROOT/Applications" "$PAYLOAD_ROOT/usr/local/bin"
@@ -92,20 +99,23 @@ ditto --norsrc --noextattr "$SOURCE_APP" "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Library/LaunchAgents" \
   "$APP_PATH/Contents/Library/LaunchDaemons" "$APP_PATH/Contents/Resources"
 ditto --norsrc --noextattr "$SOURCE_ENGINE" "$APP_PATH/Contents/MacOS/cengine-engine"
-ditto --norsrc --noextattr "$SOURCE_HELPER" "$APP_PATH/Contents/MacOS/cengine-network-helper"
+ditto --norsrc --noextattr "$SOURCE_HELPER" "$APP_PATH/Contents/MacOS/cengine-helper"
+ditto --norsrc --noextattr "$SOURCE_CONTROLLER" "$APP_PATH/Contents/MacOS/cengine-storage-controller"
 ditto "$ROOT_DIR/Configuration/dev.cengine.engine.plist" "$APP_PATH/Contents/Library/LaunchAgents/dev.cengine.engine.plist"
 ditto "$ROOT_DIR/Configuration/dev.cengine.network-helper.plist" "$APP_PATH/Contents/Library/LaunchDaemons/dev.cengine.network-helper.plist"
 mkdir -p "$APP_PATH/Contents/Resources/guest"
 ditto "$ROOT_DIR/.build/guest/vmlinux" "$APP_PATH/Contents/Resources/guest/vmlinux"
 ditto "$ROOT_DIR/.build/guest/container-initramfs.cpio.gz" "$APP_PATH/Contents/Resources/guest/container-initramfs.cpio.gz"
 ditto "$ROOT_DIR/.build/guest/storage-initramfs.cpio.gz" "$APP_PATH/Contents/Resources/guest/storage-initramfs.cpio.gz"
+ditto "$ROOT_DIR/.build/guest/disk-bootstrap.json" "$APP_PATH/Contents/Resources/guest/disk-bootstrap.json"
 ditto "$ROOT_DIR/.build/guest/SHA256SUMS" "$APP_PATH/Contents/Resources/guest/SHA256SUMS"
+python3 "$ROOT_DIR/Scripts/guest_asset_provenance.py" validate "$ROOT_DIR" "$APP_PATH/Contents/Resources/guest"
 remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine"
 remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-engine"
-remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-network-helper"
+remove_build_rpaths "$APP_PATH/Contents/MacOS/cengine-helper"
 require_uninstrumented "$APP_PATH/Contents/MacOS/cengine"
 require_uninstrumented "$APP_PATH/Contents/MacOS/cengine-engine"
-require_uninstrumented "$APP_PATH/Contents/MacOS/cengine-network-helper"
+require_uninstrumented "$APP_PATH/Contents/MacOS/cengine-helper"
 xattr -cr "$PAYLOAD_ROOT"
 ln -s /Applications/cengine.app/Contents/MacOS/cengine-engine "$PAYLOAD_ROOT/usr/local/bin/cengine"
 
@@ -130,17 +140,21 @@ if enabled "$SIGN_RELEASE"; then
   codesign --force --timestamp --options runtime --identifier dev.cengine.engine \
     --entitlements "$ENGINE_ENTITLEMENTS" --sign "$developer_id_application" "$APP_PATH/Contents/MacOS/cengine-engine"
   codesign --force --timestamp --options runtime --identifier dev.cengine.network-helper \
-    --sign "$developer_id_application" "$APP_PATH/Contents/MacOS/cengine-network-helper"
+    --sign "$developer_id_application" "$APP_PATH/Contents/MacOS/cengine-helper"
+  codesign --force --timestamp --options runtime --identifier dev.cengine.storage-control \
+    --sign "$developer_id_application" "$APP_PATH/Contents/MacOS/cengine-storage-controller"
+  managed_signing_verify "$APP_PATH/Contents/MacOS/cengine-storage-controller" dev.cengine.storage-control "$team_identifier"
   codesign --force --timestamp --options runtime --identifier dev.cengine.app \
     --entitlements "$APP_ENTITLEMENTS" --sign "$developer_id_application" "$APP_PATH"
 else
   codesign --force --entitlements "$ENGINE_ENTITLEMENTS" --sign - "$APP_PATH/Contents/MacOS/cengine-engine"
-  codesign --force --sign - "$APP_PATH/Contents/MacOS/cengine-network-helper"
+  codesign --force --sign - "$APP_PATH/Contents/MacOS/cengine-helper"
+  codesign --force --identifier dev.cengine.storage-control --sign - "$APP_PATH/Contents/MacOS/cengine-storage-controller"
   codesign --force --entitlements "$APP_ENTITLEMENTS" --sign - "$APP_PATH"
 fi
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 "$ROOT_DIR/Scripts/verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-engine" --require com.apple.security.virtualization
-"$ROOT_DIR/Scripts/verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-network-helper" --forbid com.apple.vm.networking
+"$ROOT_DIR/Scripts/verify-entitlements.sh" "$APP_PATH/Contents/MacOS/cengine-helper" --forbid com.apple.vm.networking
 [[ "$($APP_PATH/Contents/MacOS/cengine-engine version)" == "cengine $VERSION" ]]
 
 component_pkg="$BUILD_DIR/cengine-component.pkg"

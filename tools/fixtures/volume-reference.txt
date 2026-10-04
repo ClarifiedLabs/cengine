@@ -1,0 +1,3 @@
+Owned disposable volume-reference fixture.
+This seed is copied only into a newly created private run root.
+The optional macOS bind mount is an unqualified candidate, not an oracle.

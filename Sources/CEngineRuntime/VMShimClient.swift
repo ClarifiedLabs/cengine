@@ -1,7 +1,31 @@
 #if os(macOS)
 import CEngineCore
+import CryptoKit
 import Darwin
 import Foundation
+
+/// Container boot provenance obtained only from an authenticated immutable shim
+/// exchange. Decoding receipts or ordinary status snapshots cannot construct it.
+public struct VerifiedWorkloadStorageBoot: Sendable {
+    public let binding: WorkloadStorageProtocol.BootBinding
+    public let scope: WorkloadStorageProtocol.Scope?
+    public let diskIdentities: [VMShimProtocol.FileIdentity]
+    public let rootExt4UUID: String
+    public let rootBytes: UInt64
+    public let initramfsSHA256: String
+
+    public let compatibilityProfile: String?
+    /// Pinned from the authenticated original configure exchange, never from a later caller.
+    let configuredPeer: WorkloadStorageProtocol.Peer?
+
+    fileprivate init(_ receipt: WorkloadStorageBootReceipt, configuredPeer: WorkloadStorageProtocol.Peer? = nil) {
+        self.configuredPeer = configuredPeer
+        compatibilityProfile = receipt.hello.data.compatibilityProfile
+        binding = receipt.hello.binding; scope = receipt.configured?.scope
+        diskIdentities = receipt.diskIdentities; rootExt4UUID = receipt.rootExt4UUID
+        rootBytes = receipt.rootBytes; initramfsSHA256 = receipt.initramfsSHA256
+    }
+}
 
 struct PersistentFileIdentity: Codable, Equatable, Hashable, Sendable {
     let device: UInt64
@@ -274,6 +298,20 @@ final class PersistentStateDirectory: @unchecked Sendable {
             Darwin.close(descriptor)
             throw error
         }
+    }
+
+    /// Own a duplicate of the actual locked root, never a fresh pathname open.
+    static func retaining(_ storeLock: CanonicalDataStoreLock) throws -> PersistentStateDirectory {
+        let descriptor = try storeLock.duplicateRetainedDirectory()
+        let directory: PersistentStateDirectory
+        do {
+            directory = try validated(descriptor: descriptor, url: storeLock.root)
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+        try storeLock.validateRetainedOwnership()
+        return directory
     }
 
     static func openIfPresent(_ url: URL) throws -> PersistentStateDirectory? {
@@ -1468,6 +1506,16 @@ public final class VMShimClient: @unchecked Sendable {
         let startTime: UInt64
     }
 
+    /// A missing identity is not proof of exit: only ESRCH or an observed
+    /// different birth time for the same PID establishes positive death.
+    enum ProcessObservation: Equatable, Sendable {
+        case process(ProcessIdentity)
+        /// A fallback birth snapshot may prove reuse, never authorize a signal or peer.
+        case birthOnly(ProcessIdentity)
+        case absent
+        case unknown
+    }
+
     struct ProcessInspection: Equatable, Sendable {
         let identityBefore: ProcessIdentity
         let executablePath: String
@@ -1522,6 +1570,8 @@ public final class VMShimClient: @unchecked Sendable {
         let specification: VMShimProtocol.Specification
         let processIdentifier: CInt
         let processStartTime: UInt64
+        /// Absent in legacy cleanup evidence; never sufficient for managed adoption.
+        let kernelIdentity: RawStorageShimRecovery.ProcessIdentity?
         let container: ContainerRecord
 
         init(
@@ -1535,6 +1585,7 @@ public final class VMShimClient: @unchecked Sendable {
             specification: VMShimProtocol.Specification,
             processIdentifier: CInt,
             processStartTime: UInt64,
+            kernelIdentity: RawStorageShimRecovery.ProcessIdentity? = nil,
             container: ContainerRecord
         ) {
             schemaVersion = Self.currentSchemaVersion
@@ -1548,6 +1599,7 @@ public final class VMShimClient: @unchecked Sendable {
             self.specification = specification
             self.processIdentifier = processIdentifier
             self.processStartTime = processStartTime
+            self.kernelIdentity = kernelIdentity
             self.container = container
         }
     }
@@ -1726,6 +1778,8 @@ public final class VMShimClient: @unchecked Sendable {
     private let persistentContainerDirectory: PersistentStateDirectory?
     private let persistentGenerationsDirectory: PersistentStateDirectory?
     private let persistentGenerationIdentity: PersistentFileIdentity?
+    let persistentGenerationDirectory: PersistentStateDirectory?
+    let persistentLaunchIntentURL: URL?
     private var acceptsRequests = true
     private var activeDescriptors = Set<CInt>()
     private var processIdentity: ProcessIdentity?
@@ -1738,6 +1792,8 @@ public final class VMShimClient: @unchecked Sendable {
         persistentContainerDirectory = nil
         persistentGenerationsDirectory = nil
         persistentGenerationIdentity = nil
+        persistentGenerationDirectory = nil
+        persistentLaunchIntentURL = nil
         processIdentity = processIdentifier.flatMap(Self.identity(for:))
     }
 
@@ -1747,7 +1803,9 @@ public final class VMShimClient: @unchecked Sendable {
         persistentLaunchRecordURL: URL,
         persistentContainerDirectory: PersistentStateDirectory,
         persistentGenerationsDirectory: PersistentStateDirectory,
-        persistentGenerationIdentity: PersistentFileIdentity
+        persistentGenerationIdentity: PersistentFileIdentity,
+        persistentGenerationDirectory: PersistentStateDirectory,
+        persistentLaunchIntentURL: URL
     ) {
         self.specification = specification
         descriptorInvalidationHook = nil
@@ -1756,6 +1814,8 @@ public final class VMShimClient: @unchecked Sendable {
         self.persistentContainerDirectory = persistentContainerDirectory
         self.persistentGenerationsDirectory = persistentGenerationsDirectory
         self.persistentGenerationIdentity = persistentGenerationIdentity
+        self.persistentGenerationDirectory = persistentGenerationDirectory
+        self.persistentLaunchIntentURL = persistentLaunchIntentURL
         self.processIdentity = processIdentity
     }
 
@@ -1772,6 +1832,8 @@ public final class VMShimClient: @unchecked Sendable {
         persistentContainerDirectory = nil
         persistentGenerationsDirectory = nil
         persistentGenerationIdentity = nil
+        persistentGenerationDirectory = nil
+        persistentLaunchIntentURL = nil
         processIdentity = processIdentifier.flatMap(Self.identity(for:))
     }
 
@@ -1795,12 +1857,18 @@ public final class VMShimClient: @unchecked Sendable {
         executable: URL,
         cleanupPartialProcess: @escaping @Sendable (VMShimClient) async throws -> Void
     ) async throws -> VMShimClient {
-        let specURL = specificationURL(for: specification)
+        let storageLaunch = specification.kind == .storage
+            ? try RawStorageShimRecovery.prepareLaunch(specification) : nil
+        defer { withExtendedLifetime(storageLaunch) {} }
+        let launchSpecification = storageLaunch?.specification ?? specification
+        let specURL = storageLaunch?.specificationURL ?? specificationURL(for: specification)
         let client = try spawn(
-            specification: specification,
+            specification: launchSpecification,
             executable: executable,
             specificationURL: specURL,
-            persistentRecordURL: nil
+            persistentRecordURL: nil,
+            storageSpecificationData: storageLaunch?.data,
+            storageDiskHandle: storageLaunch?.diskHandle
         )
         return try await awaitReadiness(
             client,
@@ -1968,13 +2036,16 @@ public final class VMShimClient: @unchecked Sendable {
         guard specification.containerID == container.id else {
             throw EngineError(.conflict, "VM shim specification does not belong to its container")
         }
+        guard let nonce = specification.shimLaunchUUID,
+              DiskInitializationProtocol.validUUID(nonce) else {
+            throw EngineError(.conflict, "new VM shim launch requires a canonical launch UUID")
+        }
         let log = try persistentLogHandle(
             specification.logPath,
             containerDirectory: containerDirectory,
             expectedIdentity: expectedLogIdentity
         )
         try log.handle.close()
-        let nonce = UUID().uuidString.lowercased()
         let directoryName = "\(String(format: "%020llu", specification.generation))-\(nonce)"
         let generations = try containerDirectory.openOrCreateDirectory(
             named: "shim-generations"
@@ -2047,13 +2118,20 @@ public final class VMShimClient: @unchecked Sendable {
         arguments: [String]? = nil,
         specificationURL specURL: URL,
         persistentRecordURL: URL?,
+        storageSpecificationData: Data? = nil,
+        storageDiskHandle: FileHandle? = nil,
+        storageLifecycle: StorageLifecycleSpawn? = nil,
         intentURL: URL? = nil,
         generationDirectoryIdentity: PersistentFileIdentity? = nil,
         expectedLogIdentity: PersistentFileIdentity? = nil,
         persistentContainerDirectory: PersistentStateDirectory? = nil,
         persistentGenerationsDirectory: PersistentStateDirectory? = nil
     ) throws -> VMShimClient {
-        let data = try JSONEncoder().encode(specification)
+        guard let launch = specification.shimLaunchUUID,
+              DiskInitializationProtocol.validUUID(launch) else {
+            throw EngineError(.conflict, "new VM shim launch requires a canonical launch UUID")
+        }
+        let data = try storageSpecificationData ?? JSONEncoder().encode(specification)
         let persistentStateDirectory: PersistentStateDirectory?
         if intentURL != nil {
             guard let persistentGenerationsDirectory else {
@@ -2075,7 +2153,17 @@ public final class VMShimClient: @unchecked Sendable {
                 throw EngineError(.conflict, "immutable VM shim specification changed before spawn")
             }
             persistentStateDirectory = stateDirectory
+        } else if storageSpecificationData != nil {
+            let directory = try PersistentStateDirectory.open(specURL.deletingLastPathComponent())
+            guard specification.kind == .storage,
+                  try directory.readRegularFile(named: specURL.lastPathComponent) == data else {
+                throw EngineError(.conflict, "immutable storage shim specification changed before spawn")
+            }
+            persistentStateDirectory = nil
         } else {
+            guard specification.kind != .storage else {
+                throw EngineError(.conflict, "storage shim requires an immutable launch intent")
+            }
             try FileManager.default.createDirectory(
                 at: specURL.deletingLastPathComponent(), withIntermediateDirectories: true
             )
@@ -2083,9 +2171,42 @@ public final class VMShimClient: @unchecked Sendable {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: specURL.path)
             persistentStateDirectory = nil
         }
+        let launchArguments = arguments ?? [
+            "vm-shim", "--spec", specURL.path,
+            "--spec-sha256", specificationSHA256(data),
+        ]
+        if specification.kind == .storage {
+            guard let storageDiskHandle, storageSpecificationData != nil,
+                  intentURL == nil else {
+                throw EngineError(.conflict, "storage shim requires its prepared disk writer lease")
+            }
+            let log = try logHandle(
+                specification.logPath,
+                persistentContainerDirectory: persistentContainerDirectory,
+                expectedIdentity: expectedLogIdentity
+            )
+            let lifecycleArguments = storageLifecycle == nil ? []
+                : ["--storage-lifecycle-fd", String(storageLifecycleDescriptor)]
+            let pid = try spawnStorageProcess(executable: executable,
+                arguments: launchArguments + ["--storage-disk-fd", String(storageDiskDescriptor)] + lifecycleArguments,
+                disk: storageDiskHandle, output: log, lifecycle: storageLifecycle?.childSocket)
+            if let storageLifecycle {
+                // Actual suspended child is authenticated BEFORE SIGCONT/any bytes.
+                do {
+                    try storageLifecycle.authenticate(pid)
+                    guard Darwin.kill(pid, SIGCONT) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                } catch {
+                    _ = Darwin.kill(pid, SIGKILL)
+                    var status: Int32 = 0
+                    while Darwin.waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+                    throw error
+                }
+            }
+            return try storageProcessClient(specification: specification, pid: pid)
+        }
         let process = Process()
         process.executableURL = executable
-        process.arguments = arguments ?? ["vm-shim", "--spec", specURL.path]
+        process.arguments = launchArguments
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = try logHandle(
             specification.logPath,
@@ -2095,22 +2216,26 @@ public final class VMShimClient: @unchecked Sendable {
         process.standardError = process.standardOutput
         try process.run()
         guard let launchedIdentity = identity(for: process.processIdentifier) else {
-            process.terminate()
-            throw EngineError(
-                .internalError,
-                "could not capture VM shim process identity after launch"
+            // An unreadable birth identity grants no PID-signal authority and
+            // cannot certify rollback. Retain the launch evidence for recovery.
+            throw VMShimLaunchRollbackIncompleteError(
+                message: "could not capture VM shim process identity after launch",
+                client: VMShimClient(specification: specification)
             )
         }
         let client: VMShimClient
         if let persistentRecordURL, let intentURL, let generationDirectoryIdentity,
-           let persistentContainerDirectory, let persistentGenerationsDirectory {
+           let persistentContainerDirectory, let persistentGenerationsDirectory,
+           let persistentStateDirectory {
             client = VMShimClient(
                 specification: specification,
                 processIdentity: launchedIdentity,
                 persistentLaunchRecordURL: persistentRecordURL,
                 persistentContainerDirectory: persistentContainerDirectory,
                 persistentGenerationsDirectory: persistentGenerationsDirectory,
-                persistentGenerationIdentity: generationDirectoryIdentity
+                persistentGenerationIdentity: generationDirectoryIdentity,
+                persistentGenerationDirectory: persistentStateDirectory,
+                persistentLaunchIntentURL: intentURL
             )
             do {
                 _ = try publishPersistentLaunchIdentity(
@@ -2125,7 +2250,7 @@ public final class VMShimClient: @unchecked Sendable {
                 if identity(for: launchedIdentity.processIdentifier) == launchedIdentity {
                     _ = Darwin.kill(launchedIdentity.processIdentifier, SIGKILL)
                 }
-                if waitForExit(launchedIdentity, timeoutMilliseconds: 1_000) {
+                if (try? waitForExit(launchedIdentity, timeoutMilliseconds: 1_000)) == true {
                     do {
                         try client.removePersistentLaunchArtifacts(
                             allowUnpublishedLaunch: true
@@ -2147,11 +2272,227 @@ public final class VMShimClient: @unchecked Sendable {
                 )
             }
         } else {
-            client = VMShimClient(
-                specification: specification, processIdentifier: process.processIdentifier
-            )
+            client = VMShimClient(specification: specification)
+            client.processIdentity = launchedIdentity
         }
         return client
+    }
+
+    /// Capture once while this direct child is still unreaped (its PID cannot
+    /// be reused), and never query again in an initializer after enabling reap.
+    static func storageProcessClient(
+        specification: VMShimProtocol.Specification, pid: pid_t,
+        identityProvider: (CInt) -> ProcessIdentity? = { identity(for: $0) },
+        startReaper: (pid_t) -> Void = { pid in
+            DispatchQueue.global(qos: .utility).async {
+                while Darwin.waitpid(pid, nil, 0) < 0 && errno == EINTR {}
+            }
+        }
+    ) throws -> VMShimClient {
+        let captured = identityProvider(pid)
+        let client = VMShimClient(specification: specification)
+        client.processIdentity = captured
+        startReaper(pid)
+        guard captured != nil else {
+            // Preserve the immutable ambiguous intent, including query failure.
+            throw EngineError(.internalError, "could not capture storage shim process identity after launch")
+        }
+        return client
+    }
+
+    // Explicit storage-only transfer. No Process/global inheritable-FD window,
+    // and no root helper or container spawn behavior is changed.
+    static let storageDiskDescriptor: CInt = 3
+    /// Private authenticated storage lifecycle channel; the disk stays at FD3.
+    static let storageLifecycleDescriptor: CInt = 4
+
+    /// Child end of the lifecycle socketpair plus the actual-child authenticator.
+    struct StorageLifecycleSpawn {
+        let childSocket: CInt
+        let authenticate: (pid_t) throws -> Void
+    }
+
+    /// Launches the infrastructure storage shim with its sockets, fabric and
+    /// management address, plus the private control channel at FD4.
+    /// Qualification policy stays in StorageLifecycleShimProcess (compile-gated).
+    static func launchLifecycleStorage(
+        specification: VMShimProtocol.Specification,
+        rootPublicKey: StorageIdentity.RootPublicKey,
+        binding: StorageIdentity.StoreBinding,
+        storeLock: CanonicalDataStoreLock,
+        executable: URL = Bundle.main.executableURL ?? URL(filePath: CommandLine.arguments[0])
+    ) async throws -> (shim: VMShimClient, connection: StorageLifecycleShimConnection) {
+        guard specification.kind == .storage else {
+            throw EngineError(.conflict, "lifecycle storage launch requires a lifecycle storage specification")
+        }
+        try storeLock.validateRetainedOwnership()
+        let launch = try RawStorageShimRecovery.prepareLaunch(specification)
+        return try await launchLifecycleStorage(preparedLaunch: launch, diskMode: .initialize,
+            rootPublicKey: rootPublicKey, binding: binding, storeLock: storeLock, executable: executable)
+    }
+
+    /// Consume the exact cold launch and writer lease already frozen by startup.
+    /// Never allocate another launch UUID or reopen the disk here.
+    static func launchLifecycleStorage(
+        preparedLaunch: RawStorageShimRecovery.PreparedLaunch,
+        diskMode: StorageLifecycleShimProtocol.HostBootstrap.DiskMode = .open,
+        rootPublicKey: StorageIdentity.RootPublicKey,
+        binding: StorageIdentity.StoreBinding,
+        storeLock: CanonicalDataStoreLock
+    ) async throws -> (shim: VMShimClient, connection: StorageLifecycleShimConnection) {
+        try await launchLifecycleStorage(preparedLaunch: preparedLaunch, diskMode: diskMode,
+            rootPublicKey: rootPublicKey, binding: binding, storeLock: storeLock,
+            executable: Bundle.main.executableURL ?? URL(filePath: CommandLine.arguments[0]))
+    }
+
+    private static func launchLifecycleStorage(
+        preparedLaunch storageLaunch: RawStorageShimRecovery.PreparedLaunch,
+        diskMode: StorageLifecycleShimProtocol.HostBootstrap.DiskMode,
+        rootPublicKey: StorageIdentity.RootPublicKey,
+        binding: StorageIdentity.StoreBinding,
+        storeLock: CanonicalDataStoreLock, executable: URL
+    ) async throws -> (shim: VMShimClient, connection: StorageLifecycleShimConnection) {
+        guard storageLaunch.specification.kind == .storage else {
+            throw EngineError(.conflict, "lifecycle storage launch requires a lifecycle storage specification")
+        }
+        let policy = try StorageLifecycleNativePolicy.current(role: .engine)
+        try storeLock.validateRetainedOwnership()
+        let bytes = try StorageLifecycleShimProtocol.encodeHost(.init(profile: StorageLifecycleShimProtocol.HostBootstrap.version,
+            diskMode: diskMode, rootPublicKey: rootPublicKey.publicData, binding: .init(binding)))
+        let (client, connection, parentFD) = try await lifecycleSpawnWorker { () throws -> (VMShimClient, StorageLifecycleShimConnection, CInt) in
+            let sockets = try makeLifecycleSocketPair()
+            var parentFD: CInt? = sockets.parent
+            defer { if let parentFD { Darwin.close(parentFD) } }
+            var connection: StorageLifecycleShimConnection?
+            let client: VMShimClient
+            do {
+                defer { Darwin.close(sockets.child) }
+                client = try spawn(specification: storageLaunch.specification, executable: executable,
+                    specificationURL: storageLaunch.specificationURL, persistentRecordURL: nil,
+                    storageSpecificationData: storageLaunch.data, storageDiskHandle: storageLaunch.diskHandle,
+                    storageLifecycle: .init(childSocket: sockets.child, authenticate: { pid in
+                        connection = try StorageLifecycleShimConnection(parentBorrowedFD: sockets.parent,
+                            expectedChildPID: pid, policy: policy)
+                    }))
+            } // Parent copy of the child end is closed before any EOF wait.
+            guard let connection else { throw StorageLifecycleShimProtocol.Failure.unauthorized }
+            let owned = parentFD!; parentFD = nil
+            return (client, connection, owned)
+        }
+        defer { Darwin.close(parentFD); withExtendedLifetime(storageLaunch) {} }
+        do {
+            try storeLock.validateRetainedOwnership()
+            try await lifecycleSpawnWorker {
+                let deadline = StorageLifecycleShimChannel.deadline(30)
+                try StorageLifecycleShimChannel.send(bytes, fd: parentFD, deadline: deadline)
+                let reply = try StorageLifecycleShimChannel.receive(fd: parentFD, permitsDescriptor: false, deadline: deadline)
+                guard reply.body == StorageLifecycleShimProtocol.HostBootstrap.bound else {
+                    throw StorageLifecycleShimProtocol.Failure.unauthorized
+                }
+            }
+            try Task.checkCancellation()
+            let ready = try await awaitReadiness(client, cleanupPartialProcess: {
+                try await $0.terminate(gracePeriodMilliseconds: 0, forceWaitMilliseconds: 1_000)
+            })
+            return (ready, connection)
+        } catch {
+            connection.cancel()
+            try? await client.terminate(gracePeriodMilliseconds: 0, forceWaitMilliseconds: 1_000)
+            throw error
+        }
+    }
+
+    /// CLOEXEC socketpair; parent end nonblocking + SO_NOSIGPIPE.
+    static func makeLifecycleSocketPair() throws -> (parent: CInt, child: CInt) {
+        var sockets: [CInt] = [-1, -1]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var one: Int32 = 1
+        let flags = fcntl(sockets[0], F_GETFL)
+        guard fcntl(sockets[0], F_SETFD, FD_CLOEXEC) == 0, fcntl(sockets[1], F_SETFD, FD_CLOEXEC) == 0,
+              flags >= 0, fcntl(sockets[0], F_SETFL, flags | O_NONBLOCK) == 0,
+              setsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            let code = errno
+            Darwin.close(sockets[0]); Darwin.close(sockets[1])
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return (sockets[0], sockets[1])
+    }
+
+    private static func lifecycleSpawnWorker<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            Thread.detachNewThread {
+                do { continuation.resume(returning: try operation()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    static func spawnStorageProcess(
+        executable: URL, arguments: [String], disk: FileHandle,
+        input: FileHandle? = nil, output: FileHandle, lifecycle: CInt? = nil
+    ) throws -> pid_t {
+        func failure(_ code: CInt, operation: String) -> EngineError {
+            EngineError(.internalError, "storage shim \(operation) failed: \(String(cString: strerror(code)))")
+        }
+        func check(_ result: CInt, operation: String) throws {
+            guard result == 0 else { throw failure(result, operation: operation) }
+        }
+        // Foundation's nullDevice is a sink object with fileDescriptor == -1
+        // on macOS, not an OS descriptor suitable for posix_spawn file actions.
+        let inputDescriptor = input?.fileDescriptor ?? Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard inputDescriptor >= 0 else { throw failure(input == nil ? errno : EBADF, operation: "open stdin") }
+        defer {
+            if input == nil { Darwin.close(inputDescriptor) }
+            withExtendedLifetime((disk, input, output)) {}
+        }
+        var actions: posix_spawn_file_actions_t?
+        try check(posix_spawn_file_actions_init(&actions), operation: "initialize file actions")
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        var attributes: posix_spawnattr_t?
+        try check(posix_spawnattr_init(&attributes), operation: "initialize attributes")
+        defer { posix_spawnattr_destroy(&attributes) }
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        try check(posix_spawnattr_setsigmask(&attributes, &mask), operation: "set signal mask")
+        var defaults = sigset_t()
+        sigemptyset(&defaults)
+        for signal in [SIGTERM, SIGINT, SIGPIPE] { sigaddset(&defaults, signal) }
+        try check(posix_spawnattr_setsigdefault(&attributes, &defaults), operation: "set signal defaults")
+        // launchd reaps the departed daemon's process group. The persistent
+        // storage VM must survive independently, like Foundation-spawned workload
+        // shims. Set its own group atomically at spawn, before it can run.
+        try check(posix_spawnattr_setpgroup(&attributes, 0), operation: "set process group")
+        // Lifecycle children start suspended so the parent authenticates the
+        // actual child (audit token) before it runs or receives any bytes.
+        try check(posix_spawnattr_setflags(&attributes, Int16(
+            POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP
+                | (lifecycle == nil ? 0 : POSIX_SPAWN_START_SUSPENDED)
+        )), operation: "set spawn flags")
+        // Stage sources above every destination so dup2 cannot clobber a
+        // source when the original disk/log/pipe happens to occupy FD 0...3.
+        var duplicates: [CInt] = []
+        defer { for descriptor in duplicates { Darwin.close(descriptor) } }
+        for (source, target, role) in [
+            (inputDescriptor, STDIN_FILENO, "stdin"),
+            (output.fileDescriptor, STDOUT_FILENO, "stdout"),
+            (output.fileDescriptor, STDERR_FILENO, "stderr"),
+            (disk.fileDescriptor, storageDiskDescriptor, "disk"),
+        ] + (lifecycle.map { [($0, storageLifecycleDescriptor, "lifecycle")] } ?? []) {
+            let duplicate = fcntl(source, F_DUPFD_CLOEXEC, storageLifecycleDescriptor + 1)
+            guard duplicate >= 0 else { throw failure(errno, operation: "duplicate \(role)") }
+            duplicates.append(duplicate)
+            try check(posix_spawn_file_actions_adddup2(&actions, duplicate, target), operation: "transfer \(role)")
+        }
+        let strings = ([executable.path] + arguments).map { strdup($0) }
+        defer { strings.forEach { free($0) } }
+        guard strings.allSatisfy({ $0 != nil }) else { throw POSIXError(.ENOMEM) }
+        var argv = strings + [nil]
+        var pid: pid_t = 0
+        try check(posix_spawn(&pid, executable.path, &actions, &attributes, &argv, environ), operation: "spawn")
+        return pid
     }
 
     /// Called by both the parent and the shim as its first action. The launch
@@ -2217,6 +2558,29 @@ public final class VMShimClient: @unchecked Sendable {
         guard identityProvider(publicationIdentity.processIdentifier) == publicationIdentity else {
             throw EngineError(.conflict, "VM shim process identity changed after inspection")
         }
+        let kernelIdentity: RawStorageShimRecovery.ProcessIdentity?
+        if state.specification.kind == .container,
+           state.specification.workloadStorageMode == .managed {
+            guard let launch = state.specification.shimLaunchUUID,
+                  DiskInitializationProtocol.validUUID(launch), launch == state.intent.nonce,
+                  case let .process(native) = RawStorageShimRecovery.observe(publicationIdentity.processIdentifier),
+                  native.valid, native.pid == publicationIdentity.processIdentifier,
+                  native.startSeconds == publicationIdentity.startTime / 1_000_000,
+                  native.startMicroseconds == publicationIdentity.startTime % 1_000_000 else {
+                throw EngineError(.conflict, "managed VM shim native launch identity is unavailable")
+            }
+            kernelIdentity = native
+        } else {
+            // Legacy publication fixtures and cleanup retain their original contract.
+            kernelIdentity = nil
+        }
+        func validateNativePublication() throws {
+            if let kernelIdentity,
+               RawStorageShimRecovery.liveness(kernelIdentity,
+                   observation: RawStorageShimRecovery.observe(kernelIdentity.pid)) != .alive {
+                throw EngineError(.conflict, "managed VM shim native launch identity changed")
+            }
+        }
         let record = PersistentLaunchRecord(
             nonce: state.intent.nonce,
             createdAt: state.intent.createdAt,
@@ -2228,6 +2592,7 @@ public final class VMShimClient: @unchecked Sendable {
             specification: state.intent.specification,
             processIdentifier: publicationIdentity.processIdentifier,
             processStartTime: publicationIdentity.startTime,
+            kernelIdentity: kernelIdentity,
             container: state.intent.container
         )
         do {
@@ -2248,6 +2613,7 @@ public final class VMShimClient: @unchecked Sendable {
             guard directory.pathStillNamesThisDirectory() else {
                 throw EngineError(.conflict, "VM shim generation directory was replaced")
             }
+            try validateNativePublication()
             return existing
         }
         guard identityProvider(publicationIdentity.processIdentifier) == publicationIdentity else {
@@ -2256,6 +2622,7 @@ public final class VMShimClient: @unchecked Sendable {
         guard directory.pathStillNamesThisDirectory() else {
             throw EngineError(.conflict, "VM shim generation directory was replaced")
         }
+        try validateNativePublication()
         return record
     }
 
@@ -2988,6 +3355,7 @@ public final class VMShimClient: @unchecked Sendable {
               intent.specification.generation == UInt64(generationComponent),
               intent.nonce == nonceComponent,
               UUID(uuidString: intent.nonce)?.uuidString.lowercased() == intent.nonce,
+              launchNonceMatches(specification: intent.specification, nonce: intent.nonce),
               launchPathsMatch(intent.specificationPath, specificationURL.path),
               exactLaunchPathKey(intent.executablePath) != nil,
               PersistentFileIdentity.recoveryMatches(
@@ -3038,6 +3406,7 @@ public final class VMShimClient: @unchecked Sendable {
             && lhs.specification == rhs.specification
             && lhs.processIdentifier == rhs.processIdentifier
             && lhs.processStartTime == rhs.processStartTime
+            && lhs.kernelIdentity == rhs.kernelIdentity
             && leftContainer == rightContainer
     }
 
@@ -3045,7 +3414,8 @@ public final class VMShimClient: @unchecked Sendable {
         _ record: PersistentLaunchRecord,
         state: PersistentLaunchState
     ) throws -> Bool {
-        guard record.processIdentifier > 1 else { return false }
+        guard record.processIdentifier > 1,
+              launchNonceMatches(specification: record.specification, nonce: record.nonce) else { return false }
         let expected = PersistentLaunchRecord(
             nonce: state.intent.nonce,
             createdAt: state.intent.createdAt,
@@ -3057,6 +3427,7 @@ public final class VMShimClient: @unchecked Sendable {
             specification: state.intent.specification,
             processIdentifier: record.processIdentifier,
             processStartTime: record.processStartTime,
+            kernelIdentity: record.kernelIdentity,
             container: state.intent.container
         )
         return try persistentLaunchRecordsMatch(record, expected)
@@ -3272,7 +3643,9 @@ public final class VMShimClient: @unchecked Sendable {
                     persistentLaunchRecordURL: state.recordURL,
                     persistentContainerDirectory: containerDirectory,
                     persistentGenerationsDirectory: generations,
-                    persistentGenerationIdentity: generation.identity
+                    persistentGenerationIdentity: generation.identity,
+                    persistentGenerationDirectory: generation,
+                    persistentLaunchIntentURL: state.intentURL
                 ),
                 record
             ))
@@ -3648,16 +4021,356 @@ public final class VMShimClient: @unchecked Sendable {
         return status
     }
     public func boot() async throws -> VMShimProtocol.Status { try await request(.boot, response: VMShimProtocol.Status.self) }
+
+    /// Starts only through 4105 + the private 4109 hello. On recovery this reads
+    /// the existing private channel's receipt and never sends another configure.
+    public func bootWorkloadStorage() async throws -> VerifiedWorkloadStorageBoot {
+        try await requestVerifiedWorkloadStorage(.workloadStorageBoot, payload: nil)
+    }
+
+    public func configureWorkloadStorage(boot: VerifiedWorkloadStorageBoot,
+        configuration: WorkloadStorageConfiguration) async throws -> VerifiedWorkloadStorageBoot {
+        try validateWorkloadStorageBoot(boot)
+        guard boot.scope == nil else { throw PrivateWorkloadStorageCoordinator.failure() }
+        _ = try WorkloadStorageProtocol.encode(configuration.frame(binding: boot.binding))
+        let result = try await requestVerifiedWorkloadStorage(.workloadStorageConfigure,
+            payload: JSONEncoder().encode(configuration), configuredPeer: configuration.peer)
+        guard result.binding == boot.binding, result.scope == configuration.scope else {
+            throw PrivateWorkloadStorageCoordinator.failure()
+        }
+        return result
+    }
+
+    private func requestVerifiedWorkloadStorage(_ operation: VMShimProtocol.Operation,
+        payload: Data?, configuredPeer: WorkloadStorageProtocol.Peer? = nil) async throws -> VerifiedWorkloadStorageBoot {
+        guard specification.kind == .container, specification.workloadStorageMode == .managed else {
+            throw PrivateWorkloadStorageCoordinator.failure()
+        }
+        let receipt = try await request(operation, payloadData: payload, response: WorkloadStorageBootReceipt.self)
+        guard receipt.hello.operation == .hello,
+              receipt.hello.binding.shimLaunchUUID == specification.shimLaunchUUID,
+              receipt.rootBytes == specification.rootDiskSize,
+              receipt.initramfsSHA256 == specification.expectedInitramfsSHA256,
+              DiskInitializationProtocol.validUUID(receipt.rootExt4UUID),
+              let rootIdentity = specification.rootDiskIdentity,
+              receipt.diskIdentities == [rootIdentity] + specification.volumeDisks.compactMap(\.identity),
+              receipt.diskIdentities.count == specification.volumeDisks.count + 1 else {
+            throw PrivateWorkloadStorageCoordinator.failure()
+        }
+        _ = try WorkloadStorageProtocol.encode(receipt.hello)
+        if let configured = receipt.configured {
+            _ = try WorkloadStorageProtocol.encode(configured)
+            guard configured.operation == .configured, configured.binding == receipt.hello.binding,
+                  configured.scope?.container == specification.containerID else {
+                throw PrivateWorkloadStorageCoordinator.failure()
+            }
+        }
+        return VerifiedWorkloadStorageBoot(receipt, configuredPeer: configuredPeer)
+    }
+
+    private func validateWorkloadStorageBoot(_ boot: VerifiedWorkloadStorageBoot) throws {
+        guard specification.kind == .container, specification.workloadStorageMode == .managed,
+              boot.binding.shimLaunchUUID == specification.shimLaunchUUID,
+              boot.diskIdentities.first == specification.rootDiskIdentity,
+              boot.initramfsSHA256 == specification.expectedInitramfsSHA256 else {
+            throw PrivateWorkloadStorageCoordinator.failure()
+        }
+    }
+
+    public func workloadStorageCommand(_ command: WorkloadStorageProtocol.Frame,
+        boot: VerifiedWorkloadStorageBoot) async throws -> WorkloadStorageProtocol.Frame {
+        try validateWorkloadStorageBoot(boot)
+        guard let scope = boot.scope, command.operation == .command,
+              command.scope == scope, command.binding == boot.binding else {
+            throw PrivateWorkloadStorageCoordinator.failure()
+        }
+        let body = Data(try WorkloadStorageProtocol.encode(command).dropFirst(4))
+        let result = try await runBlocking { [self] in
+            try requestData(.workloadStorageCommand, payloadData: body)
+        }
+        let response: WorkloadStorageProtocol.Frame
+        do { response = try WorkloadStorageProtocol.decode(from: result) }
+        catch {
+            throw PrivateWorkloadStorageCoordinator.failure(stage: .shimResponseDecode,
+                kind: command.kind, role: command.data.role)
+        }
+        guard response.operation == .reply, response.binding == command.binding,
+              response.scope == command.scope, response.kind == command.kind else {
+            throw PrivateWorkloadStorageCoordinator.failure(stage: .shimResponseBinding,
+                kind: command.kind, role: command.data.role)
+        }
+        return response
+    }
+
+    /// A concrete, signed owner carrier. Construction requires the exact verified
+    /// workload boot; serialized bindings cannot construct this handle.
+    @MainActor public final class OriginalConsumerObservation: Sendable {
+        public let binding: OriginalConsumerObservationProtocol.Binding
+        let boot: VerifiedWorkloadStorageBoot
+        private let client: VMShimClient
+        private var previous: OriginalConsumerObservationProtocol.Evidence
+        private var deadline: UInt64?
+        private var replacementClaimed = false
+        private var released = false
+        private var baselineGate: OriginalConsumerBaselineGate
+        var backingBaseline: OriginalConsumerRuntimeCarrier.Baseline? { baselineGate.baseline }
+        func recordBackingBaseline(_ baseline: OriginalConsumerRuntimeCarrier.Baseline) throws {
+            try client.validateWorkloadStorageBoot(boot)
+            guard deadline == nil, !released else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            if binding.caseName.isRoot { try baseline.validateRootPositive(previous) }
+            try baselineGate.record(baseline, stage: previous.stage)
+        }
+        fileprivate init(binding: OriginalConsumerObservationProtocol.Binding, boot: VerifiedWorkloadStorageBoot,
+                         evidence: OriginalConsumerObservationProtocol.Evidence, client: VMShimClient) {
+            self.binding = binding; self.boot = boot; previous = evidence; self.client = client
+            baselineGate = .init(binding: binding)
+        }
+        public func begin() async throws -> Data {
+            guard deadline == nil, !released else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            try baselineGate.begin()
+            // Start BEFORE transport. This is no later than the shim's original
+            // Begin deadline, so IPC/adoption can only consume, never renew it.
+            deadline = DispatchTime.now().uptimeNanoseconds + 10_000_000_000
+            return try await exchange(.begin, payload: JSONEncoder().encode(OriginalConsumerObservationProtocol.GuestArm(binding)))
+        }
+        public func result(payload: Data) async throws -> Data { try await exchange(.result, payload: payload) }
+        public func release() async throws -> Data {
+            released = true
+            baselineGate.release()
+            return try await client.originalConsumerExchange(.init(binding: binding, command: .release,
+                payload: JSONEncoder().encode(OriginalConsumerObservationProtocol.GuestArm(binding))),
+                deadline: DispatchTime.now().uptimeNanoseconds + 1_000_000_000,
+                hostDiagnostic: OriginalConsumerHostDiagnostic.enabled(binding)).data
+        }
+        /// Identity comparison only; the caller supplies its actually installed
+        /// boot and client, never a reconstructed observation capability.
+        func validateInstalled(client: VMShimClient, boot: VerifiedWorkloadStorageBoot) throws {
+            guard self.client === client, self.boot.binding == boot.binding,
+                  self.boot.scope == boot.scope, self.boot.configuredPeer == boot.configuredPeer,
+                  binding.boot == boot.binding, binding.scope == boot.scope,
+                  binding.generation == client.specification.generation else {
+                throw OriginalConsumerObservationProtocol.Failure.invalid
+            }
+            try client.validateOriginalBaselineReader(boot)
+        }
+        func observeReplacement(_ session: ManagedStorageLifecycleOwner.ServiceReplacementMaintenance,
+                                owner: ManagedStorageLifecycleOwner) async throws -> OriginalConsumerReplacementEvidence {
+            try await owner.observeOriginalConsumerReplacement(self, session: session)
+        }
+        func remainingDeadline() throws -> UInt64 {
+            let diagnostic = OriginalConsumerHostDiagnostic(enabled: OriginalConsumerHostDiagnostic.enabled(binding), stage: .clientDeadlineCancellation)
+            do {
+                try Task.checkCancellation()
+                diagnostic.stage = .clientDeadlineBoot
+                try client.validateWorkloadStorageBoot(boot)
+                diagnostic.stage = .clientDeadlineState
+                guard let deadline, !released, DispatchTime.now().uptimeNanoseconds < deadline,
+                      binding.generation == client.specification.generation, binding.boot == boot.binding,
+                      binding.scope == boot.scope, boot.compatibilityProfile == ManagedPrepareCompatibilityProtocol.fullProfile else {
+                    throw OriginalConsumerObservationProtocol.Failure.invalid
+                }
+                return deadline
+            } catch { diagnostic.report(error); throw error }
+        }
+
+        func claimReplacement() throws {
+            _ = try remainingDeadline()
+            guard !replacementClaimed, previous.stage == "begun" else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            replacementClaimed = true
+        }
+        // No address/trust/payload chosen by a public caller. Only the actual
+        // maintenance owner can construct this immutable sealed probe carrier.
+        func probe(_ probe: OriginalConsumerReplacementProbe) async throws -> Data {
+            guard probe.binding == binding else {
+                let error = OriginalConsumerObservationProtocol.Failure.invalid
+                OriginalConsumerHostDiagnostic(enabled: OriginalConsumerHostDiagnostic.enabled(binding), stage: .clientProbeBinding).report(error)
+                throw error
+            }
+            return try await exchange(.probe, payload: probe.payload)
+        }
+        var evidence: OriginalConsumerObservationProtocol.Evidence { previous }
+        private func exchange(_ command: OriginalConsumerObservationProtocol.Command, payload: Data) async throws -> Data {
+            let diagnostic = OriginalConsumerHostDiagnostic(enabled: OriginalConsumerHostDiagnostic.enabled(binding), stage: .clientPreDeadline)
+            do {
+                let limit = try remainingDeadline()
+                let request = OriginalConsumerObservationProtocol.Request(binding: binding, command: command, payload: payload)
+                diagnostic.stage = .clientExchange
+                let checked = try await client.originalConsumerExchange(request, deadline: limit, previous: previous, hostDiagnostic: diagnostic.enabled)
+                diagnostic.stage = .clientPostDeadline
+                _ = try remainingDeadline()
+                diagnostic.stage = .clientEvidence
+                guard let evidence = checked.evidence else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+                previous = evidence
+                return checked.data
+            } catch { diagnostic.report(error); throw error }
+        }
+
+    }
+
+    /// Recovery observation only: the surviving authenticated shim owns the
+    /// retained Arm. This does NOT construct VerifiedWorkloadStorageBoot or a new
+    /// client/lease, nor accept persisted evidence as the result.
+    @MainActor func resumeOriginalConsumer(_ binding: OriginalConsumerObservationProtocol.Binding) async throws -> OriginalConsumerObservationProtocol.Evidence {
+        _ = try SignedCompatibilityIdentity.current(role: .engine)
+        guard binding.caseName == .sameEExistingData, binding.generation == specification.generation,
+              binding.boot.shimLaunchUUID == specification.shimLaunchUUID,
+              binding.scope.container == specification.containerID else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+        let checked = try await originalConsumerExchange(.init(binding: binding, command: .resume,
+            payload: JSONEncoder().encode(OriginalConsumerObservationProtocol.GuestArm(binding))),
+            deadline: DispatchTime.now().uptimeNanoseconds + 1_000_000_000)
+        guard let evidence = checked.evidence else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+        return evidence
+    }
+
+    struct RecoveredOriginalPositive: Codable, Sendable {
+        let binding: OriginalConsumerObservationProtocol.Binding
+        let resumed: OriginalConsumerObservationProtocol.Evidence
+        let begun: OriginalConsumerObservationProtocol.Evidence
+        let positive: OriginalConsumerObservationProtocol.Evidence
+        struct Released: Codable, Sendable {
+            let arm: OriginalConsumerObservationProtocol.GuestArm
+            let stage: String
+        }
+        let released: Released
+    }
+
+    /// No reconstructed boot capability: the actual adopted live permit calls
+    /// this exact original shim. Begin owns ONE budget, including all IPC hops.
+    @MainActor func recoverOriginalPositive(_ binding: OriginalConsumerObservationProtocol.Binding) async throws -> RecoveredOriginalPositive {
+        typealias O = OriginalConsumerObservationProtocol
+        let payload = try JSONEncoder().encode(O.GuestArm(binding))
+        let resumed = try await resumeOriginalConsumer(binding)
+        let deadline = DispatchTime.now().uptimeNanoseconds + OriginalConsumerObservationLease.budgetNanoseconds
+        func exchange(_ command: O.Command, previous: O.Evidence?) async throws -> O.CheckedReply {
+            try await originalConsumerExchange(.init(binding: binding, command: command, payload: payload),
+                deadline: deadline, previous: previous)
+        }
+        do {
+            guard let begun = try await exchange(.begin, previous: resumed).evidence,
+                  let positive = try await exchange(.positive, previous: begun).evidence else { throw O.Failure.invalid }
+            let released = try await exchange(.release, previous: positive)
+            return .init(binding: binding, resumed: resumed, begun: begun, positive: positive,
+                released: try JSONDecoder().decode(RecoveredOriginalPositive.Released.self, from: released.data))
+        } catch {
+            let observationError = error
+            do {
+                // A bounded teardown ACK joins the original operation. Failure
+                // cannot be reported as release or permit a replacement client.
+                _ = try await originalConsumerExchange(.init(binding: binding, command: .release, payload: payload),
+                    deadline: DispatchTime.now().uptimeNanoseconds + 1_000_000_000)
+            } catch { throw OriginalConsumerContainmentFailure(observation: observationError, containment: error) }
+            throw observationError
+        }
+    }
+
+    @MainActor func validateOriginalBaselineReader(_ boot: VerifiedWorkloadStorageBoot) throws {
+        _ = try SignedCompatibilityIdentity.current(role: .engine)
+        try validateWorkloadStorageBoot(boot)
+        guard boot.compatibilityProfile == ManagedPrepareCompatibilityProtocol.fullProfile,
+              boot.configuredPeer != nil else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+    }
+
+    @MainActor func originalConsumerArm(_ binding: OriginalConsumerObservationProtocol.Binding,
+        boot: VerifiedWorkloadStorageBoot) async throws -> OriginalConsumerObservation {
+        let diagnostic = OriginalConsumerHostDiagnostic(enabled: OriginalConsumerHostDiagnostic.enabled(binding), stage: .clientSignedIdentity)
+        do {
+            _ = try SignedCompatibilityIdentity.current(role: .engine)
+            diagnostic.stage = .clientDeadlineBoot
+            try validateWorkloadStorageBoot(boot)
+            diagnostic.stage = .clientRequestValidation
+            guard boot.compatibilityProfile == ManagedPrepareCompatibilityProtocol.fullProfile,
+                  boot.configuredPeer != nil, binding.boot == boot.binding, binding.scope == boot.scope,
+                  binding.generation == specification.generation else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            diagnostic.stage = .clientExchange
+            let checked = try await originalConsumerExchange(.init(binding: binding, command: .arm,
+                payload: JSONEncoder().encode(OriginalConsumerObservationProtocol.GuestArm(binding))),
+                deadline: DispatchTime.now().uptimeNanoseconds + 1_000_000_000, hostDiagnostic: diagnostic.enabled)
+            diagnostic.stage = .clientDeadlineBoot
+            try validateWorkloadStorageBoot(boot)
+            diagnostic.stage = .clientEvidence
+            guard let evidence = checked.evidence else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            return OriginalConsumerObservation(binding: binding, boot: boot, evidence: evidence, client: self)
+        } catch { diagnostic.report(error); throw error }
+    }
+
+    private func originalConsumerExchange(_ request: OriginalConsumerObservationProtocol.Request, deadline: UInt64,
+        previous: OriginalConsumerObservationProtocol.Evidence? = nil, hostDiagnostic: Bool = false) async throws -> OriginalConsumerObservationProtocol.CheckedReply {
+        let diagnostic = OriginalConsumerHostDiagnostic(enabled: hostDiagnostic, stage: .clientSignedIdentity)
+        do {
+            _ = try SignedCompatibilityIdentity.current(role: .engine)
+            diagnostic.stage = .clientRequestValidation
+            try OriginalConsumerObservationProtocol.validate(request)
+            diagnostic.stage = .clientEncode
+            let reply = try await managedExchange(.originalConsumerObservation,
+                payloadData: JSONEncoder().encode(request), deadlineNanoseconds: deadline, hostDiagnostic: hostDiagnostic).payload
+            diagnostic.stage = .clientReplyCancellation
+            try Task.checkCancellation()
+            diagnostic.stage = .clientReplyDeadline
+            guard DispatchTime.now().uptimeNanoseconds < deadline else { throw OriginalConsumerObservationProtocol.Failure.invalid }
+            diagnostic.stage = .clientCheckedReply
+            return try OriginalConsumerObservationProtocol.checkedReply(reply, request: request, previous: previous)
+        } catch { diagnostic.report(error); throw error }
+    }
+
+    public func workloadStoragePrepareObservation(_ arm: ManagedPrepareCompatibilityProtocol.Arm,
+        boot: VerifiedWorkloadStorageBoot) async throws -> WorkloadStorageProtocol.Frame {
+        try validateWorkloadStorageBoot(boot)
+        guard boot.compatibilityProfile == arm.profile,
+              arm.binding == boot.binding, arm.scope == boot.scope else { throw PrivateWorkloadStorageCoordinator.failure() }
+        let body = try ManagedPrepareCompatibilityProtocol.armData(arm)
+        let result = try await runBlocking { [self] in
+            try requestData(.workloadStoragePrepareObservation, payloadData: body)
+        }
+        let frame = try WorkloadStorageProtocol.decode(from: result)
+        try ManagedPrepareCompatibilityProtocol.validateObservation(frame, arm: arm)
+        return frame
+    }
+
+    /// Recovery observation only. The original configured scope (including its
+    /// controller epoch/key) survives a host-controller restart unchanged. This
+    /// exchange cannot create a boot capability or configure/boot a workload.
+    public func observeRunningWorkloadStorage(expectedScope: WorkloadStorageProtocol.Scope,
+        deadlineNanoseconds: UInt64) async throws -> WorkloadStorageProtocol.Frame {
+        guard specification.kind == .container, specification.workloadStorageMode == .managed,
+              expectedScope.container == specification.containerID,
+              expectedScope.launch == specification.shimLaunchUUID else {
+            throw PrivateWorkloadStorageCoordinator.failure(stage: .statusGuard, kind: .status)
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard deadlineNanoseconds > now else {
+            throw PrivateWorkloadStorageCoordinator.failure(stage: .statusDeadline, kind: .status)
+        }
+        let deadline = min(deadlineNanoseconds, now + VMShimManagedTransport.maximumNanoseconds)
+        let body = try JSONEncoder().encode(expectedScope)
+        // Like requestData, this transport seals the exact live native peer
+        // before sending a token and again before accepting/acknowledging the
+        // response. Its cancellation affects only this owned status exchange.
+        let result = try await managedExchange(.workloadStorageStatus, payloadData: body,
+            deadlineNanoseconds: deadline).payload
+        let reply: WorkloadStorageProtocol.Frame
+        do { reply = try WorkloadStorageProtocol.decode(from: result) }
+        catch { throw PrivateWorkloadStorageCoordinator.failure(stage: .shimResponseDecode, kind: .status) }
+        guard reply.operation == .reply, reply.kind == .status, reply.scope == expectedScope,
+              reply.binding.shimLaunchUUID == specification.shimLaunchUUID,
+              reply.data.code == nil, reply.data.phase == .running, reply.data.terminalIDs == [] else {
+            throw PrivateWorkloadStorageCoordinator.failure(stage: .shimResponseBinding, kind: .status)
+        }
+        try Task.checkCancellation()
+        guard DispatchTime.now().uptimeNanoseconds < deadline else {
+            throw PrivateWorkloadStorageCoordinator.failure(stage: .statusDeadline, kind: .status)
+        }
+        return reply
+    }
+
     public func pause() async throws -> VMShimProtocol.Status { try await request(.pause, response: VMShimProtocol.Status.self) }
     public func resume() async throws -> VMShimProtocol.Status { try await request(.resume, response: VMShimProtocol.Status.self) }
     public func stop() async throws -> VMShimProtocol.Status { try await request(.stop, response: VMShimProtocol.Status.self) }
     public func shutdown() async throws -> VMShimProtocol.Status { try await request(.shutdown, response: VMShimProtocol.Status.self) }
 
     /// Requests an authenticated shutdown without ever escalating to a process
-    /// signal. Infrastructure shims do not yet have the immutable launch
-    /// journal used to prove ownership of container shim process generations.
-    /// Strict callers bind the kernel peer to the expected executable and exact
-    /// storage launch tuple before sending credentials, then verify its exit.
+    /// signal. Strict callers bind the kernel peer to the expected executable
+    /// and exact storage launch tuple, including the immutable journal for
+    /// current generations, before sending credentials and verifying its exit.
     /// Request and process exit each have bounded waits, so a slow VM stop
     /// cannot consume the process-exit grace. Inspection injection is internal
     /// and only for isolated socket-transport tests.
@@ -3708,7 +4421,14 @@ public final class VMShimClient: @unchecked Sendable {
                 checkPeer: checkPeer
             )
             let status = try JSONDecoder().decode(VMShimProtocol.Status.self, from: payload)
-            guard waitForExit else { return }
+            if !waitForExit {
+                try validateStatus(status)
+                guard status.state == .stopped else {
+                    throw EngineError(.conflict, "VM shim administrative shutdown did not establish quiescence")
+                }
+                return
+            }
+            if specification.shimLaunchUUID != nil { try validateStatus(status) }
             guard let peerIdentity,
                   status.containerID == specification.containerID,
                   status.generation == specification.generation,
@@ -3728,63 +4448,67 @@ public final class VMShimClient: @unchecked Sendable {
     /// so a timed-out guest call cannot complete after a replacement shim starts.
     func terminate(
         gracePeriodMilliseconds: Int32 = 5_000,
-        forceWaitMilliseconds: Int32 = 1_000
-    ) async throws {
-        let knownIdentity = storedProcessIdentity()
-        if let knownIdentity, Self.identity(for: knownIdentity.processIdentifier) != knownIdentity {
-            // The exact process generation recorded at launch/status no longer
-            // exists. A reused PID is not ours to signal, but is definitive
-            // proof that this shim generation has already terminated.
-            invalidateRequests()
-            try cleanupPublishedRuntimeArtifacts()
-            return
-        }
-        // Keep the exact generation observed above even if it exits between
-        // the first identity check and status inspection. The later pre-signal
-        // revalidation turns that race into cleanup, never a signal to reuse.
-        let identity = recordedProcessIdentity() ?? knownIdentity
-        invalidateRequests()
-
-        let deadline = Self.deadline(afterMilliseconds: gracePeriodMilliseconds)
-        let graceful: Bool = await (try? runBlocking { [self] in
-            let payload = try requestData(
-                .shutdown,
-                payloadData: nil,
-                allowInvalidated: true,
-                deadlineNanoseconds: deadline
-            )
-            _ = try JSONDecoder().decode(VMShimProtocol.Status.self, from: payload)
-            return true
-        }) ?? false
-
-        if let identity, graceful,
-           Self.waitForExit(identity, timeoutMilliseconds: forceWaitMilliseconds) {
-            try cleanupPublishedRuntimeArtifacts()
-            return
-        }
-        guard let identity else {
-            guard graceful else {
+        forceWaitMilliseconds: Int32 = 1_000,
+        observe: (CInt) -> ProcessObservation = { VMShimClient.observeProcessExit($0) },
+        requestShutdown: (() async throws -> Void)? = nil,
+        forceTerminate: (CInt) throws -> Void = { pid in
+            if Darwin.kill(pid, SIGKILL) != 0, errno != ESRCH {
                 throw EngineError(
                     .internalError,
-                    "could not identify unresponsive VM shim for container \(specification.containerID)"
+                    "could not terminate VM shim \(pid): \(String(cString: strerror(errno)))"
                 )
             }
-            return
         }
-        // Revalidate as close to the destructive syscall as Darwin permits. If
-        // the PID now belongs to another process, the original shim is already
-        // gone and the replacement must not receive our signal.
-        guard Self.identity(for: identity.processIdentifier) == identity else {
+    ) async throws {
+        // A retained launch identity remains authoritative even when the status
+        // file/socket is missing or inaccessible. Never replace it on failure.
+        let identity = storedProcessIdentity() ?? recordedProcessIdentity()
+        invalidateRequests()
+        guard let identity else {
+            throw EngineError(
+                .internalError,
+                "could not identify VM shim for container \(specification.containerID); containment is unproven"
+            )
+        }
+        if try Self.hasExited(identity, observation: observe(identity.processIdentifier)) {
             try cleanupPublishedRuntimeArtifacts()
             return
         }
-        if Darwin.kill(identity.processIdentifier, SIGKILL) != 0, errno != ESRCH {
-            throw EngineError(
-                .internalError,
-                "could not terminate VM shim \(identity.processIdentifier): \(String(cString: strerror(errno)))"
-            )
+
+        let graceful: Bool
+        if let requestShutdown {
+            do { try await requestShutdown(); graceful = true }
+            catch { graceful = false }
+        } else {
+            let deadline = Self.deadline(afterMilliseconds: gracePeriodMilliseconds)
+            graceful = await (try? runBlocking { [self] in
+                let payload = try requestData(
+                    .shutdown,
+                    payloadData: nil,
+                    allowInvalidated: true,
+                    deadlineNanoseconds: deadline
+                )
+                _ = try JSONDecoder().decode(VMShimProtocol.Status.self, from: payload)
+                return true
+            }) ?? false
         }
-        guard Self.waitForExit(identity, timeoutMilliseconds: forceWaitMilliseconds) else {
+
+        if graceful, try Self.waitForExit(
+            identity, timeoutMilliseconds: forceWaitMilliseconds, observe: observe
+        ) {
+            try cleanupPublishedRuntimeArtifacts()
+            return
+        }
+        // Revalidate immediately before signaling. Unknown is an error, not
+        // permission to signal or to remove this generation's runtime evidence.
+        if try Self.hasExited(identity, observation: observe(identity.processIdentifier)) {
+            try cleanupPublishedRuntimeArtifacts()
+            return
+        }
+        try forceTerminate(identity.processIdentifier)
+        guard try Self.waitForExit(
+            identity, timeoutMilliseconds: forceWaitMilliseconds, observe: observe
+        ) else {
             throw EngineError(
                 .internalError,
                 "VM shim \(identity.processIdentifier) did not exit after SIGKILL"
@@ -3841,6 +4565,7 @@ public final class VMShimClient: @unchecked Sendable {
     }
 
     public func guest<Payload: Encodable, Response: Decodable>(operation: String, payload: Payload, response: Response.Type) async throws -> Response {
+        try VMShimServer.validateGenericWorkloadOperation(operation, specification: specification)
         let call = GuestCall(operation: operation, payload: try JSONEncoder().encode(payload))
         return try await request(.guest, payload: call, response: response)
     }
@@ -3855,6 +4580,7 @@ public final class VMShimClient: @unchecked Sendable {
         response: Response.Type,
         deadlineNanoseconds: UInt64
     ) async throws -> Response {
+        try VMShimServer.validateGenericWorkloadOperation(operation, specification: specification)
         let call = GuestCall(
             operation: operation,
             payload: try JSONEncoder().encode(payload),
@@ -3897,14 +4623,78 @@ public final class VMShimClient: @unchecked Sendable {
         response: Response.Type,
         deadlineNanoseconds: UInt64? = nil
     ) async throws -> Response {
-        let payload = try await runBlocking { [self] in
-            try requestData(
-                operation,
-                payloadData: payloadData,
-                deadlineNanoseconds: deadlineNanoseconds
-            )
+        let payload: Data
+        if specification.kind == .storage {
+            payload = try await managedExchange(operation, payloadData: payloadData, deadlineNanoseconds: deadlineNanoseconds).payload
+        } else {
+            payload = try await runBlocking { [self] in
+                try requestData(operation, payloadData: payloadData, deadlineNanoseconds: deadlineNanoseconds)
+            }
         }
-        return try JSONDecoder().decode(response, from: payload)
+        let decoded = try JSONDecoder().decode(response, from: payload)
+        if let status = decoded as? VMShimProtocol.Status { try validateStatus(status) }
+        return decoded
+    }
+
+    /// A separate owned socket per operation. The absolute deadline includes
+    /// connect, authenticated send, and the entire reply/upgrade handshake.
+    private func managedExchange(_ operation: VMShimProtocol.Operation, payloadData: Data?,
+        deadlineNanoseconds: UInt64? = nil, upgrade: Bool = false, hostDiagnostic: Bool = false) async throws -> (payload: Data, descriptor: CInt?) {
+        let diagnostic = OriginalConsumerHostDiagnostic(enabled: hostDiagnostic, stage: .clientTransportRun)
+        do {
+            let transport = VMShimManagedTransport(deadlineNanoseconds: deadlineNanoseconds)
+            defer { transport.close() }
+            let envelope = VMShimProtocol.Envelope(token: specification.token, operation: operation,
+                payload: payloadData, deadlineNanoseconds: transport.deadlineNanoseconds)
+            let payload = try await transport.run { [self] transport in
+                diagnostic.stage = .clientSocketConnect
+                try transport.connect(path: specification.socketPath)
+                diagnostic.stage = .clientSocketDescriptor
+                let descriptor = try transport.ownedDescriptor()
+                diagnostic.stage = .clientSocketRegister
+                try register(descriptor, allowInvalidated: false)
+                defer { unregister(descriptor) }
+                diagnostic.stage = .clientPeerBefore
+                try validateManagedStoragePeer(descriptor)
+                diagnostic.stage = .clientSocketEncodeWrite
+                let encoded = try VMShimProtocol.encode(envelope)
+                diagnostic.stage = .clientSocketWrite
+                try transport.write(encoded)
+                diagnostic.stage = .clientSocketReadDecode
+                let frame = try transport.readFrame()
+                diagnostic.stage = .clientSocketDecode
+                let reply = try VMShimProtocol.decode(frame)
+                diagnostic.stage = .clientSocketDeadline
+                try transport.check()
+                diagnostic.stage = .clientPeerAfter
+                try validateManagedStoragePeer(descriptor)
+                diagnostic.stage = .clientReplyBinding
+                guard reply.id == envelope.id, reply.operation == operation else {
+                    throw VMShimManagedTransport.failure()
+                }
+                // Successful upgrades already retain the socket in their relay:
+                // an acknowledgement there would become an unwanted guest byte.
+                // Error replies are ordinary one-shot responses, including upgrades.
+                diagnostic.stage = .clientReplyAcknowledgement
+                if !upgrade || reply.error != nil {
+                    try transport.write(Data([VMShimServer.managedReplyAcknowledgement]))
+                }
+                diagnostic.stage = .clientRemoteFailure
+                if let failure = reply.error {
+                    if operation == .workloadStorageStatus {
+                        throw PrivateWorkloadStorageCoordinator.forwardedFailure(failure)
+                    }
+                    throw VMShimManagedTransport.failure()
+                }
+                diagnostic.stage = .clientReplyPayload
+                guard let payload = reply.payload else {
+                    throw VMShimManagedTransport.failure()
+                }
+                diagnostic.stage = .clientTransportReturn
+                return payload
+            }
+            return (payload, upgrade ? try transport.takeDescriptor() : nil)
+        } catch { diagnostic.report(error); throw error }
     }
 
     // Container wait requests can remain blocked for the workload's lifetime. Keep
@@ -3928,7 +4718,8 @@ public final class VMShimClient: @unchecked Sendable {
         deadlineNanoseconds: UInt64? = nil,
         checkPeer: ((CInt) throws -> Void)? = nil
     ) throws -> Data {
-        let envelope = VMShimProtocol.Envelope(token: specification.token, operation: operation, payload: payloadData)
+        let envelope = VMShimProtocol.Envelope(token: specification.token, operation: operation, payload: payloadData,
+            deadlineNanoseconds: requiresManagedReplyAcknowledgement ? deadlineNanoseconds : nil)
         let timeout = deadlineNanoseconds.map { Self.remainingMilliseconds(until: $0) }
         let descriptor = try UnixSocket.connect(
             path: specification.socketPath, timeoutMilliseconds: timeout
@@ -3942,6 +4733,7 @@ public final class VMShimClient: @unchecked Sendable {
         defer { unregisterAndClose(descriptor) }
         // Capture the kernel peer before the request can cause it to exit.
         try checkPeer?(descriptor)
+        try validateManagedStoragePeer(descriptor)
         let frame: Data
         if let deadlineNanoseconds {
             let flags = fcntl(descriptor, F_GETFL)
@@ -3958,13 +4750,22 @@ public final class VMShimClient: @unchecked Sendable {
             frame = try readFrame(file)
         }
         let reply = try VMShimProtocol.decode(frame)
+        try validateManagedStoragePeer(descriptor)
         guard reply.id == envelope.id else { throw EngineError(.internalError, "VM shim response id mismatch") }
         if checkPeer != nil {
             guard reply.token == envelope.token, reply.operation == envelope.operation else {
                 throw EngineError(.conflict, "VM shim shutdown response authentication mismatch")
             }
         }
+        if requiresManagedReplyAcknowledgement {
+            guard reply.operation == operation else { throw VMShimManagedTransport.failure() }
+            try acknowledgeManagedReply(descriptor, deadlineNanoseconds: deadlineNanoseconds)
+        }
         if let failure = reply.error {
+            if specification.kind == .container, specification.workloadStorageMode == .managed,
+               [.workloadStorageBoot, .workloadStorageConfigure, .workloadStorageCommand, .workloadStoragePrepareObservation].contains(operation) {
+                throw PrivateWorkloadStorageCoordinator.forwardedFailure(failure)
+            }
             if failure.code == GuestProtocol.resourceRollbackIncompleteErrorCode {
                 throw BackendResourceRollbackIncompleteError(failure.message)
             }
@@ -3995,6 +4796,7 @@ public final class VMShimClient: @unchecked Sendable {
         do {
             try register(descriptor, allowInvalidated: false)
             defer { unregister(descriptor) }
+            try validateManagedStoragePeer(descriptor)
             let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
             let envelope = VMShimProtocol.Envelope(
                 token: specification.token,
@@ -4003,8 +4805,15 @@ public final class VMShimClient: @unchecked Sendable {
             )
             try file.write(contentsOf: VMShimProtocol.encode(envelope))
             let reply = try VMShimProtocol.decode(try readFrame(file))
+            try validateManagedStoragePeer(descriptor)
             guard reply.id == envelope.id else {
                 throw EngineError(.internalError, "VM shim response id mismatch")
+            }
+            if requiresManagedReplyAcknowledgement {
+                guard reply.operation == operation else { throw VMShimManagedTransport.failure() }
+                // Failed upgrades use the ordinary error reply path. Successful
+                // upgrades retain their relay and must receive no extra byte.
+                if reply.error != nil { try acknowledgeManagedReply(descriptor, deadlineNanoseconds: nil) }
             }
             if let failure = reply.error {
                 throw EngineError(.internalError, "VM shim \(failure.code): \(failure.message)")
@@ -4013,6 +4822,82 @@ public final class VMShimClient: @unchecked Sendable {
         } catch {
             Darwin.close(descriptor)
             throw error
+        }
+    }
+
+    private var requiresManagedReplyAcknowledgement: Bool {
+        specification.kind == .storage || specification.workloadStorageMode == .managed
+    }
+
+    private func acknowledgeManagedReply(_ descriptor: CInt, deadlineNanoseconds: UInt64?) throws {
+        let replyLimit = DispatchTime.now().uptimeNanoseconds + VMShimManagedTransport.maximumNanoseconds
+        let deadline = min(deadlineNanoseconds ?? replyLimit, replyLimit)
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw VMShimManagedTransport.failure()
+        }
+        defer { _ = fcntl(descriptor, F_SETFL, flags) }
+        try Self.writeExactly(Data([VMShimServer.managedReplyAcknowledgement]),
+            to: descriptor, deadlineNanoseconds: deadline)
+    }
+
+    // Internal visibility lets native socket tests exercise the exact production
+    // process/specification proof; it does not mint or bypass any authority.
+    func validateManagedStoragePeer(_ descriptor: CInt) throws {
+        let managedStorage = specification.kind == .storage
+        let managedWorkload = specification.kind == .container && specification.workloadStorageMode == .managed
+        guard managedStorage || managedWorkload else { return }
+        var pid: pid_t = 0
+        var size = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0,
+              size == MemoryLayout<pid_t>.size, pid > 0 else {
+            throw VMShimManagedTransport.failure()
+        }
+        if managedStorage {
+            guard let generation = try RawStorageShimRecovery.publishedGeneration(for: specification),
+                  generation.specification == specification,
+                  generation.record.process.pid == pid,
+                  RawStorageShimRecovery.liveness(generation.record.process,
+                      observation: RawStorageShimRecovery.observe(pid)) == .alive else {
+                throw VMShimManagedTransport.failure()
+            }
+            return
+        }
+        // Only descriptor-owned, exact-generation evidence authorizes a workload
+        // socket. A token, status reply, PID alone, or matching store never does.
+        guard let launch = specification.shimLaunchUUID,
+              DiskInitializationProtocol.validUUID(launch),
+              let persistentGenerationDirectory, let persistentLaunchIntentURL,
+              let persistentContainerDirectory, let persistentGenerationsDirectory,
+              let persistentGenerationIdentity, let persistentLaunchRecordURL,
+              persistentGenerationDirectory.identity == persistentGenerationIdentity,
+              persistentContainerDirectory.pathStillNamesThisDirectory(),
+              persistentGenerationsDirectory.pathStillNamesThisDirectory(),
+              persistentGenerationDirectory.pathStillNamesThisDirectory() else {
+            throw VMShimManagedTransport.failure()
+        }
+        let state = try Self.validatedLaunchState(
+            in: persistentGenerationDirectory, expectedIntentURL: persistentLaunchIntentURL,
+            expectedContainerID: specification.containerID,
+            containerDirectory: persistentContainerDirectory,
+            generationsDirectory: persistentGenerationsDirectory
+        )
+        guard state.specification == specification, state.intent.nonce == launch,
+              Self.launchPathsMatch(state.recordURL.path, persistentLaunchRecordURL.path),
+              let data = try persistentGenerationDirectory.readRegularFile(named: "launch.json"),
+              let record = try? JSONDecoder().decode(PersistentLaunchRecord.self, from: data),
+              try Self.validatedLaunchRecord(record, state: state),
+              let native = record.kernelIdentity, native.valid, native.pid == pid,
+              record.processIdentifier == pid,
+              native.startSeconds == record.processStartTime / 1_000_000,
+              native.startMicroseconds == record.processStartTime % 1_000_000,
+              storedProcessIdentity() == ProcessIdentity(processIdentifier: pid, startTime: record.processStartTime),
+              RawStorageShimRecovery.liveness(native,
+                  observation: RawStorageShimRecovery.observe(pid)) == .alive,
+              persistentContainerDirectory.pathStillNamesThisDirectory(),
+              persistentGenerationsDirectory.pathStillNamesThisDirectory(),
+              persistentGenerationDirectory.pathStillNamesThisDirectory() else {
+            throw VMShimManagedTransport.failure()
         }
     }
 
@@ -4069,8 +4954,28 @@ public final class VMShimClient: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// Legacy records remain cleanup evidence, but are never bootstrap/adoption authority.
+    static func launchNonceMatches(specification: VMShimProtocol.Specification, nonce: String) -> Bool {
+        guard let launch = specification.shimLaunchUUID else { return true }
+        return DiskInitializationProtocol.validUUID(launch) && launch == nonce
+    }
+
+    static func specificationSHA256(_ serializedSpecification: Data) -> String {
+        SHA256.hash(data: serializedSpecification).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func validateStatus(_ status: VMShimProtocol.Status) throws {
+        guard let launch = specification.shimLaunchUUID,
+              DiskInitializationProtocol.validUUID(launch), status.shimLaunchUUID == launch,
+              status.containerID == specification.containerID,
+              status.generation == specification.generation else {
+            throw EngineError(.conflict, "VM shim launch identity mismatch; legacy shims require quiescence")
+        }
+    }
+
     private func remember(_ status: VMShimProtocol.Status) {
-        guard status.containerID == specification.containerID,
+        guard (try? validateStatus(status)) != nil,
+              status.containerID == specification.containerID,
               status.generation == specification.generation,
               let startTime = status.processStartTime else { return }
         let identity = ProcessIdentity(
@@ -4084,10 +4989,7 @@ public final class VMShimClient: @unchecked Sendable {
     }
 
     private func recordedProcessIdentity() -> ProcessIdentity? {
-        let knownIdentity = storedProcessIdentity()
-        if let knownIdentity, Self.identity(for: knownIdentity.processIdentifier) == knownIdentity {
-            return knownIdentity
-        }
+        if let knownIdentity = storedProcessIdentity() { return knownIdentity }
 
         let statusURL = URL(filePath: specification.socketPath + ".status")
         if let data = try? Data(contentsOf: statusURL),
@@ -4125,12 +5027,33 @@ public final class VMShimClient: @unchecked Sendable {
         return Int32(min(roundedUp, UInt64(Int32.max)))
     }
 
-    private static func waitForExit(
+    static func hasExited(_ identity: ProcessIdentity, observation: ProcessObservation) throws -> Bool {
+        if identity.processIdentifier > 1, identity.startTime > 0 {
+            switch observation {
+            case .absent: return true
+            case .birthOnly(let current)
+                where current.processIdentifier == identity.processIdentifier && current.startTime > 0
+                    && current.startTime != identity.startTime:
+                return true
+            case .process(let current)
+                where current.processIdentifier == identity.processIdentifier && current.startTime > 0:
+                return current != identity
+            default: break
+            }
+        }
+        throw EngineError(
+            .conflict,
+            "VM shim \(identity.processIdentifier) process observation is unknown; containment is unproven; preserve launch artifacts"
+        )
+    }
+
+    static func waitForExit(
         _ identity: ProcessIdentity,
-        timeoutMilliseconds: Int32
-    ) -> Bool {
+        timeoutMilliseconds: Int32,
+        observe: (CInt) -> ProcessObservation = { VMShimClient.observeProcessExit($0) }
+    ) throws -> Bool {
         let deadline = deadline(afterMilliseconds: timeoutMilliseconds)
-        while Self.identity(for: identity.processIdentifier) == identity {
+        while try !hasExited(identity, observation: observe(identity.processIdentifier)) {
             if remainingMilliseconds(until: deadline) == 0 { return false }
             usleep(10_000)
         }
@@ -4145,18 +5068,43 @@ public final class VMShimClient: @unchecked Sendable {
         specification: VMShimProtocol.Specification,
         expectedExecutable: URL
     ) -> Bool {
-        specification.kind == .storage
-            && specification.containerID == "cengine-storage"
-            && inspection.identityBefore == peerIdentity
-            && inspection.identityAfter == peerIdentity
-            && inspection.arguments.count == 4
-            && launchPathsMatch(inspection.executablePath, expectedExecutable.path)
-            && launchPathsMatch(inspection.arguments[0], expectedExecutable.path)
-            && inspection.arguments[1] == "vm-shim"
-            && inspection.arguments[2] == "--spec"
-            && launchPathsMatch(
+        guard specification.kind == .storage,
+              specification.containerID == "cengine-storage",
+              inspection.identityBefore == peerIdentity,
+              inspection.identityAfter == peerIdentity,
+              inspection.arguments.count >= 4,
+              launchPathsMatch(inspection.executablePath, expectedExecutable.path),
+              launchPathsMatch(inspection.arguments[0], expectedExecutable.path),
+              inspection.arguments[1] == "vm-shim",
+              inspection.arguments[2] == "--spec" else { return false }
+        guard let launch = specification.shimLaunchUUID else {
+            return inspection.arguments.count == 4 && launchPathsMatch(
                 inspection.arguments[3], specificationURL(for: specification).path
             )
+        }
+        // Current storage shims launch from an immutable generation, with the
+        // specification digest and inherited writer descriptor in their argv.
+        // Lifecycle launches additionally inherit the private channel in its exact
+        // trailing slot. This authorizes shutdown only, never backend adoption.
+        guard let generation = try? RawStorageShimRecovery.publishedGeneration(for: specification),
+              generation.specification == specification,
+              generation.record.process.pid == peerIdentity.processIdentifier,
+              generation.record.process.startSeconds == peerIdentity.startTime / 1_000_000,
+              generation.record.process.startMicroseconds == peerIdentity.startTime % 1_000_000,
+              RawStorageShimRecovery.liveness(generation.record.process,
+                  observation: RawStorageShimRecovery.observe(peerIdentity.processIdentifier)) == .alive,
+              (inspection.arguments.count == 8 ||
+                (inspection.arguments.count == 10 &&
+                 inspection.arguments[8] == "--storage-lifecycle-fd" &&
+                 inspection.arguments[9] == String(storageLifecycleDescriptor))),
+              inspection.arguments[4] == "--spec-sha256",
+              inspection.arguments[5] == generation.record.intent.specificationSHA256,
+              inspection.arguments[6] == "--storage-disk-fd",
+              inspection.arguments[7] == String(storageDiskDescriptor) else { return false }
+        let path = specificationURL(for: specification).deletingLastPathComponent()
+            .appending(path: RawStorageShimRecovery.directoryName)
+            .appending(path: launch).appending(path: "spec.json")
+        return launchPathsMatch(inspection.arguments[3], path.path)
     }
 
     private static func administrativePeerIdentity(descriptor: CInt) throws -> ProcessIdentity {
@@ -4215,25 +5163,67 @@ public final class VMShimClient: @unchecked Sendable {
         identity(for: processIdentifier)?.startTime
     }
 
+    /// Optional identities are only for positive ownership checks, never death.
     private static func identity(for processIdentifier: CInt) -> ProcessIdentity? {
-        guard processIdentifier > 1 else { return nil }
+        guard case let .process(identity) = observeProcess(processIdentifier) else { return nil }
+        return identity
+    }
+
+    /// macOS can deny PROC_PIDTBSDINFO for a reused, foreign-UID PID while
+    /// KERN_PROC_PID still exposes its birth. Keep this out of positive identity
+    /// paths: even an equal birth is unknown, never permission to signal.
+    /// Darwin sys/sysctl.h (KERN_PROC_PID), sys/proc.h (kinfo_proc/external proc).
+    static func observeProcessExit(
+        _ processIdentifier: CInt,
+        primary: (CInt) -> ProcessObservation = { VMShimClient.observeProcess($0) },
+        query: (CInt, inout kinfo_proc, inout Int) -> CInt = { pid, information, size in
+            var mib: [CInt] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+            return sysctl(&mib, UInt32(mib.count), &information, &size, nil, 0)
+        }
+    ) -> ProcessObservation {
+        guard processIdentifier > 1 else { return .unknown }
+        let observation = primary(processIdentifier)
+        guard observation == .unknown else { return observation }
+        var information = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        guard query(processIdentifier, &information, &size) == 0,
+              size == MemoryLayout<kinfo_proc>.size,
+              information.kp_proc.p_pid == processIdentifier else { return .unknown }
+        let start = information.kp_proc.p_un.__p_starttime
+        guard start.tv_sec > 0, start.tv_usec >= 0, start.tv_usec < 1_000_000 else { return .unknown }
+        let seconds = UInt64(start.tv_sec), microseconds = UInt64(start.tv_usec)
+        guard seconds <= (UInt64.max - microseconds) / 1_000_000 else { return .unknown }
+        return .birthOnly(.init(processIdentifier: processIdentifier,
+            startTime: seconds * 1_000_000 + microseconds))
+    }
+
+    static func observeProcess(
+        _ processIdentifier: CInt,
+        query: (CInt, inout proc_bsdinfo) -> (byteCount: CInt, error: CInt) = { pid, information in
+            errno = 0
+            let count = proc_pidinfo(
+                pid, PROC_PIDTBSDINFO, 0, &information, CInt(MemoryLayout<proc_bsdinfo>.size)
+            )
+            let error = errno
+            return (count, error)
+        }
+    ) -> ProcessObservation {
+        guard processIdentifier > 1 else { return .unknown }
         var information = proc_bsdinfo()
-        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-        guard proc_pidinfo(
-            processIdentifier,
-            PROC_PIDTBSDINFO,
-            0,
-            &information,
-            size
-        ) == size,
-        information.pbi_start_tvsec >= 0,
-        information.pbi_start_tvusec >= 0 else { return nil }
+        let result = query(processIdentifier, &information)
+        guard result.byteCount == CInt(MemoryLayout<proc_bsdinfo>.size) else {
+            return result.byteCount <= 0 && result.error == ESRCH ? .absent : .unknown
+        }
+        guard information.pbi_pid == UInt32(processIdentifier),
+              information.pbi_start_tvsec > 0,
+              information.pbi_start_tvusec < 1_000_000 else { return .unknown }
         let seconds = UInt64(information.pbi_start_tvsec)
         let microseconds = UInt64(information.pbi_start_tvusec)
-        return ProcessIdentity(
+        guard seconds <= (UInt64.max - microseconds) / 1_000_000 else { return .unknown }
+        return .process(ProcessIdentity(
             processIdentifier: processIdentifier,
-            startTime: seconds &* 1_000_000 &+ microseconds
-        )
+            startTime: seconds * 1_000_000 + microseconds
+        ))
     }
 
     private static func wait(

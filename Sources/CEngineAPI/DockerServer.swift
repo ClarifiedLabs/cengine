@@ -1422,7 +1422,16 @@ public final class DockerServer: @unchecked Sendable {
         }
     }
 
-    public func wait() async throws { try await channel?.closeFuture.get() }
+    /// Cancellation stops admission like stop(), then returns after listener close.
+    /// The caller still owns ordered shutdown of the server and runtime resources.
+    public func wait() async throws {
+        guard let channel else { return }
+        try await withTaskCancellationHandler {
+            try await channel.closeFuture.get()
+        } onCancel: {
+            channel.close(promise: nil)
+        }
+    }
     public func stop() async throws {
         if let channel, channel.isActive { try await channel.close().get() }
     }

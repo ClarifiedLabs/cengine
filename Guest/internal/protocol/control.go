@@ -13,13 +13,11 @@ const (
 	PreviousVersion                       = 18
 	DefaultSharedMemorySize         int64 = 64 * 1024 * 1024
 	ControlPort                           = 4100
-	FileSystemPort                        = 4101
 	RootFSContentPort                     = 4102
 	ExecIOPort                            = 4103
 	PortProxyPort                         = 4104
 	SocketProxyPortBase                   = 4200
 	MaxControlFrame                       = 16 << 20
-	MaxFileSystemIO                       = 4 << 20
 	ErrorBadRequest                       = "bad_request"
 	ErrorResourceRollbackIncomplete       = "resource_rollback_incomplete"
 )
@@ -80,7 +78,6 @@ type WorkloadSpec struct {
 	MaskedPaths      []string          `json:"maskedPaths,omitempty"`
 	ReadonlyPaths    []string          `json:"readonlyPaths,omitempty"`
 	StopSignal       string            `json:"stopSignal"`
-	VolumeServer     string            `json:"volumeServer,omitempty"`
 	Mounts           []Mount           `json:"mounts"`
 	Networks         []NetworkEndpoint `json:"networks"`
 	Hosts            map[string]string `json:"hosts,omitempty"`
@@ -122,9 +119,11 @@ type Rlimit struct {
 }
 
 type Mount struct {
-	Kind                   string   `json:"kind"`
-	Source                 string   `json:"source"`
-	Device                 string   `json:"device,omitempty"`
+	Kind   string `json:"kind"`
+	Source string `json:"source"`
+	Device string `json:"device,omitempty"`
+	// ManagedAttachment is nonsecret PID1-injected stage-2 mount metadata.
+	ManagedAttachment      string   `json:"managedAttachment,omitempty"`
 	Destination            string   `json:"destination"`
 	ReadOnly               bool     `json:"readOnly"`
 	Options                []string `json:"options,omitempty"`

@@ -16,6 +16,11 @@ func ConfigureManagement(address string, vlan uint16) error {
 	if err != nil {
 		return err
 	}
+	// The initial guest namespace is created with loopback down. Local
+	// connections to our own management address route through it too.
+	if err := configureManagementLoopback(netlink.LinkByName, netlink.LinkSetUp); err != nil {
+		return err
+	}
 	trunk, err := netlink.LinkByName(trunkName)
 	if err != nil {
 		return err
@@ -41,6 +46,14 @@ func ConfigureManagement(address string, vlan uint16) error {
 		return err
 	}
 	return netlink.LinkSetUp(link)
+}
+
+func configureManagementLoopback(find func(string) (netlink.Link, error), up func(netlink.Link) error) error {
+	loopback, err := find("lo")
+	if err != nil {
+		return err
+	}
+	return up(loopback)
 }
 
 func managementConfiguration(address string, vlan uint16) (*netlink.Addr, error) {

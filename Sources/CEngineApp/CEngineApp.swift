@@ -167,12 +167,12 @@ struct OnboardingView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Welcome to cengine").font(.largeTitle.bold())
-            Text("cengine uses a privileged networking service to connect each container VM to macOS through vmnet.")
+            Text("cengine uses a Privileged Helper for VM networking and managed storage.")
             Text("macOS requires administrator approval before the engine can start.")
                 .foregroundStyle(.secondary)
             HStack {
                 Spacer()
-                Button("Enable VM Networking") { Task { await complete() } }
+                Button("Enable Privileged Helper") { Task { await complete() } }
                     .keyboardShortcut(.defaultAction)
             }
         }

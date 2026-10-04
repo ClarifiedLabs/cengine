@@ -1,0 +1,117 @@
+// Test-only Go overlay: host file executor, NOT Linux filesystem semantics.
+package storageserver
+
+import (
+	a "dev.cengine/guest/internal/storageauthority"
+	m "dev.cengine/guest/internal/storagemanaged"
+	w "dev.cengine/guest/internal/storagewire"
+	"errors"
+	"os"
+	"sync"
+)
+
+type rtm103HostExecutor struct {
+	principal *a.DataPrincipal
+	file      *os.File
+}
+
+func rtm103Entry(node w.NodeID, dir bool) w.Entry {
+	mode := uint32(0100444)
+	size := uint64(32)
+	if dir {
+		mode = 0040755
+		size = 0
+	}
+	return w.Entry{Node: node, Generation: 1, Object: w.ObjectID{byte(node)}, Attr: w.Attr{Ino: uint64(node), Mode: mode, Nlink: 1, Size: size, BlockSize: 4096}}
+}
+func (e *rtm103HostExecutor) Dispatch(g *a.Guard, r w.Request) (m.Result, error) {
+	if err := g.ValidateFor(e.principal); err != nil {
+		return m.Result{}, err
+	}
+	reply := w.Reply{Sequence: r.Sequence, Op: r.Body.Operation()}
+	switch b := r.Body.(type) {
+	case w.GetAttrRequest:
+		if b.Node != 1 || b.Handle != nil {
+			return m.Result{}, w.ErrInvalid
+		}
+		reply.Body = w.GetAttrReply{Attr: rtm103Entry(1, true).Attr}
+	case w.LookupRequest:
+		if b.Parent != 1 || string(b.Name) != "rtm103-root-object" {
+			return m.Result{}, w.ErrInvalid
+		}
+		reply.Body = w.LookupReply{Entry: rtm103Entry(2, false)}
+	case w.OpenRequest:
+		if b.Node != 2 || b.Flags != w.OpenReadOnly {
+			return m.Result{}, w.ErrInvalid
+		}
+		reply.Body = w.OpenReply{Opened: w.Opened{Handle: 1}}
+	case w.ReadRequest:
+		if b.Node != 2 || b.Handle != 1 || b.Offset != 0 || b.Size != 4096 {
+			return m.Result{}, w.ErrInvalid
+		}
+		data := make([]byte, 32)
+		n, err := e.file.ReadAt(data, 0)
+		if err != nil || n != 32 {
+			return m.Result{}, w.ErrInvalid
+		}
+		reply.Body = w.ReadReply{Data: data}
+	default:
+		return m.Result{}, w.ErrInvalid
+	}
+	return m.Result{Reply: reply}, nil
+}
+
+// Called before Serve. It changes only executor construction. Real Server.Serve,
+// TLS/PKI, AuthenticateData, per-request Authority.Admit and passive recorder run.
+type RTM103HostRegistry struct {
+	mu    sync.Mutex
+	files map[a.ID]*os.File
+}
+
+func (r *RTM103HostRegistry) Barrier(b a.Binding, root *os.File) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	file := r.files[b.Attachment]
+	if file == nil {
+		return a.ErrInvalid
+	}
+	// Authority has fenced and joined all guards before this call. Close only
+	// this executor's retained descriptor; the original client's FD stays open.
+	err := file.Close()
+	delete(r.files, b.Attachment)
+	return errors.Join(err, root.Sync())
+}
+func (r *RTM103HostRegistry) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var err error
+	for id, file := range r.files {
+		err = errors.Join(err, file.Close())
+		delete(r.files, id)
+	}
+	return err
+}
+func (s *Server) RTM103HostFiles(files map[a.ID]*os.File) *RTM103HostRegistry {
+	registry := &RTM103HostRegistry{files: map[a.ID]*os.File{}}
+	s.factory = func(g *a.Guard, p *a.DataPrincipal, b a.Binding) (executor, w.Entry, error) {
+		if err := g.ValidateFor(p); err != nil {
+			return nil, w.Entry{}, err
+		}
+		file := files[b.Volume]
+		if file == nil {
+			return nil, w.Entry{}, w.ErrInvalid
+		}
+		registry.mu.Lock()
+		defer registry.mu.Unlock()
+		if registry.files[b.Attachment] != nil {
+			return nil, w.Entry{}, a.ErrConflict
+		}
+		owned, err := os.Open(file.Name())
+		if err != nil {
+			return nil, w.Entry{}, err
+		}
+		registry.files[b.Attachment] = owned
+		return &rtm103HostExecutor{p, owned}, rtm103Entry(1, true), nil
+	}
+	return registry
+}

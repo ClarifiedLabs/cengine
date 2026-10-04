@@ -7,24 +7,6 @@ import Foundation
 import NIOPosix
 import OSLog
 
-private final class DaemonLock {
-    private let descriptor: Int32
-
-    init(url: URL) throws {
-        descriptor = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
-        guard descriptor >= 0 else { throw EngineError(.internalError, "could not open daemon lock at \(url.path)") }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            close(descriptor)
-            throw EngineError(.conflict, "another cengine daemon is already running")
-        }
-    }
-
-    deinit {
-        flock(descriptor, LOCK_UN)
-        close(descriptor)
-    }
-}
-
 @main enum CEngineMain {
     static let logger = Logger(subsystem: "dev.cengine.engine", category: "main")
     private static let retryDelays: [Duration] = [.seconds(30), .seconds(120)]
@@ -35,13 +17,17 @@ private final class DaemonLock {
             let command = arguments.first ?? "help"
             if !arguments.isEmpty { arguments.removeFirst() }
             switch command {
+            #if CENGINE_STORAGE_LIFECYCLE_QUALIFICATION
+            case "storage-lifecycle-qualification": try await StorageLifecycleQualification.run(arguments: arguments)
+            case StorageLifecycleQualificationShim.argument: try await StorageLifecycleQualificationShim.run(arguments: [command] + arguments)
+            #endif
             case "daemon": try await daemon(arguments, managed: false)
             case "service": try await service(arguments)
             case "builder": try await builder(arguments)
             case "container": try container(arguments)
             case "run": try await run(arguments)
             case "vm-shim": try await vmShim(arguments)
-            case "network-helper": try await networkHelper(arguments)
+            case "helper": try await helper(arguments)
             case "version", "--version": print("cengine \(CEngineVersion.shortVersion())")
             case "system": try await system(arguments)
             case "help", "--help", "-h": usage()
@@ -54,27 +40,31 @@ private final class DaemonLock {
     }
 
     private static func daemon(_ arguments: [String], managed: Bool) async throws {
+        guard !arguments.contains(where: { $0 == "--shared-storage" || $0.hasPrefix("--shared-storage=") }) else {
+            throw EngineError(.badRequest, "unsupported option: --shared-storage; storage is selected automatically")
+        }
+        let metadataOnly = arguments.contains("--metadata-only")
         let paths = EnginePaths()
         try paths.createDirectories()
         let socket = option("--socket", in: arguments) ?? paths.socket.path
         let lockURL = URL(filePath: socket + ".lock")
-        let daemonLock = try DaemonLock(url: lockURL)
+        let daemonLock = try DaemonSocketLock(url: lockURL)
         defer { withExtendedLifetime(daemonLock) {} }
         let requestedRoot = option("--root", in: arguments).map {
             URL(filePath: $0, directoryHint: .isDirectory)
         } ?? paths.data
-        try FileManager.default.createDirectory(
-            at: requestedRoot, withIntermediateDirectories: true
-        )
-        let root = requestedRoot.resolvingSymlinksInPath().standardizedFileURL
-        // API endpoints are configurable: different sockets must still exclude
-        // concurrent writers and upgrade teardown for the same engine data root.
-        let rootLock = try DaemonLock(url: root.appending(path: ".daemon.lock"))
-        defer { withExtendedLifetime(rootLock) {} }
+        let storeLock = try CanonicalDataStoreLock(root: requestedRoot)
+        defer { withExtendedLifetime(storeLock) {} }
+        let root = storeLock.root
         let backend: any ContainerBackend
-        if arguments.contains("--metadata-only") {
+        if metadataOnly {
             backend = MetadataOnlyBackend()
         } else {
+            // Metadata-only never resolves signing, ownership, helper or assets.
+            let sharedStorage = try ManagedStorageStartup.lifecycleConfiguration()
+            if sharedStorage.policy.namespace == .production {
+                try await ProductionStorageOwnerSetup.checkCurrentOwner()
+            }
             let kernel = option("--kernel", in: arguments).map { URL(filePath: $0) } ?? paths.kernel
             let containerInitialRamdisk = option("--container-initramfs", in: arguments).map { URL(filePath: $0) } ?? paths.containerInitialRamdisk
             let storageInitialRamdisk = option("--storage-initramfs", in: arguments).map { URL(filePath: $0) } ?? paths.storageInitialRamdisk
@@ -85,6 +75,9 @@ private final class DaemonLock {
                   FileManager.default.fileExists(atPath: storageInitialRamdisk.path) else {
                 throw EngineError(.notFound, "cengine guest initramfs assets are not installed; run `cengine system install`")
             }
+            try GuestAssetInstaller.diskBootstrapMetadata(kernel: kernel,
+                containerInitialRamdisk: containerInitialRamdisk,
+                storageInitialRamdisk: storageInitialRamdisk).requireLifecycleStorageSupport(policy: sharedStorage.policy)
             let automaticNetworkPool = try AutomaticNetworkPool(
                 ipv4CIDR: option("--automatic-ipv4-pool", in: arguments)
                     ?? AutomaticNetworkPool.default.ipv4CIDR,
@@ -96,10 +89,20 @@ private final class DaemonLock {
                 kernel: kernel,
                 containerInitialRamdisk: containerInitialRamdisk,
                 storageInitialRamdisk: storageInitialRamdisk,
-                automaticNetworkPool: automaticNetworkPool
+                automaticNetworkPool: automaticNetworkPool,
+                sharedStorage: sharedStorage,
+                compatibilityStoreLock: storeLock
             )
         }
         let runtime = try await EngineRuntime(root: root, backend: backend)
+        let replacementTrigger: ManagedStorageReplacementTrigger?
+        do {
+            replacementTrigger = metadataOnly ? nil : try ManagedStorageReplacementTrigger.start(
+                storeLock: storeLock, runtime: runtime)
+        } catch {
+            await runtime.shutdown()
+            throw error
+        }
         let admission = APIAdmissionController()
         let resourceScopes = ContainerResourceScopeManager(
             runtime: runtime, root: root, admission: admission
@@ -115,14 +118,17 @@ private final class DaemonLock {
         )
         do {
             try await server.start()
+            if managed {
+                try SystemManager.writeState(.running, message: nil, paths: paths)
+                SystemManager.configureBuildx()
+            }
         } catch {
+            await replacementTrigger?.stop()
             try? await server.shutdown()
             try? await resourceScopes.shutdown()
+            await runtime.shutdown()
+            await replacementTrigger?.join()
             throw error
-        }
-        if managed {
-            try SystemManager.writeState(.running, message: nil, paths: paths)
-            SystemManager.configureBuildx()
         }
         logger.info("listening on \(socket, privacy: .public)")
 
@@ -139,13 +145,17 @@ private final class DaemonLock {
 
         do {
             try await server.wait()
+            await replacementTrigger?.stop()
             try await server.shutdown()
             try await resourceScopes.shutdown()
             await runtime.shutdown()
+            await replacementTrigger?.join()
         } catch {
+            await replacementTrigger?.stop()
             try? await server.shutdown()
             try? await resourceScopes.shutdown()
             await runtime.shutdown()
+            await replacementTrigger?.join()
             throw error
         }
         if managed { try? SystemManager.writeState(.stopped, message: nil, paths: paths) }
@@ -154,9 +164,40 @@ private final class DaemonLock {
     private static func vmShim(_ arguments: [String]) async throws -> Never {
         guard let path = option("--spec", in: arguments) else { throw EngineError(.badRequest, "vm-shim requires --spec") }
         let launchIntentURL = option("--launch-intent", in: arguments).map { URL(filePath: $0) }
+        let specificationSHA256 = option("--spec-sha256", in: arguments)
+        guard launchIntentURL != nil || specificationSHA256 != nil else {
+            throw EngineError(.badRequest, "vm-shim requires --spec-sha256 without --launch-intent")
+        }
+        if let specificationSHA256 {
+            guard specificationSHA256.utf8.count == 64,
+                  specificationSHA256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw EngineError(.badRequest, "invalid vm-shim specification digest")
+            }
+        }
+        let storageDiskDescriptor: Int32?
+        if let value = option("--storage-disk-fd", in: arguments) {
+            guard let descriptor = Int32(value), descriptor > STDERR_FILENO else {
+                throw EngineError(.badRequest, "invalid storage disk descriptor")
+            }
+            storageDiskDescriptor = descriptor
+        } else {
+            storageDiskDescriptor = nil
+        }
+        let storageLifecycleDescriptor: Int32?
+        if let value = option("--storage-lifecycle-fd", in: arguments) {
+            guard let descriptor = Int32(value), descriptor > STDERR_FILENO else {
+                throw EngineError(.badRequest, "invalid storage lifecycle descriptor")
+            }
+            storageLifecycleDescriptor = descriptor
+        } else {
+            storageLifecycleDescriptor = nil
+        }
         return try await VMShimServer.run(
             specificationURL: URL(filePath: path),
-            launchIntentURL: launchIntentURL
+            launchIntentURL: launchIntentURL,
+            expectedSpecificationSHA256: specificationSHA256,
+            storageDiskDescriptor: storageDiskDescriptor,
+            storageLifecycleDescriptor: storageLifecycleDescriptor
         )
     }
 
@@ -257,13 +298,13 @@ private final class DaemonLock {
                 try FileManager.default.createDirectory(
                     at: options.lock.deletingLastPathComponent(), withIntermediateDirectories: true
                 )
-                let lock = try await acquireUpgradeLock(options.lock)
+                let lock = try await acquireUpgradeLock { try DaemonSocketLock(url: options.lock) }
                 defer { withExtendedLifetime(lock) {} }
                 try FileManager.default.createDirectory(at: options.root, withIntermediateDirectories: true)
-                let rootLock = try await acquireUpgradeLock(options.root.appending(path: ".daemon.lock"))
+                let rootLock = try await acquireUpgradeLock { try CanonicalDataStoreLock(root: options.root) }
                 defer { withExtendedLifetime(rootLock) {} }
                 count = try await VMShimTeardown.terminateAll(
-                    in: options.root, requireCompleteShutdown: true
+                    in: options.root, requireCompleteShutdown: true, storeLock: rootLock
                 )
             } else {
                 count = try await VMShimTeardown.terminateAll(in: options.root)
@@ -311,11 +352,11 @@ private final class DaemonLock {
         return (root ?? paths.data, socket.map { URL(filePath: $0.path + ".lock") } ?? paths.lock, forUpgrade)
     }
 
-    private static func acquireUpgradeLock(_ url: URL) async throws -> DaemonLock {
+    private static func acquireUpgradeLock<Lock>(_ acquire: () throws -> Lock) async throws -> Lock {
         let deadline = ContinuousClock.now + .seconds(10)
         while true {
             try Task.checkCancellation()
-            do { return try DaemonLock(url: url) }
+            do { return try acquire() }
             catch let error as EngineError where error.code == .conflict {
                 guard ContinuousClock.now < deadline else {
                     throw EngineError(.conflict, "engine is still running; stop its service before upgrading VMs")
@@ -325,18 +366,44 @@ private final class DaemonLock {
         }
     }
 
-    private static func networkHelper(_ arguments: [String]) async throws {
+    private static func helper(_ arguments: [String]) async throws {
         let status: NetworkHelperStatus
         switch arguments.first ?? "status" {
-        case "status": status = try await NetworkHelperControl.status()
-        case "restart": status = try await NetworkHelperControl.restart()
-        default: throw EngineError(.badRequest, "network-helper command is not implemented")
+        case "status":
+            let options = Array(arguments.dropFirst())
+            let requirement: NetworkHelperCapabilities.Requirement?
+            if options.isEmpty {
+                requirement = nil
+            } else if options.count == 2, options[0] == "--require-managed",
+                      let parsed = NetworkHelperCapabilities.Requirement(rawValue: options[1]) {
+                requirement = parsed
+            } else {
+                throw EngineError(.badRequest, "helper status accepts only --require-managed lifecycle-v2|lifecycle-qualification")
+            }
+            status = try await NetworkHelperControl.status(requirement: requirement)
+        case "check-storage-owner", "setup-storage-owner":
+            guard arguments.count == 1 else {
+                throw EngineError(.badRequest, "storage owner commands accept no arguments")
+            }
+            if arguments[0] == "setup-storage-owner" {
+                try await ProductionStorageOwnerSetup.setupCurrentOwner()
+            } else {
+                try await ProductionStorageOwnerSetup.checkCurrentOwner()
+            }
+            print("Storage owner is enrolled")
+            return
+        case "restart":
+            guard arguments.count == 1 else {
+                throw EngineError(.badRequest, "helper restart accepts no arguments")
+            }
+            status = try await NetworkHelperControl.restart()
+        default: throw EngineError(.badRequest, "unknown Privileged Helper command")
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(status)
         guard let output = String(data: data, encoding: .utf8) else {
-            throw EngineError(.internalError, "could not encode networking helper status")
+            throw EngineError(.internalError, "could not encode Privileged Helper status")
         }
         print(output)
     }
@@ -534,7 +601,10 @@ private final class DaemonLock {
           container resources [--cpus COUNT] [--memory GiB]
           run [--socket PATH] [--cpus COUNT] [--memory GiB] -- COMMAND [ARGS...]
           daemon [--socket PATH] [--root PATH] [--kernel PATH] [--container-initramfs PATH] [--storage-initramfs PATH] [--automatic-ipv4-pool CIDR] [--automatic-ipv6-prefix CIDR] [--metadata-only]
-          network-helper status|restart
+          helper status [--require-managed lifecycle-v2|lifecycle-qualification]
+          helper restart (Privileged Helper test control)
+          helper check-storage-owner
+          helper setup-storage-owner (explicit administrator approval)
           service run
           system status|doctor|shutdown|install|uninstall
           system configure-docker [--socket PATH] [--home PATH]

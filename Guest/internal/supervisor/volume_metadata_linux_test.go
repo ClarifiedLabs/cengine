@@ -3,11 +3,15 @@
 package supervisor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"dev.cengine/guest/internal/protocol"
 	"golang.org/x/sys/unix"
@@ -246,6 +250,116 @@ func TestCopyupRecoveryRejectsUntrustedJournal(t *testing.T) {
 				t.Fatal("untrusted journal accepted")
 			}
 			assertVolumeRootMetadata(t, path, original.UID, original.GID, original.Mode)
+		})
+	}
+}
+
+// This exercises local flock only. NFS nolock mounts in different guests do
+// not share this exclusion, and the direct-recovery case records that hazard.
+func TestVolumeCopyupRecoveryRequiresCallerLock(t *testing.T) {
+	const ownerEnvironment = "CENGINE_TEST_COPYUP_LOCK_OWNER"
+	if volume := os.Getenv(ownerEnvironment); volume != "" {
+		fd, err := unix.Open(volume, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(fd)
+		if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
+			t.Fatal(err)
+		}
+		staging := filepath.Join(volume, confinedCopyTransactionName, confinedCopyStagingName)
+		if err := os.MkdirAll(staging, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(staging, "partial"), []byte("live"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprint(os.Stdout, "R"); err != nil {
+			t.Fatal(err)
+		}
+		// The parent kills this initializer before it can publish a manifest.
+		if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	for _, useInitializer := range []bool{true, false} {
+		t.Run(fmt.Sprintf("initializer=%v", useInitializer), func(t *testing.T) {
+			rootfs, volume := t.TempDir(), t.TempDir()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			owner := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestVolumeCopyupRecoveryRequiresCallerLock$")
+			owner.Env = append(os.Environ(), ownerEnvironment+"="+volume)
+			owner.Stderr = os.Stderr
+			input, err := owner.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer input.Close()
+			output, err := owner.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := owner.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waited := false
+			defer func() {
+				if !waited {
+					_ = owner.Process.Kill()
+					_ = owner.Wait()
+				}
+			}()
+			var ready [1]byte
+			if _, err := io.ReadFull(output, ready[:]); err != nil || ready[0] != 'R' {
+				t.Fatalf("lock owner readiness = %q, %v", ready, err)
+			}
+			partial := filepath.Join(volume, confinedCopyTransactionName, confinedCopyStagingName, "partial")
+			if useInitializer {
+				done := make(chan error, 1)
+				started := make(chan struct{})
+				go func() {
+					close(started)
+					done <- initializeVolumeAt(rootfs, volume, protocol.Mount{Destination: "/missing"})
+				}()
+				<-started
+				select {
+				case err := <-done:
+					t.Fatalf("initializer did not wait for live owner: %v", err)
+				case <-time.After(200 * time.Millisecond):
+				}
+				if data, err := os.ReadFile(partial); err != nil || string(data) != "live" {
+					t.Fatalf("live staging changed while locked: %q, %v", data, err)
+				}
+				if err := owner.Process.Kill(); err != nil {
+					t.Fatal(err)
+				}
+				_ = owner.Wait()
+				waited = true
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("initializer did not recover after owner death")
+				}
+			} else {
+				// Model a caller outside the owner's lock domain. Recovery cannot
+				// distinguish this live manifest-less transaction from an orphan.
+				destination, err := openConfinedRoot(volume)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer destination.close()
+				if err := recoverConfinedCopyTransaction(destination); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := os.Lstat(filepath.Join(volume, confinedCopyTransactionName)); !os.IsNotExist(err) {
+				t.Fatalf("uncommitted transaction survived recovery: %v", err)
+			}
 		})
 	}
 }

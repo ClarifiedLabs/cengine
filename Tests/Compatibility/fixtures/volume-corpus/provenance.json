@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "fsx": {
+    "repository": "https://github.com/linux-test-project/ltp",
+    "revision": "dd2d61ac1a1e09797a6165f478abd4a9f4f43035",
+    "path": "testcases/kernel/fs/fsx-linux/fsx-linux.c",
+    "license": "APSL-1.1"
+  },
+  "pjdfstest": {
+    "repository": "https://github.com/pjd/pjdfstest",
+    "revision": "85a8aea9e685999ef0540392fd80535f873d7ff7",
+    "license": "BSD-2-Clause",
+    "rename_provenance": [
+      "00",
+      "10",
+      "13",
+      "14",
+      "18",
+      "20"
+    ]
+  },
+  "bounds": {
+    "fsx_seed": 1,
+    "fsx_operations": 1000,
+    "max_file_bytes": 4194304,
+    "max_operation_bytes": 65536,
+    "child_wall_seconds": 30,
+    "fsx_child_wall_seconds": 150,
+    "pjdfstest_invocations": 23,
+    "host_exec_seconds": 45,
+    "fsx_host_exec_seconds": 165,
+    "shared_peer_invocations": 8,
+    "host_exec_output_bytes": 1048576,
+    "fsx_diagnostic_seconds": 20,
+    "fsx_diagnostic_bytes": 32768
+  },
+  "sha256": {
+    "APSL-1.1.txt": "e0d876fffb52c256694d07a262240153a5a2d6b3544362bfdb824312861505f2",
+    "PJDFSTEST-COPYING": "e12b8e42b14e014b3e02f19a6b49de44dfb5f16dec55db1ace0f110be2d71330",
+    "README.md": "9cad291f7f59b60d8951912c750f2e0ddeb820ba8f53201fafed468cb7ba2bcb",
+    "build.py": "fc74f727a38a052b4b1c51202eb54680544708d76c2680827d142591de220a20",
+    "config.h": "bce9835ffde81e1662cd4e36f3ffe90be746a640dd2b8da241b2035e8d274233",
+    "limit.c": "88d7c3797e58e51f6ee18f3f17d43a5f5834b7142ae3d995acc7a901801c9952",
+    "upstream/fsx-linux.c": "cafcbd6a6afcf3486908a601f355c4824f99a2f4a9dbd5153ba5bfeddd738575",
+    "upstream/pjdfstest/configure.ac": "dc7d7ab169304a8efc3f38ee1f04241c1b64570ca485c44aac96cfb1b372be43",
+    "upstream/pjdfstest/pjdfstest.c": "a6c354f2c42015a1d2d538ea4276091278a1e4955bb6a10d0ec9b9838f24a23e",
+    "upstream/pjdfstest/tests/chmod/00.t": "bc77c99a127c5013d6f9604cea06a1216b29d34924d9f026ff272e336107d842",
+    "upstream/pjdfstest/tests/rename/00.t": "39e0c80d41d03671310d1722fbcf8ba30cad92c47bc5b880a426657e75b0d2ec",
+    "upstream/pjdfstest/tests/unlink/00.t": "0d898922eef09e28b3ab6ac2603c80f6c3b4b3a7a2f20ff27ec6e63fc2ba3c93",
+    "upstream/fsstress/global.h": "35da52fad85083d64dba9d1e298908f194f4628ea963ab589bd7ac8f19e52c84",
+    "upstream/fsstress/Makefile": "476e376d586c20c2162f0ec07dd01b79d450b5564957e3769949f3f4d22e00b6",
+    "upstream/fsstress/xfscompat.h": "74be3b8d5276ba4b16bc94ec491266db0c673884aa401abb31db6815e429f668",
+    "upstream/fsstress/COPYING": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+    "upstream/fsstress/fsstress.c": "0ba46a36349d7792ea69ff804a61adbfac4283bce76926b614f3e6c25aac8743",
+    "upstream/pjdfstest/tests/rename/10.t": "89f8aecb8309d68843a497513af9f9403d186a23ddecf7be6e32b540714c4691",
+    "upstream/pjdfstest/tests/rename/14.t": "e9ed6b55d0fb62e89adb4fefc2a4406fc3dc1579f008dde7aebdeb03f1861f87",
+    "upstream/pjdfstest/tests/rename/13.t": "30e1696362de7f724544ba574b1d32c06ae7ead7ff5fbb62d5bfc03e89365297",
+    "upstream/pjdfstest/tests/rename/18.t": "3013e55c7547efd9ab9caf98d0df8a18bf804f5e40ccd4bbff9111f660d9d3d6",
+    "upstream/pjdfstest/tests/rename/20.t": "e1677f52214a36a02d842908bf0eb10dd1dab65035db17d2b9bd08276430f135",
+    "upstream/fsstress/include/tst_common.h": "884274197adbffff6f820163393469003088a09a695beb3095f8f27c60cfadf8"
+  },
+  "fsstress": {
+    "repository": "https://github.com/linux-test-project/ltp",
+    "revision": "dd2d61ac1a1e09797a6165f478abd4a9f4f43035",
+    "paths": [
+      "testcases/kernel/fs/fsstress/fsstress.c",
+      "testcases/kernel/fs/fsstress/global.h",
+      "testcases/kernel/fs/fsstress/xfscompat.h",
+      "testcases/kernel/fs/fsstress/Makefile",
+      "include/tst_common.h",
+      "COPYING"
+    ],
+    "license": "GPL-2.0-only (fsstress.c/global.h); per-file notices retained",
+    "profile": "optional namespace-only soak",
+    "native_directory_argument": [
+      "-d",
+      "."
+    ]
+  },
+  "soak_bounds": {
+    "seeds": [
+      101,
+      202,
+      303,
+      404,
+      505,
+      606,
+      707,
+      808
+    ],
+    "epochs": 8,
+    "workers": 2,
+    "fsstress_operations_per_worker": 128,
+    "max_epoch_entries": 512,
+    "max_epoch_data_bytes": 67108864,
+    "pids_per_container": 16,
+    "memory_per_container_bytes": 268435456,
+    "backend_wall_seconds": 1200,
+    "pass_artifact_bytes": 134217728,
+    "campaign_artifact_bytes": 536870912,
+    "profile_default": "pilot"
+  }
+}

@@ -12,7 +12,14 @@ from docker import errors
 
 
 IMAGE = os.environ.get("CENGINE_TEST_IMAGE", "alpine:latest")
-pytestmark = pytest.mark.oracle
+# Applicability must be decided before daemon-dependent autouse fixtures run.
+pytestmark = [
+    pytest.mark.oracle,
+    pytest.mark.skipif(
+        not os.environ.get("DOCKER_REFERENCE_HOST"),
+        reason="set DOCKER_REFERENCE_HOST to run Docker differential contracts",
+    ),
+]
 
 
 def lifecycle_contract(value: docker.DockerClient, name: str) -> dict:
@@ -51,9 +58,7 @@ def lifecycle_contract(value: docker.DockerClient, name: str) -> dict:
 
 @pytest.mark.compat("ORC-001")
 def test_container_lifecycle_matches_reference_docker(client: docker.DockerClient):
-    host = os.environ.get("DOCKER_REFERENCE_HOST")
-    if not host:
-        pytest.skip("set DOCKER_REFERENCE_HOST to run Docker differential contracts")
+    host = os.environ["DOCKER_REFERENCE_HOST"]
     reference = docker.DockerClient(base_url=host, timeout=180, version="auto")
     try:
         platform = reference.version().get("Platform", {}).get("Name", "")
@@ -107,9 +112,7 @@ def image_metadata_contract(value: docker.DockerClient) -> dict:
 
 @pytest.mark.compat("ORC-002")
 def test_image_metadata_matches_reference_docker(client: docker.DockerClient):
-    host = os.environ.get("DOCKER_REFERENCE_HOST")
-    if not host:
-        pytest.skip("set DOCKER_REFERENCE_HOST to run Docker differential contracts")
+    host = os.environ["DOCKER_REFERENCE_HOST"]
     reference = docker.DockerClient(base_url=host, timeout=180, version="auto")
     try:
         if reference.version().get("Platform", {}).get("Name", "") == "cengine":
@@ -275,9 +278,7 @@ def runtime_process_context_contract(
 
 @pytest.mark.compat("ORC-003")
 def test_runtime_process_context_matches_reference_docker(client: docker.DockerClient):
-    host = os.environ.get("DOCKER_REFERENCE_HOST")
-    if not host:
-        pytest.skip("set DOCKER_REFERENCE_HOST to run Docker differential contracts")
+    host = os.environ["DOCKER_REFERENCE_HOST"]
     reference = docker.DockerClient(base_url=host, timeout=180, version="auto")
     try:
         if reference.version().get("Platform", {}).get("Name", "") == "cengine":
@@ -443,9 +444,7 @@ def runtime_error_contract(value: docker.DockerClient, name: str) -> dict:
 
 @pytest.mark.compat("ORC-004")
 def test_runtime_error_contract_against_reference_docker(client: docker.DockerClient):
-    host = os.environ.get("DOCKER_REFERENCE_HOST")
-    if not host:
-        pytest.skip("set DOCKER_REFERENCE_HOST to run Docker differential contracts")
+    host = os.environ["DOCKER_REFERENCE_HOST"]
     reference = docker.DockerClient(base_url=host, timeout=180, version="auto")
     try:
         if reference.version().get("Platform", {}).get("Name", "") == "cengine":

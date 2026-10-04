@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import ctypes
+import errno
+import fcntl
 import hashlib
 import ipaddress
 import json
 import os
 import pathlib
 import re
+import shlex
+import shutil
 import signal
+import stat
+import struct
+import sys
 import subprocess
 import tempfile
 import time
@@ -111,13 +120,19 @@ def persisted_container_record(state: Mapping[str, object], container_id: str) -
 
 COMPATIBILITY_OWNER_FILE = ".cengine-compat-owner"
 COMPATIBILITY_EXECUTABLES_FILE = ".cengine-compat-executables.json"
+COMPATIBILITY_RETAIN_FILE = ".cengine-compat-retain"
 VMNET_TEARDOWN_SETTLE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
 class RuntimeProcess:
     pid: int
-    command: str
+    command: str = ""  # Synthetic process-table tests only; never print argv.
+    executable: str = ""
+    arguments: tuple[str, ...] = ()
+    identity: tuple[int, int, int] | None = None  # start sec/usec + kernel uniqueid
+    pidversion: int | None = None
+    parent_pid: int | None = None  # Kernel lineage, bracketed by the birth snapshots.
 
 
 def compatibility_root_owned_by(directory: pathlib.Path, binary: pathlib.Path) -> bool:
@@ -184,30 +199,327 @@ def register_compatibility_executable(
             temporary.unlink(missing_ok=True)
 
 
-def _runtime_command_has_root(command: str, root_markers: tuple[str, ...]) -> bool:
-    # The CLI consumes the first flag. Never let a later decoy establish ownership.
-    for flag in ("--root", "--spec"):
-        if len(re.findall(r"(?:^|\s)" + flag + r"(?=\s|=|$)", command)) > 1:
+def compatibility_root_retained(directory: pathlib.Path) -> bool:
+    # Even a malformed or symlink marker must prevent automatic deletion.
+    try:
+        (directory / COMPATIBILITY_RETAIN_FILE).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # Unknown marker state is never permission to delete.
+    return True
+
+
+@contextmanager
+def _compatibility_root_claim(directory: pathlib.Path, binary: pathlib.Path):
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError("unsafe compatibility root")
+    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        # Lock the directory inode itself: no removable lock sidecar/generation.
+        fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pinned, visible = os.fstat(parent), directory.lstat()
+        if (pinned.st_dev, pinned.st_ino) != (visible.st_dev, visible.st_ino):
+            raise RuntimeError("compatibility root changed during cleanup claim")
+        if not compatibility_root_owned_by(directory, binary):
+            raise RuntimeError("unowned compatibility root")
+        yield parent
+    finally:
+        os.close(parent)
+
+
+def retain_compatibility_root(directory: pathlib.Path, binary: pathlib.Path, *, reason: str) -> None:
+    if reason not in ("unsafe-disk-phase", "cleanup-incomplete"):
+        raise ValueError("unknown compatibility retention reason")
+    with _compatibility_root_claim(directory, binary) as parent:
+        try:
+            fd = os.open(COMPATIBILITY_RETAIN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+        except FileExistsError:
+            # An explicit retention request from another process must also
+            # invalidate the creating fixture's receipt, without allocating a
+            # second file or changing existing forensic marker contents.
+            fd = os.open(COMPATIBILITY_RETAIN_FILE, os.O_RDONLY | os.O_NOFOLLOW
+                         | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.fchmod(fd, 0o400)
+                    os.fsync(fd)
+            finally:
+                os.close(fd)
+            return
+        try:
+            data = json.dumps({"schemaVersion": 1, "reason": reason}).encode() + b"\n"
+            if os.write(fd, data) != len(data):
+                raise OSError(errno.EIO, "short retention marker write")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(parent)
+
+
+@dataclass(frozen=True)
+class CompatibilityRootRetention:
+    root_identity: tuple[int, int]
+    marker_identity: tuple[int, int, int]
+    contents: bytes
+
+
+def preretain_compatibility_root(
+    directory: pathlib.Path, binary: pathlib.Path,
+) -> CompatibilityRootRetention:
+    """Publish before any managed fixture side effects; never adopt an old marker."""
+    contents = b'{"schemaVersion":1,"reason":"managed-fixture-active"}\n'
+    with _compatibility_root_claim(directory, binary) as parent:
+        root = os.fstat(parent)
+        fd = os.open(COMPATIBILITY_RETAIN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+        try:
+            if os.write(fd, contents) != len(contents):
+                raise OSError(errno.EIO, "short retention marker write")
+            os.fsync(fd)
+            marker = os.fstat(fd)
+        finally:
+            os.close(fd)
+        os.fsync(parent)
+        return CompatibilityRootRetention(
+            (root.st_dev, root.st_ino),
+            (marker.st_dev, marker.st_ino, marker.st_ctime_ns), contents,
+        )
+
+
+def release_compatibility_root(
+    directory: pathlib.Path, binary: pathlib.Path, receipt: CompatibilityRootRetention,
+) -> bool:
+    """Only the creating fixture can release its unchanged pre-retention marker."""
+    with _compatibility_root_claim(directory, binary) as parent:
+        root = os.fstat(parent)
+        if (root.st_dev, root.st_ino) != receipt.root_identity:
             return False
-    for marker in root_markers:
-        if command.startswith("daemon "):
-            if re.search(r"(?:^| )--root " + re.escape(marker) + r"(?: |$)", command):
-                return True
-        elif command.startswith(f"vm-shim --spec {marker}/"):
-            suffix = command[len(f"vm-shim --spec {marker}/"):].split(" ", 1)[0]
-            if suffix and ".." not in pathlib.Path(suffix).parts:
-                return True
-    return False
+        fd = os.open(COMPATIBILITY_RETAIN_FILE, os.O_RDONLY | os.O_NOFOLLOW
+                     | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        try:
+            marker = os.fstat(fd)
+            if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.getuid()
+                    or stat.S_IMODE(marker.st_mode) != 0o600 or marker.st_nlink != 1
+                    or (marker.st_dev, marker.st_ino, marker.st_ctime_ns) != receipt.marker_identity
+                    or os.read(fd, len(receipt.contents) + 1) != receipt.contents):
+                return False
+            visible = os.stat(COMPATIBILITY_RETAIN_FILE, dir_fd=parent, follow_symlinks=False)
+            if (visible.st_dev, visible.st_ino, visible.st_ctime_ns) != receipt.marker_identity:
+                return False
+            # Release is the final marker operation, authorized only after a
+            # clean fixture and proven runtime exit. Do not require a fallible
+            # post-unlink fsync: a crash restoring the marker safely over-retains.
+            os.unlink(COMPATIBILITY_RETAIN_FILE, dir_fd=parent)
+            return True
+        finally:
+            os.close(fd)
 
 
-def _runtime_executable_spellings(executable: pathlib.Path) -> tuple[str, ...]:
-    canonical = str(executable.resolve())
-    # Foundation launches shims using /var even when Python launched their
-    # parent via /private/var. Accept only this verified macOS filesystem alias.
-    if (canonical.startswith("/private/var/")
-            and pathlib.Path("/var").resolve() == pathlib.Path("/private/var")):
-        return canonical, canonical.removeprefix("/private")
-    return (canonical,)
+def remove_compatibility_root(directory: pathlib.Path, binary: pathlib.Path) -> bool:
+    with _compatibility_root_claim(directory, binary):
+        if compatibility_root_retained(directory):
+            return False
+        shutil.rmtree(directory)
+        return True
+
+
+def _kernel_process(pid: int, binary: pathlib.Path | None = None) -> RuntimeProcess | None:
+    """Darwin kernel executable/argv, bracketed by complete birth snapshots."""
+    if sys.platform != "darwin":
+        raise RuntimeError("compatibility runtime ownership requires Darwin process identity")
+    native = ctypes.CDLL(None, use_errno=True)
+    def pidinfo(flavor, size):
+        buffer = ctypes.create_string_buffer(size)
+        count = native.proc_pidinfo(pid, flavor, ctypes.c_uint64(0), buffer, size)
+        if count != size:
+            code = ctypes.get_errno() if count <= 0 else errno.EIO
+            raise OSError(code, "kernel process identity unavailable")
+        return buffer.raw
+    def birth():
+        before = pidinfo(17, 56)  # PROC_PIDUNIQIDENTIFIERINFO, uniqueid at 16.
+        bsd = pidinfo(3, 136)  # proc_bsdinfo: pid at 12, uid at 20, start at 120.
+        after = pidinfo(17, 56)
+        unique = struct.unpack_from("=Q", before, 16)[0]
+        seconds, micros = struct.unpack_from("=QQ", bsd, 120)
+        if (unique == 0 or unique != struct.unpack_from("=Q", after, 16)[0]
+                or struct.unpack_from("=I", bsd, 12)[0] != pid or seconds == 0 or micros >= 1_000_000):
+            raise OSError(errno.EIO, "inconsistent kernel process identity")
+        version = struct.unpack_from("=I", before, 32)[0]
+        if version == 0 or version != struct.unpack_from("=I", after, 32)[0]:
+            raise OSError(errno.EIO, "inconsistent kernel PID version")
+        return (seconds, micros, unique, version, struct.unpack_from("=I", bsd, 16)[0])
+    try:
+        path = ctypes.create_string_buffer(4096)
+        length = native.proc_pidpath(pid, path, len(path))
+        if length <= 0:
+            raise OSError(ctypes.get_errno(), "kernel executable unavailable")
+        executable = os.fsdecode(path.value)
+        if not pathlib.Path(executable).is_absolute():
+            raise OSError(errno.EIO, "invalid kernel executable")
+        if binary is not None and pathlib.Path(executable).resolve() != binary.resolve():
+            return None
+        before = birth()
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2.
+        size = ctypes.c_size_t()
+        if native.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "kernel argv unavailable")
+        if not 4 < size.value <= 1024 * 1024:
+            raise OSError(errno.EIO, "invalid kernel argv length")
+        data = ctypes.create_string_buffer(size.value)
+        if native.sysctl(mib, 3, data, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "kernel argv unavailable")
+        raw = data.raw[:size.value]
+        count = struct.unpack_from("=i", raw)[0]
+        if not 1 <= count <= 4096:
+            raise OSError(errno.EIO, "invalid kernel argv count")
+        end = raw.index(b"\0", 4)
+        index = end + 1 + (-(end - 4 + 1) % struct.calcsize("P"))
+        arguments = []
+        for _ in range(count):
+            end = raw.index(b"\0", index)
+            arguments.append(raw[index:end].decode("utf-8"))
+            index = end + 1
+        # Never decode or retain the environment after the counted argv.
+        final_path = ctypes.create_string_buffer(4096)
+        final_length = native.proc_pidpath(pid, final_path, len(final_path))
+        if final_length <= 0:
+            raise OSError(ctypes.get_errno(), "final kernel executable unavailable")
+        if final_path.value != path.value or birth() != before:
+            raise OSError(errno.EIO, "process identity changed during inspection")
+        return RuntimeProcess(pid, executable=executable, arguments=tuple(arguments),
+                              identity=before[:3], pidversion=before[3], parent_pid=before[4])
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return None
+        # A process can disappear between enumeration and any inspection read.
+        # ENOENT alone is not exit (a live executable may have been unlinked).
+        # One fresh libproc failure with ESRCH proves absence; a live/reused PID,
+        # short reply, or any other uncertainty must preserve the original error.
+        probe = ctypes.create_string_buffer(56)  # PROC_PIDUNIQIDENTIFIERINFO.
+        ctypes.set_errno(0)
+        count = native.proc_pidinfo(pid, 17, ctypes.c_uint64(0), probe, len(probe))
+        if count <= 0 and ctypes.get_errno() == errno.ESRCH:
+            return None
+        raise RuntimeError(f"kernel process inspection failed for PID {pid}, errno {error.errno}") from None
+    except (ValueError, UnicodeError):
+        raise RuntimeError(f"malformed kernel process arguments for PID {pid}") from None
+
+
+def _kernel_process_argv_excludes_runtime(pid: int) -> bool:
+    """True only when kernel argv proves the PID cannot be a runtime launcher.
+
+    Fallback for PIDs whose executable path resists kernel resolution (for
+    example hardened reporter processes) while KERN_PROCARGS2 argv remains
+    readable. The argv comes from the same kernel authority the inspector
+    itself uses, bracketed by the same birth snapshots against PID reuse; a
+    launcher shape it cannot match decides _runtime_matches independently of
+    the executable, so skipping is exactly equivalent to a completed match.
+    Vanished PIDs also return True. Every other uncertainty raises
+    RuntimeError and preserves the caller's fail-closed behavior.
+    """
+    if sys.platform != "darwin":
+        raise RuntimeError("compatibility runtime ownership requires Darwin process identity")
+    native = ctypes.CDLL(None, use_errno=True)
+    def pidinfo(flavor, size):
+        buffer = ctypes.create_string_buffer(size)
+        count = native.proc_pidinfo(pid, flavor, ctypes.c_uint64(0), buffer, size)
+        if count != size:
+            code = ctypes.get_errno() if count <= 0 else errno.EIO
+            raise OSError(code, "kernel process identity unavailable")
+        return buffer.raw
+    def birth():
+        before = pidinfo(17, 56)  # PROC_PIDUNIQIDENTIFIERINFO, uniqueid at 16.
+        bsd = pidinfo(3, 136)  # proc_bsdinfo: pid at 12, uid at 20, start at 120.
+        after = pidinfo(17, 56)
+        unique = struct.unpack_from("=Q", before, 16)[0]
+        seconds, micros = struct.unpack_from("=QQ", bsd, 120)
+        if (unique == 0 or unique != struct.unpack_from("=Q", after, 16)[0]
+                or struct.unpack_from("=I", bsd, 12)[0] != pid or seconds == 0 or micros >= 1_000_000):
+            raise OSError(errno.EIO, "inconsistent kernel process identity")
+        version = struct.unpack_from("=I", before, 32)[0]
+        if version == 0 or version != struct.unpack_from("=I", after, 32)[0]:
+            raise OSError(errno.EIO, "inconsistent kernel PID version")
+        return (seconds, micros, unique, version)
+    try:
+        before = birth()
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2.
+        size = ctypes.c_size_t()
+        if native.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "kernel argv unavailable")
+        if not 4 < size.value <= 1024 * 1024:
+            raise OSError(errno.EIO, "invalid kernel argv length")
+        data = ctypes.create_string_buffer(size.value)
+        if native.sysctl(mib, 3, data, ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "kernel argv unavailable")
+        raw = data.raw[:size.value]
+        count = struct.unpack_from("=i", raw)[0]
+        if not 1 <= count <= 4096:
+            raise OSError(errno.EIO, "invalid kernel argv count")
+        end = raw.index(b"\0", 4)
+        index = end + 1 + (-(end - 4 + 1) % struct.calcsize("P"))
+        arguments = []
+        for _ in range(count):
+            end = raw.index(b"\0", index)
+            arguments.append(raw[index:end].decode("utf-8"))
+            index = end + 1
+        if birth() != before:
+            raise OSError(errno.EIO, "process identity changed during inspection")
+        # Include qualification-only shapes in the uncertainty gate. The private
+        # FD3 shim/controller have no root argv and are NEVER generic kill targets.
+        return not (
+            len(arguments) >= 4 and arguments[1] in ("daemon", "vm-shim", "storage-lifecycle-qualification")
+            or len(arguments) == 2 and arguments[1] in ("--storage-lifecycle-qualification-shim", "--lifecycle-v2")
+        )
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return True
+        # A process can disappear between enumeration and any inspection read.
+        # One fresh libproc failure with ESRCH proves absence; a live/reused PID
+        # or any other uncertainty must preserve the original error.
+        probe = ctypes.create_string_buffer(56)  # PROC_PIDUNIQIDENTIFIERINFO.
+        ctypes.set_errno(0)
+        count = native.proc_pidinfo(pid, 17, ctypes.c_uint64(0), probe, len(probe))
+        if count <= 0 and ctypes.get_errno() == errno.ESRCH:
+            return True
+        raise RuntimeError(f"kernel process argv inspection failed for PID {pid}, errno {error.errno}") from None
+    except (ValueError, UnicodeError):
+        raise RuntimeError(f"malformed kernel process arguments for PID {pid}") from None
+
+
+def _runtime_root(process: RuntimeProcess) -> pathlib.Path | None:
+    args = process.arguments
+    if len(args) < 4 or args[1] not in ("daemon", "vm-shim", "storage-lifecycle-qualification"):
+        return None
+    for flag in ("--root", "--spec"):
+        if sum(value == flag or value.startswith(flag + "=") for value in args) > 1:
+            return None
+    option = "--spec" if args[1] == "vm-shim" else "--root"
+    if args.count(option) != 1:
+        return None
+    index = args.index(option)
+    if index < 2 or index + 1 >= len(args) or not pathlib.Path(args[index + 1]).is_absolute():
+        return None
+    return pathlib.Path(args[index + 1]).resolve()
+
+
+def _runtime_matches(process: RuntimeProcess, binary: pathlib.Path, roots: tuple[pathlib.Path, ...]) -> bool:
+    if pathlib.Path(process.executable).resolve() != binary.resolve():
+        return False
+    path = _runtime_root(process)
+    if path is None:
+        return False
+    if roots:
+        return any(path == root.resolve() if process.arguments[1] != "vm-shim"
+                   else path.is_relative_to(root.resolve()) for root in roots)
+    # Automatic cleanup requires the actual owner marker, not a root-shaped
+    # substring in a socket path or an unrelated argument. Missing roots require
+    # explicitly authorized --root receipts instead of orphan guessing.
+    candidates = (path,) if process.arguments[1] != "vm-shim" else path.parents
+    return any(root.name == "root" and root.parent.name.startswith("cengine-compat-")
+               and compatibility_root_owned_by(root.parent, binary) for root in candidates)
 
 
 def compatibility_runtime_processes(
@@ -224,44 +536,102 @@ def compatibility_runtime_processes(
         directory for directory in candidates
         if directory.is_dir() and compatibility_root_owned_by(directory, binary)
     ]
-    targets = [(binary, roots or tuple(directory / "root" for directory in directories))]
+    targets = [(binary, roots)]
     for directory in directories:
         for executable in compatibility_registered_executables(directory, binary):
             targets.append((executable, (directory / "root",)))
-    prefixes = [
-        (f"{spelling} ", tuple(dict.fromkeys(
-            marker
-            for root in target_roots
-            for marker in (str(root.absolute()), str(root.resolve()))
-        )))
-        for executable, target_roots in targets
-        for spelling in _runtime_executable_spellings(executable)
-    ]
-    if process_table is None:
-        process_table = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-        ).stdout
+    candidates = []
+    if process_table is not None:
+        # Pure matcher fixtures only. Real cleanup never treats a ps line as
+        # executable, argv or process-birth authority.
+        for line in process_table.splitlines():
+            fields = line.strip().split(maxsplit=1)
+            if len(fields) != 2 or not fields[0].isdigit():
+                continue
+            try:
+                args = tuple(shlex.split(fields[1]))
+            except ValueError:
+                continue
+            if args:
+                candidates.append(RuntimeProcess(int(fields[0]), fields[1], args[0], args))
+    else:
+        table = subprocess.run(["ps", "-axo", "pid=,uid="], check=True, text=True,
+                               stdout=subprocess.PIPE, timeout=5).stdout
+        for line in table.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and all(value.isdigit() for value in fields) and int(fields[1]) == os.getuid():
+                try:
+                    process = None
+                    for executable, _ in targets:
+                        process = _kernel_process(int(fields[0]), executable)
+                        if process is not None:
+                            break
+                except RuntimeError:
+                    # A live hardened process can refuse executable-path
+                    # resolution while kernel argv remains available. Kernel
+                    # argv is the same authority the inspector itself uses; a
+                    # launcher shape it cannot match decides _runtime_matches
+                    # independently of the executable. Anything else preserves
+                    # the original uncertainty instead of skipping blindly.
+                    if _kernel_process_argv_excludes_runtime(int(fields[0])):
+                        continue
+                    raise
+                if process is not None:
+                    candidates.append(process)
+    return [process for process in candidates
+            if any(_runtime_matches(process, executable, target_roots)
+                   for executable, target_roots in targets)]
 
-    matches: list[RuntimeProcess] = []
-    for line in process_table.splitlines():
-        fields = line.strip().split(maxsplit=1)
-        if len(fields) != 2 or not fields[0].isdigit():
-            continue
-        command = fields[1]
-        for binary_prefix, root_markers in prefixes:
-            if not command.startswith(binary_prefix):
-                continue
-            arguments = command[len(binary_prefix):]
-            if not arguments.startswith(("daemon ", "vm-shim ")):
-                continue
-            if not _runtime_command_has_root(arguments, root_markers):
-                continue
-            matches.append(RuntimeProcess(pid=int(fields[0]), command=command))
-            break
-    return matches
+
+def compatibility_process_diagnostic(pid: int, binary: pathlib.Path) -> dict:
+    """Exact lsof-reported PIDs only; never emit environment or arbitrary argv."""
+    process = _kernel_process(pid)
+    if process is None:
+        return {"pid": pid, "state": "absent"}
+    result = {"pid": pid, "executable": process.executable, "birth": process.identity,
+              "pidversion": process.pidversion}
+    if pathlib.Path(process.executable).resolve() == binary.resolve():
+        args = process.arguments
+        result["argv0"] = args[0][:1024] if args else ""
+        result["role"] = args[1] if len(args) > 1 and args[1] in ("daemon", "vm-shim", "storage-lifecycle-qualification") else "other"
+        allowed = {"--root", "--spec", "--spec-sha256", "--storage-disk-fd", "--launch-intent"}
+        result["arguments"] = {key: args[index + 1][:1024] for index, key in enumerate(args[:-1])
+                               if key in allowed and args.count(key) == 1}
+    return result
+
+
+def compatibility_disk_holder_diagnostics(records: str, binary: pathlib.Path) -> list[dict]:
+    pids = list(dict.fromkeys(int(line[1:]) for line in records.splitlines()
+                             if line.startswith("p") and line[1:].isdigit()))[:16]
+    result = []
+    for pid in pids:
+        try:
+            result.append(compatibility_process_diagnostic(pid, binary))
+        except Exception as error:
+            result.append({"pid": pid, "error_type": type(error).__name__})
+    return result
+
+
+def _signal_runtime_process(process: RuntimeProcess, selected_signal: int) -> None:
+    if process.identity is None or process.pidversion is None:
+        raise RuntimeError(f"missing process birth identity for PID {process.pid}")
+    current = _kernel_process(process.pid)
+    if current is None:
+        return
+    if (current.identity, current.pidversion, current.executable, current.arguments) != (
+            process.identity, process.pidversion, process.executable, process.arguments):
+        raise RuntimeError(f"process ownership changed for PID {process.pid}")
+    _signal_pid_incarnation(process.pid, process.pidversion, selected_signal)
+
+
+def _signal_pid_incarnation(pid: int, pidversion: int, selected_signal: int) -> None:
+    # XNU validates token slots 5/7 atomically; never fall back to kill(pid).
+    # libproc returns an errno value (not -1) on failure.
+    token = (ctypes.c_uint32 * 8)(0, 0, 0, 0, 0, pid, 0, pidversion)
+    native = ctypes.CDLL(None, use_errno=True)
+    result = native.proc_signal_with_audittoken(ctypes.byref(token), selected_signal)
+    if result not in (0, errno.ESRCH):
+        raise RuntimeError(f"incarnation signal failed for PID {pid}, errno {result}")
 
 
 def terminate_compatibility_runtime(
@@ -272,10 +642,7 @@ def terminate_compatibility_runtime(
 ) -> list[RuntimeProcess]:
     processes = compatibility_runtime_processes(binary, roots=roots)
     for process in processes:
-        try:
-            os.kill(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        _signal_runtime_process(process, signal.SIGTERM)
 
     deadline = time.monotonic() + timeout
     remaining = compatibility_runtime_processes(binary, roots=roots)
@@ -283,10 +650,10 @@ def terminate_compatibility_runtime(
         time.sleep(0.05)
         remaining = compatibility_runtime_processes(binary, roots=roots)
     for process in remaining:
-        try:
-            os.kill(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        original = next((value for value in processes if value.pid == process.pid), None)
+        if original is None or original.identity != process.identity:
+            raise RuntimeError(f"new runtime appeared during cleanup: PID {process.pid}")
+        _signal_runtime_process(original, signal.SIGKILL)
 
     deadline = time.monotonic() + timeout
     remaining = compatibility_runtime_processes(binary, roots=roots)
@@ -294,7 +661,7 @@ def terminate_compatibility_runtime(
         time.sleep(0.05)
         remaining = compatibility_runtime_processes(binary, roots=roots)
     if remaining:
-        detail = "\n".join(f"  {value.pid} {value.command}" for value in remaining)
+        detail = ", ".join(str(value.pid) for value in remaining)
         raise RuntimeError(f"could not terminate compatibility runtime processes:\n{detail}")
     if processes:
         # The shim can exit before vmnet and InternetSharing finish releasing the

@@ -510,6 +510,233 @@ import Testing
         #expect(await store.descriptor(for: "local:latest") == nil)
     }
 
+    @Test(arguments: [0, 1, 2])
+    func standardDockerSaveArchiveImportsWithoutOCIIndex(layerCount: Int) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "source")
+        let layout = root.appending(path: "layout")
+        let layers = (0..<layerCount).map { _ in Data(repeating: 0, count: 1_024) }
+        let configuration = try writeStandardDockerLayout(at: source, layers: layers)
+        let archive = root.appending(path: "image.tar")
+        try SystemTar.create(from: source, at: archive)
+        try SystemTar.extract(archive, to: layout)
+        #expect(!FileManager.default.fileExists(atPath: layout.appending(path: "index.json").path))
+        let store = try OCIContentStore(root: root.appending(path: "store"))
+
+        let imported = try await store.importLayout(layout, platforms: [.init(architecture: "arm64", os: "linux")])
+        let image = try await store.image(reference: "compat-save:latest")
+        let configDigest = "sha256:" + SHA256.hash(data: configuration).map { String(format: "%02x", $0) }.joined()
+
+        #expect(imported.map(\.reference).sorted() == ["docker.io/library/compat-save:alias", "docker.io/library/compat-save:latest"])
+        #expect(imported.allSatisfy { $0.id == configDigest })
+        #expect(image.configuration.config?.command == ["/probe", "serve"])
+        #expect(image.configuration.config?.volumes?["/data"] != nil)
+        #expect(image.manifest.layers.count == layerCount)
+        for (descriptor, contents) in zip(image.manifest.layers, layers) {
+            #expect(descriptor.mediaType == "application/vnd.oci.image.layer.v1.tar")
+            #expect(try await store.data(for: descriptor.digest) == contents)
+        }
+        let reopened = try OCIContentStore(root: root.appending(path: "store"))
+        #expect(await reopened.references() == imported.map(\.reference).sorted())
+    }
+
+    @Test(arguments: ["traversal", "absolute", "nul", "config-symlink", "layer-symlink", "directory-symlink", "index-symlink", "invalid-index"])
+    func standardDockerSaveRejectsUnsafePathsAndDoesNotBypassOCIIndex(kind: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = root.appending(path: "layout")
+        let layer = Data(repeating: 0, count: 1_024)
+        let configuration = try writeStandardDockerLayout(at: layout, layers: [layer])
+        let outside = root.appending(path: "outside.json")
+        try configuration.write(to: outside)
+        var configPath = "config.json"
+        let layerPath = "layer0/layer.tar"
+        switch kind {
+        case "traversal": configPath = "../outside.json"
+        case "absolute": configPath = outside.path
+        case "nul": configPath = "config.json\0ignored"
+        case "config-symlink":
+            try FileManager.default.removeItem(at: layout.appending(path: configPath))
+            try FileManager.default.createSymbolicLink(at: layout.appending(path: configPath), withDestinationURL: outside)
+        case "layer-symlink":
+            let outsideLayer = root.appending(path: "outside.tar")
+            try layer.write(to: outsideLayer)
+            try FileManager.default.removeItem(at: layout.appending(path: layerPath))
+            try FileManager.default.createSymbolicLink(at: layout.appending(path: layerPath), withDestinationURL: outsideLayer)
+        case "directory-symlink":
+            try FileManager.default.createSymbolicLink(at: layout.appending(path: "escape"), withDestinationURL: root)
+            configPath = "escape/outside.json"
+        case "index-symlink":
+            // A dangling OCI index must not fall back to a valid Docker manifest.
+            try FileManager.default.createSymbolicLink(at: layout.appending(path: "index.json"), withDestinationURL: root.appending(path: "missing"))
+        default:
+            try Data("not JSON".utf8).write(to: layout.appending(path: "index.json"))
+        }
+        try JSONSerialization.data(withJSONObject: [[
+            "Config": configPath, "RepoTags": ["compat-save:latest"], "Layers": [layerPath],
+        ]]).write(to: layout.appending(path: "manifest.json"))
+        let store = try OCIContentStore(root: root.appending(path: "store"))
+
+        await #expect(throws: (any Error).self) { _ = try await store.importLayout(layout) }
+        #expect(await store.references().isEmpty)
+    }
+
+    @Test(arguments: ["digest", "count", "platform"])
+    func standardDockerSaveRejectsInvalidLayersAndMissingPlatforms(kind: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = root.appending(path: "layout")
+        _ = try writeStandardDockerLayout(at: layout, layers: [Data(repeating: 0, count: 1_024)])
+        if kind == "digest" {
+            try Data("corrupt layer".utf8).write(to: layout.appending(path: "layer0/layer.tar"))
+        } else if kind == "count" {
+            try JSONSerialization.data(withJSONObject: [[
+                "Config": "config.json", "RepoTags": ["compat-save:latest"], "Layers": [String](),
+            ]]).write(to: layout.appending(path: "manifest.json"))
+        }
+        let store = try OCIContentStore(root: root.appending(path: "store"))
+        let platforms: [OCIPlatform] = kind == "platform" ? [.init(architecture: "amd64", os: "linux")] : []
+
+        await #expect(throws: EngineError.self) { _ = try await store.importLayout(layout, platforms: platforms) }
+        #expect(await store.references().isEmpty)
+    }
+
+    @Test(arguments: ["layer", "entry", "platform", "empty-os", "empty-architecture"])
+    func standardDockerSaveValidationFailureLeavesNoNewBlobs(kind: String) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storeRoot = root.appending(path: "store")
+        let store = try OCIContentStore(root: storeRoot)
+        let shared = Data(repeating: 0, count: 1_024)
+        let seed = root.appending(path: "seed")
+        _ = try writeStandardDockerLayout(at: seed, layers: [shared])
+        _ = try await store.importLayout(seed)
+        let previousBlobs = try storedBlobContents(at: storeRoot)
+        let previousReferences = await store.references()
+        let previousIndex = try Data(contentsOf: storeRoot.appending(path: "references.json"))
+        let previousEntries = try FileManager.default.contentsOfDirectory(atPath: storeRoot.path).sorted()
+
+        let layout = root.appending(path: "layout")
+        _ = try writeStandardDockerLayout(at: layout, layers: [shared, Data(repeating: 1, count: 2_048), Data("last layer".utf8)])
+        if kind == "layer" {
+            try Data("invalid trailing layer".utf8).write(to: layout.appending(path: "layer2/layer.tar"))
+        } else if kind.hasPrefix("empty-") {
+            let configURL = layout.appending(path: "config.json")
+            var config = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any])
+            config[String(kind.dropFirst(6))] = ""
+            try JSONSerialization.data(withJSONObject: config).write(to: configURL)
+        } else if kind == "entry" {
+            try JSONSerialization.data(withJSONObject: [
+                ["Config": "config.json", "RepoTags": ["compat-save:latest"], "Layers": ["layer0/layer.tar", "layer1/layer.tar", "layer2/layer.tar"]],
+                ["Config": "missing.json", "RepoTags": ["compat-save:trailing"], "Layers": [String]()],
+            ]).write(to: layout.appending(path: "manifest.json"))
+        }
+        // Validate one selected image before discovering that another requested platform is absent.
+        let platforms: [OCIPlatform] = kind == "platform"
+            ? [.init(architecture: "arm64", os: "linux"), .init(architecture: "amd64", os: "linux")]
+            : []
+        await #expect(throws: EngineError.self) { _ = try await store.importLayout(layout, platforms: platforms) }
+
+        #expect(try storedBlobContents(at: storeRoot) == previousBlobs)
+        #expect(await store.references() == previousReferences)
+        #expect(try Data(contentsOf: storeRoot.appending(path: "references.json")) == previousIndex)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: storeRoot.path).sorted() == previousEntries)
+        let reopened = try OCIContentStore(root: storeRoot)
+        #expect(await reopened.descriptor(for: "compat-save:latest") == store.descriptor(for: "compat-save:latest"))
+    }
+
+    @Test(arguments: [false, true])
+    func standardDockerSaveReferenceWriteFailureRollsBackOnlyNewBlobs(preexisting: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storeRoot = root.appending(path: "store")
+        let store = try OCIContentStore(root: storeRoot)
+        let layout = root.appending(path: "layout")
+        let shared = Data(repeating: 0, count: 1_024)
+        let configuration = try writeStandardDockerLayout(at: layout, layers: [shared, Data(repeating: 1, count: 2_048)])
+        if preexisting {
+            let seed = root.appending(path: "seed")
+            _ = try writeStandardDockerLayout(at: seed, layers: [shared])
+            _ = try await store.importLayout(seed)
+            // Preserve both a referenced shared layer and an identical unreferenced config.
+            _ = try await store.put(configuration, mediaType: "application/vnd.oci.image.config.v1+json")
+        }
+        let previousBlobs = try storedBlobContents(at: storeRoot)
+        let previousReferences = await store.references()
+        let previousDescriptor = await store.descriptor(for: "compat-save:latest")
+        let indexURL = storeRoot.appending(path: "references.json")
+        let backup = storeRoot.appending(path: "saved-references.json")
+        if preexisting { try FileManager.default.moveItem(at: indexURL, to: backup) }
+        // A directory at the ref-file destination deterministically fails the final rename,
+        // after all missing blobs have been published. It works even in privileged tests.
+        try FileManager.default.createDirectory(at: indexURL, withIntermediateDirectories: false)
+        let sentinel = indexURL.appending(path: "sentinel")
+        let sentinelData = Data("must not change".utf8)
+        try sentinelData.write(to: sentinel)
+        let previousEntries = try FileManager.default.contentsOfDirectory(atPath: storeRoot.path).sorted()
+
+        await #expect(throws: POSIXError.self) { _ = try await store.importLayout(layout) }
+
+        #expect(try storedBlobContents(at: storeRoot) == previousBlobs)
+        #expect(await store.references() == previousReferences)
+        #expect(await store.descriptor(for: "compat-save:latest") == previousDescriptor)
+        #expect(try Data(contentsOf: sentinel) == sentinelData)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: storeRoot.path).sorted() == previousEntries)
+        try FileManager.default.removeItem(at: indexURL)
+        if preexisting { try FileManager.default.moveItem(at: backup, to: indexURL) }
+        let reopened = try OCIContentStore(root: storeRoot)
+        #expect(await reopened.references() == previousReferences)
+        #expect(await reopened.descriptor(for: "compat-save:latest") == previousDescriptor)
+        // Rollback leaves the actor usable for a later successful retry.
+        #expect(try await store.importLayout(layout).count == 2)
+    }
+
+    @Test(arguments: [false, true])
+    func standardDockerSaveWithoutTagsKeepsImageIDReference(nullTags: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = root.appending(path: "layout")
+        let config = try writeStandardDockerLayout(at: layout, layers: [])
+        let entry: [String: Any] = [
+            "Config": "config.json", "Layers": [String](),
+            "RepoTags": nullTags ? NSNull() : [String]() as Any,
+        ]
+        try JSONSerialization.data(withJSONObject: [entry]).write(to: layout.appending(path: "manifest.json"))
+        let store = try OCIContentStore(root: root.appending(path: "store"))
+
+        let imported = try await store.importLayout(layout)
+        let digest = "sha256:" + SHA256.hash(data: config).map { String(format: "%02x", $0) }.joined()
+        #expect(imported.map(\.id) == [digest])
+        #expect(await store.references() == [digest])
+    }
+
+    @Test(arguments: [false, true])
+    func standardDockerSaveBoundsRepeatedSourceReads(repeated: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = root.appending(path: "layout")
+        let layer = Data(repeating: 0, count: 1_024)
+        let config = try writeStandardDockerLayout(at: layout, layers: [layer])
+        if repeated {
+            let entry: [String: Any] = ["Config": "config.json", "RepoTags": ["compat-save:latest"], "Layers": ["layer0/layer.tar"]]
+            try JSONSerialization.data(withJSONObject: [entry, entry, entry]).write(to: layout.appending(path: "manifest.json"))
+        }
+        let policy = OCITransferPolicy(
+            metadataBytes: 8_192, tokenBytes: 1_024, errorBodyBytes: 1_024,
+            maximumBlobBytes: 8_192,
+            maximumGraphBytes: repeated ? 2_048 : UInt64(config.count + layer.count - 1),
+            maximumGraphDescriptors: 100, maximumGraphDepth: 32
+        )
+        let store = try OCIContentStore(root: root.appending(path: "store"), transferPolicy: policy)
+
+        await #expect(throws: EngineError.self) { _ = try await store.importLayout(layout) }
+        #expect(await store.references().isEmpty)
+        #expect(try storedBlobContents(at: root.appending(path: "store")).isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.appending(path: "store").path) == ["blobs"])
+
+    }
+
     @Test func layerlessBuildKitDockerArchiveAcceptsNullDiffIDs() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -537,6 +764,37 @@ import Testing
             )
         }
     }
+}
+
+private func storedBlobContents(at root: URL) throws -> [String: Data] {
+    let blobs = root.appending(path: "blobs/sha256")
+    return try Dictionary(uniqueKeysWithValues: FileManager.default.contentsOfDirectory(
+        at: blobs, includingPropertiesForKeys: nil
+    ).map { ($0.lastPathComponent, try Data(contentsOf: $0)) })
+}
+
+private func writeStandardDockerLayout(at layout: URL, layers: [Data]) throws -> Data {
+    try FileManager.default.createDirectory(at: layout, withIntermediateDirectories: true)
+    let diffIDs = layers.map { data in
+        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+    let configuration = try JSONSerialization.data(withJSONObject: [
+        "architecture": "arm64", "os": "linux",
+        "config": ["Cmd": ["/probe", "serve"], "Volumes": ["/data": [String: String]()]] as [String: Any],
+        "rootfs": ["type": "layers", "diff_ids": diffIDs] as [String: Any],
+    ], options: [.sortedKeys])
+    try configuration.write(to: layout.appending(path: "config.json"))
+    var paths: [String] = []
+    for (index, contents) in layers.enumerated() {
+        let directory = layout.appending(path: "layer\(index)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        try contents.write(to: directory.appending(path: "layer.tar"))
+        paths.append("layer\(index)/layer.tar")
+    }
+    try JSONSerialization.data(withJSONObject: [[
+        "Config": "config.json", "RepoTags": ["compat-save:latest", "compat-save:alias"], "Layers": paths,
+    ]], options: [.sortedKeys]).write(to: layout.appending(path: "manifest.json"))
+    return configuration
 }
 
 private func writeBuildKitDockerLayout(

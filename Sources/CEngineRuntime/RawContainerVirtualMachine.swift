@@ -11,8 +11,24 @@ import Foundation
     public private(set) var stopError: Error?
 
     private let machine: VZVirtualMachine
+    #if CENGINE_STORAGE_LIFECYCLE_QUALIFICATION
+    /// Actual VZ state only; not a cached Ready, Guest proof or stop receipt.
+    var qualificationIsRunning: Bool { machine.state == .running }
+    #endif
     private let retainedAttachmentHandles: [FileHandle]
     private let maximumMemoryBytes: UInt64
+    private var lifecycleDiskAttempted = false
+    private var startLifetime = StorageLifecycleVMStartLifetime()
+    let storageLifecycleExit = StorageLifecycleGuestExit()
+    private var freshStorageAbortRequested = false
+    private var lifecycleBootstrapConnection: StorageLifecycleBootstrapConnectionLifetime?
+    private(set) var lifecycleBootstrapCompleted = false
+    private(set) var freshStorageForcedExit = false
+    var storageLifecycleDidTerminate: (@MainActor @Sendable () -> Void)?
+    var storageLifecycleJoinAbort: (@MainActor () async throws -> Bool)?
+    private var privateWorkloadStorage: PrivateWorkloadStorageCoordinator?
+    let rootFSContentTransfers = RootFSContentTransfers()
+    var workloadStorageDidTerminate: (@MainActor @Sendable () -> Void)?
     private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
     private var memoryPressureState = MemoryBalloonPressureState()
     private lazy var timeSynchronizer = GuestTimeSynchronizer(
@@ -39,8 +55,15 @@ import Foundation
         machine.delegate = self
     }
 
-    public func start() async throws {
+    private func startMachine() async throws {
+        // Count before VZ can run or suspend. A thrown start remains uncertain.
+        try startLifetime.beginStart()
         try await machine.start()
+    }
+
+    func start(bootstrap: RawDiskBootTransaction) async throws {
+        try await startMachine()
+        try await initializeDisks(bootstrap)
         let guest = try await GuestTimeSynchronizationTransaction.start {
             let guest = try await self.awaitGuestControl()
             try await self.timeSynchronizer.synchronizeNow()
@@ -93,28 +116,204 @@ import Foundation
         try await guest.synchronizeTime(deadlineNanoseconds: deadline)
     }
 
-    public func startInfrastructure(servicePort: UInt32) async throws {
-        try await machine.start()
+    /// `.initialize`: fresh store; requires this boot's actual initialize+sync+commit.
+    /// `.open`: existing ROOT-signed store; verified held disk WITHOUT ever
+    /// requesting or minting the fresh-initialization capability.
+    enum StorageLifecycleDiskMode: Sendable, Equatable {
+        case initialize, open, resumeReadOnly
+
+        var bootstrapPolicy: RawDiskBootTransaction.Policy {
+            switch self {
+            case .initialize: .journalDriven
+            case .open: .requireInitializedStorage
+            case .resumeReadOnly: .resumeReadOnly
+            }
+        }
+    }
+
+    /// Pure admission seam: `.open` never calls `fresh`.
+    nonisolated static func admitLifecycleDisk<Disk>(_ disk: Disk, mode: StorageLifecycleDiskMode,
+        fresh: (Disk) throws -> Void, held: (Disk) throws -> Void) throws {
+        switch mode {
+        case .initialize: try fresh(disk) // Never adopt a mounted existing disk.
+        case .open, .resumeReadOnly: try held(disk)
+        }
+    }
+
+    /// Split v2 startup: for `.initialize` ROOT allocates the generation after the
+    /// real disk commit, before the private Guest authority is initialized.
+    /// A failed attempt retains leases.
+    func startStorageLifecycleDisk(bootstrap: RawDiskBootTransaction,
+                                   mode: StorageLifecycleDiskMode) async throws -> RawDiskBootTransaction.VerifiedStorageDiskBoot {
+        guard !lifecycleDiskAttempted, machine.state == .stopped else {
+            throw EngineError(.conflict, "lifecycle disk boot is one-shot")
+        }
+        lifecycleDiskAttempted = true
+        let policy = mode.bootstrapPolicy
+        guard bootstrap.policy == policy else { throw EngineError(.conflict, "disk boot policy differs from frozen construction policy") }
+        try Task.checkCancellation()
+        try await startMachine()
+        guard !freshStorageAbortRequested else { throw CancellationError() }
+        try await initializeDisks(bootstrap, policy: policy)
+        lifecycleBootstrapCompleted = true
+        guard !freshStorageAbortRequested else { throw CancellationError() }
+        try Task.checkCancellation()
+        let verified = try bootstrap.verifiedStorageDiskBoot()
+        try Self.admitLifecycleDisk(verified, mode: mode,
+            fresh: { _ = try $0.freshInitialization() }, held: { _ = try $0.validateHeldDisk() })
+        guard machine.state == .running else {
+            throw EngineError(.conflict, "lifecycle VM stopped during disk initialization")
+        }
+        return verified
+    }
+
+    func startManagedWorkload(bootstrap: RawDiskBootTransaction, compatibilityProfile: String? = nil) async throws {
+        try await startMachine()
+        try await initializeDisks(bootstrap)
+        let verified = try bootstrap.verifiedContainerBoot()
         var lastError: Error?
         for attempt in 0..<100 {
+            try Task.checkCancellation()
+            let connection: VZVirtioSocketConnection
             do {
-                let connection = try await connect(toPort: servicePort, timeout: .milliseconds(100))
-                connection.close()
-                return
+                connection = try await connect(toPort: WorkloadStorageProtocol.port, timeout: .milliseconds(100))
             } catch {
                 lastError = error
                 try await Task.sleep(for: .milliseconds(min(25 * (attempt + 1), 250)))
+                continue
+            }
+            let held = SendableVirtioSocketConnection(connection)
+            let coordinator: PrivateWorkloadStorageCoordinator
+            do {
+                coordinator = try PrivateWorkloadStorageCoordinator(verified: verified,
+                    descriptor: connection.fileDescriptor, compatibilityProfile: compatibilityProfile, closeConnection: { held.connection.close() },
+                    onTerminal: { [weak self] in
+                        Task { @MainActor in self?.workloadStorageDidTerminate?() }
+                    })
+            } catch { connection.close(); throw error }
+            privateWorkloadStorage = coordinator
+            _ = try await workloadStorageOperation(coordinator) { try $0.hello() }
+            startMemoryPressureMonitoring()
+            return // Configure follows image-layer streaming, never a second connection.
+        }
+        throw lastError ?? PrivateWorkloadStorageCoordinator.failure()
+    }
+
+    func validateOriginalConsumer(_ binding: OriginalConsumerObservationProtocol.Binding) throws {
+        guard let privateWorkloadStorage else { throw PrivateWorkloadStorageCoordinator.failure() }
+        try privateWorkloadStorage.validateOriginalConsumer(binding)
+    }
+
+    var prepareObserver: PrivatePrepareObservation? { privateWorkloadStorage?.prepareObserver }
+
+    var workloadStorageIsTerminal: Bool { privateWorkloadStorage?.isTerminal ?? false }
+    var permitsManagedRootPreparation: Bool { privateWorkloadStorage?.permitsRootPreparation ?? false }
+
+    func workloadStorageReceipt() throws -> WorkloadStorageBootReceipt {
+        guard let privateWorkloadStorage else { throw PrivateWorkloadStorageCoordinator.failure() }
+        return try privateWorkloadStorage.currentReceipt()
+    }
+
+    func configureWorkloadStorage(_ configuration: WorkloadStorageConfiguration) async throws -> WorkloadStorageBootReceipt {
+        guard let privateWorkloadStorage else { throw PrivateWorkloadStorageCoordinator.failure() }
+        return try await workloadStorageOperation(privateWorkloadStorage) { try $0.configure(configuration) }
+    }
+
+    func workloadStorageCommand(_ command: WorkloadStorageProtocol.Frame) async throws -> WorkloadStorageProtocol.Frame {
+        guard let privateWorkloadStorage else { throw PrivateWorkloadStorageCoordinator.failure() }
+        return try await workloadStorageOperation(privateWorkloadStorage) { try $0.command(command) }
+    }
+
+    func prepareObservation(_ arm: ManagedPrepareCompatibilityProtocol.Arm) async throws -> WorkloadStorageProtocol.Frame {
+        guard let coordinator = privateWorkloadStorage else { throw PrivateWorkloadStorageCoordinator.failure() }
+        return try await withCheckedThrowingContinuation { continuation in
+            Thread.detachNewThread {
+                do { continuation.resume(returning: try coordinator.prepareObservation(arm)) }
+                catch { continuation.resume(throwing: error) }
             }
         }
-        try? await machine.stop()
-        throw lastError ?? EngineError(.internalError, "infrastructure guest service did not become ready")
+    }
+
+    func observeRunningWorkloadStorage(expectedScope: WorkloadStorageProtocol.Scope,
+        deadlineNanoseconds: UInt64) async throws -> WorkloadStorageProtocol.Frame {
+        guard let privateWorkloadStorage else { throw PrivateWorkloadStorageCoordinator.failure() }
+        // The continuation joins the owned synchronous operation, including its
+        // deadline watchdog; socket expiry never leaves an unbounded guest call.
+        return try await workloadStorageOperation(privateWorkloadStorage) {
+            try $0.observeRunningWorkloadStorage(expectedScope: expectedScope, deadlineNanoseconds: deadlineNanoseconds)
+        }
+    }
+
+    private func workloadStorageOperation<Value: Sendable>(_ coordinator: PrivateWorkloadStorageCoordinator,
+        operation: @escaping @Sendable (PrivateWorkloadStorageCoordinator) throws -> Value) async throws -> Value {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                Thread.detachNewThread {
+                    do { continuation.resume(returning: try operation(coordinator)) }
+                    catch { continuation.resume(throwing: error) }
+                }
+            }
+        } onCancel: { coordinator.cancel() }
+    }
+
+    private func initializeDisks(_ transaction: RawDiskBootTransaction,
+                                 policy: RawDiskBootTransaction.Policy = .journalDriven) async throws {
+        var lastError: Error?
+        for attempt in 0..<100 {
+            try Task.checkCancellation()
+            let connection: VZVirtioSocketConnection
+            do {
+                connection = try await connect(toPort: DiskInitializationProtocol.port, timeout: .milliseconds(100))
+            } catch {
+                lastError = error
+                try await Task.sleep(for: .milliseconds(min(25 * (attempt + 1), 250)))
+                continue
+            }
+            // Only connection establishment is retried; a connected session is
+            // consumed even if hello, manifest, acknowledgement or commit fails.
+            let held = SendableVirtioSocketConnection(connection)
+            let lifetime = StorageLifecycleBootstrapConnectionLifetime(
+                revoke: { StorageLifecycleShimRevocation.revokeStream(held.connection.fileDescriptor) },
+                close: { held.connection.close() })
+            defer {
+                lifetime.close()
+                if lifecycleBootstrapConnection === lifetime { lifecycleBootstrapConnection = nil }
+            }
+            if lifecycleDiskAttempted {
+                guard !freshStorageAbortRequested else { throw CancellationError() }
+                lifecycleBootstrapConnection = lifetime
+            }
+            let worker = Task.detached {
+                try transaction.run(descriptor: held.connection.fileDescriptor, policy: policy)
+            }
+            try await withTaskCancellationHandler {
+                try await worker.value
+                if lifecycleDiskAttempted { lifecycleBootstrapCompleted = true }
+                try Task.checkCancellation()
+            } onCancel: {
+                worker.cancel()
+            }
+            return
+        }
+        throw lastError ?? EngineError(.internalError, "disk bootstrap service unavailable")
     }
 
     public func connect(toPort port: UInt32, timeout: Duration = .seconds(5)) async throws -> VZVirtioSocketConnection {
+        try await connect(toPort: port, timeout: timeout,
+                          timeoutError: EngineError(.internalError, "virtio socket connection timed out"))
+    }
+
+    /// Only lifecycle boot needs to distinguish an uncertain timed-out attempt
+    /// from a refused connection. Keep the ordinary connect error contract intact.
+    func connectLifecycleBootPort(timeout: Duration) async throws -> VZVirtioSocketConnection {
+        try await connect(toPort: 4_106, timeout: timeout, timeoutError: VirtioSocketConnectionTimeout())
+    }
+
+    private func connect(toPort port: UInt32, timeout: Duration, timeoutError: any Error) async throws -> VZVirtioSocketConnection {
         guard let socket = machine.socketDevices.first as? VZVirtioSocketDevice else {
             throw EngineError(.internalError, "VM has no virtio socket device")
         }
-        let connection = try await Self.awaitConnection(timeout: timeout) { completion in
+        let connection = try await Self.awaitConnection(timeout: timeout, timeoutError: timeoutError) { completion in
             socket.__connect(toPort: port) { connection, error in
                 completion(connection, error)
             }
@@ -124,10 +323,12 @@ import Foundation
 
     static func awaitConnection(
         timeout: Duration,
+        timeoutError: any Error = EngineError(.internalError, "virtio socket connection timed out"),
         start: (@escaping @MainActor (VZVirtioSocketConnection?, Error?) -> Void) -> Void
     ) async throws -> SendableVirtioSocketConnection {
         try await awaitBoundedResult(
             timeout: timeout,
+            timeoutError: timeoutError,
             start: { completion in
                 start { connection, error in
                     if let connection {
@@ -145,6 +346,7 @@ import Foundation
 
     static func awaitBoundedResult<Value: Sendable>(
         timeout: Duration,
+        timeoutError: any Error = EngineError(.internalError, "virtio socket connection timed out"),
         start: (@escaping @MainActor (Result<Value, Error>) -> Void) -> Void,
         disposeLateSuccess: @escaping @MainActor (Value) -> Void = { _ in }
     ) async throws -> Value {
@@ -156,7 +358,7 @@ import Foundation
             start { attempt.resolve($0) }
             Task { @MainActor in
                 try? await Task.sleep(for: timeout)
-                attempt.resolve(.failure(EngineError(.internalError, "virtio socket connection timed out")))
+                attempt.resolve(.failure(timeoutError))
             }
         }
     }
@@ -197,22 +399,75 @@ import Foundation
         timeSynchronizer.startPeriodic()
     }
 
+    func beginFreshStorageAbort() -> Bool {
+        freshStorageAbortRequested = true
+        let neverStarted = startLifetime.freezeForAbort()
+        let held = lifecycleBootstrapConnection
+        lifecycleBootstrapConnection = nil
+        held?.close(revoking: true)
+        return neverStarted
+    }
+
+    /// Successful stop completion is forced-exit evidence, never clean shutdown.
+    /// A preexisting `.stopped` snapshot or didStopWithError alone cannot release leases.
+    func stopAfterFreshStorageAbort() async throws {
+        guard machine.canStop else {
+            throw BackendResourceRollbackIncompleteError("fresh storage fallback exit unproven")
+        }
+        try await Self.awaitBoundedResult(timeout: .seconds(5), start: { complete in
+            Task { @MainActor in
+                do {
+                    try await self.machine.stop()
+                    // Positive VZ completion remains exit evidence even if the
+                    // bounded waiter already timed out. It cannot change the
+                    // cached clean-abort result or erase the fallback marker.
+                    self.freshStorageForcedExit = true
+                    complete(.success(()))
+                } catch { complete(.failure(error)) }
+            }
+        })
+    }
+
     public func forceStop() async throws {
+        storageLifecycleDidTerminate?()
+        if try await storageLifecycleJoinAbort?() == true { return }
+        await rootFSContentTransfers.cancelAndJoin()
+        privateWorkloadStorage?.close()
         await timeSynchronizer.stop()
         stopMemoryPressureMonitoring()
         control = nil
-        guard machine.canStop else { return }
+        if machine.state == .stopped { return }
+        guard machine.canStop else {
+            throw BackendResourceRollbackIncompleteError("VM stop not proven; retaining disk leases")
+        }
         try await machine.stop()
+        guard machine.state == .stopped else {
+            throw BackendResourceRollbackIncompleteError("VM remains active; retaining disk leases")
+        }
     }
 
     public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        guard virtualMachine === machine else { return }
+        storageLifecycleExit.guestDidStop()
+        storageLifecycleDidTerminate?()
+        rootFSContentTransfers.cancel()
+        let unexpectedPrivateStop = privateWorkloadStorage?.isTerminal == false
+        privateWorkloadStorage?.close()
+        if unexpectedPrivateStop { workloadStorageDidTerminate?() }
         timeSynchronizer.cancel()
         stopMemoryPressureMonitoring()
         control = nil
     }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
+        guard virtualMachine === machine else { return }
+        storageLifecycleExit.didStopWithError()
         stopError = error
+        storageLifecycleDidTerminate?()
+        rootFSContentTransfers.cancel()
+        let unexpectedPrivateStop = privateWorkloadStorage?.isTerminal == false
+        privateWorkloadStorage?.close()
+        if unexpectedPrivateStop { workloadStorageDidTerminate?() }
         timeSynchronizer.cancel()
         stopMemoryPressureMonitoring()
         control = nil
@@ -298,6 +553,8 @@ import Foundation
         )
     }
 }
+
+struct VirtioSocketConnectionTimeout: Error {}
 
 @MainActor private final class BoundedAsyncAttempt<Value: Sendable> {
     private var continuation: CheckedContinuation<Value, Error>?

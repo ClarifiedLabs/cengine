@@ -1,0 +1,1850 @@
+[
+  {
+    "name": "normal",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "normal",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"normal\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "fa8668b48087a67d2696d4481e6a024813e79555d1787832cec18ab15165cd70",
+    "observation": {
+      "sourceAtimes": {
+        "root": 0,
+        "a": 17,
+        "z": 9223372036854775807
+      },
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "fa8668b48087a67d2696d4481e6a024813e79555d1787832cec18ab15165cd70",
+      "stage": "first-child-published",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "copyIntent": "00000004-0000-4000-8000-000000000001",
+      "filesystemUUID": "11111111111111111111111111111111",
+      "manifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifestSize": 100,
+      "root": {
+        "inode": 1,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0100000007000000"
+      },
+      "transaction": {
+        "inode": 2,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0200000007000000"
+      },
+      "published": {
+        "inode": 3,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0300000007000000"
+      },
+      "staged": {
+        "inode": 4,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0400000007000000"
+      }
+    },
+    "observationCanonical": "{\"armDigest\":\"fa8668b48087a67d2696d4481e6a024813e79555d1787832cec18ab15165cd70\",\"copyIntent\":\"00000004-0000-4000-8000-000000000001\",\"count\":1,\"filesystemUUID\":\"11111111111111111111111111111111\",\"manifestDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"manifestSize\":100,\"profile\":\"rtm096-full-nine-v3\",\"published\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0300000007000000\",\"inode\":3},\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"root\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"inode\":1},\"sourceAtimes\":{\"a\":17,\"root\":0,\"z\":9223372036854775807},\"stage\":\"first-child-published\",\"staged\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0400000007000000\",\"inode\":4},\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"transaction\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"inode\":2},\"version\":3}",
+    "observationSHA256": "595255dc7fdb5fbbcd240e87925e00fd5b6fb38758208c15ddfc570d7cac54db"
+  },
+  {
+    "name": "before-prepare-send",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "before-prepare-send",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"before-prepare-send\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "940fd3a638fb5a4bc35d832a785a6551de1fc7e7dbda60a5beb56379f2d202b4",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "940fd3a638fb5a4bc35d832a785a6551de1fc7e7dbda60a5beb56379f2d202b4",
+      "stage": "before-prepare-send",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "requestSequence": 42,
+      "prepareCommandsSent": 0,
+      "prepareCommandsAccepted": 0,
+      "dataBytesWritten": 0
+    },
+    "observationCanonical": "{\"armDigest\":\"940fd3a638fb5a4bc35d832a785a6551de1fc7e7dbda60a5beb56379f2d202b4\",\"count\":1,\"dataBytesWritten\":0,\"prepareCommandsAccepted\":0,\"prepareCommandsSent\":0,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"requestSequence\":42,\"stage\":\"before-prepare-send\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "observationSHA256": "07e8873194616e012300a4c63c59b8d764a5fbf09848620371628e3acd9affdc"
+  },
+  {
+    "name": "guest-accepted-before-prepare",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "guest-accepted-before-prepare",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"guest-accepted-before-prepare\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "34c4234d23a38bec89b5c71c7faf57e541847bed6fa3b271c497c59caec1c512",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "34c4234d23a38bec89b5c71c7faf57e541847bed6fa3b271c497c59caec1c512",
+      "stage": "guest-accepted-before-prepare",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "requestSequence": 42,
+      "prepareCommandsSent": 1,
+      "prepareCommandsAccepted": 1,
+      "dataBytesWritten": 0
+    },
+    "observationCanonical": "{\"armDigest\":\"34c4234d23a38bec89b5c71c7faf57e541847bed6fa3b271c497c59caec1c512\",\"count\":1,\"dataBytesWritten\":0,\"prepareCommandsAccepted\":1,\"prepareCommandsSent\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"requestSequence\":42,\"stage\":\"guest-accepted-before-prepare\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "observationSHA256": "d7f52806ebaa33bae3c343efb9b189d8c2eb790c611e6ed4c6b727e3ab546616"
+  },
+  {
+    "name": "data-partial-frame",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "data-partial-frame",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"data-partial-frame\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "175b57ecc40cca76858cf45973e3c6e306abe4577b6eeca97bbd4a41ebe06ee4",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "175b57ecc40cca76858cf45973e3c6e306abe4577b6eeca97bbd4a41ebe06ee4",
+      "stage": "data-partial-frame",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "requestSequence": 42,
+      "prepareCommandsSent": 1,
+      "prepareCommandsAccepted": 1,
+      "dataBytesWritten": 5
+    },
+    "observationCanonical": "{\"armDigest\":\"175b57ecc40cca76858cf45973e3c6e306abe4577b6eeca97bbd4a41ebe06ee4\",\"count\":1,\"dataBytesWritten\":5,\"prepareCommandsAccepted\":1,\"prepareCommandsSent\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"requestSequence\":42,\"stage\":\"data-partial-frame\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "observationSHA256": "1a619e77e5a804e6d1a4e9cd5cf58d20df5af2db6a3e272680dc211d9f7fb846"
+  },
+  {
+    "storageObservation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "full-frame-before-admit",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "admission": {
+        "requestSequence": 42,
+        "admitted": false,
+        "releaseToken": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    "storageObservationCanonical": "{\"admission\":{\"admitted\":false,\"releaseToken\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"requestSequence\":42},\"armDigest\":\"8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291\",\"count\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"full-frame-before-admit\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "storageObservationSHA256": "ccc568680b6fe4093b7c852a03f6591b98aab4f83c30af7b91898db32f10befd",
+    "name": "full-frame-before-admit",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "full-frame-before-admit",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"full-frame-before-admit\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "full-frame-before-admit",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "admission": {
+        "requestSequence": 42,
+        "admitted": false,
+        "releaseToken": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    "observationCanonical": "{\"admission\":{\"admitted\":false,\"releaseToken\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"requestSequence\":42},\"armDigest\":\"8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291\",\"count\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"full-frame-before-admit\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "observationSHA256": "ccc568680b6fe4093b7c852a03f6591b98aab4f83c30af7b91898db32f10befd",
+    "storageArm": {
+      "arm": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "caseName": "full-frame-before-admit",
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "binding": {
+          "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+          "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+        },
+        "scope": {
+          "intent": "00000004-0000-4000-8000-000000000001",
+          "store": "00000005-0000-4000-8000-000000000001",
+          "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+          "controllerEpoch": 18446744073709551615,
+          "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "containerInstance": "00000007-0000-4000-8000-000000000001",
+          "launch": "00000002-0000-4000-8000-000000000001",
+          "prepare": "00000008-0000-4000-8000-000000000001",
+          "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "mounts": [
+          {
+            "index": 2,
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "destination": "/other",
+            "subpath": "",
+            "mode": "read-only",
+            "noCopy": true
+          },
+          {
+            "index": 0,
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "destination": "/data",
+            "subpath": "",
+            "mode": "read-write",
+            "noCopy": false
+          }
+        ],
+        "slots": [
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000016-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-only"
+          },
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000c-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          }
+        ],
+        "credentials": [
+          {
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          {
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ]
+      },
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageQuery": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageStatus": {
+      "query": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+        "workerUUID": "00000003-0000-4000-8000-000000000001"
+      },
+      "state": "observed",
+      "retirementStarted": false,
+      "acceptedInFlight": 0,
+      "lateAdmissionRejected": false,
+      "receiptReplayCount": 0,
+      "observation": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+        "workerUUID": "00000003-0000-4000-8000-000000000001",
+        "stage": "full-frame-before-admit",
+        "count": 1,
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "admission": {
+          "requestSequence": 42,
+          "admitted": false,
+          "releaseToken": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      }
+    },
+    "storageRelease": {
+      "query": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "8f47df5a1fb2e708b8c51fe61496e56108d57a1842a5bba088a02f6654072291",
+        "workerUUID": "00000003-0000-4000-8000-000000000001"
+      },
+      "stage": "full-frame-before-admit",
+      "token": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  {
+    "storageObservation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "admitted-queued",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "admission": {
+        "requestSequence": 42,
+        "admitted": true,
+        "releaseToken": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    "storageObservationCanonical": "{\"admission\":{\"admitted\":true,\"releaseToken\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"requestSequence\":42},\"armDigest\":\"80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f\",\"count\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"admitted-queued\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "storageObservationSHA256": "b929da2a71bd8620d50fd5ee8fd3dd9b641f08fcc3fec6185ffaed57de23b9cf",
+    "name": "admitted-queued",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "admitted-queued",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"admitted-queued\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "admitted-queued",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "admission": {
+        "requestSequence": 42,
+        "admitted": true,
+        "releaseToken": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    "observationCanonical": "{\"admission\":{\"admitted\":true,\"releaseToken\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"requestSequence\":42},\"armDigest\":\"80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f\",\"count\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"admitted-queued\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "observationSHA256": "b929da2a71bd8620d50fd5ee8fd3dd9b641f08fcc3fec6185ffaed57de23b9cf",
+    "storageArm": {
+      "arm": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "caseName": "admitted-queued",
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "binding": {
+          "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+          "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+        },
+        "scope": {
+          "intent": "00000004-0000-4000-8000-000000000001",
+          "store": "00000005-0000-4000-8000-000000000001",
+          "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+          "controllerEpoch": 18446744073709551615,
+          "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "containerInstance": "00000007-0000-4000-8000-000000000001",
+          "launch": "00000002-0000-4000-8000-000000000001",
+          "prepare": "00000008-0000-4000-8000-000000000001",
+          "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "mounts": [
+          {
+            "index": 2,
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "destination": "/other",
+            "subpath": "",
+            "mode": "read-only",
+            "noCopy": true
+          },
+          {
+            "index": 0,
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "destination": "/data",
+            "subpath": "",
+            "mode": "read-write",
+            "noCopy": false
+          }
+        ],
+        "slots": [
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000016-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-only"
+          },
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000c-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          }
+        ],
+        "credentials": [
+          {
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          {
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ]
+      },
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageQuery": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageStatus": {
+      "query": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+        "workerUUID": "00000003-0000-4000-8000-000000000001"
+      },
+      "state": "observed",
+      "retirementStarted": false,
+      "acceptedInFlight": 0,
+      "lateAdmissionRejected": false,
+      "receiptReplayCount": 0,
+      "observation": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+        "workerUUID": "00000003-0000-4000-8000-000000000001",
+        "stage": "admitted-queued",
+        "count": 1,
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "admission": {
+          "requestSequence": 42,
+          "admitted": true,
+          "releaseToken": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      }
+    },
+    "storageRelease": {
+      "query": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "80f03fbaafecf290c02edd003ba8f5f18e7a475ea7f17bcfc0964ea7d888436f",
+        "workerUUID": "00000003-0000-4000-8000-000000000001"
+      },
+      "stage": "admitted-queued",
+      "token": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  {
+    "storageObservation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "transaction-published-bind-reply-lost",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "bound": {
+        "requestSequence": 43,
+        "intent": {
+          "id": "00000004-0000-4000-8000-000000000001",
+          "owner": {
+            "store": "00000005-0000-4000-8000-000000000001",
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "prepare": "00000008-0000-4000-8000-000000000001",
+            "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "launch": "00000002-0000-4000-8000-000000000001",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "role": "prepare",
+            "mode": "read-write"
+          },
+          "epoch": "00000006-0000-4000-8000-000000000001",
+          "root": {
+            "store": "00000005-0000-4000-8000-000000000001",
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "backing_uuid": "01000000000000000000000000000000",
+            "root": {
+              "inode": 1,
+              "generation": 7,
+              "file_type": 16384,
+              "handle_type": 1,
+              "handle_size": 8,
+              "handle": "0100000007000000"
+            }
+          },
+          "transaction": {
+            "inode": 2,
+            "generation": 7,
+            "file_type": 16384,
+            "handle_type": 1,
+            "handle_size": 8,
+            "handle": "0200000007000000"
+          },
+          "manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "manifest_size": 0,
+          "phase": "BOUND",
+          "initial": {
+            "uid": 501,
+            "gid": 20,
+            "mode": 493,
+            "atime_seconds": "-9223372036854775808",
+            "mtime_seconds": "9223372036854775807",
+            "atime_nanos": 1,
+            "mtime_nanos": 999999999,
+            "manifest": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            },
+            "staging": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            }
+          },
+          "initial_captured": true,
+          "cleanup": {
+            "uid": 0,
+            "gid": 0,
+            "mode": 0,
+            "atime_seconds": "0",
+            "mtime_seconds": "0",
+            "atime_nanos": 0,
+            "mtime_nanos": 0,
+            "manifest": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            },
+            "staging": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            }
+          }
+        }
+      }
+    },
+    "storageObservationCanonical": "{\"armDigest\":\"d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b\",\"bound\":{\"intent\":{\"cleanup\":{\"atime_nanos\":0,\"atime_seconds\":\"0\",\"gid\":0,\"manifest\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"mode\":0,\"mtime_nanos\":0,\"mtime_seconds\":\"0\",\"staging\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"uid\":0},\"epoch\":\"00000006-0000-4000-8000-000000000001\",\"id\":\"00000004-0000-4000-8000-000000000001\",\"initial\":{\"atime_nanos\":1,\"atime_seconds\":\"-9223372036854775808\",\"gid\":20,\"manifest\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"mode\":493,\"mtime_nanos\":999999999,\"mtime_seconds\":\"9223372036854775807\",\"staging\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"uid\":501},\"initial_captured\":true,\"manifest_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"manifest_size\":0,\"owner\":{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"role\":\"prepare\",\"store\":\"00000005-0000-4000-8000-000000000001\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},\"phase\":\"BOUND\",\"root\":{\"backing_uuid\":\"01000000000000000000000000000000\",\"root\":{\"file_type\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"handle_size\":8,\"handle_type\":1,\"inode\":1},\"store\":\"00000005-0000-4000-8000-000000000001\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},\"transaction\":{\"file_type\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"handle_size\":8,\"handle_type\":1,\"inode\":2}},\"requestSequence\":43},\"count\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"transaction-published-bind-reply-lost\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "storageObservationSHA256": "38fb06690de929c793615d7bede8997262cd29d74f19688c1bb9fba6ef3a0ba9",
+    "name": "transaction-published-bind-reply-lost",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "transaction-published-bind-reply-lost",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"transaction-published-bind-reply-lost\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "transaction-published-bind-reply-lost",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "bound": {
+        "requestSequence": 43,
+        "intent": {
+          "id": "00000004-0000-4000-8000-000000000001",
+          "owner": {
+            "store": "00000005-0000-4000-8000-000000000001",
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "prepare": "00000008-0000-4000-8000-000000000001",
+            "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "launch": "00000002-0000-4000-8000-000000000001",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "role": "prepare",
+            "mode": "read-write"
+          },
+          "epoch": "00000006-0000-4000-8000-000000000001",
+          "root": {
+            "store": "00000005-0000-4000-8000-000000000001",
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "backing_uuid": "01000000000000000000000000000000",
+            "root": {
+              "inode": 1,
+              "generation": 7,
+              "file_type": 16384,
+              "handle_type": 1,
+              "handle_size": 8,
+              "handle": "0100000007000000"
+            }
+          },
+          "transaction": {
+            "inode": 2,
+            "generation": 7,
+            "file_type": 16384,
+            "handle_type": 1,
+            "handle_size": 8,
+            "handle": "0200000007000000"
+          },
+          "manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "manifest_size": 0,
+          "phase": "BOUND",
+          "initial": {
+            "uid": 501,
+            "gid": 20,
+            "mode": 493,
+            "atime_seconds": "-9223372036854775808",
+            "mtime_seconds": "9223372036854775807",
+            "atime_nanos": 1,
+            "mtime_nanos": 999999999,
+            "manifest": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            },
+            "staging": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            }
+          },
+          "initial_captured": true,
+          "cleanup": {
+            "uid": 0,
+            "gid": 0,
+            "mode": 0,
+            "atime_seconds": "0",
+            "mtime_seconds": "0",
+            "atime_nanos": 0,
+            "mtime_nanos": 0,
+            "manifest": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            },
+            "staging": {
+              "inode": 0,
+              "generation": 0,
+              "file_type": 0,
+              "handle_type": 0,
+              "handle_size": 0,
+              "handle": "0000000000000000"
+            }
+          }
+        }
+      }
+    },
+    "observationCanonical": "{\"armDigest\":\"d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b\",\"bound\":{\"intent\":{\"cleanup\":{\"atime_nanos\":0,\"atime_seconds\":\"0\",\"gid\":0,\"manifest\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"mode\":0,\"mtime_nanos\":0,\"mtime_seconds\":\"0\",\"staging\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"uid\":0},\"epoch\":\"00000006-0000-4000-8000-000000000001\",\"id\":\"00000004-0000-4000-8000-000000000001\",\"initial\":{\"atime_nanos\":1,\"atime_seconds\":\"-9223372036854775808\",\"gid\":20,\"manifest\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"mode\":493,\"mtime_nanos\":999999999,\"mtime_seconds\":\"9223372036854775807\",\"staging\":{\"file_type\":0,\"generation\":0,\"handle\":\"0000000000000000\",\"handle_size\":0,\"handle_type\":0,\"inode\":0},\"uid\":501},\"initial_captured\":true,\"manifest_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"manifest_size\":0,\"owner\":{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"role\":\"prepare\",\"store\":\"00000005-0000-4000-8000-000000000001\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},\"phase\":\"BOUND\",\"root\":{\"backing_uuid\":\"01000000000000000000000000000000\",\"root\":{\"file_type\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"handle_size\":8,\"handle_type\":1,\"inode\":1},\"store\":\"00000005-0000-4000-8000-000000000001\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},\"transaction\":{\"file_type\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"handle_size\":8,\"handle_type\":1,\"inode\":2}},\"requestSequence\":43},\"count\":1,\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"transaction-published-bind-reply-lost\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "observationSHA256": "38fb06690de929c793615d7bede8997262cd29d74f19688c1bb9fba6ef3a0ba9",
+    "storageArm": {
+      "arm": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "caseName": "transaction-published-bind-reply-lost",
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "binding": {
+          "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+          "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+        },
+        "scope": {
+          "intent": "00000004-0000-4000-8000-000000000001",
+          "store": "00000005-0000-4000-8000-000000000001",
+          "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+          "controllerEpoch": 18446744073709551615,
+          "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "containerInstance": "00000007-0000-4000-8000-000000000001",
+          "launch": "00000002-0000-4000-8000-000000000001",
+          "prepare": "00000008-0000-4000-8000-000000000001",
+          "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "mounts": [
+          {
+            "index": 2,
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "destination": "/other",
+            "subpath": "",
+            "mode": "read-only",
+            "noCopy": true
+          },
+          {
+            "index": 0,
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "destination": "/data",
+            "subpath": "",
+            "mode": "read-write",
+            "noCopy": false
+          }
+        ],
+        "slots": [
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000016-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-only"
+          },
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000c-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          }
+        ],
+        "credentials": [
+          {
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          {
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ]
+      },
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageQuery": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b",
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageStatus": {
+      "query": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b",
+        "workerUUID": "00000003-0000-4000-8000-000000000001"
+      },
+      "state": "observed",
+      "retirementStarted": false,
+      "acceptedInFlight": 0,
+      "lateAdmissionRejected": false,
+      "receiptReplayCount": 0,
+      "observation": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "d66fd7c7a4a71f95825896c63b2ce6f2097f4022913651bd6a5963ca4505995b",
+        "workerUUID": "00000003-0000-4000-8000-000000000001",
+        "stage": "transaction-published-bind-reply-lost",
+        "count": 1,
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "bound": {
+          "requestSequence": 43,
+          "intent": {
+            "id": "00000004-0000-4000-8000-000000000001",
+            "owner": {
+              "store": "00000005-0000-4000-8000-000000000001",
+              "volume": "0000000a-0000-4000-8000-000000000001",
+              "attachment": "0000000b-0000-4000-8000-000000000001",
+              "prepare": "00000008-0000-4000-8000-000000000001",
+              "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "launch": "00000002-0000-4000-8000-000000000001",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "role": "prepare",
+              "mode": "read-write"
+            },
+            "epoch": "00000006-0000-4000-8000-000000000001",
+            "root": {
+              "store": "00000005-0000-4000-8000-000000000001",
+              "volume": "0000000a-0000-4000-8000-000000000001",
+              "backing_uuid": "01000000000000000000000000000000",
+              "root": {
+                "inode": 1,
+                "generation": 7,
+                "file_type": 16384,
+                "handle_type": 1,
+                "handle_size": 8,
+                "handle": "0100000007000000"
+              }
+            },
+            "transaction": {
+              "inode": 2,
+              "generation": 7,
+              "file_type": 16384,
+              "handle_type": 1,
+              "handle_size": 8,
+              "handle": "0200000007000000"
+            },
+            "manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+            "manifest_size": 0,
+            "phase": "BOUND",
+            "initial": {
+              "uid": 501,
+              "gid": 20,
+              "mode": 493,
+              "atime_seconds": "-9223372036854775808",
+              "mtime_seconds": "9223372036854775807",
+              "atime_nanos": 1,
+              "mtime_nanos": 999999999,
+              "manifest": {
+                "inode": 0,
+                "generation": 0,
+                "file_type": 0,
+                "handle_type": 0,
+                "handle_size": 0,
+                "handle": "0000000000000000"
+              },
+              "staging": {
+                "inode": 0,
+                "generation": 0,
+                "file_type": 0,
+                "handle_type": 0,
+                "handle_size": 0,
+                "handle": "0000000000000000"
+              }
+            },
+            "initial_captured": true,
+            "cleanup": {
+              "uid": 0,
+              "gid": 0,
+              "mode": 0,
+              "atime_seconds": "0",
+              "mtime_seconds": "0",
+              "atime_nanos": 0,
+              "mtime_nanos": 0,
+              "manifest": {
+                "inode": 0,
+                "generation": 0,
+                "file_type": 0,
+                "handle_type": 0,
+                "handle_size": 0,
+                "handle": "0000000000000000"
+              },
+              "staging": {
+                "inode": 0,
+                "generation": 0,
+                "file_type": 0,
+                "handle_type": 0,
+                "handle_size": 0,
+                "handle": "0000000000000000"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "first-child-published",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "first-child-published",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"first-child-published\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "04231f9cc8694b98eaa8cc1e13eb0559060dda0c7b27df30a1aed9f081eeb251",
+    "observation": {
+      "sourceAtimes": {
+        "root": 0,
+        "a": 17,
+        "z": 9223372036854775807
+      },
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "04231f9cc8694b98eaa8cc1e13eb0559060dda0c7b27df30a1aed9f081eeb251",
+      "stage": "first-child-published",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "copyIntent": "00000004-0000-4000-8000-000000000001",
+      "filesystemUUID": "11111111111111111111111111111111",
+      "manifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifestSize": 100,
+      "root": {
+        "inode": 1,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0100000007000000"
+      },
+      "transaction": {
+        "inode": 2,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0200000007000000"
+      },
+      "published": {
+        "inode": 3,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0300000007000000"
+      },
+      "staged": {
+        "inode": 4,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0400000007000000"
+      }
+    },
+    "observationCanonical": "{\"armDigest\":\"04231f9cc8694b98eaa8cc1e13eb0559060dda0c7b27df30a1aed9f081eeb251\",\"copyIntent\":\"00000004-0000-4000-8000-000000000001\",\"count\":1,\"filesystemUUID\":\"11111111111111111111111111111111\",\"manifestDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"manifestSize\":100,\"profile\":\"rtm096-full-nine-v3\",\"published\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0300000007000000\",\"inode\":3},\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"root\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"inode\":1},\"sourceAtimes\":{\"a\":17,\"root\":0,\"z\":9223372036854775807},\"stage\":\"first-child-published\",\"staged\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0400000007000000\",\"inode\":4},\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"transaction\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"inode\":2},\"version\":3}",
+    "observationSHA256": "a262dbeb590ed31d1f151f18b66034df4b2494e01e1718ed2cf540dfdb4b6a05"
+  },
+  {
+    "storageObservation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "drain-durable-reply-lost",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "drain": {
+        "retireOperation": "00000004-0000-4000-8000-000000000001",
+        "receipt": {
+          "schema": 3,
+          "store": "00000005-0000-4000-8000-000000000001",
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "launch": "00000002-0000-4000-8000-000000000001",
+          "prepare": "00000008-0000-4000-8000-000000000001",
+          "revision": 18446744073709551615
+        }
+      }
+    },
+    "storageObservationCanonical": "{\"armDigest\":\"f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1\",\"count\":1,\"drain\":{\"receipt\":{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"revision\":18446744073709551615,\"schema\":3,\"store\":\"00000005-0000-4000-8000-000000000001\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},\"retireOperation\":\"00000004-0000-4000-8000-000000000001\"},\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"drain-durable-reply-lost\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "storageObservationSHA256": "0d34fe115f639d01510d5aec169a24371f6edbedd9799d8a0533cd0ec13a47d6",
+    "physicalObservation": {
+      "sourceAtimes": {
+        "root": 0,
+        "a": 17,
+        "z": 9223372036854775807
+      },
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+      "stage": "first-child-published",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "copyIntent": "00000004-0000-4000-8000-000000000001",
+      "filesystemUUID": "11111111111111111111111111111111",
+      "manifestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifestSize": 100,
+      "root": {
+        "inode": 1,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0100000007000000"
+      },
+      "transaction": {
+        "inode": 2,
+        "generation": 7,
+        "fileType": 16384,
+        "handle": "0200000007000000"
+      },
+      "published": {
+        "inode": 3,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0300000007000000"
+      },
+      "staged": {
+        "inode": 4,
+        "generation": 7,
+        "fileType": 32768,
+        "handle": "0400000007000000"
+      }
+    },
+    "physicalObservationCanonical": "{\"armDigest\":\"f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1\",\"copyIntent\":\"00000004-0000-4000-8000-000000000001\",\"count\":1,\"filesystemUUID\":\"11111111111111111111111111111111\",\"manifestDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"manifestSize\":100,\"profile\":\"rtm096-full-nine-v3\",\"published\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0300000007000000\",\"inode\":3},\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"root\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0100000007000000\",\"inode\":1},\"sourceAtimes\":{\"a\":17,\"root\":0,\"z\":9223372036854775807},\"stage\":\"first-child-published\",\"staged\":{\"fileType\":32768,\"generation\":7,\"handle\":\"0400000007000000\",\"inode\":4},\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"transaction\":{\"fileType\":16384,\"generation\":7,\"handle\":\"0200000007000000\",\"inode\":2},\"version\":3}",
+    "physicalObservationSHA256": "12ca48f3e5d634f13e7c97d11f939426bcaa7f0edb3aa63b83da44d838440b2b",
+    "name": "drain-durable-reply-lost",
+    "arm": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "caseName": "drain-durable-reply-lost",
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "binding": {
+        "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+        "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+      },
+      "scope": {
+        "intent": "00000004-0000-4000-8000-000000000001",
+        "store": "00000005-0000-4000-8000-000000000001",
+        "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+        "controllerEpoch": 18446744073709551615,
+        "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "containerInstance": "00000007-0000-4000-8000-000000000001",
+        "launch": "00000002-0000-4000-8000-000000000001",
+        "prepare": "00000008-0000-4000-8000-000000000001",
+        "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "mounts": [
+        {
+          "index": 2,
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "destination": "/other",
+          "subpath": "",
+          "mode": "read-only",
+          "noCopy": true
+        },
+        {
+          "index": 0,
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "destination": "/data",
+          "subpath": "",
+          "mode": "read-write",
+          "noCopy": false
+        }
+      ],
+      "slots": [
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000016-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-only"
+        },
+        {
+          "volume": "00000014-0000-4000-8000-000000000001",
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000c-0000-4000-8000-000000000001",
+          "role": "runtime",
+          "mode": "read-write"
+        },
+        {
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "role": "prepare",
+          "mode": "read-write"
+        }
+      ],
+      "credentials": [
+        {
+          "attachment": "00000015-0000-4000-8000-000000000001",
+          "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    "canonical": "{\"binding\":{\"guestBootNonce\":\"00000003-0000-4000-8000-000000000001\",\"shimLaunchUUID\":\"00000002-0000-4000-8000-000000000001\"},\"caseName\":\"drain-durable-reply-lost\",\"credentials\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"certificateSHA256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"certificateSHA256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"key\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"mounts\":[{\"destination\":\"/data\",\"index\":0,\"mode\":\"read-write\",\"noCopy\":false,\"subpath\":\"\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"destination\":\"/other\",\"index\":2,\"mode\":\"read-only\",\"noCopy\":true,\"subpath\":\"\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"scope\":{\"container\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"containerInstance\":\"00000007-0000-4000-8000-000000000001\",\"controllerEpoch\":18446744073709551615,\"controllerKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":\"00000004-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"serviceEpoch\":\"00000006-0000-4000-8000-000000000001\",\"specificationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"store\":\"00000005-0000-4000-8000-000000000001\"},\"slots\":[{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"0000000c-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"runtime\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},{\"attachment\":\"00000015-0000-4000-8000-000000000001\",\"mode\":\"read-write\",\"role\":\"prepare\",\"volume\":\"00000014-0000-4000-8000-000000000001\"},{\"attachment\":\"00000016-0000-4000-8000-000000000001\",\"mode\":\"read-only\",\"role\":\"runtime\",\"volume\":\"00000014-0000-4000-8000-000000000001\"}],\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3}",
+    "sha256": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+    "observation": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+      "workerUUID": "00000003-0000-4000-8000-000000000001",
+      "stage": "drain-durable-reply-lost",
+      "count": 1,
+      "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+      "drain": {
+        "retireOperation": "00000004-0000-4000-8000-000000000001",
+        "receipt": {
+          "schema": 3,
+          "store": "00000005-0000-4000-8000-000000000001",
+          "volume": "0000000a-0000-4000-8000-000000000001",
+          "attachment": "0000000b-0000-4000-8000-000000000001",
+          "launch": "00000002-0000-4000-8000-000000000001",
+          "prepare": "00000008-0000-4000-8000-000000000001",
+          "revision": 18446744073709551615
+        }
+      }
+    },
+    "observationCanonical": "{\"armDigest\":\"f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1\",\"count\":1,\"drain\":{\"receipt\":{\"attachment\":\"0000000b-0000-4000-8000-000000000001\",\"launch\":\"00000002-0000-4000-8000-000000000001\",\"prepare\":\"00000008-0000-4000-8000-000000000001\",\"revision\":18446744073709551615,\"schema\":3,\"store\":\"00000005-0000-4000-8000-000000000001\",\"volume\":\"0000000a-0000-4000-8000-000000000001\"},\"retireOperation\":\"00000004-0000-4000-8000-000000000001\"},\"profile\":\"rtm096-full-nine-v3\",\"requestID\":\"00000001-0000-4000-8000-000000000001\",\"stage\":\"drain-durable-reply-lost\",\"targetAttachment\":\"0000000b-0000-4000-8000-000000000001\",\"version\":3,\"workerUUID\":\"00000003-0000-4000-8000-000000000001\"}",
+    "observationSHA256": "0d34fe115f639d01510d5aec169a24371f6edbedd9799d8a0533cd0ec13a47d6",
+    "storageArm": {
+      "arm": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "caseName": "drain-durable-reply-lost",
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "binding": {
+          "shimLaunchUUID": "00000002-0000-4000-8000-000000000001",
+          "guestBootNonce": "00000003-0000-4000-8000-000000000001"
+        },
+        "scope": {
+          "intent": "00000004-0000-4000-8000-000000000001",
+          "store": "00000005-0000-4000-8000-000000000001",
+          "serviceEpoch": "00000006-0000-4000-8000-000000000001",
+          "controllerEpoch": 18446744073709551615,
+          "controllerKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "container": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "containerInstance": "00000007-0000-4000-8000-000000000001",
+          "launch": "00000002-0000-4000-8000-000000000001",
+          "prepare": "00000008-0000-4000-8000-000000000001",
+          "specificationDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "mounts": [
+          {
+            "index": 2,
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "destination": "/other",
+            "subpath": "",
+            "mode": "read-only",
+            "noCopy": true
+          },
+          {
+            "index": 0,
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "destination": "/data",
+            "subpath": "",
+            "mode": "read-write",
+            "noCopy": false
+          }
+        ],
+        "slots": [
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000016-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-only"
+          },
+          {
+            "volume": "00000014-0000-4000-8000-000000000001",
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000c-0000-4000-8000-000000000001",
+            "role": "runtime",
+            "mode": "read-write"
+          },
+          {
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "role": "prepare",
+            "mode": "read-write"
+          }
+        ],
+        "credentials": [
+          {
+            "attachment": "00000015-0000-4000-8000-000000000001",
+            "key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "certificateSHA256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          {
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "certificateSHA256": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ]
+      },
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageQuery": {
+      "version": 3,
+      "profile": "rtm096-full-nine-v3",
+      "requestID": "00000001-0000-4000-8000-000000000001",
+      "armDigest": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+      "workerUUID": "00000003-0000-4000-8000-000000000001"
+    },
+    "storageStatus": {
+      "query": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+        "workerUUID": "00000003-0000-4000-8000-000000000001"
+      },
+      "state": "observed",
+      "retirementStarted": false,
+      "acceptedInFlight": 0,
+      "lateAdmissionRejected": false,
+      "receiptReplayCount": 0,
+      "observation": {
+        "version": 3,
+        "profile": "rtm096-full-nine-v3",
+        "requestID": "00000001-0000-4000-8000-000000000001",
+        "armDigest": "f86644d35736f42c05abb30b88221a9b5638913703d2aaf84b3ec83c435545a1",
+        "workerUUID": "00000003-0000-4000-8000-000000000001",
+        "stage": "drain-durable-reply-lost",
+        "count": 1,
+        "targetAttachment": "0000000b-0000-4000-8000-000000000001",
+        "drain": {
+          "retireOperation": "00000004-0000-4000-8000-000000000001",
+          "receipt": {
+            "schema": 3,
+            "store": "00000005-0000-4000-8000-000000000001",
+            "volume": "0000000a-0000-4000-8000-000000000001",
+            "attachment": "0000000b-0000-4000-8000-000000000001",
+            "launch": "00000002-0000-4000-8000-000000000001",
+            "prepare": "00000008-0000-4000-8000-000000000001",
+            "revision": 18446744073709551615
+          }
+        }
+      }
+    }
+  }
+]

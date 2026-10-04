@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -77,6 +78,17 @@ func main() {
 		for {
 			time.Sleep(time.Hour)
 		}
+	case "mountinfo":
+		f, err := os.Open("/proc/self/mountinfo")
+		must(err)
+		data, err := io.ReadAll(io.LimitReader(f, 65537))
+		must(err)
+		must(f.Close())
+		if len(data) > 65536 {
+			panic("mountinfo exceeds bound")
+		}
+		must(json.NewEncoder(os.Stdout).Encode(string(data)))
+		return
 	case "stat":
 		info, err := os.Stat(a[1])
 		must(err)

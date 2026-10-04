@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import resource
 import signal
 import socket
@@ -4316,3 +4317,42 @@ def test_scoped_socket_authenticates_owner_descendants_and_cleans_on_exit(daemon
                 pass
             process.wait(timeout=5)
     wait_for_compat_value(scoped_socket.exists, False, "scope cleanup after owner exit")
+
+
+@pytest.mark.compat("RTM-105")
+def test_disk_mount_sources_name_distinct_block_devices(client: docker.DockerClient):
+    """Each ext4 disk beneath the container names its own /dev node as mount source.
+
+    Linux records the mount(2) source string verbatim as the mount's device name
+    (mountinfo field 10). Per-device consumers such as kubelet's cAdvisor key
+    their partition map by that string and only fall back to `/dev/`-prefixed
+    sources, so one shared `/proc/self/fd/N` spelling for the root disk and a
+    block-backed volume hid the volume's device from kubelet (`KND-001`).
+    """
+    suffix = uuid.uuid4().hex[:8]
+    volume = client.volumes.create(f"mount-source-{suffix}")
+    container = client.containers.create(
+        ALPINE_IMAGE, command=["tail", "-f", "/dev/null"], name=f"mount-source-{suffix}",
+        mounts=[Mount(target="/data", source=volume.name, type="volume")],
+    )
+    try:
+        container.start()
+        result = container.exec_run(["cat", "/proc/self/mountinfo"])
+        assert result.exit_code == 0, result.output.decode(errors="replace")
+        mounts = {}
+        for line in result.output.decode(errors="replace").splitlines():
+            fields = line.split()
+            separator = fields.index("-")
+            mounts[fields[4]] = {
+                "device": fields[2], "filesystem": fields[separator + 1],
+                "source": fields[separator + 2], "raw": line,
+            }
+        root, data = mounts["/"], mounts["/data"]
+        assert (root["filesystem"], data["filesystem"]) == ("ext4", "ext4"), (root, data)
+        assert root["device"] != data["device"], (root, data)
+        for mount in (root, data):
+            assert re.fullmatch(r"/dev/vd[a-z]", mount["source"]), mount
+        assert root["source"] != data["source"], (root, data)
+    finally:
+        container.remove(force=True)
+        volume.remove()

@@ -496,6 +496,7 @@ public struct ContainerSummaryResponse: Codable, Sendable {
     public let Labels: [String: String]
     public let HostConfig: HostConfigSummary
     public let NetworkSettings: NetworkSettingsSummary
+    public let Mounts: [ContainerInspectResponse.MountResponse]
     public let Health: HealthSummary?
 
     public init(_ record: ContainerRecord, networks: [NetworkRecord] = [], version: DockerAPIVersion = .maximum) {
@@ -506,6 +507,8 @@ public struct ContainerSummaryResponse: Codable, Sendable {
         Status = record.phase == .running ? "Up" : record.phase.rawValue.capitalized
         Ports = record.ports.map { .init(IP: $0.hostIP, PrivatePort: $0.containerPort, PublicPort: $0.hostPort, Type: $0.proto) }
         Labels = record.labels
+        // Compose uses list mount identities to inherit anonymous volumes on recreation.
+        Mounts = record.mounts.map { .init($0, version: version) }
         let networkByID = Dictionary(uniqueKeysWithValues: networks.map { ($0.id, $0) })
         let networkMode = record.networkDisabled == true
             ? "none"

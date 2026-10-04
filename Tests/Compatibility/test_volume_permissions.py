@@ -17,6 +17,8 @@ import docker
 from docker.types import Mount
 import pytest
 
+from storage_backend_proof import daemon_startup_mode, verify_backend
+
 
 def _tar(entries):
     output = io.BytesIO()
@@ -115,9 +117,16 @@ def _configure(container, path, uid, gid, mode):
     _probe(container, "configure", path, uid, gid, oct(mode), user="0:0")
 
 
-def _storage_mode(daemon, volume, expected):
+def _storage_mode(daemon, volume, expected, container, destination="/data"):
     modes = json.loads((daemon.root / "volume-storage.json").read_text())
     assert modes[volume.name] == expected
+    text = json.loads(_probe(container, "mountinfo"))
+    proof = verify_backend(daemon.root, expected, text, destination,
+                           startup_mode=daemon_startup_mode(daemon))
+    directory = Path(__file__).resolve().parents[2] / ".build/volume-hunt/backend-proofs"
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / (volume.name + ".jsonl")).open("a") as output:
+        output.write(json.dumps({"container": container.id, "proof": proof}) + "\n")
 
 
 @pytest.mark.compat("RTM-053")
@@ -158,8 +167,8 @@ def test_named_volume_copyup_preserves_root_metadata_and_existing_data(
                 return value
 
             first = target(True)
-            for volume in volumes.values():
-                _storage_mode(daemon, volume, storage)
+            for role, volume in volumes.items():
+                _storage_mode(daemon, volume, storage, first, "/" + role)
             _metadata(first, "/empty", 10001, 10001, 0o700)
             _metadata(first, "/populated", 10001, 20000, 0o3770)
             _metadata(first, "/populated/seed", 10001, 20000, 0o640)
@@ -177,6 +186,8 @@ def test_named_volume_copyup_preserves_root_metadata_and_existing_data(
             first.remove(force=True)
             containers.remove(first)
             second = target(False)
+            for role, volume in volumes.items():
+                _storage_mode(daemon, volume, storage, second, "/" + role)
             _metadata(second, "/existing", 10002, 20002, 0o3710)
             _probe(second, "verify", "/existing/preserved", 10002, 20002, user="10002:20002")
             _probe(second, "absent", "/existing/seed")
@@ -215,7 +226,8 @@ def test_shared_volume_enforces_caller_ownership_permissions_and_groups(
         initializer.start()
         _configure(initializer, "/data", 10001, 10001, 0o700)
         consumer.start()
-        _storage_mode(daemon, volume, "shared")
+        for mounted in containers:
+            _storage_mode(daemon, volume, "shared", mounted)
         # The same descriptor-first check on the workload root is a control.
         _probe(consumer, "create", "/control/local", 10001, 10001)
         _probe(consumer, "create", "/data/private", 10001, 10001)
@@ -253,6 +265,8 @@ def test_shared_volume_enforces_caller_ownership_permissions_and_groups(
         _probe(consumer, "deny", "/data/public/caller-10002-0")
         _probe(initializer, "deny", "/data/public/caller-10001-0", user="10002:10002")
         consumer.restart(timeout=5)
+        for mounted in containers:
+            _storage_mode(daemon, volume, "shared", mounted)
         _probe(consumer, "verify", "/data/private", 10001, 10001)
         _probe(initializer, "verify", "/data/private", 10001, 10001, user="10001:10001")
     finally:

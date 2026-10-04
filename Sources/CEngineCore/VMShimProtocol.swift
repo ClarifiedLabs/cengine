@@ -2,16 +2,23 @@ import Foundation
 
 public enum VMShimProtocol {
     public static let execStreamActivationByte: UInt8 = 1
-    public static let version: UInt32 = 5
+    // Sole lifecycle storage removes v1 operations and the startup selector.
+    public static let version: UInt32 = 7
     public static let maximumFrameSize = 16 * 1_024 * 1_024
     public static let managementVLAN: UInt16 = 4_094
 
-    public enum Operation: String, Codable, Sendable {
+    public enum Operation: String, Codable, Sendable, CaseIterable {
         case boot
         case guest
         case prepareRootFS
         case startExecStream
         case startPortStream
+        case workloadStorageBoot
+        case workloadStorageConfigure
+        case workloadStorageCommand
+        case workloadStoragePrepareObservation
+        case workloadStorageStatus
+        case originalConsumerObservation
         case configureNetwork
         case configureFabric
         case pause
@@ -38,6 +45,7 @@ public enum VMShimProtocol {
         public var operation: Operation
         public var payload: Data?
         public var error: GuestProtocol.Failure?
+        public var deadlineNanoseconds: UInt64?
 
         public init(
             version: UInt32 = VMShimProtocol.version,
@@ -45,7 +53,8 @@ public enum VMShimProtocol {
             token: String,
             operation: Operation,
             payload: Data? = nil,
-            error: GuestProtocol.Failure? = nil
+            error: GuestProtocol.Failure? = nil,
+            deadlineNanoseconds: UInt64? = nil
         ) {
             self.version = version
             self.id = id
@@ -53,6 +62,7 @@ public enum VMShimProtocol {
             self.operation = operation
             self.payload = payload
             self.error = error
+            self.deadlineNanoseconds = deadlineNanoseconds
         }
     }
 
@@ -68,6 +78,7 @@ public enum VMShimProtocol {
         /// UUID of the executable mapped by this process, not the replacement
         /// binary currently at its path. Absent on legacy shims.
         public var executableUUID: UUID?
+        public var shimLaunchUUID: String?
         public var exitCode: Int32?
         public var error: String?
 
@@ -78,19 +89,23 @@ public enum VMShimProtocol {
             processIdentifier: Int32,
             processStartTime: UInt64? = nil,
             executableUUID: UUID? = nil,
+            shimLaunchUUID: String? = nil,
             exitCode: Int32? = nil,
             error: String? = nil
         ) {
             self.containerID = containerID; self.generation = generation; self.state = state
             self.processIdentifier = processIdentifier; self.processStartTime = processStartTime
             self.executableUUID = executableUUID
+            self.shimLaunchUUID = shimLaunchUUID
             self.exitCode = exitCode; self.error = error
         }
     }
 
     public struct Specification: Codable, Sendable, Equatable {
         public enum Kind: String, Codable, Sendable { case container, storage }
+        public enum WorkloadStorageMode: String, Codable, Sendable { case none, managed }
         public var kind: Kind
+        public var workloadStorageMode: WorkloadStorageMode
         public var containerID: String
         public var generation: UInt64
         public var token: String
@@ -109,12 +124,15 @@ public enum VMShimProtocol {
         public var socketPath: String
         public var logPath: String
         public var kernelArguments: [String]
-        public var fileSystemSocketPath: String?
         public var networkSocketPath: String?
         public var networkNamespace: String
         public var vlans: [UInt16]
         public var rosetta: Bool
         public var outputSpool: OutputSpool?
+        /// Missing values identify legacy ownership records, never a new launch.
+        public var shimLaunchUUID: String?
+        public var diskBootstrapVersion: UInt32?
+        public var expectedInitramfsSHA256: String?
 
         public init(
             kind: Kind = .container,
@@ -136,14 +154,18 @@ public enum VMShimProtocol {
             socketPath: String,
             logPath: String,
             kernelArguments: [String] = [],
-            fileSystemSocketPath: String? = nil,
             networkSocketPath: String? = nil,
             networkNamespace: String = "",
             vlans: [UInt16] = [],
             rosetta: Bool = false,
-            outputSpool: OutputSpool? = nil
+            outputSpool: OutputSpool? = nil,
+            shimLaunchUUID: String? = nil,
+            diskBootstrapVersion: UInt32? = nil,
+            expectedInitramfsSHA256: String? = nil,
+            workloadStorageMode: WorkloadStorageMode = .none
         ) {
             self.kind = kind
+            self.workloadStorageMode = workloadStorageMode
             self.containerID = containerID
             self.generation = generation
             self.token = token
@@ -162,12 +184,14 @@ public enum VMShimProtocol {
             self.socketPath = socketPath
             self.logPath = logPath
             self.kernelArguments = kernelArguments
-            self.fileSystemSocketPath = fileSystemSocketPath
             self.networkSocketPath = networkSocketPath
             self.networkNamespace = networkNamespace
             self.vlans = vlans
             self.rosetta = rosetta
             self.outputSpool = outputSpool
+            self.shimLaunchUUID = shimLaunchUUID
+            self.diskBootstrapVersion = diskBootstrapVersion
+            self.expectedInitramfsSHA256 = expectedInitramfsSHA256
         }
 
         // Persisted specifications and prepared-shim journals written before
@@ -176,6 +200,7 @@ public enum VMShimProtocol {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             kind = try container.decode(Kind.self, forKey: .kind)
+            workloadStorageMode = try container.decode(WorkloadStorageMode.self, forKey: .workloadStorageMode)
             containerID = try container.decode(String.self, forKey: .containerID)
             generation = try container.decode(UInt64.self, forKey: .generation)
             token = try container.decode(String.self, forKey: .token)
@@ -194,7 +219,6 @@ public enum VMShimProtocol {
             socketPath = try container.decode(String.self, forKey: .socketPath)
             logPath = try container.decode(String.self, forKey: .logPath)
             kernelArguments = try container.decode([String].self, forKey: .kernelArguments)
-            fileSystemSocketPath = try container.decodeIfPresent(String.self, forKey: .fileSystemSocketPath)
             networkSocketPath = try container.decodeIfPresent(String.self, forKey: .networkSocketPath)
             networkNamespace = try container.decode(String.self, forKey: .networkNamespace)
             vlans = try container.decode([UInt16].self, forKey: .vlans)
@@ -202,6 +226,9 @@ public enum VMShimProtocol {
             outputSpool = try container.decodeIfPresent(
                 OutputSpool.self, forKey: .outputSpool
             )
+            shimLaunchUUID = try container.decodeIfPresent(String.self, forKey: .shimLaunchUUID)
+            diskBootstrapVersion = try container.decodeIfPresent(UInt32.self, forKey: .diskBootstrapVersion)
+            expectedInitramfsSHA256 = try container.decodeIfPresent(String.self, forKey: .expectedInitramfsSHA256)
         }
     }
 

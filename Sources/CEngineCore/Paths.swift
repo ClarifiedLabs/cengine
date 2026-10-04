@@ -33,7 +33,9 @@ public struct EnginePaths: Sendable {
 
     public func createDirectories() throws {
         let fm = FileManager.default
-        try fm.createDirectory(at: data, withIntermediateDirectories: true)
+        try fm.createDirectory(
+            at: data, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
+        )
         try fm.createDirectory(at: runtime, withIntermediateDirectories: true)
         try fm.createDirectory(at: logs, withIntermediateDirectories: true)
     }

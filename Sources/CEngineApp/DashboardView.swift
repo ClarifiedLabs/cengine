@@ -73,8 +73,8 @@ struct DashboardView: View {
                         .font(.title2)
                         .foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("VM networking needs administrator approval").font(.headline)
-                        Text("Allow cengine in Login Items & Extensions before container networking can start.")
+                        Text("Privileged Helper needs administrator approval").font(.headline)
+                        Text("Allow cengine in Login Items & Extensions before container networking and managed storage can start.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -209,7 +209,7 @@ struct DashboardView: View {
             DetailRow(label: "Driver", value: snapshot.info.Driver)
             DetailRow(label: "Architecture", value: snapshot.info.Architecture)
             DetailRow(label: "Kernel", value: snapshot.version.KernelVersion)
-            DetailRow(label: "VM networking", value: model.helperStatus)
+            DetailRow(label: "Privileged Helper", value: model.helperStatus)
             DetailRow(label: "Git commit", value: snapshot.version.GitCommit, selectable: true)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)

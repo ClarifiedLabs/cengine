@@ -30,8 +30,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "CE0000000000000000000037"
-               BuildableName = "cengine-network-helper"
-               BlueprintName = "CEngineNetworkHelper"
+               BuildableName = "cengine-helper"
+               BlueprintName = "CEngineHelper"
                ReferencedContainer = "container:cengine.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>

@@ -1,4 +1,4 @@
-import CEngineCore
+import CEngineHelperSupport
 import Darwin
 import Foundation
 import vmnet
@@ -19,10 +19,11 @@ private struct OwnedHelperVMNetUplink {
     let uplink: HelperVMNetUplink
 }
 
-@main enum CEngineNetworkHelper {
+@main enum CEngineHelper {
     private static let uplinkLock = NSLock()
     nonisolated(unsafe) private static var uplinks: [String: OwnedHelperVMNetUplink] = [:]
     nonisolated(unsafe) private static var isTerminating = false
+    private static let admission = try? StorageBootstrapAdmission.current()
     private static let environment = ProcessInfo.processInfo.environment
     private static let expectedAuthenticationToken = PrivilegedPortProtocol.authenticationToken(
         environment: environment
@@ -32,32 +33,47 @@ private struct OwnedHelperVMNetUplink {
     ] == "1"
 
     static func main() {
+        if StorageLifecycleOwnerAdministration.handles(CommandLine.arguments) {
+            // Root-only administrative owner enrollment (flock-serialized); the helper
+            // re-reads the owner per request. Quiesce the storage lifecycle first.
+            let outcome = StorageLifecycleOwnerAdministration.live(CommandLine.arguments)
+            FileHandle(fileDescriptor: outcome.status == 0 ? 1 : 2).write(Data((outcome.message + "\n").utf8))
+            exit(outcome.status)
+        }
         guard geteuid() == 0 else {
-            FileHandle.standardError.write(Data("cengine-network-helper must run as root\n".utf8))
+            FileHandle.standardError.write(Data("cengine-helper must run as root\n".utf8))
             exit(1)
         }
         if environment[PrivilegedPortProtocol.authenticationTokenFileEnvironmentKey] != nil,
            expectedAuthenticationToken == nil {
             FileHandle.standardError.write(Data(
-                "cengine-network-helper could not load its authentication token\n".utf8
+                "cengine-helper could not load its authentication token\n".utf8
             ))
             exit(1)
         }
+        guard let admission else {
+            FileHandle.standardError.write(Data("cengine-helper requires an authenticated lifecycle profile\n".utf8))
+            exit(1)
+        }
         let listener = xpc_connection_create_mach_service(
-            PrivilegedPortProtocol.serviceName, nil, UInt64(XPC_CONNECTION_MACH_SERVICE_LISTENER)
+            admission.policy.serviceName, nil, UInt64(XPC_CONNECTION_MACH_SERVICE_LISTENER)
         )
         xpc_connection_set_event_handler(listener) { event in
             guard xpc_get_type(event) == XPC_TYPE_CONNECTION else { return }
             let peer: xpc_connection_t = event
-            let team = Bundle.main.object(forInfoDictionaryKey: "CEngineTeamIdentifier") as? String ?? ""
-            let requirement = team.isEmpty
-                ? "identifier \"\(PrivilegedPortProtocol.engineIdentifier)\""
-                : "anchor apple generic and identifier \"\(PrivilegedPortProtocol.engineIdentifier)\" and certificate leaf[subject.OU] = \"\(team)\""
+            guard let requirement = try? admission.listenerRequirement() else {
+                xpc_connection_cancel(peer); return
+            }
             let status = requirement.withCString { xpc_connection_set_peer_code_signing_requirement(peer, $0) }
             guard status == 0 else { xpc_connection_cancel(peer); return }
             let session = HelperPeerSession()
             xpc_connection_set_event_handler(peer) { message in
                 if xpc_get_type(message) == XPC_TYPE_ERROR {
+                    #if CENGINE_STORAGE_LIFECYCLE_QUALIFICATION
+                    StorageBootstrapLifecycleQualification.installed?.disconnected(peer)
+                    #endif
+                    StorageBootstrapLifecycleRouter.existingProductionRouter?.disconnected(peer)
+                    StorageBootstrapLifecycleRouter.existingCompatibilityRouter?.disconnected(peer)
                     Task { await stopUplinks(for: session) }
                     return
                 }
@@ -88,9 +104,48 @@ private struct OwnedHelperVMNetUplink {
         guard xpc_get_type(message) == XPC_TYPE_DICTIONARY,
               let reply = xpc_dictionary_create_reply(message) else { return }
         do {
+            // Read-only production status must not instantiate a lifecycle router.
+            if let operation = xpc_dictionary_get_string(message, "operation"),
+               String(cString: operation) == StorageOwnerStatusProtocol.operation {
+                try StorageLifecycleOwnerStatus.handle(message, reply: reply)
+                xpc_connection_send_message(peer, reply)
+                return
+            }
+            #if CENGINE_STORAGE_LIFECYCLE_QUALIFICATION
+            // v2 ROOT envelopes deliberately have no networking protocol version.
+            // This adapter owns its asynchronous reply and never falls into networking.
+            if let operation = xpc_dictionary_get_string(message, "operation"),
+               admission?.policy.isQualification == true,
+               StorageBootstrapLifecycleQualification.recognizes(String(cString: operation)) {
+                guard let qualification = StorageBootstrapLifecycleQualification.installed else {
+                    throw EngineError(.unsupported, "native storage lifecycle qualification is unavailable")
+                }
+                if try qualification.dispatch(message, reply: reply, peer: peer) { return }
+                throw EngineError(.unsupported, "unsupported native storage lifecycle qualification operation")
+            }
+            #endif
+            if let operation = xpc_dictionary_get_string(message, "operation").map({ String(cString: $0) }),
+               StorageBootstrapLifecycleRouter.recognizes(operation) {
+                guard !uplinkLock.withLock({ isTerminating }) else {
+                    throw EngineError(.internalError, "helper is terminating")
+                }
+                let router: StorageBootstrapLifecycleRouter
+                do { router = try StorageBootstrapLifecycleRouter.ordinaryRouter() }
+                catch { throw EngineError(.unsupported, "native storage lifecycle is unavailable: \(error)") }
+                if try router.dispatch(message, reply: reply, peer: peer) { return }
+                throw EngineError(.unsupported, "unsupported native storage lifecycle operation")
+            }
             guard xpc_dictionary_get_int64(message, "version") == PrivilegedPortProtocol.version else {
                 throw EngineError(.unsupported, "incompatible privileged networking helper protocol")
             }
+            guard !uplinkLock.withLock({ isTerminating }) else {
+                throw EngineError(.internalError, "helper is terminating")
+            }
+            // Closed networking operations and an independently pinned ENGINE role:
+            // neither a controller nor a retired storage operation reaches the token.
+            guard let admission else { throw BootstrapFailure(.unauthorized) }
+            try StorageBootstrapAdmission.requireNetworkingOperation(message)
+            try admission.authenticateNetworking(message)
             try authenticate(message)
             guard let operationValue = xpc_dictionary_get_string(message, "operation") else {
                 throw EngineError(.badRequest, "privileged networking helper request has no operation")
@@ -104,11 +159,17 @@ private struct OwnedHelperVMNetUplink {
                 PrivilegedPortProtocol.buildFingerprint.withCString {
                     xpc_dictionary_set_string(reply, "build-fingerprint", $0)
                 }
-                PrivilegedPortProtocol.serviceName.withCString {
+                admission.policy.serviceName.withCString {
                     xpc_dictionary_set_string(reply, "service-name", $0)
                 }
                 xpc_dictionary_set_uint64(reply, "owner-uid", UInt64(ownerUID()))
                 xpc_dictionary_set_int64(reply, "pid", Int64(getpid()))
+                if let capabilities = StorageBootstrapCapabilities.current() {
+                    let bytes = try NetworkHelperCapabilities.encode(capabilities)
+                    bytes.withUnsafeBytes {
+                        xpc_dictionary_set_data(reply, "capabilities", $0.baseAddress, $0.count)
+                    }
+                }
             case "restart":
                 guard testControlEnabled else {
                     throw EngineError(.unsupported, "networking helper restart control is disabled")
@@ -206,11 +267,19 @@ private struct OwnedHelperVMNetUplink {
     }
 
     private static func beginTermination() -> Bool {
-        uplinkLock.withLock {
+        let began = uplinkLock.withLock {
             guard !isTerminating else { return false }
             isTerminating = true
             return true
         }
+        if began {
+            #if CENGINE_STORAGE_LIFECYCLE_QUALIFICATION
+            StorageBootstrapLifecycleQualification.installed?.quiesce()
+            #endif
+            StorageBootstrapLifecycleRouter.existingProductionRouter?.quiesce()
+            StorageBootstrapLifecycleRouter.existingCompatibilityRouter?.quiesce()
+        }
+        return began
     }
 
     private static func stopAllUplinks() async {

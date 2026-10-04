@@ -1,0 +1,26 @@
+// Test-only Go overlay. Never included in a guest build.
+package storageclient
+
+import (
+	w "dev.cengine/guest/internal/storagewire"
+	"math"
+)
+
+// RTM103HostDo replaces only the unavailable /dev/fuse credential ioctl.
+// Capture, live-grant admission, FIFO serialization and reply witnesses stay real.
+func (c *Client) RTM103HostDo(present bool, kind w.AuthKind, body w.RequestBody) (Result, error) {
+	s, err := c.capture(func(_ int, h *credentialHeader, _ []uint32) error {
+		if present {
+			h.State = 1
+			h.Valid = c.supportedCaps
+		} else {
+			h.FSUID = math.MaxUint32
+			h.FSGID = math.MaxUint32
+		}
+		return nil
+	}, 71, 123456)
+	if err != nil {
+		return Result{}, err
+	}
+	return c.Do(s, kind, body)
+}

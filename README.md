@@ -28,11 +28,15 @@ open /Applications/cengine.app
 
 The installer does not show the app, request networking approval, or start the
 engine until you open it. Upgrades and standard reinstalls resume an engine that
-was previously enabled. On first user launch, cengine registers its required VM
-networking service for administrator approval. Once approved, it enables the
-per-user engine service, installs the bundled cengine kernel and guest initramfs
-assets, initializes its runtime, and configures the Docker context and Buildx
-builder when Docker CLI is available.
+was previously enabled. On first user launch, cengine registers its required
+Privileged Helper for administrator approval. Onboarding also explicitly enrolls
+one storage owner before enabling the per-user engine service, installing the
+bundled kernel and guest initramfs assets, and configuring Docker and Buildx.
+**Enable** or **Restart** retries this setup; ordinary background startup only
+checks ownership and never enrolls the first XPC caller. For CLI setup, run
+`cengine helper setup-storage-owner` as your normal user and approve the
+administrator prompt once. `cengine helper check-storage-owner` checks without
+requesting enrollment.
 
 Check that the engine is ready:
 
@@ -92,8 +96,7 @@ cengine builder resources --cpus 6 --memory 8g
 ```
 
 Applying new resources recreates the managed builder while preserving its
-BuildKit cache. Upgrading a builder that used the older native snapshotter
-recreates its cache once so it can use overlayfs.
+BuildKit cache.
 
 Ordinary containers default to 4 CPUs and 1 GiB of memory. Change those defaults
 for newly created containers from **Container Defaults** on the app's Settings
@@ -132,15 +135,21 @@ before its first use:
 - A volume with one known consumer uses a directly attached ext4 block device.
   This supports filesystem behavior required by workloads such as BuildKit and
   kind.
-- A volume with multiple known consumers is exported over NFS by cengine's
-  storage VM so the containers can mount it concurrently.
+- A volume with multiple known consumers uses FUSE to share an ext4 filesystem
+  hosted in cengine's storage VM.
 
 The selected mode is persistent. Once a block-backed volume has been used,
 cengine cannot later attach it to a second container as a shared volume. Declare
 the complete sharing topology before first use; Compose does this automatically
 because cengine receives the project topology before starting its containers.
-See [Raw runtime architecture](docs/raw-runtime.md) for the detailed storage
-design.
+Unsupported store formats are rejected without modifying their data. cengine does
+not migrate or automatically reset them. Preserve the store and its recovery
+metadata; do not delete metadata to bypass a refusal.
+
+Shared storage supports daemon-only restart without stopping workloads,
+controlled first-start retry, and recovery after a system reboot. This does not
+promise uninterrupted recovery from arbitrary helper, VM, or disk failures. See
+[Managed storage](docs/storage-adoption.md) for the recovery contract.
 
 To make `cengine` the default engine for subsequent Docker commands, activate
 its Docker context:
@@ -191,7 +200,6 @@ are retried twice. The daemon logs to
 See [Development](docs/development.md) for build and test commands. Architecture
 and implementation details are documented in
 [Raw runtime architecture](docs/raw-runtime.md). Docker API and Compose support
-is tracked in [Docker compatibility](docs/docker-compatibility.md), and current
-priorities are tracked in the [Roadmap](docs/roadmap.md). Runtime compatibility
+is tracked in [Docker compatibility](docs/docker-compatibility.md). Runtime compatibility
 uses a standards-first layer of focused OCI/Linux semantic contracts before the
 broader kind and application integration tests.
