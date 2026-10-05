@@ -22,7 +22,8 @@ IDENTITY = "Developer ID Application: Fixture Company (ABCDEFGHIJ)"
 
 def environment(**extra):
     value = {key: value for key, value in os.environ.items()
-             if not key.startswith(("CENGINE_", "XCODE", "PREPARE_", "CODE_SIGN", "CONFIGURATION"))}
+             if not key.startswith(("CENGINE_", "XCODE", "PREPARE_", "CODE_SIGN", "CONFIGURATION"))
+             and key not in ("MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "GNUMAKEFLAGS")}
     value.update(extra)
     return value
 
@@ -61,6 +62,13 @@ def assets(root, pin, suffix=b""):
 
 
 class QualificationTests(unittest.TestCase):
+    def test_environment_drops_parent_make_overrides(self):
+        overrides = {key: "XCODE_DERIVED_DATA=.build/ci/xcode-derived-data"
+                     for key in ("MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "GNUMAKEFLAGS")}
+        with patch.dict(os.environ, overrides):
+            self.assertTrue(overrides.keys().isdisjoint(environment()))
+            self.test_make_keeps_qualification_outputs_separate()
+
     def test_closed_selection_and_signing(self):
         self.assertEqual(Q.selection({}), "")
         self.assertEqual(Q.selection(selected()), Q.PROFILE)

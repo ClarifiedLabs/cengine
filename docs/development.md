@@ -15,6 +15,13 @@ make dist-cli              # tests and staged CLI/assets
 make package               # local unsigned package
 ```
 
+The hosted Linux CI job runs general guest tests without root, then runs the
+storageworker and supervisor component suites as root for credential, ownership,
+and direct-ext4 xattr coverage. The managed symlink-capability test requires the
+patched guest kernel and runs with `make test-guest`; it is excluded from the
+hosted-kernel job. The two root component suites are excluded from its
+unprivileged pass and run in the root pass instead.
+
 ## Guest assets and kernels
 
 `make guest-assets` fetches the checksum-verified kernel release selected by

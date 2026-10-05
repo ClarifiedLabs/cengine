@@ -19,8 +19,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run guest tests
-        run: make test-guest
+      - name: Run guest tests on the hosted kernel
+        working-directory: Guest
+        # Managed symlink capabilities need the patched guest kernel. Worker
+        # credentials and direct-ext4 ownership/xattrs run as root below.
+        run: |
+          packages="$(go list ./... | sed -e '\|/internal/storageworker$|d' -e '\|/internal/supervisor$|d')"
+          go test $packages -p=1 -count=1 -timeout=20m -json \
+            -skip '^TestSymlinkValidCapabilityXattrsMatchDirectExt4$'
+      - name: Run root guest component tests
+        working-directory: Guest
+        run: |
+          sudo env "PATH=$PATH" go test ./internal/storageworker ./internal/supervisor \
+            -p=1 -count=1 -timeout=20m -json
 
   test:
     name: macOS tests
@@ -67,6 +78,9 @@ jobs:
             -derivedDataPath "$PWD/$XCODE_DERIVED_DATA_PATH" -skipPackagePluginValidation
       - name: Run tests
         run: |
+          python3 -m venv .build/compat-venv
+          .build/compat-venv/bin/python -m pip install --disable-pip-version-check \
+            -r Tests/Compatibility/requirements.txt
           mkdir -p "$(dirname "$XCODE_RESULT_BUNDLE_PATH")"
           make test XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
             XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
