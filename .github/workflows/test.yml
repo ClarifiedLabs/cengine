@@ -52,8 +52,10 @@ jobs:
       - name: Require Xcode 27.1
         run: |
           set -euo pipefail
+          sudo xcode-select --switch "$DEVELOPER_DIR"
           version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
           case "$version" in 27.1) ;; *) echo "Xcode 27.1 is required; found $version" >&2; exit 1;; esac
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
       - name: Set up pinned Go toolchain
         run: |
           go="$(sh Scripts/ensure-go-toolchain.sh)"
@@ -90,7 +92,7 @@ jobs:
           mkdir -p "$(dirname "$XCODE_RESULT_BUNDLE_PATH")"
           make test XCODE_SOURCE_PACKAGES="$XCODE_SOURCE_PACKAGES_PATH" \
             XCODE_DERIVED_DATA="$XCODE_DERIVED_DATA_PATH" \
-            XCODE_RESULT_BUNDLE="$XCODE_RESULT_BUNDLE_PATH"
+            XCODE_RESULT_BUNDLE_FLAGS="-resultBundlePath $XCODE_RESULT_BUNDLE_PATH -parallel-testing-enabled NO"
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

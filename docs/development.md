@@ -66,6 +66,9 @@ build procedure and required compatibility checks.
 `CEngineAPITests`, and `CEngineAppTests` through the shared `cengine` scheme.
 Hosted macOS test and release jobs use the `xcode-27` preview runner image
 and explicitly select Xcode 27.1. Use Xcode 27.1 locally to match CI.
+The jobs also select that Xcode globally and resolve its `SDKROOT` for native
+subprocess fixtures. Hosted tests run serially to avoid contention in deadline
+and subprocess tests on the smaller CI machines.
 The host regression checks also require Go on `PATH`. To use the same pinned
 toolchain as macOS CI, run `export PATH="$(dirname "$(sh Scripts/ensure-go-toolchain.sh)"):$PATH"`
 before `make test`.

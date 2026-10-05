@@ -19,11 +19,15 @@ def main() -> None:
             "runs-on: xcode-27",
             "DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer",
             'case "$version" in 27.1)',
+            'sudo xcode-select --switch "$DEVELOPER_DIR"',
+            'echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"',
             f"xcode-27.1-deriveddata-{name}-",
         ):
             require_contains(workflow, needle, f"{name}.yml")
         require_absent(workflow, "Require Xcode 26", f"{name}.yml")
         require_absent(workflow, "xcode-deriveddata-", f"{name}.yml")
+    require_contains(test, "-parallel-testing-enabled NO", "test.yml")
+    require_contains(test, '-resultBundlePath $XCODE_RESULT_BUNDLE_PATH', "test.yml")
     for needle in (
         "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
         "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default", "CENGINE_KERNEL_MODE: release",
