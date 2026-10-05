@@ -103,6 +103,7 @@ final class StorageLifecycleServiceShim: @unchecked Sendable {
     /// effective even when native authentication or disk checks block the worker.
     func start() throws {
         guard !Thread.isMainThread else { throw Failure.unavailable }
+        let gate = self.gate
         let connection = xpc_connection_create_mach_service(policy.serviceName,
             events, UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
         do {
@@ -111,7 +112,6 @@ final class StorageLifecycleServiceShim: @unchecked Sendable {
                 gate.started = true; gate.connection = connection
             }
         } catch { xpc_connection_cancel(connection); throw error }
-        let gate = self.gate
         xpc_connection_set_event_handler(connection) { [weak self] message in
             guard xpc_get_type(message) == XPC_TYPE_DICTIONARY, let self else { gate.close(); return }
             let settled = Mutex(false)
@@ -194,6 +194,7 @@ final class StorageLifecycleServiceShim: @unchecked Sendable {
     }
 
     private func send(_ greeting: Wire.Greeting) throws {
+        let gate = self.gate
         let connection: xpc_connection_t = try gate.lock.withLock {
             guard !gate.closed, let connection = gate.connection else { throw Failure.unavailable }
             return connection
@@ -204,7 +205,7 @@ final class StorageLifecycleServiceShim: @unchecked Sendable {
         xpc_dictionary_set_string(message, "operation", "storage-lifecycle-service-shim")
         let bytes = try L.encode(greeting)
         bytes.withUnsafeBytes { xpc_dictionary_set_data(message, "request", $0.baseAddress, $0.count) }
-        let done = DispatchSemaphore(value: 0), accepted = Mutex(false), gate = self.gate
+        let done = DispatchSemaphore(value: 0), accepted = Mutex(false)
         xpc_connection_send_message_with_reply(connection, message, events) { [weak self] reply in
             guard let self else { gate.close(); done.signal(); return }
             self.worker.async {

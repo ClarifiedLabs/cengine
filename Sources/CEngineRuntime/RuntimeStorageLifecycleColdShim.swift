@@ -129,6 +129,7 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
     /// re-instantiating cannot reset the underlying boot's first-claim freeze.
     func start() throws {
         guard !Thread.isMainThread else { throw Failure.unavailable }
+        let gate = self.gate
         let connection = xpc_connection_create_mach_service(policy.serviceName,
             events, UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
         do {
@@ -137,7 +138,6 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
                 gate.started = true; gate.connection = connection
             }
         } catch { xpc_connection_cancel(connection); throw error }
-        let gate = self.gate
         xpc_connection_set_event_handler(connection) { [weak self] message in
             guard xpc_get_type(message) == XPC_TYPE_DICTIONARY, let self else { gate.close(); return }
             let settled = Mutex(false)
