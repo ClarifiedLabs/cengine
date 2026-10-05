@@ -9,11 +9,21 @@ def main() -> None:
     makefile = read(REPO_ROOT / "Makefile")
     engine_entitlements = read(REPO_ROOT / "Configuration/cengine.entitlements")
     for needle in (
-        "- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: macos-26", "make test",
+        "- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: xcode-27", "make test",
         "python3 tools/tests/test-homebrew-formula.py",
         "python3 tools/tests/test-package.py", "python3 tools/tests/test-installer.py",
     ):
         require_contains(test, needle, "test.yml")
+    for name, workflow in (("test", test), ("release", release)):
+        for needle in (
+            "runs-on: xcode-27",
+            "DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer",
+            'case "$version" in 27.1)',
+            f"xcode-27.1-deriveddata-{name}-",
+        ):
+            require_contains(workflow, needle, f"{name}.yml")
+        require_absent(workflow, "Require Xcode 26", f"{name}.yml")
+        require_absent(workflow, "xcode-deriveddata-", f"{name}.yml")
     for needle in (
         "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
         "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default", "CENGINE_KERNEL_MODE: release",

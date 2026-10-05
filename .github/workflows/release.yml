@@ -127,13 +127,14 @@ jobs:
   build:
     name: Build notarized release artifacts
     needs: [require-tests, guest-assets]
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 90
     permissions:
       contents: write
     env:
       PROJECT: cengine.xcodeproj
       SCHEME: cengine
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       XCODE_SOURCE_PACKAGES_PATH: .build/ci/xcode-source-packages
       XCODE_DERIVED_DATA_PATH: .build/ci/xcode-derived-data
       BUILD_DIR: .build/release
@@ -161,10 +162,10 @@ jobs:
           fi
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Require Xcode 26
+      - name: Require Xcode 27.1
         run: |
           version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
-          case "$version" in 26|26.*) ;; *) exit 1;; esac
+          case "$version" in 27.1) ;; *) echo "Xcode 27.1 is required; found $version" >&2; exit 1;; esac
       - name: Download Linux guest assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -180,8 +181,8 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.XCODE_DERIVED_DATA_PATH }}
-          key: xcode-deriveddata-release-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'Sources/**/*.swift', 'Configuration/*.entitlements', 'Scripts/package-release.sh') }}
-          restore-keys: xcode-deriveddata-release-${{ runner.os }}-
+          key: xcode-27.1-deriveddata-release-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'Sources/**/*.swift', 'Configuration/*.entitlements', 'Scripts/package-release.sh') }}
+          restore-keys: xcode-27.1-deriveddata-release-${{ runner.os }}-
       - name: Install App Store Connect API key
         env:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}

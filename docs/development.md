@@ -64,6 +64,8 @@ build procedure and required compatibility checks.
 
 `make test` checks harness isolation, then runs `CEngineCoreTests`,
 `CEngineAPITests`, and `CEngineAppTests` through the shared `cengine` scheme.
+Hosted macOS test and release jobs use the `xcode-27` preview runner image
+and explicitly select Xcode 27.1. Use Xcode 27.1 locally to match CI.
 The host regression checks also require Go on `PATH`. To use the same pinned
 toolchain as macOS CI, run `export PATH="$(dirname "$(sh Scripts/ensure-go-toolchain.sh)"):$PATH"`
 before `make test`.

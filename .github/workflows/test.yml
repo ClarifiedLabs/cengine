@@ -35,11 +35,12 @@ jobs:
 
   test:
     name: macOS tests
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 90
     env:
       PROJECT: cengine.xcodeproj
       SCHEME: cengine
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       XCODE_SOURCE_PACKAGES_PATH: .build/ci/xcode-source-packages
       XCODE_DERIVED_DATA_PATH: .build/ci/xcode-derived-data
       XCODE_RESULT_BUNDLE_PATH: .build/ci/xcresults/CEngineTests.xcresult
@@ -48,11 +49,11 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - name: Require Xcode 26
+      - name: Require Xcode 27.1
         run: |
           set -euo pipefail
           version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
-          case "$version" in 26|26.*) ;; *) echo "Xcode 26 is required; found $version" >&2; exit 1;; esac
+          case "$version" in 27.1) ;; *) echo "Xcode 27.1 is required; found $version" >&2; exit 1;; esac
       - name: Set up pinned Go toolchain
         run: |
           go="$(sh Scripts/ensure-go-toolchain.sh)"
@@ -73,8 +74,8 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.XCODE_DERIVED_DATA_PATH }}
-          key: xcode-deriveddata-test-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'cengine.xcodeproj/xcshareddata/xcschemes/*.xcscheme', 'Sources/**/*.swift', 'Tests/**/*.swift', 'Configuration/*.entitlements') }}
-          restore-keys: xcode-deriveddata-test-${{ runner.os }}-
+          key: xcode-27.1-deriveddata-test-${{ runner.os }}-${{ hashFiles('cengine.xcodeproj/project.pbxproj', 'cengine.xcodeproj/xcshareddata/xcschemes/*.xcscheme', 'Sources/**/*.swift', 'Tests/**/*.swift', 'Configuration/*.entitlements') }}
+          restore-keys: xcode-27.1-deriveddata-test-${{ runner.os }}-
       - name: Resolve packages
         run: |
           mkdir -p "$XCODE_SOURCE_PACKAGES_PATH" "$XCODE_DERIVED_DATA_PATH"
