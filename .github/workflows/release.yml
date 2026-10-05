@@ -26,7 +26,12 @@ jobs:
         run: docker --context default buildx version
       - name: Build and test guest assets
         run: |
-          make test-guest
+          # Managed sessions need the patched kernel; run their ordinary units
+          # unprivileged so those fixtures retain their existing setup skips.
+          (cd Guest && go test -skip '^TestSymlinkValidCapabilityXattrsMatchDirectExt4$' \
+            ./internal/storagemanaged ./internal/storageserver -p=1 -count=1 -timeout=20m -json)
+          # Guest fixtures require real Linux root and an ext4 scratch directory.
+          sudo env "PATH=$PATH" "TMPDIR=$RUNNER_TEMP" ./Scripts/test-guest.sh
           make guest-assets
       - name: Upload guest assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

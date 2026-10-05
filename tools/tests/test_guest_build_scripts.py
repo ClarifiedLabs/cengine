@@ -90,10 +90,51 @@ class GuestBuildScriptTests(unittest.TestCase):
 
         self.assertIn('command -v go', script)
         self.assertIn('go env GOOS)" = linux', script)
-        self.assertIn("exec go test ./... -p=1 -count=1 -timeout=20m -json", script)
+        self.assertIn("exec setsid --wait go test -skip '^TestNative(MountedManagedV3|IssuedDataTLS)' \"$@\" -p=1 -count=1 -timeout=20m -json", script)
         # All entry paths must run uncached, serialize scratch users and retain
         # per-test JSON evidence under an explicit finite package deadline.
         self.assertEqual(script.count("-p=1 -count=1 -timeout=20m -json"), 3)
+
+    def test_native_guest_tests_require_root_and_ext4_before_running_go(self) -> None:
+        # Exercise the real script with stubbed host tools, without elevation.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name, body in {
+                "go": ('case "$1" in env) echo linux;; list) '
+                       'printf "%s\\n" dev.cengine/guest/internal/storageworker '
+                       'dev.cengine/guest/internal/storagemanaged dev.cengine/guest/internal/storageserver;; '
+                       '*) echo "go:$*"; exit "${TEST_GO_STATUS:-0}";; esac'),
+                "id": 'case "$1" in -u) echo "$TEST_UID";; -g) echo "$TEST_GID";; esac',
+                "findmnt": 'echo "$TEST_FS"',
+                "setsid": 'test "$1" = --wait || exit 1; shift; echo "setsid"; exec "$@"',
+            }.items():
+                tool = directory / name
+                tool.write_text("#!/bin/sh\n" + body + "\n")
+                tool.chmod(0o755)
+            for uid, gid, filesystem, status, diagnostic in (
+                ("1001", "0", "ext4", 2, "require Linux root uid/gid"),
+                ("0", "1001", "ext4", 2, "require Linux root uid/gid"),
+                ("0", "0", "tmpfs", 2, "require TMPDIR on ext4"),
+                ("0", "0", "ext4", 0, "host kernel:"),
+            ):
+                with self.subTest(uid=uid, gid=gid, filesystem=filesystem):
+                    environment = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                                       TEST_UID=uid, TEST_GID=gid, TEST_FS=filesystem)
+                    result = subprocess.run(["sh", str(ROOT / "Scripts/test-guest.sh")],
+                                            env=environment, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+                    if status:
+                        self.assertNotIn("go:test", result.stdout)
+                    else:
+                        self.assertIn("setsid\n", result.stdout)
+                        self.assertIn("go:test -skip ^TestNative(MountedManagedV3|IssuedDataTLS) dev.cengine/guest/internal/storageworker", result.stdout)
+                        self.assertNotIn("storagemanaged", result.stdout)
+                        self.assertNotIn("storageserver", result.stdout)
+            environment.update(TEST_UID="0", TEST_GID="0", TEST_FS="ext4", TEST_GO_STATUS="7")
+            result = subprocess.run(["sh", str(ROOT / "Scripts/test-guest.sh")],
+                                    env=environment, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 7, "guest test failures must fail CI")
 
     def test_guest_test_container_supplies_fixture_tree_scratch_and_fuse(self) -> None:
         script = (ROOT / "Scripts" / "test-guest.sh").read_text()

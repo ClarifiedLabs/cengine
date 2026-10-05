@@ -44,6 +44,9 @@ def main() -> None:
     for forbidden in ("draft: true", "--draft", "TestFlight"):
         require_absent(release, forbidden, "release.yml")
     require_absent(release, "make kernel-build", "release.yml")
+    require_contains(release, 'sudo env "PATH=$PATH" "TMPDIR=$RUNNER_TEMP" ./Scripts/test-guest.sh', "release.yml")
+    require_contains(release, "go test -skip '^TestSymlinkValidCapabilityXattrsMatchDirectExt4$'", "release.yml")
+    require_contains(release, "./internal/storagemanaged ./internal/storageserver -p=1 -count=1 -timeout=20m -json", "release.yml")
     for needle in (
         "kernel-v*", "runs-on: ubuntu-24.04-arm", "make kernel-build CENGINE_HOST_OS=Linux",
         "Configuration/kernel-release", "Scripts/kernel-input-sha256.sh",

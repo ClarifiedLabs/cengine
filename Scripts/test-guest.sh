@@ -3,8 +3,29 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if command -v go >/dev/null 2>&1 && [ "$(go env GOOS)" = linux ]; then
+    if [ "$(id -u)" != 0 ] || [ "$(id -g)" != 0 ]; then
+        echo "native guest tests require Linux root uid/gid" >&2
+        exit 2
+    fi
+    if [ "$(findmnt -n -o FSTYPE -T "${TMPDIR:-/tmp}")" != ext4 ]; then
+        echo "native guest tests require TMPDIR on ext4" >&2
+        exit 2
+    fi
     cd "$ROOT/Guest"
-    exec go test ./... -p=1 -count=1 -timeout=20m -json
+    # Managed session fixtures use a custom ioctl unavailable on stock kernels.
+    # The release workflow runs these packages' ordinary units unprivileged.
+    packages=$(go list ./...)
+    set --
+    for package in $packages; do
+        case "$package" in
+            dev.cengine/guest/internal/storagemanaged|dev.cengine/guest/internal/storageserver) ;;
+            *) set -- "$@" "$package" ;;
+        esac
+    done
+    # Hosted Linux runs component tests on the host kernel. These two families
+    # require the patched cengine FUSE ABI and run in the disposable VM below.
+    echo "host kernel: excluding patched-FUSE mounted and DATA TLS fixtures" >&2
+    exec setsid --wait go test -skip '^TestNative(MountedManagedV3|IssuedDataTLS)' "$@" -p=1 -count=1 -timeout=20m -json
 fi
 
 IMAGE=${CENGINE_GUEST_TEST_IMAGE:-golang:1.25-trixie}
