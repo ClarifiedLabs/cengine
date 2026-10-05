@@ -106,6 +106,16 @@ class ReaderTests(unittest.TestCase):
 
 
 class GuestSupervisorTests(unittest.TestCase):
+    def test_macos_ci_provisions_go_before_host_regressions(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        macos = workflow[workflow.index("  test:\n"):]
+        setup = macos[macos.index("      - name: Set up pinned Go toolchain\n"):]
+        setup = setup[:setup.index("      - name:", 1)]
+        self.assertIn('go="$(sh Scripts/ensure-go-toolchain.sh)"', setup)
+        self.assertIn('dirname "$go" >> "$GITHUB_PATH"', setup)
+        self.assertIn('"$go" version', setup)
+        self.assertLess(macos.index(setup), macos.index("      - name: Run tests\n"))
+
     def test_actual_supervisor_joins_real_children_before_emitting_result(self):
         source = (ROOT / "Tests/Compatibility/fixtures/managed-prepare-faults.go").read_text()
         body = source[source.index("func superviseReader("):source.index("func retainedWait(")]

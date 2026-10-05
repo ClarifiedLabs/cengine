@@ -53,6 +53,11 @@ jobs:
           set -euo pipefail
           version="$(xcodebuild -version | awk '/^Xcode / { print $2 }')"
           case "$version" in 26|26.*) ;; *) echo "Xcode 26 is required; found $version" >&2; exit 1;; esac
+      - name: Set up pinned Go toolchain
+        run: |
+          go="$(sh Scripts/ensure-go-toolchain.sh)"
+          dirname "$go" >> "$GITHUB_PATH"
+          "$go" version
       - name: Validate Homebrew cask and installer
         run: |
           python3 tools/tests/test-homebrew-formula.py

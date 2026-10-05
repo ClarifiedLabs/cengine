@@ -64,6 +64,9 @@ build procedure and required compatibility checks.
 
 `make test` checks harness isolation, then runs `CEngineCoreTests`,
 `CEngineAPITests`, and `CEngineAppTests` through the shared `cengine` scheme.
+The host regression checks also require Go on `PATH`. To use the same pinned
+toolchain as macOS CI, run `export PATH="$(dirname "$(sh Scripts/ensure-go-toolchain.sh)"):$PATH"`
+before `make test`.
 Run focused checks first, then `make test` before review. VM-backed changes also
 require `make test-compat` locally; GitHub-hosted runners cannot run that suite.
 To retain an Xcode result bundle:
