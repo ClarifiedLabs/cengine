@@ -297,7 +297,9 @@ import Testing
         let initial = try await ManagedStorageLifecycleRestartTests().freshStore(disk, base)
         let peer = try Peer(base: base, grant: initial, stateURL: disk.url.appending(path: "managed-storage-owner/state.json"))
         peer.state.withLock { $0.losePrepare = false }
-        let clock = Mutex(ProcessInfo.processInfo.systemUptime)
+        // A fixed origin keeps exact budget arithmetic independent of uptime
+        // rounding; only the simulated operations below advance this clock.
+        let clock = Mutex<TimeInterval>(1000)
         let timing = Owner.IsolatedTestSeam.RecoveryTiming(now: { clock.withLock { $0 } },
             sleep: { seconds in clock.withLock { $0 += seconds } })
         let budgets = Mutex<[TimeInterval]>([])
@@ -320,10 +322,10 @@ import Testing
         try await owner.bootCold(using: transport, greeting: greeting, storeLock: lock,
             nowUnixSeconds: 1_800_000_000, lifetimeSeconds: 3600)
         let observed = budgets.withLock { $0 }
-        #expect(observed.count == 3)
-        #expect(observed[0] > 119 && observed[0] <= 120)
-        #expect(observed[1] > 104 && observed[1] <= 105)
-        #expect(observed[2] > 64 && observed[2] < 65)
+        try #require(observed.count == 3)
+        #expect(observed[0] == 120)
+        #expect(observed[1] == 105)
+        #expect(abs(observed[2] - 64.9) < 0.000001)
         #expect(transport.configurations == 1)
         let completions = peer.state.withLock { $0.requests.filter { if case .complete = $0.body { true } else { false } } }
         #expect(completions.count == 2 && completions[0] == completions[1])

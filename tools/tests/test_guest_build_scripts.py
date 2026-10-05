@@ -90,7 +90,7 @@ class GuestBuildScriptTests(unittest.TestCase):
 
         self.assertIn('command -v go', script)
         self.assertIn('go env GOOS)" = linux', script)
-        self.assertIn("exec setsid --wait go test -skip '^TestNative(MountedManagedV3|IssuedDataTLS)' \"$@\" -p=1 -count=1 -timeout=20m -json", script)
+        self.assertIn("exec unshare --mount --propagation private setsid --wait go test -skip '^TestNative(MountedManagedV3|IssuedDataTLS)' \"$@\" -p=1 -count=1 -timeout=20m -json", script)
         # All entry paths must run uncached, serialize scratch users and retain
         # per-test JSON evidence under an explicit finite package deadline.
         self.assertEqual(script.count("-p=1 -count=1 -timeout=20m -json"), 3)
@@ -107,6 +107,9 @@ class GuestBuildScriptTests(unittest.TestCase):
                 "id": 'case "$1" in -u) echo "$TEST_UID";; -g) echo "$TEST_GID";; esac',
                 "findmnt": 'echo "$TEST_FS"',
                 "setsid": 'test "$1" = --wait || exit 1; shift; echo "setsid"; exec "$@"',
+                "unshare": ('test "$1" = --mount && test "$2" = --propagation '
+                            '&& test "$3" = private || exit 1; '
+                            'shift 3; echo "private mount namespace"; exec "$@"'),
             }.items():
                 tool = directory / name
                 tool.write_text("#!/bin/sh\n" + body + "\n")
@@ -126,7 +129,9 @@ class GuestBuildScriptTests(unittest.TestCase):
                     self.assertIn(diagnostic, result.stderr)
                     if status:
                         self.assertNotIn("go:test", result.stdout)
+                        self.assertNotIn("private mount namespace", result.stdout)
                     else:
+                        self.assertIn("private mount namespace\nsetsid\n", result.stdout)
                         self.assertIn("setsid\n", result.stdout)
                         self.assertIn("go:test -skip ^TestNative(MountedManagedV3|IssuedDataTLS) dev.cengine/guest/internal/storageworker", result.stdout)
                         self.assertNotIn("storagemanaged", result.stdout)

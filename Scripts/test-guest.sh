@@ -25,7 +25,9 @@ if command -v go >/dev/null 2>&1 && [ "$(go env GOOS)" = linux ]; then
     # Hosted Linux runs component tests on the host kernel. These two families
     # require the patched cengine FUSE ABI and run in the disposable VM below.
     echo "host kernel: excluding patched-FUSE mounted and DATA TLS fixtures" >&2
-    exec setsid --wait go test -skip '^TestNative(MountedManagedV3|IssuedDataTLS)' "$@" -p=1 -count=1 -timeout=20m -json
+    # Attachment composition exercises real preflight, which rejects shared
+    # mount propagation. Isolate the tests without changing the host's mounts.
+    exec unshare --mount --propagation private setsid --wait go test -skip '^TestNative(MountedManagedV3|IssuedDataTLS)' "$@" -p=1 -count=1 -timeout=20m -json
 fi
 
 IMAGE=${CENGINE_GUEST_TEST_IMAGE:-golang:1.25-trixie}
