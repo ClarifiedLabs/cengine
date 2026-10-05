@@ -26,6 +26,20 @@ def main() -> None:
             require_contains(workflow, needle, f"{name}.yml")
         require_absent(workflow, "Require Xcode 26", f"{name}.yml")
         require_absent(workflow, "xcode-deriveddata-", f"{name}.yml")
+        job = "test" if name == "test" else "build"
+        macos = workflow.split(f"  {job}:\n", 1)[1].split("\n  homebrew-publish:", 1)[0]
+        setup_name = "      - name: Set up pinned Go toolchain\n"
+        require_contains(macos, setup_name, f"{name}.yml macOS job")
+        setup = macos.split(setup_name, 1)[1].split("      - name:", 1)[0]
+        for needle in (
+            'go="$(sh Scripts/ensure-go-toolchain.sh)"',
+            'dirname "$go" >> "$GITHUB_PATH"',
+            '"$go" version',
+        ):
+            require_contains(setup, needle, f"{name}.yml Go setup")
+        consumer = "Run tests" if name == "test" else "Build signed notarized release artifacts"
+        if macos.index(setup_name) >= macos.index(f"      - name: {consumer}\n"):
+            raise AssertionError(f"{name}.yml must provision Go before {consumer}")
     require_contains(test, "-parallel-testing-enabled NO", "test.yml")
     require_contains(test, '-resultBundlePath $XCODE_RESULT_BUNDLE_PATH', "test.yml")
     for needle in (

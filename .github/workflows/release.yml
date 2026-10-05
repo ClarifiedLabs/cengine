@@ -179,6 +179,11 @@ jobs:
         with:
           name: cengine-guest-assets
           path: .build/guest
+      - name: Set up pinned Go toolchain
+        run: |
+          go="$(sh Scripts/ensure-go-toolchain.sh)"
+          dirname "$go" >> "$GITHUB_PATH"
+          "$go" version
       - name: Cache Xcode Swift packages
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
