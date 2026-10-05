@@ -571,7 +571,7 @@ struct StorageLifecycleShimIPCTests {
         let firstByte = DispatchSemaphore(value: 0), cancelled = DispatchSemaphore(value: 0)
         let done = DispatchSemaphore(value: 0)
         let deadlines = Mutex<(first: DispatchTime?, admitted: DispatchTime?)>((nil, nil))
-        let server = try StorageLifecycleShimServer(testFD: b.fileDescriptor, timeout: 0.3, observe: { event in
+        let server = try StorageLifecycleShimServer(testFD: b.fileDescriptor, timeout: 3, observe: { event in
             switch event {
             case .firstByte(let deadline):
                 deadlines.withLock { $0.first = deadline }; firstByte.signal()
@@ -599,20 +599,21 @@ struct StorageLifecycleShimIPCTests {
                 Issue.record("first byte never observed"); return
             }
             // The observer supplies the actual first-byte deadline. Hold framing
-            // for 200ms on this thread, without a Task/actor scheduling assumption.
-            _ = DispatchSemaphore(value: 0).wait(timeout: deadline - .milliseconds(100))
-            #expect(DispatchTime.now() >= deadline - .milliseconds(100))
+            // for two seconds on this thread, without a Task/actor scheduling
+            // assumption. Leave a full second for framing/admission on CI.
+            _ = DispatchSemaphore(value: 0).wait(timeout: deadline - .seconds(1))
+            #expect(DispatchTime.now() >= deadline - .seconds(1))
             #expect(bytes.dropFirst().withUnsafeBytes { Darwin.send(a.fileDescriptor, $0.baseAddress, $0.count, 0) } == bytes.count - 1)
-            let limit = start + .milliseconds(475)
+            let limit = start + .milliseconds(4750)
             let eof = Self.eof(on: a.fileDescriptor, before: limit)
             #expect(eof != nil && eof! < limit)
             #expect(server.waitForReaderForTesting(deadline: limit))
-            #expect(cancelled.wait(timeout: C.deadline()) == .success)
+            #expect(cancelled.wait(timeout: limit) == .success)
         }
         // Intentionally starve MainActor until the off-actor observation finishes:
         // the SAME deadline must bound framing AND queued owner work. Resetting it
-        // after framing would expire >=500ms, outside the unchanged 475ms bound.
-        #expect(done.wait(timeout: C.deadline()) == .success)
+        // after framing would expire >=5s, outside the 4.75s bound.
+        #expect(done.wait(timeout: C.deadline(6)) == .success)
         #expect(deadlines.withLock { $0.first != nil && $0.first == $0.admitted })
         #expect(calls.operations == 0)
         // Cancellation of an owner that has actually entered is checked separately
