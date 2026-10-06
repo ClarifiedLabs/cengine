@@ -42,7 +42,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 import compat_image_fixtures
 
 LOCAL_COMPOSE_IDS = {"CMP-008", "CMP-009", "CMP-010"}
-LOCAL_BUILDX_IDS = {"BLD-001", "BLD-003", "BLD-004", "BLD-006", "BLD-007"}
+LOCAL_BUILDX_IDS = {"BLD-001", "BLD-003", "BLD-004", "BLD-006", "BLD-007", "BLD-008"}
 DEFAULT_BINARY = REPO_ROOT / ".build/xcode-derived/Build/Products/test-compat/cengine"
 DEFAULT_KERNEL = REPO_ROOT / ".build/guest/vmlinux"
 DEFAULT_CONTAINER_INITRAMFS = REPO_ROOT / ".build/guest/container-initramfs.cpio.gz"

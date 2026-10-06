@@ -48,6 +48,16 @@ Canonical release assets and provenance are defined by [release policy](release.
 local validation/preview artifacts do not establish canonical-release provenance,
 notarization or distribution status.
 
+Newly formatted native ext4 disks enable the `verity` feature and the guest kernel
+builds in `CONFIG_FS_VERITY`. Applications opt individual files into immutable,
+verified reads under Linux’s [fs-verity contract](https://docs.kernel.org/filesystems/fsverity.html).
+Existing disks retain their feature set; this change does not migrate them or
+add fs-verity ioctls to shared FUSE volumes. BuildKit uses its direct ext4 state
+volume, with explicit `--oci-worker-net=bridge` for separate build network
+namespaces and outbound access. This follows [BuildKit’s bridge provider](https://github.com/moby/buildkit/blob/v0.32.2/util/network/cniprovider/bridge.go);
+it is not an egress allowlist. Reconciliation replaces older managed builders
+while retaining compatible overlayfs state.
+
 ## Verification scope
 
 `make test-compat` runs the isolated VM suite; `make test-compat-soak` repeats it
@@ -60,7 +70,8 @@ Run `make test-compat-images` to prepare verified digest-pinned local OCI fixtur
 for CMP-008–010 and BLD-001/003/004/006/007. These use real Compose/Buildx builds,
 the unmodified managed default builder and named OCI contexts with RUN networking
 disabled; missing/invalid fixtures fail before daemon setup. BLD-002/005 retain
-remote-pull/uplink tests. The whole suite is **not** offline.
+remote-pull/uplink tests. BLD-008 uses local image inputs but explicitly tests
+bridge DNS and HTTPS egress. The whole suite is **not** offline.
 
 Inventory status **Covered** means the stated contract has runtime coverage, not
 complete upstream certification. **Intentional gap** rows verify rejection or a
@@ -104,7 +115,7 @@ protocols implement Docker behavior beneath OCI mounts, not new OCI fields.
 | Process args, user/groups, cwd, environment, exec status | Covered: RTM-001/008/009/011/029/038–043/072/106/112, ORC-003/004 | Explicit exec overrides preserve namespace/root identity; no GroupAdd/ambient-set or per-probe health-log claim. |
 | Terminal | Covered: CTR-031, RTM-030, CLI-009 | Docker height/width only; pixel dimensions stay zero. |
 | Guest architecture | Partial: RTM-045 | Rosetta x86-64 ELF run/exec only, not i386 or cross-architecture build. |
-| Root, read-only composition, mount ordering/confinement | Covered: RTM-002/003/020/022/023/031/046/048/049/056/105 | Source symlinks fail closed; confined intermediate workload links are distinct. |
+| Root, read-only composition, mount ordering/confinement | Covered: RTM-002/003/020/022/023/031/046/048/049/056/105/134 | Source symlinks fail closed; confined intermediate workload links are distinct. RTM-134 covers Linux fs-verity on new native ext4 roots/direct volumes, not shared FUSE or image signatures. |
 | Host bind consistency | Partial: RTM-036/037/064–066/071, CMP-009 | Eventual coherence and completed-write fresh opens/content polling; no retained-FD atomicity, event-only watcher, host UID remapping or macOS differential claim. |
 | Namespaces | Partial: RTM-001/012/016/017/033/044 | Separate VM kernels cannot share Docker-host/peer namespaces. Private/default and IPC none supported; no OCI namespace-path interface. |
 | Capabilities, no-new-privileges, seccomp and path policy | Partial: RTM-006/014/018/021/024/025/028 | Built-in/unconfined seccomp only; custom JSON, AppArmor/SELinux and driver DeviceRequests unsupported. |
@@ -385,6 +396,7 @@ but the newer option does not, and **Gap** identifies future work. This version 
 | `RTM-131` | `test_lifecycle_v2_cold_enrollment_survives_live_reattachment` | Covered | Cold enrollment regression | Strict cold recovery then live reattachment preserves new VM births/E/worker/restart counts, advances C once, and retains seeds/new DATA. Recovery enrollment budget and late-ACK refusal are unit-tested; native case injects no delay or reboot. |
 | `RTM-132` | `test_lifecycle_v2_committed_unenrolled_cold_recovery` | Covered | Committed cold enrollment failure | ROOT/HOST-committed but unenrolled cold successor recovers only after all exact native participants exit and adoption rotates. Fresh cold operation keeps publication fenced until real enrollment, preserving original peers/seeds/new DATA. No synthetic ACK, old boot replay, L2 bridge or reset. |
 | `RTM-133` | `test_lifecycle_v2_retained_history_allows_live_storage_control` | Covered | Retained storage history | Repeated cold cycles preserve immutable old launch history; authenticated storage-control/network CRUD and live reattachment retain automatic peers/seeds/new DATA. Prior-boot inaccessible-PID classification and death-only differing-birth fallback are unit-covered; native test neither forges boot IDs nor injects EPERM/reboot. |
+| `RTM-134` | `test_fsverity_root_and_direct_volume_survive_restart` | Covered | Support | Fresh root/direct-volume ext4 files accept FS_IOC_ENABLE_VERITY and SHA-256 measurement, reject writable opens, retain contents/digests across container restart, and can still be deleted. Ordinary files remain writable. No shared FUSE, existing-disk migration, corruption injection, or publisher authentication claim. See Linux [fs-verity](https://docs.kernel.org/filesystems/fsverity.html). |
 
 ## Containers
 
@@ -570,8 +582,9 @@ but the newer option does not, and **Gap** identifies future work. This version 
 | `BLD-003` | `test_buildx_overlay_worker_has_large_state_volume` | Covered | Support | Parallel stages use overlayfs on a 512 GiB sparse block-backed state volume. |
 | `BLD-004` | `test_buildx_relaunches_missing_stopped_container_shim` | Covered | Support | A stopped BuildKit container relaunches its missing VM shim after a daemon replacement without losing its writable root. |
 | `BLD-005` | `test_buildx_recovers_uplink_after_network_helper_restart` | Covered | Support | A running BuildKit VM automatically recreates its vmnet uplink after the dedicated compatibility helper performs an authenticated, launchd-managed restart without another administrator session. |
-| `BLD-006` | `test_managed_docker_context_and_default_builder` | Covered | Support | The shipped synchronous `cengine system configure-docker` command creates the exact `cengine` context and `cengine-builder` in fresh isolated client state without activating the context globally. It persists exactly the context and resolved Unix-endpoint Buildx default keys while leaving ordinary Docker defaults untouched. A bare context-qualified Buildx build/load/run uses the pinned BuildKit image, overlayfs, and configured resources; repeated reconciliation preserves context endpoint, BuildKit container, and state volume. No builder override, temporary builder, legacy `POST /build`, or cross-architecture execution is involved. |
+| `BLD-006` | `test_managed_docker_context_and_default_builder` | Covered | Support | The shipped synchronous `cengine system configure-docker` command creates the exact `cengine` context and `cengine-builder` in fresh isolated client state without activating the context globally. It persists exactly the context and resolved Unix-endpoint Buildx default keys while leaving ordinary Docker defaults untouched. A bare context-qualified Buildx build/load/run uses the pinned BuildKit image, overlayfs, bridge networking, fs-verity-protected committed blobs on a fresh state volume, and configured resources; repeated reconciliation preserves context endpoint, BuildKit container, and state volume. No builder override, temporary builder, legacy `POST /build`, or cross-architecture execution is involved. |
 | `BLD-007` | `test_buildx_bake_load_immediately_publishes_every_target` | Covered | Support | A two-target Bake creates distinct images and loads both through concurrent Docker exporters; every explicit tag is inspectable as soon as Bake returns, while BuildKit's shared `org.opencontainers.image.ref.name=local` metadata does not become a Docker tag. This locks down the synchronous visibility promised by Docker API v1.55 [`POST /images/load`](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Image/operation/ImageLoad). |
+| `BLD-008` | `test_managed_builder_bridge_dns_egress_and_namespace_isolation` | Covered | Support | Default RUN networking uses a namespace distinct from the builder daemon, with an eth0 interface, DNS and HTTPS egress before and after daemon restart. Local base-image inputs and no-cache execution keep these probes explicit. |
 
 ## Daemon recovery
 

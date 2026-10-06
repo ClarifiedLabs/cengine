@@ -95,6 +95,7 @@ def test_managed_docker_context_and_default_builder(
             'cpu-period="100000"',
             'cpu-quota="200000"',
             "--oci-worker-snapshotter=overlayfs",
+            "--oci-worker-net=bridge",
         )
         named = managed.run(
             "buildx", "inspect", MANAGED_BUILDER, "--bootstrap", timeout=300,
@@ -132,6 +133,16 @@ def test_managed_docker_context_and_default_builder(
         assert "ERROR" not in build.stdout
         assert client.images.get(tag).attrs["Os"] == "linux"
         assert client.images.get(tag).attrs["Architecture"] == "arm64"
+        buildkit = client.containers.get(first_container)
+        workers = buildkit.exec_run(["buildctl", "debug", "workers", "--verbose"])
+        assert workers.exit_code == 0, workers.output.decode()
+        assert "org.mobyproject.buildkit.worker.network: cni" in " ".join(workers.output.decode().split())
+        attributes = buildkit.exec_run([
+            "sh", "-c", "lsattr /var/lib/buildkit/runc-overlayfs/content/blobs/sha256/*",
+        ])
+        assert attributes.exit_code == 0, attributes.output.decode()
+        assert attributes.output.strip(), "build did not commit any content blobs"
+        assert all("V" in line.split()[0] for line in attributes.output.decode().splitlines()), attributes.output.decode()
         run = managed.run("--context", "cengine", "run", "--rm", tag)
         assert run.stdout.strip() == "cengine-buildx-ok"
 
@@ -156,6 +167,40 @@ def test_managed_docker_context_and_default_builder(
     except Exception:
         print("\nmanaged Buildx diagnostics:\n" + managed.diagnostics())
         raise
+
+
+@pytest.mark.compat("BLD-008")
+def test_managed_builder_bridge_dns_egress_and_namespace_isolation(
+    daemon, client: docker.DockerClient, managed_docker_integration, tmp_path,
+):
+    managed = managed_docker_integration
+    managed.run("buildx", "inspect", MANAGED_BUILDER, "--bootstrap", timeout=300)
+    buildkit = client.containers.get(f"buildx_buildkit_{MANAGED_BUILDER}0")
+    namespace = buildkit.exec_run(["readlink", "/proc/self/ns/net"])
+    assert namespace.exit_code == 0, namespace.output.decode()
+    (tmp_path / "Dockerfile").write_text(
+        "FROM alpine-base\n"
+        "ARG BUILDER_NETNS\n"
+        'RUN test "$(readlink /proc/self/ns/net)" != "$BUILDER_NETNS" '
+        "&& test -d /sys/class/net/eth0 "
+        "&& nslookup mirror.gcr.io "
+        # The registry's unauthenticated /v2/ endpoint returns an HTTPS 401.
+        "&& { wget -T 30 -S -O /dev/null https://mirror.gcr.io/v2/ 2>/tmp/registry-response; "
+        "response_status=$?; cat /tmp/registry-response; "
+        'test "$response_status" = 1 '
+        "&& grep -q 'HTTP/1.1 401 Unauthorized' /tmp/registry-response; }\n"
+    )
+    tag = f"compat-bridge:{uuid.uuid4().hex[:8]}"
+    managed.register_image(tag)
+    for restart in (False, True):
+        if restart:
+            daemon.restart(kill=True)
+        managed.run(
+            "--context", "cengine", "buildx", "build", "--no-cache", "--load", "--tag", tag,
+            "--build-arg", f"BUILDER_NETNS={namespace.output.decode().strip()}",
+            "--build-context", f"alpine-base={local_alpine_context(daemon)}",
+            str(tmp_path), timeout=300,
+        )
 
 
 @pytest.mark.compat("BLD-001")

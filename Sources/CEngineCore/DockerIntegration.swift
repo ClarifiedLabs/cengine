@@ -28,6 +28,7 @@ public enum DockerIntegration {
     public static let buildkitImage =
         "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
     public static let buildkitSnapshotter = "overlayfs"
+    public static let buildkitNetwork = "bridge"
     private static let cpuPeriod = 100_000
 
     /// Locates an executable on PATH, falling back to the standard Homebrew
@@ -194,7 +195,7 @@ public enum DockerIntegration {
             "--driver-opt", "memory=\(settings.memoryBytes)",
             "--driver-opt", "cpu-period=\(cpuPeriod)",
             "--driver-opt", "cpu-quota=\(quota)",
-            "--buildkitd-flags", "--oci-worker-snapshotter=\(buildkitSnapshotter)", contextName,
+            "--buildkitd-flags", "--oci-worker-snapshotter=\(buildkitSnapshotter) --oci-worker-net=\(buildkitNetwork)", contextName,
         ]
     }
 
@@ -208,6 +209,7 @@ public enum DockerIntegration {
             "cpu-period=\"\(cpuPeriod)\"",
             "cpu-quota=\"\(quota)\"",
             "--oci-worker-snapshotter=\(buildkitSnapshotter)",
+            "--oci-worker-net=\(buildkitNetwork)",
         ]
         return expected.allSatisfy(inspection.contains)
     }

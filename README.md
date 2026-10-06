@@ -82,7 +82,12 @@ docker --context cengine buildx build --builder cengine-builder --load .
 Builds are supported through cengine's managed Buildx builder. Use
 `docker buildx build`; cengine does not implement Docker Engine's legacy
 `/build` API. The managed `cengine-builder` uses BuildKit's overlayfs
-snapshotter on a directly attached ext4 volume. On first use, its resources are
+snapshotter on a directly attached ext4 volume and bridge networking for build
+steps. Bridge provides separate network namespaces with outbound access; builds
+can opt out with `--network=none`. Newly formatted ext4 disks support fs-verity,
+which BuildKit uses to protect committed content blobs. Existing disks retain
+their filesystem features and cache; they are not automatically migrated.
+On first use, its resources are
 selected from the host: half the CPUs (minimum 4 where available, maximum 8)
 and 4 GiB, 6 GiB, or 8 GiB of memory on hosts with less than 16 GiB, 16–23 GiB,
 or at least 24 GiB, respectively. Saved settings remain explicit overrides.

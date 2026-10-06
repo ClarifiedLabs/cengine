@@ -183,6 +183,7 @@ class GuestBuildScriptTests(unittest.TestCase):
             "CONFIG_FUSE_FS=y",
             "CONFIG_VIRTIO_FS=y",
             "CONFIG_OVERLAY_FS=y",
+            "CONFIG_FS_VERITY=y",
             "CONFIG_VETH=y",
             "CONFIG_BRIDGE_NETFILTER=y",
             "CONFIG_NF_TABLES=y",

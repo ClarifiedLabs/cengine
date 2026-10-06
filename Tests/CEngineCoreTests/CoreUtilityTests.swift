@@ -340,15 +340,19 @@ import Testing
         #expect(arguments.contains("memory=4294967296"))
         #expect(arguments.contains("cpu-period=100000"))
         #expect(arguments.contains("cpu-quota=400000"))
-        #expect(arguments.contains("--oci-worker-snapshotter=overlayfs"))
+        #expect(arguments.contains("--oci-worker-snapshotter=overlayfs --oci-worker-net=bridge"))
     }
 
     @Test func builderInspectionMustMatchEveryManagedResource() {
-        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs --oci-worker-net=bridge"#
 
         #expect(DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 6, memoryGiB: 4)))
         #expect(!DockerIntegration.builder(inspection, matches: .init(cpus: 4, memoryGiB: 8)))
+        #expect(!DockerIntegration.builder(
+            inspection.replacingOccurrences(of: "--oci-worker-net=bridge", with: "--oci-worker-net=host"),
+            matches: .init(cpus: 4, memoryGiB: 4)
+        ))
         #expect(!DockerIntegration.builder(
             inspection.replacingOccurrences(of: "overlayfs", with: "native"),
             matches: .init(cpus: 4, memoryGiB: 4)
@@ -356,7 +360,7 @@ import Testing
     }
 
     @Test func configuringMatchingBuilderSelectsIt() throws {
-        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs --oci-worker-net=bridge"#
         let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []
 
@@ -407,8 +411,23 @@ import Testing
         ])
     }
 
-    @Test func configuringNewResourcesPreservesOverlayState() throws {
+    @Test func configuringHostNetworkBuilderPreservesOverlayState() throws {
         let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs"#
+        var commands: [[String]] = []
+
+        try DockerIntegration.configureBuilder(
+            .init(cpus: 4, memoryGiB: 4), socket: URL(fileURLWithPath: "/tmp/cengine-test.sock")
+        ) { arguments in
+            commands.append(arguments)
+            return arguments == ["buildx", "inspect", DockerIntegration.builderName] ? inspection : ""
+        }
+
+        #expect(commands.contains(["buildx", "rm", "--force", "--keep-state", DockerIntegration.builderName]))
+        #expect(commands.contains(try DockerIntegration.createBuilderArguments(.init(cpus: 4, memoryGiB: 4))))
+    }
+
+    @Test func configuringNewResourcesPreservesOverlayState() throws {
+        let inspection = #"Driver Options: image="moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8" memory="4294967296" cpu-period="100000" cpu-quota="400000" BuildKit daemon flags: --oci-worker-snapshotter=overlayfs --oci-worker-net=bridge"#
         let settings = BuilderSettings(cpus: 2, memoryGiB: 4)
         let socket = URL(fileURLWithPath: "/tmp/cengine-test.sock")
         var commands: [[String]] = []

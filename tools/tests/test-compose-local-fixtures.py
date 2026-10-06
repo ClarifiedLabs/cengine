@@ -32,7 +32,7 @@ def load_functions(*names, **overrides):
     namespace = dict(pathlib=pathlib, io=io, json=json, tempfile=tempfile, tarfile=tarfile,
                      os=os, compat_image_fixtures=fixtures,
                      LOCAL_COMPOSE_IDS={"CMP-008", "CMP-009", "CMP-010"},
-                     LOCAL_BUILDX_IDS={"BLD-001", "BLD-003", "BLD-004", "BLD-006", "BLD-007"})
+                     LOCAL_BUILDX_IDS={"BLD-001", "BLD-003", "BLD-004", "BLD-006", "BLD-007", "BLD-008"})
     namespace.update(overrides)
     for name in names:
         node = ast.parse(ast.unparse(function(name))).body[0]
@@ -61,7 +61,7 @@ class LocalComposeFixturesTests(unittest.TestCase):
                 result = ns["local_build_image_preflight"](request(compat_id))
                 self.assertEqual(set(result), {"python", "buildkit"})
                 self.assertEqual(verify.call_args_list, [call("python"), call("buildkit")])
-        for compat_id in ("BLD-001", "BLD-003", "BLD-004", "BLD-006", "BLD-007"):
+        for compat_id in ("BLD-001", "BLD-003", "BLD-004", "BLD-006", "BLD-007", "BLD-008"):
             with self.subTest(compat_id=compat_id), patch.object(fixtures, "verify", side_effect=lambda name: pathlib.Path("/cache") / name) as verify:
                 result = ns["local_build_image_preflight"](request(compat_id))
                 self.assertEqual(set(result), {"alpine", "buildkit"})
