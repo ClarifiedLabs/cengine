@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import docker
 import pytest
 
-from helper_fixture_lifetime import FixtureBoundary
+from helper_fixture_lifetime import ClientIsolationRefusal, FixtureBoundary
 
 from harness import (
     COMPATIBILITY_OWNER_FILE,
@@ -668,6 +668,8 @@ def daemon(request: pytest.FixtureRequest, image_cache: pathlib.Path) -> Daemon:
     managed_storage_arguments(os.environ)
     try:
         HELPER_FIXTURE_BOUNDARY.prepare(binary)
+    except ClientIsolationRefusal as error:
+        pytest.fail(f"{error}; no root created", pytrace=False)
     except Exception:
         # No root exists yet. Never retry an ambiguous helper restart or expose
         # status/argv/token-bearing subprocess diagnostics.

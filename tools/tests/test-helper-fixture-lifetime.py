@@ -155,11 +155,77 @@ class LifetimeTests(unittest.TestCase):
                 self.kernel.side_effect = result if isinstance(result, Exception) else None
                 self.kernel.return_value = result
                 with self.assertRaises(RuntimeError):
-                    lifetime.require_no_clients()
+                    lifetime.require_no_clients(Path("/never"))
         self.command.return_value = SimpleNamespace(stdout=f"319 -2\n43960 4294967294\n123 {uid}\n456 {uid}\n")
         self.kernel.side_effect = None
         self.kernel.return_value = True
-        lifetime.require_no_clients()
+        lifetime.require_no_clients(Path("/never"))
+
+    def production_candidate(self):
+        return lifetime.harness.RuntimeProcess(
+            456, executable="/untrusted/path/cengine",
+            arguments=("cengine", "vm-shim", "--spec", "/secret/spec"),
+            identity=(10, 2, 300), pidversion=8,
+        )
+
+    def test_census_allows_only_natively_verified_production_clients(self):
+        uid = os.getuid()
+        self.kernel.side_effect = lambda pid: pid == 123
+        candidate = self.production_candidate()
+        self.owner_process.return_value = candidate
+        self.command.side_effect = [
+            SimpleNamespace(stdout=f"123 {uid}\n456 {uid}\n"),
+            SimpleNamespace(stdout="production-runtime\n"),
+        ]
+        lifetime.require_no_clients(Path("/compat/cengine"))
+        self.assertEqual(self.command.call_args_list[1].args[0], [
+            "/compat/cengine", "helper", "verify-production-client", "456", "300", "8"])
+        self.assertEqual(self.owner_process.call_args_list, [unittest.mock.call(456)] * 2)
+
+    def test_client_verification_refuses_failure_timeout_malformed_receipt_and_pid_reuse(self):
+        from dataclasses import replace
+        candidate = self.production_candidate()
+        secret = "secret-token-and-argv"
+        for reply, after in [
+            (subprocess.CalledProcessError(1, secret, output=secret, stderr=secret), candidate),
+            (subprocess.TimeoutExpired(secret, 10, output=secret, stderr=secret), candidate),
+            (SimpleNamespace(stdout=secret), candidate),
+            (SimpleNamespace(stdout="production-runtime\n"), replace(candidate, pidversion=9)),
+            (SimpleNamespace(stdout="production-runtime\n"), replace(candidate, identity=(10, 2, 301))),
+            (SimpleNamespace(stdout="production-runtime\n"), replace(candidate, executable="/replaced")),
+        ]:
+            with self.subTest(reply=type(reply).__name__, after=after.pidversion):
+                self.owner_process.side_effect = [candidate, after]
+                self.command.side_effect = [reply]
+                with self.assertRaises(lifetime.ClientIsolationRefusal) as failure:
+                    lifetime.require_production_client(Path("/compat/cengine"), 456)
+                self.assertIn("PID 456", str(failure.exception))
+                self.assertNotIn(secret, str(failure.exception))
+                self.assertNotIn("/secret/spec", str(failure.exception))
+
+    def test_proven_exit_is_safe_but_unknown_identity_is_not(self):
+        candidate = self.production_candidate()
+        self.owner_process.return_value = None
+        lifetime.require_production_client(Path("/compat/cengine"), 456)
+        self.command.assert_not_called()
+        self.owner_process.side_effect = [candidate, None]
+        self.command.side_effect = [SimpleNamespace(stdout="production-runtime\n")]
+        lifetime.require_production_client(Path("/compat/cengine"), 456)
+        for failure in [RuntimeError("secret"), SimpleNamespace(identity=None, pidversion=None)]:
+            self.owner_process.side_effect = [failure]
+            self.command.reset_mock()
+            with self.assertRaises(lifetime.ClientIsolationRefusal):
+                lifetime.require_production_client(Path("/compat/cengine"), 456)
+            self.command.assert_not_called()
+
+    def test_census_unknown_inspection_reports_only_pid(self):
+        self.command.side_effect = None
+        self.command.return_value = SimpleNamespace(stdout=f"123 {os.getuid()}\n")
+        self.kernel.side_effect = RuntimeError("secret-token")
+        with self.assertRaises(lifetime.ClientIsolationRefusal) as failure:
+            lifetime.require_no_clients(Path("/never"))
+        self.assertIn("PID 123", str(failure.exception))
+        self.assertNotIn("secret-token", str(failure.exception))
 
     def test_canonical_lock_ignores_tmp_and_override_cannot_compete(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -298,6 +364,7 @@ class LifetimeTests(unittest.TestCase):
         fail = Mock(side_effect=RuntimeError("fixture failed"))
         namespace = dict(pytest=SimpleNamespace(fail=fail), pathlib=__import__("pathlib"),
                          os=os, tempfile=tempfile, HELPER_FIXTURE_BOUNDARY=boundary,
+                         ClientIsolationRefusal=lifetime.ClientIsolationRefusal,
                          local_build_image_preflight=lambda request: {},
                          managed_storage_arguments=lambda env: [],
                          DEFAULT_BINARY="/never", DEFAULT_KERNEL="/never",

@@ -57,7 +57,12 @@ The fixture checks the claim, requires the previous fixture's final cleanup to h
 completed (including expected call-phase xfails), refuses any leftover/unknown root in
 the standard user temp, `/private/tmp`, or matrix work cache, and performs a conservative
 read-only current-UID kernel process census. Active daemon/shim/private-controller
-clients or inspection uncertainty refuse; no client is signalled by this guard.
+clients refuse unless the compatibility engine verifies the actual running code as a
+same-team, hardened Developer-ID production engine/controller in the separate production
+namespace. Verification brackets the PID's kernel unique ID, exec version, credentials,
+start time and code status; executable paths, argv and environment cannot grant this
+exception. Compatibility clients and inspection/signature uncertainty still refuse, with
+PID-only diagnostics; no client is signalled by this guard.
 The installed fingerprint exported by preflight, exact test namespace, current UID,
 protocol and signed `--require-managed lifecycle-v2` status must match. One bounded
 restart must produce a different PID, followed by authenticated status with unchanged
@@ -142,8 +147,14 @@ Ordinary lifecycle builds remain fault-free.
 The test helper has a distinct service name, executable identity, client identity,
 authentication token, and per-engine-root vmnet resource namespace. Its automatic
 IPv4 and IPv6 pools also differ from the production defaults. An installed cengine
-helper service `dev.cengine.network-helper` is never changed. The fixture's conservative
-current-UID census may refuse while a production daemon is running; it never stops it.
+helper service `dev.cengine.network-helper` is never changed. Production cengine may
+remain running during tests when its clients pass the native signed-namespace check.
+Each helper's listener admits only its own namespace's signed engine/controller identities;
+networking also authenticates the engine's native identity before token authorization.
+Changing service environment variables or possessing the test token does not let a
+production engine use the test helper, or a test engine use the production helper.
+Unsigned, foreign-team, debug-enabled, stale or unverifiable runtime clients still block
+testing rather than being stopped or trusted by their installation path.
 
 Run `make test-compat-helper-install` deliberately after changing helper behavior that
 must be exercised by live VM-backed tests or after an incompatible protocol change.

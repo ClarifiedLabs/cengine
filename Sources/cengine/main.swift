@@ -392,6 +392,18 @@ import OSLog
             }
             print("Storage owner is enrolled")
             return
+        case "verify-production-client":
+            // Read-only compatibility census: no helper connection or runtime mutation.
+            guard arguments.count == 4,
+                  let pid = Int32(arguments[1]), pid > 0,
+                  let uniqueID = UInt64(arguments[2]), uniqueID > 0,
+                  let pidVersion = UInt32(arguments[3]), pidVersion > 0 else {
+                throw EngineError(.badRequest, "verify-production-client requires PID, unique ID and PID version")
+            }
+            try CompatibilityRuntimeIsolation.verifyProductionClient(
+                pid: pid, uniqueID: uniqueID, pidVersion: pidVersion)
+            print("production-runtime")
+            return
         case "restart":
             guard arguments.count == 1 else {
                 throw EngineError(.badRequest, "helper restart accepts no arguments")

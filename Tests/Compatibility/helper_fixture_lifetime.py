@@ -135,8 +135,38 @@ def require_no_roots() -> None:
                 raise RuntimeError(f"helper isolation refused a retained or unknown compatibility root: {entry}")
 
 
-def require_no_clients() -> None:
-    # ps enumerates IDs only. Kernel argv inspection is read-only and fails closed.
+class ClientIsolationRefusal(RuntimeError):
+    """Safe census diagnostic: PID/reason only, never argv, environment or tokens."""
+
+
+def require_production_client(binary: Path, pid: int) -> None:
+    try:
+        before = harness._kernel_process(pid)
+        if before is None:
+            return  # Kernel inspection proved the enumerated process exited.
+        if before.identity is None or before.pidversion is None:
+            raise RuntimeError("missing process generation")
+        result = subprocess.run(
+            [str(binary), "helper", "verify-production-client", str(pid),
+             str(before.identity[2]), str(before.pidversion)],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        if result.stdout != "production-runtime\n":
+            raise RuntimeError("invalid namespace verification receipt")
+        after = harness._kernel_process(pid)
+        if after is not None and after != before:
+            raise RuntimeError("process changed during namespace verification")
+    except Exception:
+        # Never expose native/subprocess diagnostics: arguments may contain secrets.
+        raise ClientIsolationRefusal(
+            f"helper isolation refused runtime client PID {pid}: "
+            "not verified as a separate signed production runtime"
+        ) from None
+
+
+def require_no_clients(binary: Path) -> None:
+    # ps enumerates IDs only. Kernel/native signature inspection is read-only.
+    # Only verified production clients are exempt; compatibility and unknown clients refuse.
     table = subprocess.run(["/bin/ps", "-axo", "pid=,uid="], check=True,
                            capture_output=True, text=True, timeout=5).stdout
     owner = int(os.environ["CENGINE_COMPAT_OWNER_PID"])
@@ -155,8 +185,14 @@ def require_no_clients() -> None:
         if uid != os.getuid():
             continue
         seen_owner |= pid == owner
-        if not harness._kernel_process_argv_excludes_runtime(pid):
-            raise RuntimeError("helper isolation refused an active or unknown runtime client")
+        try:
+            excludes_runtime = harness._kernel_process_argv_excludes_runtime(pid)
+        except Exception:
+            raise ClientIsolationRefusal(
+                f"helper isolation could not inspect runtime client PID {pid}"
+            ) from None
+        if not excludes_runtime:
+            require_production_client(binary, pid)
     if not seen_owner:
         raise RuntimeError("invoking runner disappeared")
 
@@ -193,7 +229,7 @@ def restart_before_fixture(binary: Path) -> None:
         raise RuntimeError("helper isolation requires the exact test namespace")
     claim = require_claim()
     require_no_roots()
-    require_no_clients()
+    require_no_clients(binary)
 
     def command(*arguments: str, timeout: int) -> dict:
         result = subprocess.run([str(binary), "helper", *arguments], check=True,
@@ -205,7 +241,7 @@ def restart_before_fixture(binary: Path) -> None:
     if require_claim() != claim:
         raise RuntimeError("helper isolation claim changed")
     require_no_roots()
-    require_no_clients()
+    require_no_clients(binary)
     restarted = command("restart", timeout=45)
     after = command("status", "--require-managed", "lifecycle-v2", timeout=10)
     if (after["processIdentifier"] == before["processIdentifier"]
@@ -216,7 +252,7 @@ def restart_before_fixture(binary: Path) -> None:
         raise RuntimeError("helper restart did not prove a new process with unchanged identity")
     # A successful status is not proof that no unexpected client forked meanwhile.
     require_no_roots()
-    require_no_clients()
+    require_no_clients(binary)
     if require_claim() != claim:
         raise RuntimeError("helper isolation claim changed after final census")
 
@@ -261,7 +297,7 @@ def restart_for_offline_remount(transaction) -> None:
                 if (entry.name.startswith("cengine-compat-")
                         and entry not in (canonical_lock(), transaction.value.work)):
                     raise RuntimeError("offline remount refused competing compatibility root")
-        require_no_clients()
+        require_no_clients(transaction.value.binary)
 
     def command(*arguments, timeout):
         result = subprocess.run([str(transaction.value.binary), "helper", *arguments],

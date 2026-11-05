@@ -1068,6 +1068,7 @@ class ManagedStartupTests(unittest.TestCase):
         creation.attach_mock(boundary.created, 'created')
         namespace = dict(__name__=__name__, dataclass=dataclass, field=field, pathlib=pathlib,
             HELPER_FIXTURE_BOUNDARY=boundary,
+            ClientIsolationRefusal=__import__('helper_fixture_lifetime').ClientIsolationRefusal,
             local_build_image_preflight=lambda request: {},
             subprocess=fake_subprocess, time=fake_time, os=SimpleNamespace(environ={}),
             compatibility_environment=Mock(return_value={}),
