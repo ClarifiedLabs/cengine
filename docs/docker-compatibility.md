@@ -490,6 +490,20 @@ but the newer option does not, and **Gap** identifies future work. This version 
 | `IMG-023` | `test_manifest_options_reject_conflicts_and_preserve_identity_after_retag` | Covered | Support | Inspect rejects conflicting selectors, and retagging cannot manufacture trusted identity origins. |
 | `IMG-024` | `test_docker_cli_saves_multiple_images` | Covered | Support | Docker CLI collection export preserves every requested image and its repository tags in one archive, as required by `GET /images/get` and consumed by kind image loading. |
 | `IMG-025` | `test_load_layerless_buildkit_archive_uses_docker_tag` | Covered | Support | `POST /images/load` accepts BuildKit's layerless Docker archive encoding (`Layers=[]` and `rootfs.diff_ids=null`), restores the explicit Docker `RepoTags` name, and does not invent a `local:latest` tag from the generic OCI annotation. See Docker API v1.55 [`POST /images/load`](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Image/operation/ImageLoad). |
+| `IMG-026` | `test_image_manifest_kinds_and_cli_rendering_with_missing_content` | Covered | Support | A local partial OCI index preserves unavailable descriptors in `GET /images/json?manifests=true`. Every `image` has `ImageData`, including an empty platform when metadata is unavailable; every `attestation` has `AttestationData.For`. An unannotated `unknown/unknown` descriptor remains `unknown`, not an attestation with a fabricated target. Both default Docker image listing and `--tree` render without a formatting override. See Docker API v1.55 [image list](https://docs.docker.com/reference/api/engine/version/v1.55/#tag/Image/operation/ImageList). |
+
+Image-summary regression provenance: Moby commit
+[`98f37c8a000ae3f57c574baac896268ccdd66735`](https://github.com/moby/moby/tree/98f37c8a000ae3f57c574baac896268ccdd66735),
+[`TestAttestationDataFor`](https://github.com/moby/moby/blob/98f37c8a000ae3f57c574baac896268ccdd66735/daemon/containerd/image_provenance_test.go#L210-L234),
+[`TestImageList`](https://github.com/moby/moby/blob/98f37c8a000ae3f57c574baac896268ccdd66735/daemon/containerd/image_list_test.go#L302-L491),
+and [`TestAPIImagesListManifests`](https://github.com/moby/moby/blob/98f37c8a000ae3f57c574baac896268ccdd66735/integration/image/list_test.go#L314-L395).
+Swift tests extend these cases to missing target annotations with both cached and
+absent manifest blobs, API version gating, and inspect/list serialization. IMG-026
+uses an offline-generated archive with the unannotated `unknown/unknown` shape
+found in Ryuk, plus an annotated attestation and a platformless missing image.
+Listing does not fetch remote attestations or infer targets from statement bodies;
+unresolved pseudo-images stay `unknown`, matching Moby's classification policy.
+This is image API metadata coverage, not a change to OCI Runtime applicability.
 
 ## System
 

@@ -1181,8 +1181,11 @@ public actor OCIContentStore {
         _ = try descriptor.validated(policy: transferPolicy, errorCode: .internalError)
         guard hasVerifiedBlob(descriptor), Self.manifestMediaTypes.contains(descriptor.mediaType) else {
             let kind: ImageManifestKind
-            if annotatedTarget != nil || isAttestationDescriptor(descriptor) {
+            if annotatedTarget != nil {
                 kind = .attestation
+            } else if isAttestationDescriptor(descriptor) {
+                // unknown/unknown is only a pseudo-image hint, not an attestation target.
+                kind = .unknown
             } else if descriptor.platform != nil || Self.manifestMediaTypes.contains(descriptor.mediaType) {
                 kind = .image
             } else {
@@ -1199,9 +1202,8 @@ public actor OCIContentStore {
         }
         let manifest = try decoder.decode(OCIManifest.self, from: data(for: descriptor))
         let target = annotatedTarget ?? manifest.subject?.digest
-        let isAttestation = target != nil && (
-            isAttestationDescriptor(descriptor) || manifest.artifactType == Self.attestationManifestArtifactType
-        )
+        let isAttestation = isAttestationDescriptor(descriptor)
+            || manifest.artifactType == Self.attestationManifestArtifactType
         let children = [manifest.config] + manifest.layers
         for child in children {
             _ = try child.validated(policy: transferPolicy, errorCode: .internalError)
@@ -1219,7 +1221,7 @@ public actor OCIContentStore {
             return .init(
                 descriptor: descriptor,
                 available: available,
-                kind: .attestation,
+                kind: target == nil ? .unknown : .attestation,
                 platform: descriptor.platform,
                 contentSize: contentSize,
                 attestationFor: target

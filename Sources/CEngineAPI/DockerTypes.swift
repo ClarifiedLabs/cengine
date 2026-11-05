@@ -939,10 +939,15 @@ public struct ImageManifestSummaryResponse: Encodable, Sendable {
         Descriptor = manifest.descriptor
         Available = manifest.available
         Size = .init(Content: manifest.contentSize, Total: manifest.contentSize)
-        Kind = manifest.kind.rawValue
-        ImageData = manifest.kind == .image ? manifest.platform.map {
-            .init(Platform: $0, Identity: identity.map(ImageIdentityResponse.init), Containers: containers, Size: .init(Unpacked: 0))
-        } : nil
+        // Docker clients dereference the data object promised by Kind, even for
+        // unavailable manifests. An unknown platform is an empty OCI platform;
+        // an unknown attestation target must not be advertised as an attestation.
+        Kind = manifest.kind == .attestation && manifest.attestationFor == nil
+            ? ImageManifestKind.unknown.rawValue : manifest.kind.rawValue
+        ImageData = manifest.kind == .image ? .init(
+            Platform: manifest.platform ?? .init(architecture: "", os: ""),
+            Identity: identity.map(ImageIdentityResponse.init), Containers: containers, Size: .init(Unpacked: 0)
+        ) : nil
         AttestationData = manifest.kind == .attestation ? manifest.attestationFor.map { .init(For: $0) } : nil
     }
 }

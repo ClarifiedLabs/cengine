@@ -7205,6 +7205,103 @@ private actor AuthImageBackend: ContainerBackend {
         #expect(containers.allSatisfy { $0["ImageID"] as? String == returnedID })
     }
 
+    @Test(arguments: [false, true])
+    func attestationResponseKindRequiresATarget(hasTarget: Bool) throws {
+        let descriptor = OCIDescriptor(
+            mediaType: "application/vnd.oci.image.manifest.v1+json",
+            digest: "sha256:" + String(repeating: "a", count: 64), size: 100
+        )
+        let target = "sha256:" + String(repeating: "b", count: 64)
+        let record = ImageManifestRecord(
+            descriptor: descriptor, available: false, kind: .attestation,
+            attestationFor: hasTarget ? target : nil
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            ImageManifestSummaryResponse(record)
+        )) as? [String: Any])
+        #expect(json["Kind"] as? String == (hasTarget ? "attestation" : "unknown"))
+        #expect((json["AttestationData"] as? [String: String])?["For"] == (hasTarget ? target : nil))
+        #expect(json["ImageData"] == nil)
+    }
+
+    @Test func imageListPreservesMissingManifestKindsAndData() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try OCIContentStore(root: root.appending(path: "content"))
+        let encoder = JSONEncoder()
+        let config = try await store.put(
+            Data(#"{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#.utf8),
+            mediaType: "application/vnd.oci.image.config.v1+json"
+        )
+        let image = try await store.put(encoder.encode(OCIManifest(
+            schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json",
+            config: config, layers: [], annotations: nil
+        )), mediaType: "application/vnd.oci.image.manifest.v1+json")
+        let unresolved = OCIDescriptor(
+            mediaType: image.mediaType, digest: "sha256:" + String(repeating: "a", count: 64), size: 100,
+            platform: .init(architecture: "unknown", os: "unknown")
+        )
+        let attestation = OCIDescriptor(
+            mediaType: image.mediaType, digest: "sha256:" + String(repeating: "b", count: 64), size: 100,
+            annotations: [
+                OCIContentStore.attestationReferenceTypeAnnotation: OCIContentStore.attestationReferenceType,
+                OCIContentStore.attestationReferenceDigestAnnotation: image.digest,
+            ], platform: .init(architecture: "unknown", os: "unknown")
+        )
+        let platformless = OCIDescriptor(
+            mediaType: image.mediaType, digest: "sha256:" + String(repeating: "c", count: 64), size: 100
+        )
+        let index = try await store.put(encoder.encode(OCIIndex(
+            schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json",
+            manifests: [image, unresolved, attestation, platformless], annotations: nil
+        )), mediaType: "application/vnd.oci.image.index.v1+json")
+        try await store.tag(index, as: "example:partial")
+        let runtime = try await EngineRuntime(root: root, backend: LocalOCIImageBackend(store: store))
+        let router = DockerRouter(runtime: runtime, root: root)
+
+        let legacy = await router.route(.init(method: .GET, uri: "/v1.46/images/json?manifests=true"))
+        #expect(legacy.status == .ok)
+        let legacyImage = try #require((JSONSerialization.jsonObject(with: legacy.body) as? [[String: Any]])?.first)
+        #expect(legacyImage["Manifests"] == nil)
+
+        for uri in [
+            "/v1.47/images/json?manifests=true",
+            "/v1.55/images/json?manifests=true",
+            "/v1.55/images/example:partial/json?manifests=true",
+        ] {
+            let response = await router.route(.init(method: .GET, uri: uri))
+            #expect(response.status == .ok)
+            let body = try JSONSerialization.jsonObject(with: response.body)
+            let summary = try #require((body as? [[String: Any]])?.first ?? body as? [String: Any])
+            let manifests = try #require(summary["Manifests"] as? [[String: Any]])
+            #expect(manifests.count == 4)
+            let byID = Dictionary(uniqueKeysWithValues: try manifests.map {
+                (try #require($0["ID"] as? String), $0)
+            })
+            let unknown = try #require(byID[unresolved.digest])
+            #expect(unknown["Kind"] as? String == "unknown")
+            #expect(unknown["Available"] as? Bool == false)
+            #expect(unknown["AttestationData"] == nil)
+            #expect(unknown["ImageData"] == nil)
+            let attested = try #require(byID[attestation.digest])
+            #expect(attested["Kind"] as? String == "attestation")
+            #expect(attested["Available"] as? Bool == false)
+            #expect((attested["AttestationData"] as? [String: String])?["For"] == image.digest)
+            #expect(attested["ImageData"] == nil)
+            for digest in [image.digest, platformless.digest] {
+                let item = try #require(byID[digest])
+                #expect(item["Kind"] as? String == "image")
+                #expect(item["Available"] as? Bool == (digest == image.digest))
+                let data = try #require(item["ImageData"] as? [String: Any])
+                let platform = try #require(data["Platform"] as? [String: String])
+                #expect(platform["architecture"] == (digest == image.digest ? "arm64" : ""))
+                #expect(platform["os"] == (digest == image.digest ? "linux" : ""))
+                #expect(data["Containers"] as? [String] == [])
+                #expect(item["AttestationData"] == nil)
+            }
+        }
+    }
+
     @Test func multiPlatformImageMetadataIsVersionedAndPlatformSelectable() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

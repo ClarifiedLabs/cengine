@@ -447,3 +447,138 @@ def test_load_layerless_buildkit_archive_uses_docker_tag(client: docker.DockerCl
     assert image.attrs["RootFS"]["Layers"] == []
     with pytest.raises(errors.ImageNotFound):
         client.images.get("local:latest")
+
+
+@pytest.mark.compat("IMG-026")
+def test_image_manifest_kinds_and_cli_rendering_with_missing_content(client: docker.DockerClient, daemon):
+    # Adapted from Moby TestAttestationDataFor (98f37c8a000ae3f57c574baac896268ccdd66735,
+    # daemon/containerd/image_provenance_test.go:213) and missing-content TestImageList.
+    repository = f"compat-manifest-kinds-{uuid.uuid4().hex[:8]}"
+    reference = f"{repository}:latest"
+    manifest_type = "application/vnd.oci.image.manifest.v1+json"
+    index_type = "application/vnd.oci.image.index.v1+json"
+
+    def encoded(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    def descriptor(contents: bytes, media_type: str) -> dict:
+        return {
+            "mediaType": media_type,
+            "digest": f"sha256:{hashlib.sha256(contents).hexdigest()}",
+            "size": len(contents),
+        }
+
+    config = encoded({
+        "architecture": "arm64",
+        "os": "linux",
+        "config": {"Labels": {"compat.cengine.manifest-kinds": "true"}},
+        "rootfs": {"type": "layers", "diff_ids": []},
+    })
+    config_descriptor = descriptor(config, "application/vnd.oci.image.config.v1+json")
+    manifest = encoded({
+        "schemaVersion": 2,
+        "mediaType": manifest_type,
+        "config": config_descriptor,
+        "layers": [],
+    })
+    stored_image = descriptor(manifest, manifest_type)
+    stored_image["platform"] = {"architecture": "arm64", "os": "linux"}
+    unresolved = {
+        "mediaType": manifest_type,
+        "digest": f"sha256:{hashlib.sha256(b'compat-missing-unknown').hexdigest()}",
+        "size": 101,
+        "platform": {"architecture": "unknown", "os": "unknown"},
+        # Ryuk-shaped descriptor: unknown/unknown alone does not identify an attestation.
+    }
+    attestation = {
+        "mediaType": manifest_type,
+        "digest": f"sha256:{hashlib.sha256(b'compat-missing-attestation').hexdigest()}",
+        "size": 102,
+        "platform": {"architecture": "unknown", "os": "unknown"},
+        "annotations": {
+            "vnd.docker.reference.type": "attestation-manifest",
+            "vnd.docker.reference.digest": stored_image["digest"],
+        },
+    }
+    platformless_image = {
+        "mediaType": manifest_type,
+        "digest": f"sha256:{hashlib.sha256(b'compat-missing-platformless-image').hexdigest()}",
+        "size": 103,
+    }
+    descriptors = [stored_image, unresolved, attestation, platformless_image]
+    index = encoded({"schemaVersion": 2, "mediaType": index_type, "manifests": descriptors})
+    index_descriptor = descriptor(index, index_type)
+    index_descriptor["annotations"] = {
+        "io.containerd.image.name": reference,
+        "org.opencontainers.image.ref.name": reference,
+    }
+    entries = {
+        "oci-layout": encoded({"imageLayoutVersion": "1.0.0"}),
+        "index.json": encoded({
+            "schemaVersion": 2,
+            "mediaType": index_type,
+            "manifests": [index_descriptor],
+        }),
+    }
+    # Only the runnable image and the index are stored; all three other blobs stay absent.
+    for contents, item in ((config, config_descriptor), (manifest, stored_image), (index, index_descriptor)):
+        entries[f"blobs/sha256/{item['digest'].removeprefix('sha256:')}"] = contents
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, contents in sorted(entries.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(contents)
+            archive.addfile(info, io.BytesIO(contents))
+
+    try:
+        assert client.images.load(buffer.getvalue())
+        images = image_request(client, "/images/json", params={"manifests": "true"})
+        matches = [item for item in images if reference in (item.get("RepoTags") or [])]
+        assert len(matches) == 1, images
+        image = matches[0]
+        assert image["Descriptor"]["digest"] == index_descriptor["digest"]
+        summaries = image["Manifests"]
+        assert len(summaries) == 4, summaries
+        by_digest = {item["Descriptor"]["digest"]: item for item in summaries}
+        expected = {
+            stored_image["digest"]: ("image", True),
+            unresolved["digest"]: ("unknown", False),
+            attestation["digest"]: ("attestation", False),
+            platformless_image["digest"]: ("image", False),
+        }
+        assert by_digest.keys() == expected.keys(), summaries
+        for item in descriptors:
+            summary = by_digest[item["digest"]]
+            kind, available = expected[item["digest"]]
+            assert summary["ID"] == item["digest"], summary
+            assert summary["Descriptor"] == item, summary
+            assert summary["Kind"] == kind, summary
+            assert summary["Available"] is available, summary
+            if kind == "image":
+                assert isinstance(summary.get("ImageData"), dict), summary
+                assert summary.get("AttestationData") is None, summary
+            elif kind == "attestation":
+                assert summary.get("ImageData") is None, summary
+                assert summary.get("AttestationData") == {"For": stored_image["digest"]}, summary
+            else:
+                assert summary.get("ImageData") is None, summary
+                assert summary.get("AttestationData") is None, summary
+        assert by_digest[stored_image["digest"]]["ImageData"]["Platform"] == stored_image["platform"]
+
+        environment = docker_environment(daemon.socket)
+        environment["DOCKER_CLI_EXPERIMENTAL"] = "enabled"
+        for options in ([], ["--tree"]):
+            command = ["docker", "image", "ls", *options, reference]
+            result = subprocess.run(
+                command, env=environment, text=True, capture_output=True, timeout=60,
+            )
+            output = f"{command!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            assert result.returncode == 0, output
+            assert repository in result.stdout, output
+            if "--tree" in options:
+                assert "linux/arm64" in result.stdout, output
+    finally:
+        try:
+            client.images.remove(reference, force=True)
+        except errors.NotFound:
+            pass

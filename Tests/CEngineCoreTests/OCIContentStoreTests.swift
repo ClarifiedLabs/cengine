@@ -406,6 +406,55 @@ import Testing
         #expect(after.manifests.first(where: { $0.descriptor.digest == amd64.digest })?.available == true)
     }
 
+    // Moby TestAttestationDataFor + TestImageList's partial-content fixtures,
+    // extended to the unannotated unknown/unknown descriptors found in Ryuk.
+    @Test(arguments: [false, true], [false, true])
+    func attestationSummariesRequireATarget(manifestPresent: Bool, targetAnnotated: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try OCIContentStore(root: root)
+        let encoder = JSONEncoder()
+        let config = try await store.put(
+            Data(#"{"architecture":"arm64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#.utf8),
+            mediaType: "application/vnd.oci.image.config.v1+json"
+        )
+        let image = try await store.put(encoder.encode(OCIManifest(
+            schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json",
+            config: config, layers: [], annotations: nil
+        )), mediaType: "application/vnd.oci.image.manifest.v1+json")
+        // A readable config must not turn an unresolved pseudo-image into a runnable image.
+        let contents = try encoder.encode(OCIManifest(
+            schemaVersion: 2, mediaType: image.mediaType,
+            config: config, layers: [], annotations: ["fixture": "pseudo-image"]
+        ))
+        let digest = "sha256:" + SHA256.hash(data: contents).map { String(format: "%02x", $0) }.joined()
+        if manifestPresent {
+            _ = try await store.put(contents, mediaType: image.mediaType)
+        }
+        let descriptor = OCIDescriptor(
+            mediaType: image.mediaType, digest: digest, size: Int64(contents.count),
+            annotations: targetAnnotated ? [
+                OCIContentStore.attestationReferenceTypeAnnotation: OCIContentStore.attestationReferenceType,
+                OCIContentStore.attestationReferenceDigestAnnotation: image.digest,
+            ] : nil,
+            platform: .init(architecture: "unknown", os: "unknown")
+        )
+        let index = try await store.put(encoder.encode(OCIIndex(
+            schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json",
+            manifests: [image, descriptor], annotations: nil
+        )), mediaType: "application/vnd.oci.image.index.v1+json")
+        try await store.tag(index, as: "example:partial-attestation")
+
+        let summary = try #require(try await store.summaries().first)
+        #expect(summary.manifests.count == 2)
+        #expect(summary.preferredManifestDigest == image.digest)
+        let record = try #require(summary.manifests.first { $0.descriptor.digest == digest })
+        #expect(record.kind == (targetAnnotated ? .attestation : .unknown))
+        #expect(record.attestationFor == (targetAnnotated ? image.digest : nil))
+        #expect(record.available == manifestPresent)
+        #expect(record.descriptor == descriptor)
+    }
+
     @Test func attachedInTotoStatementsAreDiscoveredAndReadOnlyOnRequest() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
