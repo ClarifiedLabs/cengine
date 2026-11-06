@@ -246,6 +246,12 @@ unregisters the networking helper, waits for service unregistration, and registe
 replacement services as permitted by the enabled/approval state. Networking stays
 available until container writers and shared infrastructure have exited. Failure
 keeps automatic registration fenced until an explicit Enable/Restart retry.
+If cask cleanup already removed the helper while a managed storage VM survived,
+an enabled engine restores the bundled helper first: authenticated VM retirement
+requires ROOT. Pending helper approval blocks migration with Enable/Restart
+instructions. A helper restored for shutdown is kept registered; storage owner
+setup and replacement engine registration still wait for successful strict
+teardown. Disabled engines do not automatically enable a missing helper.
 `cengine system shutdown --for-upgrade` waits for and holds the same socket and
 canonical engine-root lifetime locks as the daemon throughout strict teardown,
 preventing recreation even by a daemon using a different API socket. A stopped VM

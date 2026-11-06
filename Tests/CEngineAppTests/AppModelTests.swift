@@ -391,11 +391,121 @@ import CEngineCore
         await model.restartEngineService()
 
         #expect(sequence.entries.filter { $0 == "vms" }.count == (phase == "engine" ? 1 : 2))
-        #expect(sequence.entries.suffix(2) == ["register-helper", "register-engine"])
+        if ["helper", "settled", "register-helper"].contains(phase) {
+            // The failed attempt left ROOT absent: retry must restore it before
+            // strict shutdown, then keep that current-bundle registration.
+            #expect(sequence.entries.suffix(3) == ["register-helper", "vms", "register-engine"])
+        } else {
+            #expect(sequence.entries.suffix(2) == ["register-helper", "register-engine"])
+        }
         #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
         #expect(defaults.bool(forKey: AppModel.engineServiceEnabledKey))
         #expect(agent.status == .enabled)
         #expect(helper.status == .enabled)
+        #expect(model.error == nil)
+    }
+
+    @MainActor @Test(arguments: [SMAppService.Status.notFound, .notRegistered])
+    func upgradeRestoresMissingHelperBeforeStrictShutdown(status: SMAppService.Status) async {
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("24", forKey: AppModel.serviceRegistrationRevisionKey)
+        let sequence = TeardownSequenceRecorder()
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled,
+            onRegister: { sequence.record("register-engine") },
+            onUnregister: { sequence.record("engine") })
+        let helper = MockAppService(status: status, statusAfterRegistration: .enabled,
+            onRegister: { sequence.record("restore-helper") })
+        let model = AppModel(
+            agent: agent, helper: helper, client: UnavailableEngineClient(),
+            serviceRegistrationRevision: "25", serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in sequence.record("owner") },
+            waitForServiceUnregistration: { sequence.record("settled") },
+            stopVirtualMachinesForUpgrade: {
+                #expect(helper.status == .enabled)
+                #expect(agent.status == .notRegistered)
+                sequence.record("vms")
+            }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+
+        #expect(sequence.entries == ["engine", "restore-helper", "vms", "settled", "owner", "register-engine"])
+        #expect(helper.registerCount == 1)
+        #expect(helper.unregisterCount == 0)
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
+        #expect(model.error == nil)
+    }
+
+    @MainActor @Test(arguments: ["restore", "approval", "shutdown"])
+    func missingHelperUpgradeFailureStaysFencedUntilExplicitRetry(phase: String) async {
+        enum Failure: Error { case upgrade }
+        let suiteName = "AppModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("24", forKey: AppModel.serviceRegistrationRevisionKey)
+        var shouldFail = true
+        var shutdownCount = 0
+        var ownerCount = 0
+        var settingsOpenCount = 0
+        let agent = MockAppService(status: .enabled, statusAfterRegistration: .enabled)
+        let helper = MockAppService(status: .notFound,
+            statusAfterRegistration: phase == "approval" ? .requiresApproval : .enabled,
+            onRegister: { if shouldFail, phase == "restore" { throw Failure.upgrade } })
+        let client = UnavailableEngineClient()
+        let model = AppModel(
+            agent: agent, helper: helper, client: client,
+            serviceRegistrationRevision: "25", serviceRegistrationDefaults: defaults,
+            ensureStorageOwner: { _ in ownerCount += 1 },
+            waitForServiceUnregistration: {},
+            stopVirtualMachinesForUpgrade: {
+                shutdownCount += 1
+                #expect(helper.status == .enabled)
+                if shouldFail { throw Failure.upgrade }
+            },
+            restartRegisteredEngine: { Issue.record("retry must finish migration, not kickstart") },
+            openLoginItemsSettings: { settingsOpenCount += 1 }
+        )
+        defer { model.setActive(false) }
+
+        await model.start()
+        #expect(model.error != nil)
+        if phase == "approval" {
+            #expect(model.error?.contains("Approve the Privileged Helper") == true)
+        }
+        #expect(shutdownCount == (phase == "shutdown" ? 1 : 0))
+        #expect(ownerCount == 0)
+        #expect(agent.registerCount == 0)
+        #expect(helper.unregisterCount == 0)
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "24")
+
+        await model.refresh()
+        await model.start()
+        #expect(await client.requestCount == 0)
+        #expect(agent.registerCount == 0)
+        #expect(helper.registerCount == 1)
+
+        if phase == "approval" {
+            await model.completeOnboarding()
+            #expect(settingsOpenCount == 1)
+            #expect(shutdownCount == 0)
+            #expect(ownerCount == 0)
+            #expect(agent.registerCount == 0)
+            #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "24")
+        }
+
+        // Simulate approval/restoration by the user, then explicitly retry.
+        shouldFail = false
+        helper.status = .enabled
+        helper.statusAfterRegistration = .enabled
+        await model.restartEngineService()
+
+        #expect(shutdownCount == (phase == "shutdown" ? 2 : 1))
+        #expect(ownerCount == 1)
+        #expect(agent.registerCount == 1)
+        #expect(defaults.string(forKey: AppModel.serviceRegistrationRevisionKey) == "25")
         #expect(model.error == nil)
     }
 
@@ -718,7 +828,7 @@ private actor RestartRecorder {
 
 @MainActor private final class MockAppService: AppService {
     var status: SMAppService.Status
-    let statusAfterRegistration: SMAppService.Status
+    var statusAfterRegistration: SMAppService.Status
     let registrationError: Error?
     let onRegister: (() throws -> Void)?
     let onUnregister: (() async throws -> Void)?

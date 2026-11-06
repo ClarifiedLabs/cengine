@@ -257,6 +257,7 @@ extension SMAppService: AppService {}
             if helper.status == .requiresApproval { openLoginItemsSettings() }
             error = nil
         } catch {
+            if helper.status == .requiresApproval { openLoginItemsSettings() }
             self.error = "Could not enable the Privileged Helper: \(error.localizedDescription)"
         }
         updateServiceStatus()
@@ -687,11 +688,20 @@ extension SMAppService: AppService {}
             try await agent.unregister()
             unregisteredService = true
         }
+        // Cask teardown can remove ROOT while a managed storage shim survives.
+        // Restore only this shutdown prerequisite, never the replacement engine
+        // or storage ownership, before the strict retirement gate succeeds.
+        let restoredHelper = engineServiceEnabled && CEngineServices.needsRegistration(helper.status)
+        if restoredHelper { try registerRequiredNetworking() }
+        if engineServiceEnabled, helper.status == .requiresApproval {
+            throw EngineError(.serviceUnavailable,
+                "Approve the Privileged Helper in System Settings > General > Login Items & Extensions, then choose Enable or Restart to finish the upgrade.")
+        }
         // This strict command waits for daemon quiescence and verifies owned VM
         // exits. It must run even if cask teardown already removed the agent.
         // Keep networking available until all VMs have stopped successfully.
         try await stopVirtualMachinesForUpgrade()
-        if helper.status == .enabled || helper.status == .requiresApproval {
+        if !restoredHelper, helper.status == .enabled || helper.status == .requiresApproval {
             try await helper.unregister()
             unregisteredService = true
         }
