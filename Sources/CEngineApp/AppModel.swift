@@ -387,7 +387,16 @@ extension SMAppService: AppService {}
     }
 
     func refresh() async {
-        guard automaticServiceRegistrationAllowed, !isManagingEngineService, !isRefreshing else { return }
+        guard !isManagingEngineService, !isRefreshing else { return }
+        guard automaticServiceRegistrationAllowed else {
+            // The startup fence blocks side effects, not observation of approval.
+            let wasAwaitingApproval = helperNeedsApproval
+            updateServiceStatus()
+            if wasAwaitingApproval, helper.status == .enabled {
+                engineServiceActionStatus = "Privileged Helper approved. Choose Enable or Restart to finish setup."
+            }
+            return
+        }
         isRefreshing = true
         defer { isRefreshing = false }
         do {

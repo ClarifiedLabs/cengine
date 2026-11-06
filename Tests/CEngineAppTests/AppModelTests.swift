@@ -500,6 +500,14 @@ import CEngineCore
         shouldFail = false
         helper.status = .enabled
         helper.statusAfterRegistration = .enabled
+        await model.refresh()
+        #expect(!model.helperNeedsApproval)
+        #expect(model.helperStatus == "Running")
+        #expect(model.error != nil)
+        #expect(shutdownCount == (phase == "shutdown" ? 1 : 0))
+        #expect(ownerCount == 0)
+        #expect(agent.registerCount == 0)
+        #expect(await client.requestCount == 0)
         await model.restartEngineService()
 
         #expect(shutdownCount == (phase == "shutdown" ? 2 : 1))
@@ -718,15 +726,25 @@ import CEngineCore
         let agent = MockAppService(status: .notFound, statusAfterRegistration: .enabled)
         let helper = MockAppService(status: .requiresApproval, statusAfterRegistration: .enabled)
         var modes: [Bool] = []
-        let model = AppModel(agent: agent, helper: helper, client: UnavailableEngineClient(),
+        let client = UnavailableEngineClient()
+        let model = AppModel(agent: agent, helper: helper, client: client,
             serviceRegistrationRevision: nil, serviceRegistrationDefaults: defaults,
-            ensureStorageOwner: { modes.append($0) })
+            ensureStorageOwner: { modes.append($0) },
+            openLoginItemsSettings: { Issue.record("polling must not open approval settings") })
         defer { model.setActive(false) }
         await model.enableEngineService()
+        await model.refresh()
+        #expect(model.helperNeedsApproval)
+        #expect(model.helperStatus == "Needs approval")
         helper.status = .enabled
         await model.refresh()
+        #expect(!model.helperNeedsApproval)
+        #expect(model.helperStatus == "Running")
+        #expect(model.engineServiceActionStatus == "Privileged Helper approved. Choose Enable or Restart to finish setup.")
         #expect(modes.isEmpty)
         #expect(agent.registerCount == 0)
+        #expect(helper.registerCount == 0)
+        #expect(await client.requestCount == 0)
         await model.restartEngineService()
         #expect(modes == [true])
         #expect(agent.registerCount == 1)
