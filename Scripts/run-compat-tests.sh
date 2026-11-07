@@ -56,7 +56,20 @@ if [ "${CENGINE_COMPAT_SHARED_STORAGE+x}${CENGINE_COMPAT_MANAGED_STORAGE+x}" != 
     echo 'CENGINE_COMPAT_SHARED_STORAGE and CENGINE_COMPAT_MANAGED_STORAGE are retired; lifecycle is the default' >&2
     exit 2
 fi
-TEAM_IDENTIFIER=$(managed_signing_team "${CENGINE_DEVELOPER_ID_APPLICATION:-}")
+if [ "${CENGINE_COMPAT_HELPER_MODE:-}" = "unprivileged" ] && \
+   [ -z "$CENGINE_STORAGE_LIFECYCLE_QUALIFICATION" ] && \
+   [ -z "$CENGINE_COMPAT_LIFECYCLE_FAULT" ] && \
+   [ "${CENGINE_DEVELOPER_ID_APPLICATION:-}" = "" ]; then
+    CENGINE_DEVELOPER_ID_APPLICATION=-
+fi
+if [ "${CENGINE_COMPAT_HELPER_MODE:-}" = "unprivileged" ] && \
+   [ -z "$CENGINE_STORAGE_LIFECYCLE_QUALIFICATION" ] && \
+   [ -z "$CENGINE_COMPAT_LIFECYCLE_FAULT" ] && \
+   [ "${CENGINE_DEVELOPER_ID_APPLICATION:-}" = "-" ]; then
+    TEAM_IDENTIFIER=0000000000
+else
+    TEAM_IDENTIFIER=$(managed_signing_team "${CENGINE_DEVELOPER_ID_APPLICATION:-}")
+fi
 BUILD_DEFAULT_ASSETS=0
 if [ "${CENGINE_COMPAT_MANAGED_ASSET_DIR+x}" = x ]; then
     [ -n "$CENGINE_COMPAT_MANAGED_ASSET_DIR" ] || { echo 'explicit asset directory must not be empty' >&2; exit 2; }

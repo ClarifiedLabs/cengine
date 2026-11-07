@@ -11,6 +11,7 @@ public struct SignedStorageIdentity: Sendable {
     /// CS_RUNTIME (XNU cs_blobs.h). Code identity alone does not protect a
     /// same-UID nonexporting key holder against debugger/DYLD injection.
     public static let controllerRuntimeFlag: UInt32 = 0x0001_0000
+    public static let adHocCompatibilityTeam = "0000000000"
     public static let forbiddenControllerEntitlements: Set<String> = [
         "com.apple.security.get-task-allow", "com.apple.security.cs.debugger",
         "com.apple.security.cs.disable-library-validation", "com.apple.security.cs.allow-unsigned-executable-memory",
@@ -67,21 +68,28 @@ public struct SignedStorageIdentity: Sendable {
               SecCodeCopyStaticCode(running, [], &code) == errSecSuccess, let code,
               SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let values = information as? [String: Any],
-              let team = values[kSecCodeInfoTeamIdentifier as String] as? String,
               let identifier = values[kSecCodeInfoIdentifier as String] as? String,
               let plist = values[kSecCodeInfoPList as String] as? [String: Any],
               let executable = values[kSecCodeInfoMainExecutable as String] as? URL,
               executable.isFileURL, executable.path.hasPrefix("/") else { throw unavailable() }
+        let rawTeam = values[kSecCodeInfoTeamIdentifier as String] as? String
+        let isAdHocCompat = rawTeam == nil && (plist["CEngineTeamIdentifier"] as? String) == adHocCompatibilityTeam
+        guard let team = rawTeam ?? (isAdHocCompat ? adHocCompatibilityTeam : nil) else { throw unavailable() }
         let namespace = try selectedNamespace(role: role, team: team, identifier: identifier, plist: plist)
         guard expectedNamespace == nil || expectedNamespace == namespace else { throw unavailable() }
-        try validateFlags(values)
-        let requirement = try requirement(identifier: identifier, team: team)
+        if isAdHocCompat {
+            guard namespace == .compatibility else { throw unavailable() }
+            try validateAdHocCompatibilityFlags(values)
+        } else {
+            try validateFlags(values)
+        }
+        let requirement = try requirement(identifier: identifier, team: team, namespace: namespace)
         let flags = SecCSFlags(rawValue: kSecCSStrictValidate)
         var status: UInt32 = 0
         guard SecStaticCodeCheckValidity(code, flags, requirement) == errSecSuccess,
               SecCodeCheckValidity(running, flags, requirement) == errSecSuccess,
               storageCodeStatus(getpid(), 0, &status, MemoryLayout<UInt32>.size) == 0,
-              status & controllerRuntimeFlag != 0 else { throw unavailable() }
+              isAdHocCompat || (status & controllerRuntimeFlag != 0) else { throw unavailable() }
         return Self(teamIdentifier: team, executable: executable, role: role, namespace: namespace)
     }
 
@@ -91,12 +99,17 @@ public struct SignedStorageIdentity: Sendable {
         guard role == .engine else { throw Self.unavailable() }
         let child = executable.deletingLastPathComponent().appending(path: "cengine-storage-controller")
         var code: SecStaticCode?, information: CFDictionary?
+        let isAdHocCompat = namespace == .compatibility && teamIdentifier == Self.adHocCompatibilityTeam
         guard SecStaticCodeCreateWithPath(child as CFURL, [], &code) == errSecSuccess, let code,
               SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate),
-                try Self.requirement(identifier: namespace.controllerIdentifier, team: teamIdentifier)) == errSecSuccess,
+                try Self.requirement(identifier: namespace.controllerIdentifier, team: teamIdentifier, namespace: namespace)) == errSecSuccess,
               SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let values = information as? [String: Any] else { throw Self.unavailable() }
-        try Self.validateFlags(values)
+        if isAdHocCompat {
+            try Self.validateAdHocCompatibilityFlags(values)
+        } else {
+            try Self.validateFlags(values)
+        }
         return child
     }
 
@@ -130,6 +143,14 @@ public struct SignedStorageIdentity: Sendable {
                 entitlementKeys: Set((entitlements as? [String: Any] ?? [:]).keys)) else { throw unavailable() }
     }
 
+    static func validateAdHocCompatibilityFlags(_ information: [String: Any]) throws {
+        let entitlements = information[kSecCodeInfoEntitlementsDict as String]
+        guard let flags = information[kSecCodeInfoFlags as String] as? NSNumber,
+              flags.uint32Value & 0x2 != 0,
+              entitlements == nil || entitlements is [String: Any],
+              forbiddenControllerEntitlements.isDisjoint(with: Set((entitlements as? [String: Any] ?? [:]).keys)) else { throw unavailable() }
+    }
+
     /// Policy text only, not an authenticated identity proof.
     public static func developerIDRequirement(identifiers: [String], team: String) throws -> String {
         let allowed = Set(Namespace.allCases.flatMap { [$0.engineIdentifier, $0.helperIdentifier, $0.controllerIdentifier] })
@@ -140,6 +161,18 @@ public struct SignedStorageIdentity: Sendable {
         return "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and (\(roles)) and certificate leaf[subject.OU] = \"\(team)\""
     }
 
+    public static func peerRequirement(identifiers: [String], team: String, namespace: Namespace) throws -> String {
+        if namespace == .compatibility && team == adHocCompatibilityTeam {
+            let allowed = Set([Namespace.compatibility.engineIdentifier,
+                               Namespace.compatibility.helperIdentifier,
+                               Namespace.compatibility.controllerIdentifier])
+            guard !identifiers.isEmpty, identifiers.count <= 2, Set(identifiers).count == identifiers.count,
+                  identifiers.allSatisfy(allowed.contains) else { throw unavailable() }
+            return identifiers.map { "identifier \"\($0)\"" }.joined(separator: " or ")
+        }
+        return try developerIDRequirement(identifiers: identifiers, team: team)
+    }
+
     /// Additional checks on an immutable-audit-pinned engine/helper. The caller
     /// retains its PID-generation checks around validation; this mints no proof.
     public static func validatePeer(_ running: SecCode, pid: Int32, role: Role,
@@ -148,21 +181,28 @@ public struct SignedStorageIdentity: Sendable {
         guard pid > 0, SecCodeCopyStaticCode(running, [], &code) == errSecSuccess, let code,
               SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let values = information as? [String: Any],
-              let team = values[kSecCodeInfoTeamIdentifier as String] as? String, team == expectedTeam,
               let identifier = values[kSecCodeInfoIdentifier as String] as? String,
               let plist = values[kSecCodeInfoPList as String] as? [String: Any] else { throw unavailable() }
+        let isAdHocCompat = namespace == .compatibility && expectedTeam == adHocCompatibilityTeam
+        let rawTeam = values[kSecCodeInfoTeamIdentifier as String] as? String
+        guard let team = rawTeam ?? (isAdHocCompat ? (plist["CEngineTeamIdentifier"] as? String) : nil),
+              team == expectedTeam, (rawTeam != nil) != isAdHocCompat else { throw unavailable() }
         try validateFields(role: role, namespace: namespace, team: team, identifier: identifier, plist: plist)
-        try validateFlags(values)
-        let policy = try requirement(identifier: identifier, team: team)
+        if isAdHocCompat {
+            try validateAdHocCompatibilityFlags(values)
+        } else {
+            try validateFlags(values)
+        }
+        let policy = try requirement(identifier: identifier, team: team, namespace: namespace)
         var status: UInt32 = 0
         guard SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), policy) == errSecSuccess,
               SecCodeCheckValidity(running, SecCSFlags(rawValue: kSecCSStrictValidate), policy) == errSecSuccess,
               storageCodeStatus(pid, 0, &status, MemoryLayout<UInt32>.size) == 0,
-              status & controllerRuntimeFlag != 0 else { throw unavailable() }
+              isAdHocCompat || (status & controllerRuntimeFlag != 0) else { throw unavailable() }
     }
 
-    private static func requirement(identifier: String, team: String) throws -> SecRequirement {
-        let text = try developerIDRequirement(identifiers: [identifier], team: team)
+    private static func requirement(identifier: String, team: String, namespace: Namespace = .production) throws -> SecRequirement {
+        let text = try peerRequirement(identifiers: [identifier], team: team, namespace: namespace)
         var value: SecRequirement?
         guard SecRequirementCreateWithString(text as CFString, [], &value) == errSecSuccess, let value else { throw unavailable() }
         return value

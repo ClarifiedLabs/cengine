@@ -80,17 +80,19 @@ nonisolated public enum CompatibilityRuntimeIsolation {
               let values = information as? [String: Any],
               let identifier = values[kSecCodeInfoIdentifier as String] as? String,
               let team = values[kSecCodeInfoTeamIdentifier as String] as? String else { throw refused() }
-        try validateSigningFields(identifier: identifier, team: team, expectedTeam: expectedTeam)
-        let text = try SignedStorageIdentity.developerIDRequirement(identifiers: [identifier], team: expectedTeam)
+        let targetTeam = (expectedTeam == SignedStorageIdentity.adHocCompatibilityTeam
+            && team != SignedStorageIdentity.adHocCompatibilityTeam) ? team : expectedTeam
+        try validateSigningFields(identifier: identifier, team: team, expectedTeam: targetTeam)
+        let text = try SignedStorageIdentity.developerIDRequirement(identifiers: [identifier], team: targetTeam)
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement,
               SecCodeCheckValidity(running, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else { throw refused() }
         let policy = StorageLifecycleNativePolicy.production
         if identifier == policy.engineIdentifier {
-            try policy.validatePeer(running, pid: pid, role: .engine, expectedTeam: expectedTeam)
+            try policy.validatePeer(running, pid: pid, role: .engine, expectedTeam: targetTeam)
         } else {
             // Includes the shared signed flags/entitlements and ordinary-profile checks.
-            try policy.validateControllerCode(code, expectedTeam: expectedTeam)
+            try policy.validateControllerCode(code, expectedTeam: targetTeam)
         }
     }
 

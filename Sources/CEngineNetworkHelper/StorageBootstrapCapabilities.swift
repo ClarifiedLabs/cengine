@@ -63,8 +63,8 @@ struct StorageBootstrapAdmission {
     }
     /// Text-only rejection seam, not a native policy or authentication proof.
     static func listenerRequirement(namespace: SignedStorageIdentity.Namespace, team: String) throws -> String {
-        try SignedStorageIdentity.developerIDRequirement(
-            identifiers: [namespace.engineIdentifier, namespace.controllerIdentifier], team: team)
+        try SignedStorageIdentity.peerRequirement(
+            identifiers: [namespace.engineIdentifier, namespace.controllerIdentifier], team: team, namespace: namespace)
     }
 
     static func requireNetworkingOperation(_ message: xpc_object_t) throws {

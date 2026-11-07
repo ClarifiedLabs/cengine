@@ -73,7 +73,9 @@ final class PrivilegedPortClient: @unchecked Sendable {
     }
 
     private func signingRequirement(identifier: String) -> String {
-        guard !teamIdentifier.isEmpty else { return "identifier \"\(identifier)\"" }
+        guard !teamIdentifier.isEmpty, teamIdentifier != SignedStorageIdentity.adHocCompatibilityTeam else {
+            return "identifier \"\(identifier)\""
+        }
         return "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
     }
 

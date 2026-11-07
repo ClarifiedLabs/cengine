@@ -103,7 +103,7 @@ final class StorageLifecycleFreshShim: @unchecked Sendable {
         guard !Thread.isMainThread else { throw Failure.unavailable }
         let gate = self.gate
         let connection = xpc_connection_create_mach_service(policy.serviceName,
-            events, UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
+            events, policy.namespace == .production ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
         do {
             try gate.whileOpen {
                 guard !gate.started else { throw Failure.unavailable }
@@ -187,7 +187,9 @@ final class StorageLifecycleFreshShim: @unchecked Sendable {
         var token = audit_token_t()
         freshShimMessageAudit(message, &token)
         let pid = Int32(bitPattern: token.val.5)
-        guard token.val.1 == 0, token.val.3 == 0,
+        let validUID = (token.val.1 == 0 && token.val.3 == 0)
+            || (policy.namespace == .compatibility && token.val.1 == geteuid() && token.val.3 == getuid())
+        guard validUID,
               let before = RuntimeProcessIdentity.processIdentity(pid: pid, pidVersion: token.val.7) else {
             throw Failure.unauthorized
         }

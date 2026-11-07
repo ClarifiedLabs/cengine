@@ -328,14 +328,14 @@ struct StorageLifecycleShimIPCTests {
         defer { peer.close() }
         let releaseDeadline = DispatchSemaphore(value: 0)
         let crossedDeadline = Mutex(false)
-        let client = try StorageLifecycleShimConnection.testing(borrowedFD: a.fileDescriptor, timeout: 5,
+        let client = try StorageLifecycleShimConnection.testing(borrowedFD: a.fileDescriptor, timeout: C.budget,
             beforePublication: { deadline in
                 // This seam is AFTER the last unlocked check. Simulate a worker
                 // scheduling pause while the independent timer is also delayed.
                 _ = DispatchSemaphore(value: 0).wait(timeout: deadline + .milliseconds(20))
                 crossedDeadline.withLock { $0 = DispatchTime.now() >= deadline }
             }, beforeDeadline: {
-                #expect(releaseDeadline.wait(timeout: C.deadline(5)) == .success)
+                #expect(releaseDeadline.wait(timeout: C.deadline()) == .success)
             })
         defer { releaseDeadline.signal(); client.cancel() }
         let transport: any ManagedStorageLifecycleServiceTransport = client
@@ -344,11 +344,12 @@ struct StorageLifecycleShimIPCTests {
         let observed = AsyncStream<Result<Void, any Error>>.makeStream()
         Thread.detachNewThread {
             let result = Result<Void, any Error> {
-                let packet = try C.receive(fd: b.fileDescriptor, permitsDescriptor: false, deadline: C.deadline(5))
+                defer { releaseDeadline.signal() }
+                let packet = try C.receive(fd: b.fileDescriptor, permitsDescriptor: false, deadline: C.deadline())
                 let request = try W.decode(packet.body)
                 try #require(request.operation == .command && request.command == frames[3])
                 let reply = W.Frame(sequence: request.sequence, operation: .command, reply: true, command: frames[4])
-                try C.send(W.encode(reply), fd: b.fileDescriptor, deadline: C.deadline(5))
+                try C.send(W.encode(reply), fd: b.fileDescriptor, deadline: C.deadline())
                 try #require(Self.eof(on: b.fileDescriptor, before: deadline + .seconds(2)) != nil)
             }
             observed.continuation.yield(result); observed.continuation.finish()
@@ -364,7 +365,7 @@ struct StorageLifecycleShimIPCTests {
     }
     @Test func commandDeadlineIncludesExistingWorkerQueueAndRevokesGeneration() async throws {
         let (a, b) = try pair()
-        let client = try StorageLifecycleShimConnection.testing(borrowedFD: a.fileDescriptor, timeout: 5)
+        let client = try StorageLifecycleShimConnection.testing(borrowedFD: a.fileDescriptor, timeout: C.budget)
         defer { client.cancel() }
         let transport: any ManagedStorageLifecycleServiceTransport = client
         let command = try StorageLifecycleServiceBootProtocolTests.vectors()[3]
@@ -375,11 +376,11 @@ struct StorageLifecycleShimIPCTests {
         Thread.detachNewThread {
             let result = Result<Void, any Error> {
                 defer { received.continuation.finish() }
-                let packet = try C.receive(fd: b.fileDescriptor, permitsDescriptor: false, deadline: C.deadline(5))
+                let packet = try C.receive(fd: b.fileDescriptor, permitsDescriptor: false, deadline: C.deadline())
                 let request = try W.decode(packet.body)
                 try #require(request.operation == .command)
                 received.continuation.yield(); received.continuation.finish()
-                try #require(submitted.wait(timeout: C.deadline(5)) == .success)
+                try #require(submitted.wait(timeout: C.deadline()) == .success)
                 let limit = try #require(deadline.withLock { $0 }) + .milliseconds(700)
                 // The first request remains unanswered. Any byte here would be
                 // the queued command escaping its expired generation.
@@ -392,9 +393,9 @@ struct StorageLifecycleShimIPCTests {
         var didReceive = false
         for await _ in received.stream { didReceive = true }
         try #require(didReceive)
-        let bound = C.deadline(0.3)
-        deadline.withLock { $0 = bound }; submitted.signal()
         await #expect(throws: (any Error).self) {
+            let bound = C.deadline(0.3)
+            deadline.withLock { $0 = bound }; submitted.signal()
             try await transport.command(command, deadlineNanoseconds: bound.uptimeNanoseconds)
         }
         await #expect(throws: (any Error).self) { try await first.value }
@@ -462,25 +463,34 @@ struct StorageLifecycleShimIPCTests {
         let (a, b) = try pair()
         let peer = try C(borrowedFD: b.fileDescriptor)
         defer { peer.close() }
-        let client = try StorageLifecycleShimConnection.testing(borrowedFD: a.fileDescriptor, timeout: 5)
-        defer { client.cancel() }
+        let secondInFlight = DispatchSemaphore(value: 0)
+        let firstCallback = Mutex(true)
+        let client = try StorageLifecycleShimConnection.testing(borrowedFD: a.fileDescriptor, timeout: C.budget,
+            beforeDeadline: {
+                if firstCallback.withLock({ let isFirst = $0; $0 = false; return isFirst }) {
+                    _ = secondInFlight.wait(timeout: C.deadline())
+                }
+            })
+        defer { secondInFlight.signal(); client.cancel() }
         let transport: any ManagedStorageLifecycleServiceTransport = client
         let frames = try StorageLifecycleServiceBootProtocolTests.vectors()
         let deadline = C.deadline(1)
         let observed = AsyncStream<Result<Void, any Error>>.makeStream()
         Thread.detachNewThread {
             let result = Result<Void, any Error> {
+                defer { secondInFlight.signal() }
                 for sequence: UInt64 in [1, 2] {
-                    let packet = try C.receive(fd: b.fileDescriptor, permitsDescriptor: false, deadline: C.deadline(5))
+                    let packet = try C.receive(fd: b.fileDescriptor, permitsDescriptor: false, deadline: C.deadline())
                     let request = try W.decode(packet.body)
                     try #require(request.sequence == sequence && request.command == frames[3])
                     if sequence == 2 {
+                        secondInFlight.signal()
                         // Keep a later request pending across the completed one's
                         // absolute deadline: its stale callback must not revoke it.
-                        _ = DispatchSemaphore(value: 0).wait(timeout: deadline + .milliseconds(200))
+                        _ = DispatchSemaphore(value: 0).wait(timeout: max(deadline, .now()) + .milliseconds(200))
                     }
                     let reply = W.Frame(sequence: sequence, operation: .command, reply: true, command: frames[4])
-                    try C.send(W.encode(reply), fd: b.fileDescriptor, deadline: C.deadline(5))
+                    try C.send(W.encode(reply), fd: b.fileDescriptor, deadline: C.deadline())
                 }
             }
             observed.continuation.yield(result); observed.continuation.finish()

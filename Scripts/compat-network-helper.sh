@@ -4,6 +4,11 @@
 # their historical network-helper spelling; executable/UI names do not.
 # Source this file from compatibility runners; do not execute it directly.
 
+compat_network_helper_is_unprivileged() {
+    [ "${CENGINE_COMPAT_HELPER_MODE:-}" = "unprivileged" ] &&
+        [ -z "${CENGINE_STORAGE_LIFECYCLE_QUALIFICATION:-}" ]
+}
+
 compat_network_helper_service_name="dev.cengine.network-helper.test-compat"
 compat_network_helper_label="dev.cengine.network-helper.test-compat"
 compat_network_helper_protocol_version=5
@@ -14,6 +19,15 @@ compat_network_helper_path="$compat_network_helper_root/cengine-helper"
 compat_network_helper_token_path="$compat_network_helper_root/client-token"
 compat_network_helper_manifest_path="$compat_network_helper_root/manifest"
 compat_network_helper_plist="/Library/LaunchDaemons/dev.cengine.network-helper.test-compat.plist"
+if compat_network_helper_is_unprivileged; then
+    compat_network_helper_support_root=${CENGINE_COMPAT_HELPER_SUPPORT_ROOT:-"$HOME/Library/Application Support/cengine"}
+    compat_network_helper_parent="$compat_network_helper_support_root/compat"
+    compat_network_helper_root="$compat_network_helper_parent/dev.cengine.network-helper.test-compat"
+    compat_network_helper_path="$compat_network_helper_root/cengine-helper"
+    compat_network_helper_token_path="$compat_network_helper_root/client-token"
+    compat_network_helper_manifest_path="$compat_network_helper_root/manifest"
+    compat_network_helper_plist="$compat_network_helper_root/dev.cengine.network-helper.test-compat.plist"
+fi
 
 compat_network_helper_local_for_binary() {
     _cnh_binary_dir=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd) || return 1
@@ -106,6 +120,27 @@ compat_network_helper_validate_root_controlled() {
     esac
 }
 
+compat_network_helper_validate_owner_controlled() {
+    _cnh_controlled_path=$1
+    _cnh_expected_uid=$2
+    [ ! -L "$_cnh_controlled_path" ] || {
+        echo "compatibility Privileged Helper path must not be a symbolic link: $_cnh_controlled_path" >&2
+        return 1
+    }
+    _cnh_controlled_owner=$(/usr/bin/stat -f '%u' "$_cnh_controlled_path") || return 1
+    [ "$_cnh_controlled_owner" = "$_cnh_expected_uid" ] || {
+        echo "compatibility Privileged Helper path is not owned by UID $_cnh_expected_uid: $_cnh_controlled_path" >&2
+        return 1
+    }
+    _cnh_controlled_permissions=$(/usr/bin/stat -f '%Sp' "$_cnh_controlled_path") || return 1
+    case "$_cnh_controlled_permissions" in
+        ?????w????*|????????w?*)
+            echo "compatibility Privileged Helper path is group- or world-writable: $_cnh_controlled_path" >&2
+            return 1
+            ;;
+    esac
+}
+
 compat_network_helper_validate_installation() {
     _cnh_expected_owner=$(id -u)
     for _cnh_controlled_path in \
@@ -141,7 +176,11 @@ compat_network_helper_validate_installation() {
         "$compat_network_helper_path" \
         "$compat_network_helper_manifest_path" \
         "$compat_network_helper_plist"; do
-        compat_network_helper_validate_root_controlled "$_cnh_controlled_path" || return $?
+        if compat_network_helper_is_unprivileged; then
+            compat_network_helper_validate_owner_controlled "$_cnh_controlled_path" "$_cnh_expected_owner" || return $?
+        else
+            compat_network_helper_validate_root_controlled "$_cnh_controlled_path" || return $?
+        fi
     done
 
     /usr/bin/codesign --verify --strict "$compat_network_helper_path" >/dev/null 2>&1 || {
@@ -179,10 +218,17 @@ compat_network_helper_validate_installation() {
         return 1
     }
 
-    /bin/launchctl print "system/$compat_network_helper_label" >/dev/null 2>&1 || {
-        echo "compatibility Privileged Helper LaunchDaemon is not loaded" >&2
-        return 1
-    }
+    if compat_network_helper_is_unprivileged; then
+        /bin/launchctl print "gui/$_cnh_expected_owner/$compat_network_helper_label" >/dev/null 2>&1 || {
+            echo "compatibility Privileged Helper LaunchAgent is not loaded" >&2
+            return 1
+        }
+    else
+        /bin/launchctl print "system/$compat_network_helper_label" >/dev/null 2>&1 || {
+            echo "compatibility Privileged Helper LaunchDaemon is not loaded" >&2
+            return 1
+        }
+    fi
 }
 
 compat_network_helper_matches_local_build() {
@@ -217,6 +263,67 @@ compat_network_helper_install() {
     _cnh_temp_token="$_cnh_temporary/client-token"
 
     compat_network_helper_prepare_token "$_cnh_temp_token"
+    if compat_network_helper_is_unprivileged; then
+        _cnh_log_dir="$compat_network_helper_root/logs"
+        _cnh_state_dir="$compat_network_helper_root/storage-lifecycle-v2"
+        /usr/bin/printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' \
+            "<key>Label</key><string>$compat_network_helper_label</string>" \
+            "<key>ProgramArguments</key><array><string>$compat_network_helper_path</string></array>" \
+            "<key>MachServices</key><dict><key>$compat_network_helper_service_name</key><true/></dict>" \
+            '<key>EnvironmentVariables</key><dict>' \
+            "<key>CENGINE_NETWORK_HELPER_SERVICE_NAME</key><string>$compat_network_helper_service_name</string>" \
+            '<key>CENGINE_NETWORK_HELPER_CLIENT_IDENTIFIER</key><string>dev.cengine.engine.test-compat</string>' \
+            "<key>CENGINE_NETWORK_HELPER_BUILD_FINGERPRINT</key><string>$_cnh_fingerprint</string>" \
+            "<key>CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE</key><string>$compat_network_helper_token_path</string>" \
+            "<key>CENGINE_NETWORK_HELPER_OWNER_UID</key><string>$_cnh_owner_uid</string>" \
+            '<key>CENGINE_NETWORK_HELPER_TEST_CONTROL</key><string>1</string>' \
+            '<key>CENGINE_NETWORK_HELPER_UPLINK_MODE</key><string>userspace</string>' \
+            "<key>CENGINE_COMPAT_HELPER_STATE_DIR</key><string>$_cnh_state_dir</string>" \
+            '</dict>' \
+            '<key>ProcessType</key><string>Interactive</string>' \
+            "<key>StandardOutPath</key><string>$_cnh_log_dir/dev.cengine.network-helper.test-compat.out.log</string>" \
+            "<key>StandardErrorPath</key><string>$_cnh_log_dir/dev.cengine.network-helper.test-compat.err.log</string>" \
+            '</dict></plist>' > "$_cnh_temp_plist"
+        /usr/bin/printf 'fingerprint=%s\nowner_uid=%s\nhelper_sha256=%s\n' \
+            "$_cnh_fingerprint" "$_cnh_owner_uid" "$_cnh_helper_sha" > "$_cnh_temp_manifest"
+        /usr/bin/plutil -lint "$_cnh_temp_plist" >/dev/null
+
+        echo "provisioning unprivileged compatibility helper LaunchAgent $compat_network_helper_label" >&2
+        if /bin/launchctl print "gui/$_cnh_owner_uid/$compat_network_helper_label" >/dev/null 2>&1; then
+            /bin/launchctl bootout "gui/$_cnh_owner_uid" "$compat_network_helper_plist" >/dev/null 2>&1 || \
+                /bin/launchctl bootout "gui/$_cnh_owner_uid/$compat_network_helper_label" >/dev/null 2>&1 || true
+            _cnh_wait=0
+            while /bin/launchctl print "gui/$_cnh_owner_uid/$compat_network_helper_label" >/dev/null 2>&1 && [ "$_cnh_wait" -lt 20 ]; do
+                /bin/sleep 0.1
+                _cnh_wait=$((_cnh_wait + 1))
+            done
+        fi
+        /bin/mkdir -p "$compat_network_helper_support_root" "$compat_network_helper_parent" \
+            "$compat_network_helper_root" "$_cnh_log_dir"
+        /bin/chmod 700 "$compat_network_helper_support_root" "$compat_network_helper_parent" \
+            "$compat_network_helper_root" "$_cnh_log_dir"
+        /bin/rmdir "$_cnh_state_dir" 2>/dev/null || true
+        /bin/rm -f "$compat_network_helper_path" "$compat_network_helper_token_path" \
+            "$compat_network_helper_manifest_path" "$compat_network_helper_plist"
+        /usr/bin/ditto --norsrc --noextattr "$_cnh_helper" "$compat_network_helper_path"
+        /bin/cp "$_cnh_temp_token" "$compat_network_helper_token_path"
+        /bin/cp "$_cnh_temp_manifest" "$compat_network_helper_manifest_path"
+        /bin/cp "$_cnh_temp_plist" "$compat_network_helper_plist"
+        /bin/chmod 755 "$compat_network_helper_path"
+        /bin/chmod 600 "$compat_network_helper_token_path"
+        /bin/chmod 644 "$compat_network_helper_manifest_path" "$compat_network_helper_plist"
+        /usr/bin/codesign --verify --strict "$compat_network_helper_path"
+        /usr/bin/plutil -lint "$compat_network_helper_plist" >/dev/null
+        /bin/launchctl bootstrap "gui/$_cnh_owner_uid" "$compat_network_helper_plist"
+        /bin/launchctl kickstart -k "gui/$_cnh_owner_uid/$compat_network_helper_label"
+        /bin/sleep 1
+        /bin/launchctl print "gui/$_cnh_owner_uid/$compat_network_helper_label" >/dev/null
+        /bin/rm -rf "$_cnh_temporary"
+        return 0
+    fi
     /usr/bin/printf '%s\n' \
         '<?xml version="1.0" encoding="UTF-8"?>' \
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -469,6 +576,21 @@ compat_network_helper_code_digest() {
 compat_network_helper_validate_managed_signatures() {
     _cnh_managed_binary=$1 _cnh_managed_helper=$2
     _cnh_managed_team=$(/usr/bin/codesign -dv --verbose=4 "$_cnh_managed_binary" 2>&1 | /usr/bin/sed -n 's/^TeamIdentifier=//p')
+    if compat_network_helper_is_unprivileged && [ "$_cnh_managed_team" = "not set" ]; then
+        for _cnh_managed_component in engine network-helper storage-control installed-helper; do
+            case "$_cnh_managed_component" in
+                engine) _cnh_managed_path=$_cnh_managed_binary; _cnh_managed_id=dev.cengine.engine.test-compat;;
+                network-helper) _cnh_managed_path=$_cnh_managed_helper; _cnh_managed_id=dev.cengine.network-helper.test-compat;;
+                storage-control) _cnh_managed_path="$(dirname "$_cnh_managed_binary")/cengine-storage-controller"; _cnh_managed_id=dev.cengine.storage-control.test-compat;;
+                installed-helper) _cnh_managed_path=$compat_network_helper_path; _cnh_managed_id=dev.cengine.network-helper.test-compat;;
+            esac
+            /usr/bin/codesign --verify --strict -R "=identifier \"$_cnh_managed_id\"" "$_cnh_managed_path" || return $?
+            _cnh_managed_details=$(/usr/bin/codesign -dv --verbose=4 "$_cnh_managed_path" 2>&1) || return $?
+            printf '%s\n' "$_cnh_managed_details" | /usr/bin/grep -q '^Signature=adhoc$' || return 1
+            printf '%s\n' "$_cnh_managed_details" | /usr/bin/grep -q '^TeamIdentifier=not set$' || return 1
+        done
+        return 0
+    fi
     case "$_cnh_managed_team" in ''|*[!A-Z0-9]*) return 1;; esac
     [ "${#_cnh_managed_team}" -eq 10 ] || return 1
     for _cnh_managed_component in engine network-helper storage-control installed-helper; do
@@ -495,6 +617,14 @@ compat_network_helper_require() {
         echo "compatibility cengine binary is missing: $_cnh_binary" >&2
         return 1
     }
+    if compat_network_helper_is_unprivileged && [ -n "$_cnh_local_fingerprint" ]; then
+        _cnh_auto_helper=$(compat_network_helper_local_for_binary "$_cnh_binary" 2>/dev/null || true)
+        if [ -n "$_cnh_auto_helper" ] && [ -x "$_cnh_auto_helper" ]; then
+            if ! compat_network_helper_matches_local_build "$_cnh_auto_helper" "$_cnh_local_fingerprint"; then
+                compat_network_helper_install "$_cnh_auto_helper" "$_cnh_local_fingerprint" || return $?
+            fi
+        fi
+    fi
     compat_network_helper_validate_installation || {
         _cnh_status=$?
         compat_network_helper_print_install_instruction
@@ -580,6 +710,13 @@ compat_network_helper_provision() {
 
 compat_network_helper_uninstall() {
     echo "removing compatibility Privileged Helper $compat_network_helper_label" >&2
+    if compat_network_helper_is_unprivileged; then
+        _cnh_owner_uid=$(id -u)
+        /bin/launchctl bootout "gui/$_cnh_owner_uid" "$compat_network_helper_plist" >/dev/null 2>&1 || \
+            /bin/launchctl bootout "gui/$_cnh_owner_uid/$compat_network_helper_label" >/dev/null 2>&1 || true
+        /bin/rm -rf "$compat_network_helper_root"
+        return 0
+    fi
     compat_network_helper_run_as_administrator '
 set -eu
 root=$1

@@ -2,6 +2,8 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CENGINE_COMPAT_HELPER_MODE=${CENGINE_COMPAT_HELPER_MODE:-unprivileged}
+export CENGINE_COMPAT_HELPER_MODE
 # shellcheck source=Scripts/compat-network-helper.sh
 . "$ROOT/Scripts/compat-network-helper.sh"
 if [ "${CENGINE_COMPAT_SHARED_STORAGE+x}${CENGINE_COMPAT_MANAGED_STORAGE+x}" != '' ]; then

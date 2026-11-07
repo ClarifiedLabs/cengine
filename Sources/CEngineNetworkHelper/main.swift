@@ -40,7 +40,9 @@ private struct OwnedHelperVMNetUplink {
             FileHandle(fileDescriptor: outcome.status == 0 ? 1 : 2).write(Data((outcome.message + "\n").utf8))
             exit(outcome.status)
         }
-        guard geteuid() == 0 else {
+        let unprivilegedCompatibility = admission?.policy.namespace == .compatibility
+            && ownerUID() != 0 && geteuid() == ownerUID() && getuid() == ownerUID()
+        guard geteuid() == 0 || unprivilegedCompatibility else {
             FileHandle.standardError.write(Data("cengine-helper must run as root\n".utf8))
             exit(1)
         }
@@ -451,15 +453,26 @@ private struct OwnedHelperVMNetUplink {
 }
 
 private final class HelperVMNetUplink: @unchecked Sendable {
-    private let network: RetainedOpaquePointer
-    private let interface: interface_ref
-    private let queue: DispatchQueue
-    private let vlan: UInt16
-    private let packets: FileHandle
+    private enum Backend {
+        case vmnet(
+            network: RetainedOpaquePointer,
+            interface: interface_ref,
+            queue: DispatchQueue,
+            vlan: UInt16,
+            packets: FileHandle
+        )
+        case userspace(UserspaceNetworkUplink)
+    }
+
+    private let backend: Backend
     private let lock = NSLock()
     private var stopTask: Task<Void, Never>?
 
     static func start(request: PrivilegedVMNetRequest) async throws -> (HelperVMNetUplink, CInt) {
+        if geteuid() != 0 || ProcessInfo.processInfo.environment["CENGINE_NETWORK_HELPER_UPLINK_MODE"] == "userspace" {
+            let (uplink, clientDescriptor) = try await UserspaceNetworkUplink.start(request: request)
+            return (HelperVMNetUplink(backend: .userspace(uplink)), clientDescriptor)
+        }
         let networkOwner = try createNetwork(request: request)
         let descriptor = xpc_dictionary_create(nil, nil, 0)
         // A cengine uplink is a VLAN trunk carrying many container MAC addresses,
@@ -509,11 +522,13 @@ private final class HelperVMNetUplink: @unchecked Sendable {
             throw error
         }
         let value = HelperVMNetUplink(
-            network: networkOwner,
-            interface: reference,
-            queue: queue,
-            vlan: request.vlan,
-            packets: FileHandle(fileDescriptor: sockets[0], closeOnDealloc: true)
+            backend: .vmnet(
+                network: networkOwner,
+                interface: reference,
+                queue: queue,
+                vlan: request.vlan,
+                packets: FileHandle(fileDescriptor: sockets[0], closeOnDealloc: true)
+            )
         )
         value.startReading()
         return (value, sockets[1])
@@ -570,19 +585,11 @@ private final class HelperVMNetUplink: @unchecked Sendable {
         return RetainedOpaquePointer(network, release: releaseCFObject)
     }
 
-    private init(
-        network: RetainedOpaquePointer,
-        interface: interface_ref,
-        queue: DispatchQueue,
-        vlan: UInt16,
-        packets: FileHandle
-    ) {
-        self.network = network
-        self.interface = interface
-        self.queue = queue
-        self.vlan = vlan
-        self.packets = packets
-        packets.readabilityHandler = { [weak self] handle in self?.writeTagged(handle.availableData) }
+    private init(backend: Backend) {
+        self.backend = backend
+        if case .vmnet(_, _, _, _, let packets) = backend {
+            packets.readabilityHandler = { [weak self] handle in self?.writeTagged(handle.availableData) }
+        }
     }
 
     func stop() async {
@@ -596,14 +603,20 @@ private final class HelperVMNetUplink: @unchecked Sendable {
     }
 
     private func performStop() async {
-        packets.readabilityHandler = nil
-        try? packets.close()
-        _ = vmnet_interface_set_event_callback(interface, .VMNET_INTERFACE_PACKETS_AVAILABLE, nil, nil)
-        await Self.stopInterface(interface, queue: queue)
-        network.release()
+        switch backend {
+        case .vmnet(let network, let interface, let queue, _, let packets):
+            packets.readabilityHandler = nil
+            try? packets.close()
+            _ = vmnet_interface_set_event_callback(interface, .VMNET_INTERFACE_PACKETS_AVAILABLE, nil, nil)
+            await Self.stopInterface(interface, queue: queue)
+            network.release()
+        case .userspace(let uplink):
+            await uplink.stop()
+        }
     }
 
     private func startReading() {
+        guard case .vmnet(_, let interface, let queue, _, _) = backend else { return }
         let result = vmnet_interface_set_event_callback(interface, .VMNET_INTERFACE_PACKETS_AVAILABLE, queue) {
             [weak self] _, _ in self?.readAvailable()
         }
@@ -622,6 +635,7 @@ private final class HelperVMNetUplink: @unchecked Sendable {
     }
 
     private func readAvailable() {
+        guard case .vmnet(_, let interface, _, let vlan, let packets) = backend else { return }
         while true {
             var storage = [UInt8](repeating: 0, count: 65_535)
             let received: Data? = storage.withUnsafeMutableBytes { bytes in
@@ -643,7 +657,8 @@ private final class HelperVMNetUplink: @unchecked Sendable {
     }
 
     private func writeTagged(_ packet: Data) {
-        guard let untagged = Self.untag(packet, vlan: vlan) else { return }
+        guard case .vmnet(_, let interface, _, let vlan, _) = backend,
+              let untagged = Self.untag(packet, vlan: vlan) else { return }
         untagged.withUnsafeBytes { bytes in
             var vector = iovec(
                 iov_base: UnsafeMutableRawPointer(mutating: bytes.baseAddress),

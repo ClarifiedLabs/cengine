@@ -103,14 +103,24 @@ Reference Docker/Moby behavior only where those specifications are silent.
 
 ## Compatibility setup
 
-Provision the dedicated compatibility helper once with
-`make test-compat-helper-install` (an attended administrator action), then run
-`make test-compat-doctor`. Normal suite, soak, oracle and isolated-tool runs do
-not request authorization or repair/replace the helper. Guest-only and engine-only
+By default (`CENGINE_COMPAT_HELPER_MODE=unprivileged`), `make test-compat` and
+`make test-guest` automatically provision an unprivileged per-user LaunchAgent
+(`gui/$UID/dev.cengine.network-helper.test-compat`) backed by a userspace L2/L3 NAT
+uplink and per-user lifecycle state under
+`~/Library/Application Support/cengine/compat/dev.cengine.network-helper.test-compat`,
+and accept either a local `Developer ID Application` certificate or ad-hoc signing
+when `CENGINE_DEVELOPER_ID_APPLICATION` is unset.
+
+To test against the root-owned LaunchDaemon (`system/dev.cengine.network-helper.test-compat`)
+and Apple `vmnet.framework`, pass `CENGINE_COMPAT_HELPER_MODE=privileged` and
+provision the dedicated compatibility helper once with
+`make test-compat-helper-install CENGINE_COMPAT_HELPER_MODE=privileged` (an attended
+administrator action), then run `make test-compat-doctor`. Normal suite, soak, oracle and isolated-tool runs do
+not request authorization or repair/replace the privileged helper. Guest-only and engine-only
 updates do not ordinarily require reinstalling it: compatibility uses authenticated
 capabilities and a security floor, not an exact local binary. Deliberately update
 it when testing changed helper behavior or an incompatible protocol.
-Qualification and fault campaigns require an exact signed pair.
+Qualification and fault campaigns require an exact Developer-ID-signed pair.
 
 The helper is shared across worktrees. Before replacing it, have every consumer's
 owner quiesce their work or explicitly authorize interruption. Never stop foreign

@@ -14,6 +14,7 @@ private func bootstrapRegisteredCodeStatus(_ pid: Int32, _ operation: UInt32,
 /// The hash is the frozen ROOT checkpoint hash, never the current executable path.
 struct BootstrapRegisteredShimCodePin {
     let hash: Data
+    let allowAdHoc: Bool
 
     init?(signingIdentity: String, identifier: String, team: String) {
         let fields = signingIdentity.split(separator: ":", omittingEmptySubsequences: false)
@@ -24,13 +25,15 @@ struct BootstrapRegisteredShimCodePin {
               let hash = Data(base64Encoded: String(fields[2])), hash.count == 20,
               hash.base64EncodedString() == fields[2] else { return nil }
         self.hash = hash
+        self.allowAdHoc = identifier == PrivilegedPortProtocol.testCompatEngineIdentifier
+            && team == SignedStorageIdentity.adHocCompatibilityTeam
     }
 
     func accepts(hash: Data, beforeStatus: UInt32, afterStatus: UInt32) -> Bool {
         // SDK Kernel.framework/Headers/kern/cs_blobs.h: CS_VALID, CS_RUNTIME,
         // CS_ADHOC, CS_DEBUGGED (0x10000000, NOT CS_KILLED 0x01000000).
-        let required: UInt32 = 0x0000_0001 | 0x0001_0000
-        let forbidden: UInt32 = 0x0000_0002 | 0x1000_0000
+        let required: UInt32 = allowAdHoc ? 0x0000_0001 : (0x0000_0001 | 0x0001_0000)
+        let forbidden: UInt32 = allowAdHoc ? 0x1000_0000 : (0x0000_0002 | 0x1000_0000)
         return hash.count == 20 && hash == self.hash && beforeStatus == afterStatus &&
             beforeStatus & required == required && beforeStatus & forbidden == 0
     }
@@ -180,7 +183,12 @@ struct StorageBootstrapProcesses: Sendable {
             throw BootstrapFailure(.unauthorized)
         }
         let boot = try Self.boot()
-        let text = try SignedCompatibilityIdentity.developerIDRequirement(identifiers: [identifier], team: team)
+        let isAdHocCompat = lifecyclePolicy.namespace == .compatibility
+            && !lifecyclePolicy.isQualification
+            && team == SignedStorageIdentity.adHocCompatibilityTeam
+        let text = try SignedStorageIdentity.peerRequirement(
+            identifiers: [identifier], team: team, namespace: lifecyclePolicy.namespace
+        )
         var requirement: SecRequirement?
         var code: SecCode?
         guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess,
@@ -206,12 +214,17 @@ struct StorageBootstrapProcesses: Sendable {
             try lifecyclePolicy.validateControllerCode(staticCode, expectedTeam: team)
             let entitlements = dictionary[kSecCodeInfoEntitlementsDict as String]
             guard entitlements == nil || entitlements is [String: Any],
-                  let flags = dictionary[kSecCodeInfoFlags as String] as? NSNumber,
-                  SignedStorageIdentity.acceptsControllerCodeSigning(flags: flags.uint32Value,
+                  let flags = dictionary[kSecCodeInfoFlags as String] as? NSNumber else { throw BootstrapFailure(.unauthorized) }
+            if isAdHocCompat {
+                guard SignedStorageIdentity.forbiddenControllerEntitlements.isDisjoint(
+                    with: Set((entitlements as? [String: Any] ?? [:]).keys)) else { throw BootstrapFailure(.unauthorized) }
+            } else {
+                guard SignedStorageIdentity.acceptsControllerCodeSigning(flags: flags.uint32Value,
                     entitlementKeys: Set((entitlements as? [String: Any] ?? [:]).keys)) else { throw BootstrapFailure(.unauthorized) }
+            }
             var status: UInt32 = 0
             guard bootstrapControllerCodeStatus(pid, 0, &status, MemoryLayout<UInt32>.size) == 0,
-                  status & SignedStorageIdentity.controllerRuntimeFlag != 0,
+                  isAdHocCompat || (status & SignedStorageIdentity.controllerRuntimeFlag != 0),
                   BootstrapKernelIdentity.read(pid) == after else { throw BootstrapFailure(.unauthorized) }
         }
         return BootstrapProcess(pid: pid, startSeconds: afterInfo.pbi_start_tvsec, startMicroseconds: afterInfo.pbi_start_tvusec,

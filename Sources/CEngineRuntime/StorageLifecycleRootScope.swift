@@ -20,7 +20,7 @@ nonisolated extension StorageLifecycleRootClient {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         let queue = DispatchQueue(label: "dev.cengine.lifecycle.scope-client")
         let connection = xpc_connection_create_mach_service(policy.serviceName, queue,
-            UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
+            policy.namespace == .production ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
         let pending = ScopeBindPending()
         xpc_connection_set_event_handler(connection) { event in
             if xpc_get_type(event) == XPC_TYPE_ERROR { pending.finish(.failure(Failure(.unavailable))) }

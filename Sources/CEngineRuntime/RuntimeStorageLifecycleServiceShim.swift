@@ -105,7 +105,7 @@ final class StorageLifecycleServiceShim: @unchecked Sendable {
         guard !Thread.isMainThread else { throw Failure.unavailable }
         let gate = self.gate
         let connection = xpc_connection_create_mach_service(policy.serviceName,
-            events, UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
+            events, policy.namespace == .production ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
         do {
             try gate.whileOpen {
                 guard !gate.started else { throw Failure.unavailable }

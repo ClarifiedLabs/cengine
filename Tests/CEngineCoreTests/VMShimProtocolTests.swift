@@ -30,13 +30,20 @@ private final class LockedUptimeBox: @unchecked Sendable {
     var attempts = 0
     var reportedFailures = 0
     var failuresRemaining = 0
-    private let attemptEvents = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    private var attemptWaiters: [UUID: AsyncStream<Int>.Continuation] = [:]
 
     func waitForAttempts(_ count: Int) async throws {
         if attempts >= count { return }
+        let id = UUID()
+        let events = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        attemptWaiters[id] = events.continuation
+        events.continuation.yield(attempts)
+        defer {
+            attemptWaiters.removeValue(forKey: id)?.finish()
+        }
         // Events establish readiness; the watchdog only bounds a broken retry/restart.
-        try await AsyncTimeout.run(for: .seconds(5)) { [events = attemptEvents.stream] in
-            for await attempts in events {
+        try await AsyncTimeout.run(for: .seconds(30)) { [stream = events.stream] in
+            for await attempts in stream {
                 if attempts >= count { return }
             }
             throw CancellationError()
@@ -45,7 +52,11 @@ private final class LockedUptimeBox: @unchecked Sendable {
 
     func synchronize() async throws {
         attempts += 1
-        defer { attemptEvents.continuation.yield(attempts) }
+        defer {
+            for continuation in attemptWaiters.values {
+                continuation.yield(attempts)
+            }
+        }
         if failuresRemaining > 0 {
             failuresRemaining -= 1
             throw Failure.injected

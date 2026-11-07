@@ -39,9 +39,51 @@ enum StorageLifecycleQualificationFiles {
     }
     /// Both fixed namespaces require current markers; only empty directories initialize.
     static func fixedBase(_ namespace: StorageLifecycleScopeNamespace = .compatibility) throws -> Int32 {
+        if namespace == .compatibility && geteuid() != 0 {
+            let owner = try StorageLifecycleScopeNamespace.compatibility.configuredOwner()
+            guard owner == geteuid() else { throw BootstrapFailure(.unauthorized) }
+            let fd = try unprivilegedCompatibilityDirectory(owner: owner)
+            do { try StorageLifecycleProductionFormat.require(fd, owner: owner, namespace: namespace, sync: sync); return fd }
+            catch { close(fd); throw error }
+        }
         let fd = try fixedDirectory(namespace.components, privateLeaf: true)
         do { try StorageLifecycleProductionFormat.require(fd, owner: 0, namespace: namespace, sync: sync); return fd }
         catch { close(fd); throw error }
+    }
+    static func unprivilegedCompatibilityDirectory(owner: uid_t) throws -> Int32 {
+        let statePath: String
+        if let raw = getenv("CENGINE_COMPAT_HELPER_STATE_DIR"), raw[0] != 0 {
+            statePath = String(cString: raw)
+        } else if let pw = getpwuid(owner), let dir = pw.pointee.pw_dir {
+            statePath = String(cString: dir) + "/" + StorageLifecycleScopeNamespace.compatibility.components.joined(separator: "/")
+        } else {
+            throw BootstrapFailure(.unavailable)
+        }
+        guard statePath.hasPrefix("/") else { throw BootstrapFailure(.invalidRequest) }
+        var isDir: ObjCBool = false
+        let existed = FileManager.default.fileExists(atPath: statePath, isDirectory: &isDir)
+        if !existed {
+            do {
+                try FileManager.default.createDirectory(
+                    atPath: statePath,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                throw BootstrapFailure(.repairRequired)
+            }
+            _ = chmod(statePath, 0o700)
+        }
+        let fd = open(statePath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard fd >= 0 else { throw BootstrapFailure(.repairRequired) }
+        do {
+            try validate(fd, owner: owner, directory: true, privateMode: true)
+            if !existed { try sync(fd) }
+            return fd
+        } catch {
+            close(fd)
+            throw error
+        }
     }
     static func fixedDirectory(_ components: [String], privateLeaf: Bool, create: Bool = true) throws -> Int32 {
         var fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -376,10 +418,13 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
                 rootObservation = try StorageBootstrapBindings(ownerUID: owner).observe(duplicate, type: S_IFDIR, role: .root)
                 guard rootObservation.stableIdentity == binding.root else { throw BootstrapFailure(.conflict) }
                 let base = try StorageLifecycleQualificationFiles.fixedBase(namespace); defer { close(base) }
-                directory = try .init(baseFD: base, binding: binding, owner: 0)
+                let authorityOwner: uid_t = (namespace == .compatibility && geteuid() != 0) ? owner : 0
+                directory = try .init(baseFD: base, binding: binding, owner: authorityOwner)
                 // Only this construction's genuinely fresh scope may enroll the
                 // no-state leaf. Missing/partial existing enrollment never resets.
-                let adoptionJournal = try directory.adoptionJournal(enrollIfNoState: directory.wasCreated)
+                let adoptionJournal = authorityOwner == 0
+                    ? try directory.adoptionJournal(enrollIfNoState: directory.wasCreated)
+                    : try directory.adoptionJournalForTesting(enrollIfNoState: directory.wasCreated)
                 let key = try directory.journal.lifecycleRootPublicKey()
                 fresh = .init(ownerUID: owner, team: team, expectedRootPublicKey: key, worker: worker, policy: policy)
                 service = .init(ownerUID: owner, team: team, expectedRootPublicKey: key, worker: worker, policy: policy)
@@ -460,7 +505,8 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
     private var scopes = StorageLifecycleQualificationScopes<Scope>()
     init(namespace: StorageLifecycleScopeNamespace, policy: StorageLifecycleNativePolicy, team: String,
          owner: @escaping () throws -> uid_t) throws {
-        guard geteuid() == 0, namespace == StorageLifecycleScopeNamespace(policy.namespace) else {
+        let allowedUID = geteuid() == 0 || (namespace == .compatibility && geteuid() != 0 && (try? owner()) == geteuid())
+        guard allowedUID, namespace == StorageLifecycleScopeNamespace(policy.namespace) else {
             throw BootstrapFailure(.unauthorized)
         }
         self.namespace = namespace; self.policy = policy; self.team = team; self.owner = owner

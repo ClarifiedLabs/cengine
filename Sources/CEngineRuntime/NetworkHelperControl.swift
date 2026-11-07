@@ -157,16 +157,23 @@ public enum NetworkHelperControl {
         identifier: String, managed: Bool,
         decode: @escaping @Sendable (xpc_object_t) throws -> Value) async throws -> Value {
         let pending = NetworkHelperRequestState<Value>()
+        let isCompatibility = serviceName == PrivilegedPortProtocol.testCompatServiceName
+            || identifier == PrivilegedPortProtocol.testCompatHelperIdentifier
         let signingRequirement = managed
-            ? try SignedStorageIdentity.developerIDRequirement(identifiers: [identifier], team: team)
-            : (team.isEmpty ? "identifier \"\(identifier)\""
+            ? try SignedStorageIdentity.peerRequirement(
+                identifiers: [identifier],
+                team: team,
+                namespace: isCompatibility ? .compatibility : .production
+            )
+            : ((team.isEmpty || team == SignedStorageIdentity.adHocCompatibilityTeam)
+                ? "identifier \"\(identifier)\""
                 : "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(team)\"")
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pending.start(continuation) {
                     let queue = DispatchQueue(label: "dev.cengine.helper.status")
                     let connection = xpc_connection_create_mach_service(serviceName, queue,
-                        managed ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
+                        (managed && !isCompatibility) ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
                     let result = signingRequirement.withCString {
                         xpc_connection_set_peer_code_signing_requirement(connection, $0)
                     }

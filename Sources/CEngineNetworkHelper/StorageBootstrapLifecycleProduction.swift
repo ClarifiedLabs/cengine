@@ -316,7 +316,10 @@ enum StorageLifecycleSignedPeer {
         var code: SecCode?
         guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributeAudit: data] as CFDictionary, [], &code) == errSecSuccess,
               let code else { throw BootstrapFailure(.unauthorized) }
-        let text = try SignedStorageIdentity.developerIDRequirement(identifiers: [identifier], team: team)
+        let namespace: SignedStorageIdentity.Namespace = (identifier == PrivilegedPortProtocol.testCompatEngineIdentifier
+            || identifier == PrivilegedPortProtocol.testCompatHelperIdentifier
+            || identifier == "dev.cengine.storage-control.test-compat") ? .compatibility : .production
+        let text = try SignedStorageIdentity.peerRequirement(identifiers: [identifier], team: team, namespace: namespace)
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement,
               SecCodeCheckValidity(code, [], requirement) == errSecSuccess else { throw BootstrapFailure(.unauthorized) }

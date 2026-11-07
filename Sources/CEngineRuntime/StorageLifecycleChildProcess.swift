@@ -265,14 +265,17 @@ nonisolated public final class StorageLifecycleChildProcess: @unchecked Sendable
         // This is preflight only. ROOT independently authenticates each message's
         // immutable audit token and executable identity after launch.
         let identifier = policy.controllerIdentifier
+        let allowAdHoc = policy.namespace == .compatibility && !policy.isQualification && installedHelperTeam == SignedStorageIdentity.adHocCompatibilityTeam
         var code: SecStaticCode?, requirement: SecRequirement?
-        let expression = try SignedStorageIdentity.developerIDRequirement(identifiers: [identifier], team: installedHelperTeam)
+        let expression = allowAdHoc
+            ? try SignedStorageIdentity.peerRequirement(identifiers: [identifier], team: installedHelperTeam, namespace: policy.namespace)
+            : try SignedStorageIdentity.developerIDRequirement(identifiers: [identifier], team: installedHelperTeam)
         guard SecStaticCodeCreateWithPath(executable as CFURL, [], &code) == errSecSuccess, let code,
               SecRequirementCreateWithString(expression as CFString, [], &requirement) == errSecSuccess, let requirement,
               SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else {
             throw Failure.unauthorized
         }
-        try requireHardenedCode(code)
+        try requireHardenedCode(code, allowAdHoc: allowAdHoc)
         try policy.validateControllerCode(code, expectedTeam: installedHelperTeam)
         var sockets: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else { throw Failure.system(errno) }
@@ -330,11 +333,11 @@ nonisolated public final class StorageLifecycleChildProcess: @unchecked Sendable
             }
             var runningStatic: SecStaticCode?
             guard SecCodeCopyStaticCode(running, [], &runningStatic) == errSecSuccess, let runningStatic else { throw Failure.unauthorized }
-            try requireHardenedCode(runningStatic)
+            try requireHardenedCode(runningStatic, allowAdHoc: allowAdHoc)
             try policy.validateControllerCode(runningStatic, expectedTeam: installedHelperTeam)
             var status: UInt32 = 0
             guard lifecycleControllerCodeStatus(pid, 0, &status, MemoryLayout<UInt32>.size) == 0,
-                  status & SignedStorageIdentity.controllerRuntimeFlag != 0 else { throw Failure.unauthorized }
+                  (allowAdHoc ? (status & 0x1 != 0) : (status & SignedStorageIdentity.controllerRuntimeFlag != 0)) else { throw Failure.unauthorized }
             guard kill(pid, SIGCONT) == 0 else { throw Failure.system(errno) }
             process.ioDeadline = ProcessInfo.processInfo.systemUptime + 5
             let hello: ProcessHello = try process.receive()
@@ -346,14 +349,15 @@ nonisolated public final class StorageLifecycleChildProcess: @unchecked Sendable
         }
     }
 
-    private static func requireHardenedCode(_ code: SecStaticCode) throws {
+    private static func requireHardenedCode(_ code: SecStaticCode, allowAdHoc: Bool = false) throws {
         var information: CFDictionary?
         guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let dictionary = information as? [String: Any], let flags = dictionary[kSecCodeInfoFlags as String] as? NSNumber else { throw Failure.unauthorized }
         let entitlements = dictionary[kSecCodeInfoEntitlementsDict as String]
+        let keys = Set((entitlements as? [String: Any] ?? [:]).keys)
         guard entitlements == nil || entitlements is [String: Any],
-              SignedStorageIdentity.acceptsControllerCodeSigning(flags: flags.uint32Value,
-                entitlementKeys: Set((entitlements as? [String: Any] ?? [:]).keys)) else { throw Failure.unauthorized }
+              (allowAdHoc ? (flags.uint32Value & 0x2 != 0 && SignedStorageIdentity.forbiddenControllerEntitlements.isDisjoint(with: keys))
+                          : SignedStorageIdentity.acceptsControllerCodeSigning(flags: flags.uint32Value, entitlementKeys: keys)) else { throw Failure.unauthorized }
     }
 
     private static func observe(_ hello: ProcessHello, childPID: Int32) throws -> NativeProcessIdentity {

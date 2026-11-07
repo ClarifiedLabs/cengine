@@ -40,6 +40,7 @@ public struct StorageLifecycleNativePolicy: Equatable, Sendable {
     /// this policy. Both the running signature and its sealed plist are required.
     public static func qualification(role: SignedStorageIdentity.Role) throws -> Self {
         let identity = try SignedStorageIdentity.current(role: role, namespace: .compatibility)
+        guard identity.teamIdentifier != SignedStorageIdentity.adHocCompatibilityTeam else { throw unavailable() }
         var running: SecCode?
         guard SecCodeCopySelf([], &running) == errSecSuccess, let running else { throw unavailable() }
         try SignedStorageIdentity.validatePeer(running, pid: getpid(), role: role,
@@ -76,13 +77,18 @@ public struct StorageLifecycleNativePolicy: Equatable, Sendable {
     /// Controllers have their own role, not an engine/helper SignedStorageIdentity.
     public func validateControllerCode(_ code: SecStaticCode, expectedTeam: String) throws {
         if let team { guard expectedTeam == team else { throw Self.unavailable() } }
-        let text = try SignedStorageIdentity.developerIDRequirement(identifiers: [controllerIdentifier], team: expectedTeam)
+        let isAdHocCompat = namespace == .compatibility && !isQualification && expectedTeam == SignedStorageIdentity.adHocCompatibilityTeam
+        let text = try SignedStorageIdentity.peerRequirement(identifiers: [controllerIdentifier], team: expectedTeam, namespace: namespace)
         var requirement: SecRequirement?, information: CFDictionary?
         guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement,
               SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess,
               SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let values = information as? [String: Any] else { throw Self.unavailable() }
-        try SignedStorageIdentity.validateFlags(values)
+        if isAdHocCompat {
+            try SignedStorageIdentity.validateAdHocCompatibilityFlags(values)
+        } else {
+            try SignedStorageIdentity.validateFlags(values)
+        }
         let metadata = values[kSecCodeInfoPList as String]
         guard metadata == nil || metadata is [String: Any] else { throw Self.unavailable() }
         try validateProfile(plist: metadata as? [String: Any] ?? [:])

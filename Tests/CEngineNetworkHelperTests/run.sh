@@ -21,7 +21,7 @@ done
 cp "$root/Tests/CEngineCoreTests/CanonicalDataStoreLockTests.swift" "$work/Tests/StorageBootstrapHelperTests/"
 cp "$root"/Tests/CEngineCoreTests/StorageLifecycleCold*ProtocolTests.swift "$root"/Tests/CEngineCoreTests/StorageLifecycleResume*ProtocolTests.swift "$work/Tests/StorageBootstrapHelperTests/"
 # Includes the paired native StorageBootstrapLifecycleAdoptionXPC transport.
-cp "$root"/Sources/CEngineNetworkHelper/StorageBootstrap*.swift "$work/Sources/StorageBootstrapHelper/"
+cp "$root"/Sources/CEngineNetworkHelper/StorageBootstrap*.swift "$root/Sources/CEngineNetworkHelper/UserspaceNetworkUplink.swift" "$work/Sources/StorageBootstrapHelper/"
 cp "$root"/Tests/CEngineNetworkHelperTests/*Tests.swift "$root/Tests/CEngineCoreTests/SignedCompatibilityIdentityTests.swift" "$root/Tests/CEngineCoreTests/SignedStorageIdentityTests.swift" "$work/Tests/StorageBootstrapHelperTests/"
 cp "$root/Tests/CEngineCoreTests/StorageLifecycleNativePolicyTests.swift" "$root/Tests/CEngineCoreTests/StorageLifecycleServiceProofProtocolTests.swift" "$root/Tests/CEngineCoreTests/StorageLifecycleProtocolTests.swift" "$root/Tests/CEngineCoreTests/StorageLifecycleChildProtocolTests.swift" "$root/Tests/CEngineCoreTests/StorageLifecycleFreshProtocolTests.swift" "$work/Tests/StorageBootstrapHelperTests/"
 cp "$root/Tests/CEngineCoreTests/StorageLifecycleAdoptionRootProtocolTests.swift" "$root/Tests/CEngineCoreTests/StorageLifecycleAdoptionProtocolTests.swift" "$work/Tests/StorageBootstrapHelperTests/"

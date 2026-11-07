@@ -92,12 +92,12 @@ The helper uses `dev.cengine.network-helper[.test-compat]` service/signing ident
 and `CENGINE_NETWORK_HELPER_*` environment keys. Installation must preserve its
 protected storage directories and authority.
 
-Provision the dedicated test helper once before running compatibility tests:
+Provision the dedicated test helper once before running compatibility tests in privileged mode, or run directly in the default unprivileged LaunchAgent mode (`CENGINE_COMPAT_HELPER_MODE=unprivileged`):
 
 ```sh
-make test-compat-helper-install   # attended administrator action
+make test-compat                  # default unprivileged mode (auto-provisions per-user LaunchAgent + userspace L2/L3 NAT uplink; supports Developer ID or ad-hoc signing)
+make test-compat-helper-install   # optional: explicit helper provisioning (uses sudo only when CENGINE_COMPAT_HELPER_MODE=privileged)
 make test-compat-doctor
-make test-compat                  # unattended thereafter
 ```
 
 The helper is shared across worktrees: replacing it stops its VMNet uplinks. Have

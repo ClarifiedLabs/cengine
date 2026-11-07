@@ -24,15 +24,21 @@ while [[ $# -gt 1 ]]; do
     esac
 done
 [[ $# == 1 ]] || { echo 'usage: build-storage-controller.sh [--sign IDENTITY [--compat] [--prepare-compatibility=rtm096-full-nine-v3]] OUTPUT_FILE' >&2; exit 64; }
-if [[ -n $identity ]]; then team=$(managed_signing_team "$identity"); fi
-[[ $compat == 0 || -n $identity ]] || { echo 'compatibility builds require --sign' >&2; exit 64; }
-[[ -z $prepare_profile || -z ${CENGINE_COMPAT_LIFECYCLE_FAULT:-} ]] || { echo 'PREPARE cannot combine lifecycle runtime faults' >&2; exit 64; }
 qualification=$(python3 "$root/Scripts/storage_lifecycle_qualification.py" selection)
 if [[ -n $qualification ]]; then
     [[ -n $identity && $compat == 1 && -z $prepare_profile ]] || {
         echo 'lifecycle qualification requires --sign IDENTITY --compat and no PREPARE selection' >&2; exit 64;
     }
 fi
+if [[ -n $identity ]]; then
+    if [[ $identity == - && ${CENGINE_COMPAT_HELPER_MODE:-} == unprivileged && $compat == 1 && -z $qualification && -z ${CENGINE_COMPAT_LIFECYCLE_FAULT:-} ]]; then
+        team=0000000000
+    else
+        team=$(managed_signing_team "$identity")
+    fi
+fi
+[[ $compat == 0 || -n $identity ]] || { echo 'compatibility builds require --sign' >&2; exit 64; }
+[[ -z $prepare_profile || -z ${CENGINE_COMPAT_LIFECYCLE_FAULT:-} ]] || { echo 'PREPARE cannot combine lifecycle runtime faults' >&2; exit 64; }
 output=$1
 [[ $output == /* ]] || output="$PWD/$output"
 if [[ -n $qualification ]]; then
@@ -60,6 +66,19 @@ Path(sys.argv[1]).write_bytes(plistlib.dumps({
 }))
 PY
     link_flags=(-ldflags "-linkmode=external -extldflags=-Wl,-sectcreate,__TEXT,__info_plist,$qualification_info/Info.plist")
+elif [[ $compat == 1 && ${team:-} == 0000000000 ]]; then
+    compat_info=$(mktemp -d /tmp/cengine-compat-plist.XXXXXX)
+    trap 'rm -rf "$compat_info"' EXIT
+    python3 - "$compat_info/Info.plist" "$team" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(plistlib.dumps({
+    "CFBundleIdentifier": "dev.cengine.storage-control.test-compat",
+    "CEngineTeamIdentifier": sys.argv[2],
+}))
+PY
+    link_flags=(-ldflags "-linkmode=external -extldflags=-Wl,-sectcreate,__TEXT,__info_plist,$compat_info/Info.plist")
 fi
 mkdir -p "$(dirname "$output")"
 cd "$root/Guest"
@@ -92,6 +111,11 @@ if [[ -n $qualification ]]; then
     }
 fi
 if [[ -n $identity ]]; then
-    codesign --force --options runtime "$timestamp" --identifier "$identifier" --sign "$identity" "$output"
-    managed_signing_verify "$output" "$identifier" "$team"
+    if [[ $identity == - && ${team:-} == 0000000000 ]]; then
+        codesign --force "$timestamp" --identifier "$identifier" --sign - "$output"
+        codesign --verify --strict -R "=identifier \"$identifier\"" "$output"
+    else
+        codesign --force --options runtime "$timestamp" --identifier "$identifier" --sign "$identity" "$output"
+        managed_signing_verify "$output" "$identifier" "$team"
+    fi
 fi

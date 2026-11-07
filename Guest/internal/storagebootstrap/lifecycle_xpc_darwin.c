@@ -66,6 +66,11 @@ static CFStringRef root_identifier(const struct ce_lifecycle_root *r) {
 static CFStringRef identity_requirement(const struct ce_lifecycle_root *r, CFStringRef identifier) {
     if (strnlen(r->team, sizeof(r->team)) != 10) return NULL;
     for (int i=0;i<10;i++) if (!((r->team[i]>='A' && r->team[i]<='Z') || (r->team[i]>='0' && r->team[i]<='9'))) return NULL;
+#if defined(CE_STORAGE_LIFECYCLE_COMPATIBILITY) && !defined(CE_STORAGE_LIFECYCLE_QUALIFICATION)
+    if (!memcmp(r->team, "0000000000", 11)) {
+        return CFStringCreateWithFormat(NULL, NULL, CFSTR("identifier \"%@\""), identifier);
+    }
+#endif
     return CFStringCreateWithFormat(NULL, NULL,
         CFSTR("anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and (identifier \"%@\") and certificate leaf[subject.OU] = \"%s\""),
         identifier, r->team);
@@ -81,13 +86,17 @@ static void entitlement_key(const void *key, const void *value, void *context) {
     (void)value;
     if (CFGetTypeID(key) != CFStringGetTypeID()) *(int *)context = 0;
 }
-static int code_flags(CFDictionaryRef info) {
+static int code_flags_mode(CFDictionaryRef info, int allow_adhoc) {
     if (!info || CFGetTypeID(info) != CFDictionaryGetTypeID()) return 0;
     CFTypeRef raw_flags = CFDictionaryGetValue(info, kSecCodeInfoFlags);
     int64_t flags = 0;
     if (!raw_flags || CFGetTypeID(raw_flags) != CFNumberGetTypeID() ||
-        !CFNumberGetValue(raw_flags, kCFNumberSInt64Type, &flags) || flags < 0 || flags > UINT32_MAX ||
-        !(flags & CE_CS_RUNTIME) || (flags & CE_CS_ADHOC)) return 0;
+        !CFNumberGetValue(raw_flags, kCFNumberSInt64Type, &flags) || flags < 0 || flags > UINT32_MAX) return 0;
+    if (allow_adhoc) {
+        if (!(flags & CE_CS_ADHOC)) return 0;
+    } else {
+        if (!(flags & CE_CS_RUNTIME) || (flags & CE_CS_ADHOC)) return 0;
+    }
     CFDictionaryRef entitlements = CFDictionaryGetValue(info, kSecCodeInfoEntitlementsDict);
     if (entitlements) {
         if (CFGetTypeID(entitlements) != CFDictionaryGetTypeID()) return 0;
@@ -123,10 +132,15 @@ static int qualification_fields(CFDictionaryRef plist, char pin[65], char assets
 }
 #endif
 static int root_information(const struct ce_lifecycle_root *r, CFDictionaryRef info) {
-    if (!code_flags(info)) return 0;
+    int adhoc_compat = 0;
+#if defined(CE_STORAGE_LIFECYCLE_COMPATIBILITY) && !defined(CE_STORAGE_LIFECYCLE_QUALIFICATION)
+    adhoc_compat = !memcmp(r->team, "0000000000", 11);
+#endif
+    if (!code_flags_mode(info, adhoc_compat)) return 0;
     CFStringRef team = CFStringCreateWithCString(NULL, r->team, kCFStringEncodingASCII);
     if (!team) return 0;
-    int ok = string_field(info, kSecCodeInfoTeamIdentifier, team) &&
+    int ok = (adhoc_compat ? (CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier) == NULL)
+                           : string_field(info, kSecCodeInfoTeamIdentifier, team)) &&
         string_field(info, kSecCodeInfoIdentifier, root_identifier(r));
     CFDictionaryRef plist = CFDictionaryGetValue(info, kSecCodeInfoPList);
     ok = ok && plist && CFGetTypeID(plist) == CFDictionaryGetTypeID() &&
@@ -153,6 +167,20 @@ static int self_identity(struct ce_lifecycle_root *r) {
         SecCodeCopyStaticCode(code, kSecCSDefaultFlags, &stat) != errSecSuccess ||
         SecCodeCopySigningInformation(stat, kSecCSSigningInformation, &info) != errSecSuccess) goto out;
     CFStringRef t = CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier);
+#if defined(CE_STORAGE_LIFECYCLE_COMPATIBILITY) && !defined(CE_STORAGE_LIFECYCLE_QUALIFICATION)
+    if (!t) {
+        CFDictionaryRef plist = CFDictionaryGetValue(info, kSecCodeInfoPList);
+        if (code_flags_mode(info, 1) &&
+            string_field(info, kSecCodeInfoIdentifier, CFSTR(CE_LIFECYCLE_CONTROLLER)) &&
+            plist && CFGetTypeID(plist) == CFDictionaryGetTypeID() &&
+            string_field(plist, CFSTR("CFBundleIdentifier"), CFSTR(CE_LIFECYCLE_CONTROLLER)) &&
+            string_field(plist, CFSTR("CEngineTeamIdentifier"), CFSTR("0000000000"))) {
+            memcpy(r->team, "0000000000", 11);
+            ok = 1;
+        }
+        goto out;
+    }
+#endif
     if (!t || CFGetTypeID(t) != CFStringGetTypeID() || CFStringGetLength(t) != 10 ||
         !CFStringGetCString(t, r->team, sizeof(r->team), kCFStringEncodingASCII) ||
         !string_field(info, kSecCodeInfoIdentifier, CFSTR(CE_LIFECYCLE_CONTROLLER))) goto out;
@@ -161,7 +189,7 @@ static int self_identity(struct ce_lifecycle_root *r) {
     expression = identity_requirement(r, CFSTR(CE_LIFECYCLE_CONTROLLER));
     if (!expression || SecRequirementCreateWithString(expression, kSecCSDefaultFlags, &requirement) != errSecSuccess ||
         SecCodeCheckValidity(code, kSecCSStrictValidate, requirement) != errSecSuccess ||
-        SecStaticCodeCheckValidity(stat, kSecCSStrictValidate, requirement) != errSecSuccess || !code_flags(info) ||
+        SecStaticCodeCheckValidity(stat, kSecCSStrictValidate, requirement) != errSecSuccess || !code_flags_mode(info, 0) ||
         csops(getpid(), 0, &status, sizeof(status)) != 0 || !(status & CE_CS_RUNTIME) ||
         !qualification_fields(CFDictionaryGetValue(info, kSecCodeInfoPList), r->source_pin, r->assets_sha256)) goto out;
 #endif
@@ -177,12 +205,22 @@ static int root_message(struct ce_lifecycle_root *r, xpc_object_t message) {
     audit_token_t audit = {{0}};
     xpc_dictionary_get_audit_token(message, &audit);
     uid_t owner = 0;
+#if defined(CE_STORAGE_LIFECYCLE_COMPATIBILITY) || defined(CE_STORAGE_LIFECYCLE_QUALIFICATION)
+    int valid_owner = (audit.val[1] == owner && audit.val[3] == owner) ||
+        (audit.val[1] == geteuid() && audit.val[3] == getuid());
+    if (!valid_owner || audit.val[5] == 0) return 0;
+#else
     if (audit.val[1] != owner || audit.val[3] != owner || audit.val[5] == 0) return 0;
+#endif
     uint64_t id, parent, after, after_parent; uint32_t version, after_version;
     if (!unique((pid_t)audit.val[5], &id, &parent, &version) || version != audit.val[7]) return 0;
     CFStringRef expression = root_requirement(r);
     SecRequirementRef requirement = NULL; SecCodeRef code = NULL; SecStaticCodeRef stat = NULL;
     CFDictionaryRef info = NULL; uint32_t status = 0;
+    int adhoc_compat = 0;
+#if defined(CE_STORAGE_LIFECYCLE_COMPATIBILITY) && !defined(CE_STORAGE_LIFECYCLE_QUALIFICATION)
+    adhoc_compat = !memcmp(r->team, "0000000000", 11);
+#endif
     CFDataRef data = CFDataCreate(NULL, (const UInt8 *)&audit, sizeof(audit));
     const void *keys[] = { kSecGuestAttributeAudit }; const void *values[] = { data };
     CFDictionaryRef attributes = data ? CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks) : NULL;
@@ -194,7 +232,7 @@ static int root_message(struct ce_lifecycle_root *r, xpc_object_t message) {
         SecStaticCodeCheckValidity(stat, kSecCSStrictValidate, requirement) == errSecSuccess &&
         SecCodeCopySigningInformation(stat, kSecCSSigningInformation, &info) == errSecSuccess &&
         root_information(r, info) &&
-        csops((pid_t)audit.val[5], 0, &status, sizeof(status)) == 0 && (status & CE_CS_RUNTIME) != 0 &&
+        csops((pid_t)audit.val[5], 0, &status, sizeof(status)) == 0 && (adhoc_compat || (status & CE_CS_RUNTIME) != 0) &&
         unique((pid_t)audit.val[5], &after, &after_parent, &after_version) &&
         id == after && parent == after_parent && version == after_version;
     if (info) CFRelease(info); if (stat) CFRelease(stat);
@@ -260,7 +298,11 @@ ce_lifecycle_root *ce_lifecycle_open(const void *greeting, size_t length) {
     r->ready = dispatch_semaphore_create(0); r->closed = dispatch_semaphore_create(0); r->ended = dispatch_semaphore_create(0);
     r->pending = dispatch_group_create();
     r->greeting_deadline = dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC);
+#if defined(CE_STORAGE_LIFECYCLE_COMPATIBILITY) || defined(CE_STORAGE_LIFECYCLE_QUALIFICATION)
+    r->connection = xpc_connection_create_mach_service(CE_LIFECYCLE_ROOT, r->queue, 0);
+#else
     r->connection = xpc_connection_create_mach_service(CE_LIFECYCLE_ROOT, r->queue, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
+#endif
     xpc_connection_set_event_handler(r->connection, ^(xpc_object_t message) { received(r, message); });
     xpc_connection_resume(r->connection);
     xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);

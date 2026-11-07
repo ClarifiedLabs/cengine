@@ -74,7 +74,7 @@ nonisolated public final class StorageLifecycleRootClient: @unchecked Sendable {
         let message = try Self.message(request, rootFD: rootFD, backingFD: backingFD)
         let queue = DispatchQueue(label: "dev.cengine.storage-lifecycle.root-client-replies")
         let connection = xpc_connection_create_mach_service(policy.serviceName,
-            queue, UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
+            queue, policy.namespace == .production ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
         let pending = Pending()
         xpc_connection_set_event_handler(connection) { event in
             if xpc_get_type(event) == XPC_TYPE_ERROR { pending.finish(.failure(Failure(.unavailable))) }
@@ -147,7 +147,9 @@ nonisolated public final class StorageLifecycleRootClient: @unchecked Sendable {
     /// Kernel audit token seam for unsigned rejection tests, not a peer assertion API.
     static func authenticate(token: audit_token_t, team: String, policy: StorageLifecycleNativePolicy = .production) throws {
         let pid = Int32(bitPattern: token.val.5)
-        guard pid > 0, token.val.1 == 0, token.val.3 == 0 else { throw Failure(.unauthorized) }
+        let validUID = (token.val.1 == 0 && token.val.3 == 0)
+            || (policy.namespace == .compatibility && token.val.1 == geteuid() && token.val.3 == getuid())
+        guard pid > 0, validUID else { throw Failure(.unauthorized) }
         func identity() -> Data? { RuntimeProcessIdentity.processIdentity(pid: pid, pidVersion: token.val.7) }
         guard let before = identity() else { throw Failure(.unauthorized) }
         let audit = withUnsafeBytes(of: token) { Data($0) }

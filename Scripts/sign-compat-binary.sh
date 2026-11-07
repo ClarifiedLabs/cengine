@@ -16,7 +16,11 @@ if [[ ${CENGINE_COMPAT_MANAGED_STORAGE+x}${CENGINE_COMPAT_SHARED_STORAGE+x} != '
     echo 'retired compatibility storage selector; lifecycle is the default' >&2
     exit 64
 fi
-team=$(managed_signing_team "$identity")
+if [[ $identity == - && ${CENGINE_COMPAT_HELPER_MODE:-} == unprivileged && -z ${CENGINE_STORAGE_LIFECYCLE_QUALIFICATION:-} && -z ${CENGINE_COMPAT_LIFECYCLE_FAULT:-} ]]; then
+    team=0000000000
+else
+    team=$(managed_signing_team "$identity")
+fi
 
 binary="$1"
 helper="$(compat_network_helper_local_for_binary "$binary")"
@@ -52,13 +56,17 @@ sign_path "$binary" \
     --identifier dev.cengine.engine.test-compat \
     --entitlements "$ROOT_DIR/Configuration/cengine.entitlements"
 
+controller="$(dirname "$binary")/cengine-storage-controller"
+[[ -x $controller ]] || { echo "managed controller is missing: $controller" >&2; exit 1; }
+sign_path "$controller" --identifier dev.cengine.storage-control.test-compat
 if [[ $identity != - ]]; then
-    controller="$(dirname "$binary")/cengine-storage-controller"
-    [[ -x $controller ]] || { echo "managed controller is missing: $controller" >&2; exit 1; }
-    sign_path "$controller" --identifier dev.cengine.storage-control.test-compat
     managed_signing_verify "$controller" dev.cengine.storage-control.test-compat "$team"
     managed_signing_verify "$helper" dev.cengine.network-helper.test-compat "$team"
     managed_signing_verify "$binary" dev.cengine.engine.test-compat "$team"
+else
+    codesign --verify --strict -R '=identifier "dev.cengine.storage-control.test-compat"' "$controller"
+    codesign --verify --strict -R '=identifier "dev.cengine.network-helper.test-compat"' "$helper"
+    codesign --verify --strict -R '=identifier "dev.cengine.engine.test-compat"' "$binary"
 fi
 
 codesign --verify --strict --verbose=2 "$helper"

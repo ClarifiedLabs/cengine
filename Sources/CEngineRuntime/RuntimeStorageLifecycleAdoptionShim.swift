@@ -292,7 +292,7 @@ final class StorageLifecycleAdoptionShim: @unchecked Sendable {
         defer { lock.withLock { scheduleLocked(transport.finished(generation, succeeded: succeeded)) } }
         guard attempt.gate.withLock({ $0.permitsProgress(at: .now()) }) else { throw Failure.unavailable }
         let connection = xpc_connection_create_mach_service(policy.serviceName,
-            events, UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED))
+            events, policy.namespace == .production ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
         let next = Channel(connection, generation: generation)
         do {
             try lock.withLock {

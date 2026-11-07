@@ -17,6 +17,17 @@ SERVICE = "dev.cengine.network-helper.test-compat"
 TOKEN = f"/Library/Application Support/cengine/compat/{SERVICE}/client-token"
 
 
+def expected_token_path() -> str:
+    if (os.environ.get("CENGINE_COMPAT_HELPER_MODE") == "unprivileged"
+            and not os.environ.get("CENGINE_STORAGE_LIFECYCLE_QUALIFICATION")):
+        support_root = os.environ.get(
+            "CENGINE_COMPAT_HELPER_SUPPORT_ROOT",
+            str(Path.home() / "Library/Application Support/cengine"),
+        )
+        return f"{support_root}/compat/{SERVICE}/client-token"
+    return TOKEN
+
+
 def canonical_temp() -> Path:
     result = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
                             check=True, capture_output=True, text=True, timeout=5)
@@ -223,7 +234,7 @@ def restart_before_fixture(binary: Path) -> None:
         "CENGINE_NETWORK_HELPER_SERVICE_NAME": SERVICE,
         "CENGINE_NETWORK_HELPER_IDENTIFIER": SERVICE,
         "CENGINE_COMPAT_NETWORK_HELPER_LABEL": SERVICE,
-        "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE": TOKEN,
+        "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE": expected_token_path(),
     }
     if any(os.environ.get(key) != value for key, value in expected_environment.items()):
         raise RuntimeError("helper isolation requires the exact test namespace")
@@ -272,7 +283,7 @@ def restart_for_offline_remount(transaction) -> None:
         "CENGINE_NETWORK_HELPER_SERVICE_NAME": SERVICE,
         "CENGINE_NETWORK_HELPER_IDENTIFIER": SERVICE,
         "CENGINE_COMPAT_NETWORK_HELPER_LABEL": SERVICE,
-        "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE": TOKEN,
+        "CENGINE_NETWORK_HELPER_AUTH_TOKEN_FILE": expected_token_path(),
     }
     if any(os.environ.get(key) != value for key, value in expected.items()):
         raise RuntimeError("offline remount requires exact test helper namespace")
