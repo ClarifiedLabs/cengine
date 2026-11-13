@@ -16,6 +16,7 @@ Sources/CEngineCore/StorageLifecycleAdoptionProtocol.swift
 Sources/CEngineCore/StorageLifecycleAdoptionRootProtocol.swift
 Sources/CEngineCore/StorageLifecycleBootTrust.swift
 Sources/CEngineCore/StorageLifecycleChildProtocol.swift
+Sources/CEngineCore/StorageLifecycleColdObservationProtocol.swift
 Sources/CEngineCore/StorageLifecycleColdProtocol.swift
 Sources/CEngineCore/StorageLifecycleColdRootProtocol.swift
 Sources/CEngineCore/StorageLifecycleColdShimProtocol.swift

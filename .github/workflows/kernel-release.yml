@@ -41,6 +41,12 @@ jobs:
       - name: Prepare kernel release assets
         run: |
           set -euo pipefail
+          python3 Scripts/guest_asset_provenance.py check-kernel \
+            "$PWD" .build/guest/vmlinux .build/guest/kernel-origin.json local
+          # Necessary build sanity checks, not substitutes for native ABI probes.
+          for marker in cengine-storage request_cred managed_close_to_open host_close_to_open; do
+            LC_ALL=C grep -aFq "$marker" .build/guest/vmlinux
+          done
           mkdir -p "$OUTPUT"
           install -m 0644 .build/guest/vmlinux "$OUTPUT/cengine-kernel-arm64"
           install -m 0644 .build/guest/kernel-input.sha256 "$OUTPUT/kernel-input.sha256"
@@ -74,5 +80,5 @@ jobs:
             "$OUTPUT/kernel-input.sha256" \
             "$OUTPUT/SHA256SUMS" \
             --title "cengine kernel $version" \
-            --notes "Pinned cengine ARM64 guest kernel built from Linux $version commit $commit." \
+            --notes "Pinned cengine ARM64 guest kernel built from Linux $version commit $commit with the managed-storage patch series (request credentials ABI3 and storage-session ABI1)." \
             --verify-tag

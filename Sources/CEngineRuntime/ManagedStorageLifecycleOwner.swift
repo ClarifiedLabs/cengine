@@ -109,6 +109,7 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
     private var resumeStatus: ResumeRoot.Status?
     typealias ColdRoot = StorageLifecycleColdRootProtocol
     typealias ColdShim = StorageLifecycleColdShimProtocol
+    typealias ColdObservation = StorageLifecycleColdObservationProtocol
     enum Failure: Error { case blocked, invalid, incomplete, repairRequired, system(Int32) }
 
     struct Preparation: Sendable {
@@ -262,6 +263,9 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
     private var adoptionLock: CanonicalDataStoreLock?
     private var adoptedShim: AdoptedShim?
     private var coldStatus: ColdRoot.Status?
+    private var coldObservationKey: StorageIdentity.RootPublicKey?
+    /// Process-local successful ROOT observation, never reconstructed from O2.
+    private var freshColdObservation: ColdObservation.History?
     /// Never reconstructed from HOST metadata. Only this owner's authenticated
     /// complete response may attest the immediate cross-E predecessor.
     private struct FreshColdCompletion {
@@ -634,14 +638,17 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
     func prepareTakeover(storeLock: CanonicalDataStoreLock? = nil) async throws -> Preparation {
         try begin(); defer { busy = false }
         guard existing, !takeoverAttempted else { throw Failure.blocked }
-        if let storeLock, try physicalState().resolvedDeadCold == nil {
+        if let storeLock, try physicalState().resolvedDeadCold == nil, try physicalState().observedCold == nil {
             try await recoverInterruptedHandoffLocked(storeLock: storeLock,
                 deadline: ProcessInfo.processInfo.systemUptime + 30)
         }
         let state = try physicalState()
-        guard state.sealed == nil, state.terminal == nil, state.pendingService == nil, state.pendingCold == nil,
+        let observed = state.observedCold
+        guard observed == nil || (observed?.history == freshColdObservation && freshColdObservation != nil),
+              state.sealed == nil, state.terminal == nil, state.pendingService == nil,
+              state.pendingCold == nil || state.pendingCold == observed?.attempted,
               state.handoffRetry == nil, state.pending == nil, state.pendingTakeover == nil else { throw Failure.blocked }
-        let current = try Checkpoint.coldPredecessor(in: state).context
+        let epoch = try observed?.history?.predecessor.controllerEpoch ?? Checkpoint.coldPredecessor(in: state).context.controllerEpoch
         if let resolved = state.resolvedDeadCold {
             guard let status = coldStatus, status.eligibility == .eligible,
                   status.predecessor.currentGrant == resolved.value.successor.grant,
@@ -650,7 +657,7 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
         }
         let reply = try await checkedRootRequest(keyRequest)
         guard case .rootPublicKey(let key) = reply.body, key.publicData == state.rootPublicKey else { throw Failure.invalid }
-        try await prepareChild(key: key, epoch: current.controllerEpoch)
+        try await prepareChild(key: key, epoch: epoch)
         guard let preparation else { throw Failure.invalid }
         return preparation
     }
@@ -827,20 +834,49 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
         try begin(); defer { busy = false }
         guard existing, !bootAttempted, !takeoverAttempted else { throw Failure.blocked }
         let deadline = worker.coldNow() + timeout
-        // A persisted attempted cold operation is never configured again. ROOT
-        // may resolve only an exact committed L2 whose participants all exited.
-        try await resolveInterruptedColdLocked(storeLock: storeLock, deadline: deadline)
-        // Ordinary adoption remains fenced while dead-cold history is retained.
+        // Ask ROOT before choosing the keyless recovery lane: missing L2 is
+        // observed read-only; only an existing exact L2 may use resolveDead.
+        let initial = try physicalState()
+        if let pending = initial.pendingCold {
+            guard preparation == nil, recipient == nil, pending.bootAttempted,
+                  let prepared = pending.prepared, prepared.recoveryBridge == nil,
+                  prepared.observedHistory == nil,
+                  initial.observedCold == nil || initial.observedCold?.attempted == pending else { throw Failure.blocked }
+            if pending.resolutionRequest == nil {
+                let envelope = try ColdRoot.Request(requestID: .init(Self.id()), body: .status(initial.identity))
+                do {
+                    let reply = try await checkedColdRequest(envelope, storeLock: storeLock, deadline: deadline)
+                    guard case .status(let status) = reply.body else { throw Failure.invalid }
+                    if status.eligibility == .observationRequired || initial.observedCold?.history != nil {
+                        guard let anchor = initial.currentService,
+                              status.origin == pending.request.prepare.expectedOrigin,
+                              status.allocatedEpoch == pending.request.prepare.expectedAllocatedEpoch,
+                              status.origin.rootPublicKey == initial.rootPublicKey,
+                              try status.origin.binding.value() == binding,
+                              status.predecessor == (try initial.observedCold?.history?.predecessor ?? Checkpoint.coldProtectedPredecessor(anchor))
+                        else { throw Failure.invalid }
+                        // Even cached O2 requires a fresh observation on this owner.
+                        let selected = try ColdRoot.Status(predecessor: status.predecessor, origin: status.origin,
+                            allocatedEpoch: status.allocatedEpoch, eligibility: .observationRequired)
+                        coldStatus = selected
+                        return selected
+                    }
+                } catch let failure as StorageLifecycleRootClient.Failure where failure.code == .blocked {
+                    // ROOT's existing L2 path does not provide a cold status until
+                    // the exact dead transaction has been resolved.
+                }
+            }
+            try await resolveInterruptedColdLocked(storeLock: storeLock, deadline: deadline)
+        }
         if worker.requiresAdoption, try physicalState().resolvedDeadCold == nil {
             try await recoverInterruptedHandoffLocked(storeLock: storeLock, deadline: deadline)
         }
         let state = try physicalState()
-        guard state.pendingCold == nil else {
-            throw EngineError(.conflict, "cold recovery is pending or its boot outcome is uncertain; data and launch evidence preserved")
-        }
+        guard state.pendingCold == nil else { throw Failure.blocked }
         let request = try ColdRoot.Request(requestID: .init(Self.id()), body: .status(state.identity))
-        let reply = try await checkedColdRequest(request, storeLock: storeLock,
-            deadline: deadline)
+        let reply = try await StorageLifecycleStartupDiagnostic.perform(.coldStatus) {
+            try await checkedColdRequest(request, storeLock: storeLock, deadline: deadline)
+        }
         guard case .status(let status) = reply.body, status.origin.rootPublicKey == state.rootPublicKey,
               try status.origin.binding.value() == binding else { throw Failure.invalid }
         if let resolved = state.resolvedDeadCold {
@@ -858,14 +894,65 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
         return status
     }
 
+    /// Validate the pinned ROOT key without allocating a controller child. The
+    /// mounted observer must precede selection of the effective Guest C.
+    func prepareColdObservation() async throws -> StorageIdentity.RootPublicKey {
+        try begin(); defer { busy = false }
+        let state = try physicalState()
+        guard existing, preparation == nil, recipient == nil, !bootAttempted, !takeoverAttempted,
+              coldStatus?.eligibility == .observationRequired,
+              let pending = state.pendingCold, pending.bootAttempted,
+              let prepared = pending.prepared, prepared.recoveryBridge == nil,
+              prepared.observedHistory == nil, pending.resolutionRequest == nil else { throw Failure.blocked }
+        let reply = try await checkedRootRequest(keyRequest)
+        guard case .rootPublicKey(let key) = reply.body, key.publicData == state.rootPublicKey else { throw Failure.invalid }
+        coldObservationKey = key
+        return key
+    }
+
+    func observeCold(greeting: ColdShim.Greeting, storeLock: CanonicalDataStoreLock,
+                     timeout: TimeInterval = 30) async throws -> ColdObservation.History {
+        guard timeout.isFinite, timeout > 0, timeout <= 30 else { throw Failure.invalid }
+        try begin(); defer { busy = false }
+        guard existing, preparation == nil, recipient == nil, !bootAttempted, !takeoverAttempted,
+              let key = coldObservationKey, let status = coldStatus,
+              status.eligibility == .observationRequired,
+              greeting.rootPublicKey == key.publicData, try greeting.binding.value() == binding else { throw Failure.blocked }
+        let state = try physicalState()
+        guard let pending = state.pendingCold, pending.bootAttempted, let prepared = pending.prepared,
+              let anchorService = state.currentService, let live = state.currentContext,
+              let anchor = state.contexts.first(where: { $0.context == live }) else { throw Failure.blocked }
+        let observed: Checkpoint.ObservedCold
+        if let retained = state.observedCold {
+            guard retained.attempted == pending, retained.request.observerGreeting == greeting else { throw Failure.blocked }
+            observed = retained
+        } else {
+            observed = try .init(attempted: pending,
+                request: .init(observationID: Self.id(), identity: state.identity,
+                    operationID: pending.request.prepare.operationID, signedOpenSHA256: prepared.signedOpenSHA256,
+                    observerGreeting: greeting), requestID: Self.id(), anchor: anchor, anchorService: anchorService)
+            try persist(.stageColdObservation(observed)) // O1 before ROOT IO.
+        }
+        let deadline = worker.coldNow() + timeout
+        let reply = try await checkedColdRequest(.init(requestID: .init(observed.requestID), body: .observe(observed.request)),
+            storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        guard case .observed(let history) = reply.body, history.request == observed.request else { throw Failure.invalid }
+        try history.validate(preparedFailed: prepared, anchor: anchorService)
+        try persist(.observeCold(history)) // O2 before child selection/configure.
+        coldStatus = try .init(predecessor: history.predecessor, origin: status.origin,
+            allocatedEpoch: status.allocatedEpoch, eligibility: .eligible)
+        freshColdObservation = history
+        return history
+    }
+
     /// Keyless authenticated reconciliation only. Freeze correlation BEFORE IO;
     /// a lost reply retries exactly this request, never the attempted configure.
     private func resolveInterruptedColdLocked(storeLock: CanonicalDataStoreLock, deadline: TimeInterval) async throws {
         let state = try physicalState()
         guard let pending = state.pendingCold else { return }
         guard preparation == nil, recipient == nil, pending.bootAttempted,
-              let prepared = pending.prepared, prepared.recoveryBridge == nil,
-              state.resolvedDeadCold == nil else {
+              let prepared = pending.prepared, prepared.recoveryBridge == nil, prepared.observedHistory == nil,
+              state.resolvedDeadCold == nil, state.observedCold == nil else {
             throw EngineError(.conflict, "cold recovery remains uncertain; data and launch evidence preserved")
         }
         let retry: Checkpoint.ColdResolutionRequest
@@ -878,7 +965,9 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
             try persist(.stageColdResolution(retry))
         }
         let envelope = try ColdRoot.Request(requestID: .init(retry.requestID), body: .resolveDead(retry.value))
-        let reply = try await checkedColdRequest(envelope, storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        let reply = try await StorageLifecycleStartupDiagnostic.perform(.resolveCold, operationID: retry.value.operationID) {
+            try await checkedColdRequest(envelope, storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        }
         guard case .resolvedDead(let value) = reply.body, value.request == retry.value,
               let anchor = state.currentService else { throw Failure.invalid }
         try value.validate(prepared: prepared, anchor: anchor)
@@ -901,15 +990,15 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
               let status = coldStatus, status.eligibility == .eligible else { throw Failure.blocked }
         let state = try physicalState()
         let predecessor = try Checkpoint.coldPredecessor(in: state).context
-        guard status.predecessor.currentGrant == (try Checkpoint.coldPredecessorService(in: state)).grant,
-              status.predecessor.serviceEpoch == predecessor.serviceEpoch,
-              status.predecessor.controllerEpoch == predecessor.controllerEpoch,
-              status.predecessor.controllerKey == predecessor.controllerKey,
-              state.pendingCold?.bootAttempted != true,
+        let observed = state.observedCold
+        let expectedPredecessor = try observed?.history?.predecessor ?? Checkpoint.coldProtectedPredecessor(Checkpoint.coldPredecessorService(in: state))
+        guard status.predecessor == expectedPredecessor,
+              observed == nil || (observed?.history == freshColdObservation && freshColdObservation != nil),
+              state.pendingCold?.bootAttempted != true || state.pendingCold == observed?.attempted,
               greeting.rootPublicKey == preparation.rootPublicKey.publicData,
               try greeting.binding.value() == binding else { throw Failure.blocked }
         let request: Checkpoint.ColdRequest
-        if let retained = state.pendingCold {
+        if let retained = state.pendingCold, retained != observed?.attempted {
             guard retained.request.recipient == recipient, retained.request.prepare.mountedGreeting == greeting,
                   retained.request.prepare.nowUnixSeconds == nowUnixSeconds,
                   retained.request.prepare.lifetimeSeconds == lifetimeSeconds else { throw Failure.blocked }
@@ -920,12 +1009,15 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
             request = try .init(prepare: .init(operationID: Self.id(), identity: state.identity,
                 expectedPredecessor: status.predecessor, expectedOrigin: status.origin,
                 expectedAllocatedEpoch: status.allocatedEpoch, candidate: candidate, mountedGreeting: greeting,
-                nowUnixSeconds: nowUnixSeconds, lifetimeSeconds: lifetimeSeconds), recipient: recipient,
+                nowUnixSeconds: nowUnixSeconds, lifetimeSeconds: lifetimeSeconds,
+                observationID: observed?.request.observationID), recipient: recipient,
                 prepareRequestID: Self.id(), completionRequestID: Self.id())
             try persist(.stageColdRequest(request))
         }
-        let reply = try await checkedColdRequest(.init(requestID: .init(request.prepareRequestID), body: .prepare(request.prepare)),
-            storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        let reply = try await StorageLifecycleStartupDiagnostic.perform(.prepareCold, operationID: request.prepare.operationID) {
+            try await checkedColdRequest(.init(requestID: .init(request.prepareRequestID), body: .prepare(request.prepare)),
+                storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        }
         guard case .prepared(let prepared) = reply.body else { throw Failure.invalid }
         try prepared.validate(for: request.prepare)
         let signed = prepared.signedOpen.request.takeover
@@ -969,32 +1061,49 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
                                 storeLock: CanonicalDataStoreLock, deadline: TimeInterval,
                                 commandDeadline: UInt64) async throws {
         let signed = prepared.signedOpen.request.takeover
+        let operationID = request.prepare.operationID
         try checkColdDeadline(deadline)
-        try await worker.bind(signed)
+        try await StorageLifecycleStartupDiagnostic.perform(.bindController, operationID: operationID) {
+            try await worker.bind(signed)
+        }
         try checkColdDeadline(deadline)
-        let ready = try await transport.configure(configuration)
+        let ready = try await StorageLifecycleStartupDiagnostic.perform(.configureGuest, operationID: operationID) {
+            try await transport.configure(configuration)
+        }
         try checkColdDeadline(deadline)
         try Self.validate(ready, binding: expected, grant: signed.grant, root: preparation.rootPublicKey)
         guard ready.ready.serviceEpoch != predecessor.serviceEpoch else { throw Failure.invalid }
         boot = ready
-        let csr = try await worker.csr()
+        let csr = try await StorageLifecycleStartupDiagnostic.perform(.controllerCSR, operationID: operationID) {
+            try await worker.csr()
+        }
         try checkColdDeadline(deadline)
-        let issued = try await command(.issueController, csr: csr, deadlineNanoseconds: commandDeadline)
+        let issued = try await StorageLifecycleStartupDiagnostic.perform(.issueController, operationID: operationID) {
+            try await command(.issueController, csr: csr, deadlineNanoseconds: commandDeadline)
+        }
         try checkColdDeadline(deadline)
         guard let certificate = issued.certificate else { throw Failure.invalid }
         let childBoot = try StorageLifecycleChildProcess.Boot(certificateDER: certificate, identity: ready.ready.identity,
             rootDER: ready.ready.tlsRootDER, serverSPKI: ready.ready.serverSPKI,
             serviceEpoch: ready.ready.serviceEpoch, signed: signed)
-        let stream = try await transport.connectLifecycle()
+        let stream = try await StorageLifecycleStartupDiagnostic.perform(.connectLifecycle, operationID: operationID) {
+            try await transport.connectLifecycle()
+        }
         defer { try? stream.close() }
         try checkColdDeadline(deadline)
-        try await worker.connectBoot(stream, boot: childBoot)
+        try await StorageLifecycleStartupDiagnostic.perform(.connectController, operationID: operationID) {
+            try await worker.connectBoot(stream, boot: childBoot)
+        }
         try checkColdDeadline(deadline)
-        try await worker.takeover()
+        try await StorageLifecycleStartupDiagnostic.perform(.takeover, operationID: operationID) {
+            try await worker.takeover()
+        }
         try checkColdDeadline(deadline)
-        let reconciled = try await command(.reconcileController, signed: signed,
-            controller: .init(epoch: signed.grant.expectedEpoch + 1, key: signed.grant.newKey),
-            deadlineNanoseconds: commandDeadline)
+        let reconciled = try await StorageLifecycleStartupDiagnostic.perform(.reconcileController, operationID: operationID) {
+            try await command(.reconcileController, signed: signed,
+                controller: .init(epoch: signed.grant.expectedEpoch + 1, key: signed.grant.newKey),
+                deadlineNanoseconds: commandDeadline)
+        }
         try checkColdDeadline(deadline)
         guard let actual = reconciled.ready else { throw Failure.invalid }
         let successor = ManagedStorageLifecycleServiceReady(binding: reconciled.binding, ready: actual)
@@ -1004,9 +1113,14 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
               actual.tlsRootDER == ready.ready.tlsRootDER, actual.serverDER == ready.ready.serverDER,
               actual.serverSPKI == ready.ready.serverSPKI else { throw Failure.invalid }
         boot = successor; takeoverReconciled = true
-        let completed = try await checkedColdRequest(.init(requestID: .init(request.completionRequestID),
-            body: .complete(operationID: request.prepare.operationID, signedOpenSHA256: prepared.signedOpenSHA256)),
-            storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        #if CENGINE_COMPAT_LIFECYCLE_FAULT
+        try StorageLifecycleCompatibilityFaultPolicy.afterFirstColdApply(prepared)
+        #endif
+        let completed = try await StorageLifecycleStartupDiagnostic.perform(.completeCold, operationID: operationID) {
+            try await checkedColdRequest(.init(requestID: .init(request.completionRequestID),
+                body: .complete(operationID: operationID, signedOpenSHA256: prepared.signedOpenSHA256)),
+                storeLock: storeLock, deadline: deadline, retryUnavailable: true)
+        }
         guard case .completed(let result) = completed.body else { throw Failure.invalid }
         try result.validate(prepared: prepared)
         try Self.match(result.successor, boot: successor)
@@ -1595,6 +1709,16 @@ struct ManagedStorageLifecycleServiceReady: Equatable, Sendable {
                   fresh.completion.successor == state.currentService,
                   fresh.predecessor == state.latestCold?.predecessor.context else { throw Failure.blocked }
             var proven: Set<Checkpoint.Context> = [fresh.predecessor]
+            if let history = fresh.completion.observedHistory {
+                guard let retained = state.latestCold?.observedPredecessor,
+                      retained.history == history, retained.anchor.context == fresh.predecessor,
+                      retained.anchorService == history.anchor,
+                      fresh.completion.recoveryBridge == nil else { throw Failure.blocked }
+                // Observation supplies no controller/service authority. Only this
+                // fresh completion plus live Query/census covers the committed anchor.
+            } else {
+                guard state.latestCold?.observedPredecessor == nil else { throw Failure.blocked }
+            }
             if let bridge = fresh.completion.recoveryBridge {
                 guard let retained = state.latestCold?.deadPredecessor,
                       retained.value == bridge,

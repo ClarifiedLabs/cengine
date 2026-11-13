@@ -19,9 +19,9 @@ is adapted to Docker semantics, not Podman-specific behavior.
   and original open-unlinked FD progress, including while the daemon is absent.
   The storage shim's independent process group prevents launchd job cleanup from
   killing it. Reattachment requires authenticated authority, not public receipts.
-- **Normal macOS reboot recovery is qualified by attended installed-production
-  acceptance.** The same store, backing/ext4
-  identity and manifest survive; fresh storage/workload births and the next
+- **Normal macOS reboot recovery has a separate attended installed-production
+  acceptance gate.** The same store, backing/ext4
+  identity and manifest must survive; fresh storage/workload births and the next
   controller generation restore retained `always` peers automatically, with synced
   seed bytes and new bidirectional shared DATA. This is not same-VM survival across
   reboot, abrupt power-loss durability or arbitrary disk repair.
@@ -39,6 +39,40 @@ is adapted to Docker semantics, not Podman-specific behavior.
   uncertainty remains contained; EOF, timeout and cancellation do not prove death
   or DRAINED. A committed-but-unenrolled cold owner needs a genuine fresh cold
   successor, not a synthetic ACK. PREPARE has no timeout-as-drain shortcut.
+- **Failed unenrolled cold launches use bounded teardown, not orphan retention.**
+  Closing the initial control channel joins Guest shutdown or positively observed
+  VZ stop before releasing disk leases and exiting the shim. ROOT enrollment wins
+  atomically: losing the daemon reply after enrollment preserves the VM. RTM-135/136
+  require natural native exit, retained disk/manifest/attempt evidence and successful
+  observed recovery after respectively unchanged Guest state or Guest application
+  without helper L2 completion. Both passed locally with a separately built managed
+  kernel; installed-production OS reboot acceptance remains a separate gate.
+- **Missing L2 can recover only through exact observed pre-L2 cold recovery.** ROOT
+  proves all original/failed native participants dead and authenticates a fresh
+  observer shim with nonce/counter/expiry and exact held-backing proof. Protected O1
+  intent binds the original signed attempt and fresh observer; O2 retains the exact
+  Guest registry projection after read-only application-journal loading under the
+  real exclusive `flock`. `unchanged` exactly matches the original predecessor;
+  `applied` matches its original takeover grant/key at C+1, new E, higher revision,
+  unchanged bootstrap key and exact durable `ColdApplied` marker. Anything else
+  remains blocked with data/evidence preserved. The same mounted ordinary cold ext4
+  store allows normal kernel journal replay; this is **not** unused-store resume or
+  its no-replay probe, and it never repairs an uncertain application journal.
+  Observation is never a `Receipt`, `ServiceState`, TLS trust or enrollment. A new
+  operation/key/higher serial and fresh births/E retain the original committed
+  anchor, then rotate adoption directly from it without synthetic failed enrollment.
+  Genuine new completion/native enrollment, fresh ROOT service proof, authenticated
+  full Guest Query and physical HOST intent census gate settlement/admission. One
+  bounded observed bridge is allowed; a failed new observed recovery edge or
+  uncertain nested state stays fenced. Older helpers/assets fail closed: admission
+  requires `lifecycle-v2-cold-observed-recovery-v1` and Guest metadata
+  `storageColdObservationVersion: 1`. Linux
+  [ext4 journal recovery](https://docs.kernel.org/filesystems/ext4/journal.html),
+  [fsync](https://man7.org/linux/man-pages/man2/fsync.2.html) and
+  [syncfs](https://man7.org/linux/man-pages/man2/syncfs.2.html) apply; kernel replay or
+  later synchronization is not proof of an uncertain application commit. EOF and
+  timeouts prove neither commit nor exit. This is host/storage behavior beneath
+  OCI mounts, not an additional OCI process-lifecycle field.
 
 See [supported storage](storage-adoption.md#supported-storage),
 [lifecycle checkpoints](storage-production-checkpoints.md),
@@ -132,7 +166,7 @@ protocols implement Docker behavior beneath OCI mounts, not new OCI fields.
 | Disk initialization and failed start | Partial: RTM-074/077 | Explicit initialization then mount-only; corrupt initialized disk refuses. Failed-start test does not check in-place userdata corruption. |
 | Fresh lifecycle checkpoint/retirement | Scoped Guest RTM-113 and signed qualification RTM-114–116 | Fresh stores, actual physical HOST/ROOT only where stated; not DATA/drain or thousands of native VM cycles. |
 | Ordinary shared DATA, live restore and worker replacement | Covered: RTM-117–125/127 | Positive births/exits and exact generation authority; original VMs survive daemon exit, not worker/storage replacement. |
-| Host identity and cold recovery | Covered: RTM-126/128–133; normal installed OS reboot qualified separately | Fresh births and saved/new DATA, immutable store/history. No same-VM reboot survival, cloned-media provenance, power loss or fabricated ACK/death. |
+| Host identity and cold recovery | Covered: RTM-126/128–133; RTM-135/136 locally verified with a managed kernel for unchanged/applied observed pre-L2 recovery; attended installed OS reboot acceptance is separate | Fresh births and saved/new shared DATA, immutable store/history, natural failed-launch exit. Exact read-only registry projection under real flock, protected O1/O2, original anchor and genuine new completion/enrollment gate recovery. Ordinary ext4 kernel replay is allowed; uncertain application publication/artifacts and failed nested recovery stay fenced. No direct harness Query evidence, same-VM reboot survival, cloned-media provenance, power loss or fabricated ACK/death. |
 | Annotations | Covered: CTR-048 | Runtime metadata, not injected environment variables. |
 | OCI lifecycle CLI/hooks | Not applicable | Docker lifecycle uses cengine shim/guest control. Logs/admission/events (RTM-047/051/052/055), upgrade/fabric recovery (RTM-056/057) and Darwin host admission add no OCI configuration fields. |
 
@@ -153,9 +187,9 @@ induce writeback loops. Payloads, volume identities and global sequences validat
 before filtering; origin ATTR/ENTRY and all same-volume remote events remain
 ordered. Errors, short/missing/mismatched replies and other operations never gain
 this suppression. Authentication and durability are unchanged. See pinned Linux
-[fuse_write_update_attr](https://github.com/gregkh/linux/blob/1efe5d048a391de3ead2804b2e7f86376c356cc5/fs/fuse/file.c),
-[fuse_do_setattr](https://github.com/gregkh/linux/blob/1efe5d048a391de3ead2804b2e7f86376c356cc5/fs/fuse/dir.c)
-and [fuse_reverse_inval_inode](https://github.com/gregkh/linux/blob/1efe5d048a391de3ead2804b2e7f86376c356cc5/fs/fuse/inode.c).
+[fuse_write_update_attr](https://github.com/gregkh/linux/blob/1cdda838e8475edf89b73ff0cc952005dd0b1fa7/fs/fuse/file.c),
+[fuse_do_setattr](https://github.com/gregkh/linux/blob/1cdda838e8475edf89b73ff0cc952005dd0b1fa7/fs/fuse/dir.c)
+and [fuse_reverse_inval_inode](https://github.com/gregkh/linux/blob/1cdda838e8475edf89b73ff0cc952005dd0b1fa7/fs/fuse/inode.c).
 
 Curated upstream adaptations are **not wholesale suite ports**. Immutable source pins:
 
@@ -394,9 +428,11 @@ but the newer option does not, and **Gap** identifies future work. This version 
 | `RTM-129` | `test_lifecycle_v2_interrupted_cold_l2_recovers` | Covered | Interrupted committed-cold recovery | Sealed ROOT L2/pre-A1 failure preserves the exact frozen attempt. Positive participant exit, real protected dead-history bridge and fresh C+2/key/E/birth recover automatic peers and saved/new DATA. HOST pending metadata alone is not L2 proof; no reset/fabricated authority. |
 | `RTM-130` | `test_lifecycle_v2_guest_initramfs_update_cold_recovery` | Covered | Guest artifact update regression | Timestamp-only compressed guest-image update changes digest but not decompressed code/provenance. After positive native exit, protected interrupted-cold recovery preserves launch records/store/seeds and fresh DATA. Artifact admission regression; does not establish guest-protocol compatibility or store-format conversion. |
 | `RTM-131` | `test_lifecycle_v2_cold_enrollment_survives_live_reattachment` | Covered | Cold enrollment regression | Strict cold recovery then live reattachment preserves new VM births/E/worker/restart counts, advances C once, and retains seeds/new DATA. Recovery enrollment budget and late-ACK refusal are unit-tested; native case injects no delay or reboot. |
-| `RTM-132` | `test_lifecycle_v2_committed_unenrolled_cold_recovery` | Covered | Committed cold enrollment failure | ROOT/HOST-committed but unenrolled cold successor recovers only after all exact native participants exit and adoption rotates. Fresh cold operation keeps publication fenced until real enrollment, preserving original peers/seeds/new DATA. No synthetic ACK, old boot replay, L2 bridge or reset. |
+| `RTM-132` | `test_lifecycle_v2_committed_unenrolled_cold_recovery` | Covered | Committed cold enrollment failure | ROOT/HOST-committed but unenrolled cold successor must naturally retire every exact native participant, without fallback test SIGKILL, before recovery and adoption rotation. Fresh cold operation keeps publication fenced until real enrollment, preserving original peers/seeds/new DATA. No synthetic ACK, old boot replay, L2 bridge or reset. |
 | `RTM-133` | `test_lifecycle_v2_retained_history_allows_live_storage_control` | Covered | Retained storage history | Repeated cold cycles preserve immutable old launch history; authenticated storage-control/network CRUD and live reattachment retain automatic peers/seeds/new DATA. Prior-boot inaccessible-PID classification and death-only differing-birth fallback are unit-covered; native test neither forges boot IDs nor injects EPERM/reboot. |
 | `RTM-134` | `test_fsverity_root_and_direct_volume_survive_restart` | Covered | Support | Fresh root/direct-volume ext4 files accept FS_IOC_ENABLE_VERITY and SHA-256 measurement, reject writable opens, retain contents/digests across container restart, and can still be deleted. Ordinary files remain writable. No shared FUSE, existing-disk migration, corruption injection, or publisher authentication claim. See Linux [fs-verity](https://docs.kernel.org/filesystems/fsverity.html). |
+| `RTM-135` | `test_lifecycle_v2_failed_cold_start_reaps_unenrolled_shim` | Covered locally; managed kernel | Unchanged observed pre-L2 cold recovery | Sealed pre-configure rejection after HOST boot-attempt persistence requires positive natural exit of exact daemon/controller/shim births without test-side signals and no failed-start API admission. Exact `unchanged` Guest observation and protected O1/O2 history retain the original committed anchor and frozen attempt; a new operation/key/higher serial genuinely completes/enrolls, directly rotates original adoption and automatically restores retained always-policy peers. Store/disk/ext4/manifest/volume/mount identity, saved seeds and new bidirectional shared DATA are required. Runtime Query/census gates are unit-covered, not directly observed by this harness; DATA demonstrates end-to-end admission only. Not an OS reboot, power-loss qualification or full VM-suite pass. |
+| `RTM-136` | `test_lifecycle_v2_applied_cold_without_helper_completion_recovers` | Covered locally; managed kernel | Applied observed pre-L2 cold recovery | Sealed cut after actual Guest application but before helper L2 completion requires natural exact native exit without test-side signals. Exact `applied` registry/ColdApplied proof selects the failed grant's C+1 as Guest predecessor without manufacturing its receipt/service/TLS authority or enrollment; protected O1/O2 retains the original committed anchor. A fresh operation/key/higher serial advances from that projection, directly rotates original adoption and genuinely completes/enrolls before automatic peers, saved seeds and new bidirectional shared DATA. Same mounted ordinary cold ext4 permits kernel replay, not application-journal repair or unused-store resume. Runtime Query/census gates are unit-covered; no direct harness Query evidence, actual OS reboot/power-loss acceptance or full VM-suite pass. |
 
 ## Containers
 

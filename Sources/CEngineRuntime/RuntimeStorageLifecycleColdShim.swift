@@ -39,6 +39,32 @@ struct StorageLifecycleColdClaimState: Sendable {
     }
 }
 
+/// Observation replay evidence is deliberately disjoint from the later mounted
+/// takeover claim. Observation never installs a grant or enrollment seed.
+struct StorageLifecycleColdObservationClaimState: Sendable {
+    typealias Wire = StorageLifecycleColdShimProtocol
+    private var first: Wire.ObservationChallenge?
+    private var latest: Wire.ObservationChallenge?
+    private var nonces = Set<Data>()
+    static let maximumChallenges = 128
+    mutating func accept(_ challenge: Wire.ObservationChallenge, now: UInt64) throws {
+        try challenge.validate()
+        guard challenge.isFresh(at: now) else { throw StorageLifecycleColdShim.Failure.unauthorized }
+        if let first {
+            guard first.authorization == challenge.authorization, first.greeting == challenge.greeting,
+                  first.shimAudit == challenge.shimAudit, first.shimUniqueID == challenge.shimUniqueID,
+                  first.daemonAudit == challenge.daemonAudit, first.daemonUniqueID == challenge.daemonUniqueID else {
+                throw StorageLifecycleColdShim.Failure.unauthorized
+            }
+        }
+        if latest == challenge { return }
+        guard (nonces.count < Self.maximumChallenges), challenge.counter > (latest?.counter ?? 0),
+              !nonces.contains(challenge.nonce) else { throw StorageLifecycleColdShim.Failure.unauthorized }
+        if first == nil { first = challenge }
+        latest = challenge; nonces.insert(challenge.nonce)
+    }
+}
+
 /// Native mounted responder. Construction requires actual mount-only
 /// 4105 completion and an independently authenticated signed parent socket.
 final class StorageLifecycleColdShim: @unchecked Sendable {
@@ -83,6 +109,8 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
     private let worker = DispatchQueue(label: "dev.cengine.storage-cold-shim.worker")
     private let events = DispatchQueue(label: "dev.cengine.storage-cold-shim.events")
     private var rootPeer: RootPeer? // Worker only; first native sender pins the channel.
+    private let readGuest: @Sendable (StorageLifecycleColdObservationProtocol.SignedRequest) throws -> StorageLifecycleColdObservationProtocol.Observation
+    private let closeObserver: @Sendable () -> Void
 
     private static let constructed = Mutex(false)
     private let enrollment = Mutex<LocalEnrollmentSeed?>(nil)
@@ -91,12 +119,15 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
          binding: StorageIdentity.StoreBinding,
          pinnedRoot: StorageIdentity.RootPublicKey,
          parentBorrowedFD: Int32, policy: StorageLifecycleNativePolicy = .production,
-         purpose: Wire.Purpose = .cold) throws {
+         purpose: Wire.Purpose = .cold,
+         readGuest: @escaping @Sendable (StorageLifecycleColdObservationProtocol.SignedRequest) throws -> StorageLifecycleColdObservationProtocol.Observation = { _ in throw Failure.unavailable },
+         closeObserver: @escaping @Sendable () -> Void = {}) throws {
         guard !Thread.isMainThread else { throw Failure.unavailable }
         let descriptor = fcntl(parentBorrowedFD, F_DUPFD_CLOEXEC, 0)
         guard descriptor >= 0 else { throw Failure.unauthorized }
         let parent = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         let (observed, team) = try Self.authenticatedParent(parentFD: descriptor, policy: policy)
+        self.readGuest = readGuest; self.closeObserver = closeObserver
         self.capability = capability; self.parent = parent; processes = observed
         self.team = team; self.policy = policy
         let held = try capability.validateRecoveryDisk(purpose: purpose), dto = StorageLifecycleStoreBinding(binding)
@@ -139,15 +170,16 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
             }
         } catch { xpc_connection_cancel(connection); throw error }
         xpc_connection_set_event_handler(connection) { [weak self] message in
-            guard xpc_get_type(message) == XPC_TYPE_DICTIONARY, let self else { gate.close(); return }
+            guard let self else { gate.close(); return }
+            guard xpc_get_type(message) == XPC_TYPE_DICTIONARY else { self.close(); return }
             let settled = Mutex(false)
             self.events.asyncAfter(deadline: .now() + 5) {
-                if !settled.withLock({ $0 }) { gate.close() }
+                if !settled.withLock({ $0 }) { self.close() }
             }
             self.worker.async {
                 defer { settled.withLock { $0 = true } }
                 do { try self.respond(message, connection: connection) }
-                catch { gate.close() }
+                catch { self.close() }
             }
         }
         xpc_connection_resume(connection)
@@ -167,7 +199,7 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
                             try self.authenticate(reply)
                             guard xpc_dictionary_get_bool(reply, "ok") else { throw Failure.invalidMessage }
                             try gate.acknowledge()
-                        } catch { gate.close() }
+                        } catch { self.close() }
                     }
                 }
             }
@@ -175,8 +207,8 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
                   gate.lock.withLock({ gate.acknowledged && !gate.closed }) else { throw Failure.unavailable }
         } catch { close(); throw error }
     }
-    func close() { gate.close() }
-    deinit { gate.close() }
+    func close() { gate.close(); closeObserver() }
+    deinit { gate.close(); closeObserver() }
 
     private func authenticate(_ message: xpc_object_t) throws {
         try gate.whileOpen {}
@@ -196,8 +228,22 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
         let payload = Data(bytes: bytes, count: count)
         let encoded: Data
         var proofChallenge: Wire.Challenge?
+        var observationChallenge: Wire.ObservationChallenge?
         var backing: FileHandle?
         switch String(cString: operation) {
+        case "storage-lifecycle-cold-observation-challenge":
+            let challenge = try Wire.decodeObservationChallenge(payload)
+            guard greeting.purpose == .cold, challenge.greeting == greeting,
+                  challenge.shimAudit == processes.shimAudit, challenge.daemonAudit == processes.daemonAudit,
+                  challenge.shimUniqueID == processes.shimUniqueID,
+                  challenge.daemonUniqueID == processes.daemonUniqueID else { throw Failure.unauthorized }
+            try capability.acceptColdObservation(challenge)
+            observationChallenge = challenge
+            let observation = try readGuest(challenge.authorization)
+            try observation.validate(for: challenge.authorization.request)
+            try capability.validateColdObservationBacking(challenge)
+            encoded = try Wire.encode(Wire.ObservationReply(challengeSHA256: challenge.digest, observation: observation))
+            backing = try capability.duplicateHeldDisk()
         case "storage-lifecycle-cold-challenge", "storage-lifecycle-resume-challenge":
             guard String(cString: operation) == (greeting.purpose == .cold
                 ? "storage-lifecycle-cold-challenge" : "storage-lifecycle-resume-challenge") else { throw Failure.unauthorized }
@@ -227,6 +273,9 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
         try authenticate(message)
         if let proofChallenge {
             guard proofChallenge.isFresh(at: UInt64(Date().timeIntervalSince1970 * 1000)) else { throw Failure.invalidMessage }
+        }
+        if let observationChallenge {
+            try capability.validateColdObservationBacking(observationChallenge)
         }
         guard let reply = xpc_dictionary_create_reply(message) else { throw Failure.invalidMessage }
         xpc_dictionary_set_bool(reply, "ok", true)
@@ -259,9 +308,12 @@ final class StorageLifecycleColdShim: @unchecked Sendable {
             switch value.purpose {
             case .cold:
                 guard let signed = boot.configuration.cold else { throw Failure.unauthorized }
-                let prepared = try StorageLifecycleColdRootProtocol.Prepared(signedOpen: signed,
-                    successorOrigin: value.successorOrigin, baseEpoch: value.baseEpoch)
-                try value.validate(prepared: prepared)
+                // History is protected ROOT state, not part of Guest configure.
+                // Do not fabricate a Prepared without its observedHistory.
+                guard value.operationID == signed.request.operationID,
+                      try value.signedOpenSHA256 == StorageLifecycleColdRootProtocol.signedOpenDigest(signed) else {
+                    throw Failure.unauthorized
+                }
             case .resumeReadOnly:
                 guard let signed = boot.configuration.resume else { throw Failure.unauthorized }
                 let prepared = try StorageLifecycleResumeRootProtocol.Prepared(signedOpen: signed,

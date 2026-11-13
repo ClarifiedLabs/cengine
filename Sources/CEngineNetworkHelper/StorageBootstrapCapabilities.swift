@@ -29,9 +29,9 @@ enum StorageBootstrapCapabilities {
         guard let namespace, let profile else { return nil }
         let contracts: [NetworkHelperCapabilities.StorageContract]
         switch (namespace, profile) {
-        case (.compatibility, .ordinary): contracts = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery]
-        case (.production, .ordinary): contracts = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery]
-        case (.compatibility, .lifecycleQualification): contracts = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery]
+        case (.compatibility, .ordinary): contracts = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery]
+        case (.production, .ordinary): contracts = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery]
+        case (.compatibility, .lifecycleQualification): contracts = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery]
         case (.production, .lifecycleQualification): return nil
         }
         return .init(securityRevision: NetworkHelperCapabilities.securityRevision,

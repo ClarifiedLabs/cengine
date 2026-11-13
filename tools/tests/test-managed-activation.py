@@ -35,7 +35,7 @@ class ManagedActivationTests(unittest.TestCase):
         root.mkdir()
         for name in ('vmlinux', 'container-initramfs.cpio.gz', 'storage-initramfs.cpio.gz'):
             (root / name).write_bytes(name.encode())
-        metadata: dict[str, object] = dict(schemaVersion=1, protocolVersion=1, storageServiceBootVersion=2, workloadStorageBootVersion=1, storageLifecycleVersion=2)
+        metadata: dict[str, object] = dict(schemaVersion=1, protocolVersion=1, storageServiceBootVersion=2, workloadStorageBootVersion=1, storageLifecycleVersion=2, storageColdObservationVersion=1)
         for prefix in ('container', 'storage'):
             metadata[f'{prefix}InitramfsSHA256'] = hashlib.sha256((root / f'{prefix}-initramfs.cpio.gz').read_bytes()).hexdigest()
         (root / 'disk-bootstrap.json').write_text(json.dumps(metadata))
@@ -99,6 +99,9 @@ class ManagedActivationTests(unittest.TestCase):
             accepted = subprocess.run(command, env=environment, text=True, capture_output=True)
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             mutations = [dict(valid, storageLifecycleVersion=value) for value in (None, 1, True, '2')]
+            mutations += [dict(valid, storageColdObservationVersion=value) for value in (None, 0, 2, True, '1', 1.0)]
+            mutations += [{key: value for key, value in valid.items() if key != 'storageColdObservationVersion'},
+                          dict(valid, storageColdObservationUnknownVersion=1)]
             mutations += [dict(valid, ordinaryProvenance=value) for value in (None, {},
                 dict(valid['ordinaryProvenance'], sourceSHA256='0' * 64),
                 dict(valid['ordinaryProvenance'], policy='qualification'))]
@@ -196,7 +199,7 @@ class ManagedActivationTests(unittest.TestCase):
             valid = self.ordinary_assets(root)
             command = ['python3', str(ROOT / 'Scripts/check-managed-guest-assets.py'), str(root)]
             self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
-            for field in ('storageServiceBootVersion', 'workloadStorageBootVersion'):
+            for field in ('storageServiceBootVersion', 'workloadStorageBootVersion', 'storageColdObservationVersion'):
                 for value in (None, 0, 1 if field == 'storageServiceBootVersion' else 2, True, '1'):
                     metadata = dict(valid, **{field: value})
                     (root / 'disk-bootstrap.json').write_text(json.dumps(metadata))

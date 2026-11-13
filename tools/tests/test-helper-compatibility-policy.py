@@ -69,7 +69,7 @@ class HelperPolicyTests(unittest.TestCase):
         for version in (None, True, 1, 2.0, "2"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 P.select(env, {**asset, "storageLifecycleVersion": version})
-        for fault in ("before-configure-v1", "after-replacement-before-completion-v1",
+        for fault in ("before-configure-v1", "before-cold-configure-v1", "after-replacement-before-completion-v1",
                       "after-cold-l2-before-a1-v1"):
             with self.subTest(fault=fault), self.assertRaises(ValueError):
                 P.select({**env, P.KEYS[1]: fault}, asset)
@@ -97,9 +97,9 @@ class HelperPolicyTests(unittest.TestCase):
             P.select(env, metadata(prepare=P.PREPARE_PROFILES[0], qualification=P.QUALIFICATION))
 
     def test_fault_campaign_remains_exact(self):
-        for profile in ("before-configure-v1", "after-replacement-before-completion-v1",
+        for profile in ("before-configure-v1", "before-cold-configure-v1", "after-replacement-before-completion-v1",
                         "before-takeover-apply-v1", "after-takeover-apply-v1",
-                        "after-cold-l2-before-a1-v1", "after-first-cold-completion-v1"):
+                        "after-cold-l2-before-a1-v1", "after-first-cold-apply-v1", "after-first-cold-completion-v1"):
             env = {P.KEYS[1]: profile}
             self.assertEqual(P.select(env, metadata()), ("exact", "lifecycle-v2"))
             with self.assertRaises(ValueError):

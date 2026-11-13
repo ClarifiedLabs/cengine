@@ -22,12 +22,13 @@ class HelperFingerprintTests(unittest.TestCase):
     def test_closed_manifest_is_explicit_unique_and_complete(self):
         sources = support_sources()
         self.assertEqual(sources, sorted(set(sources)))
-        self.assertEqual(len(sources), 37)  # Includes the three closed interrupted-handoff value protocols.
+        self.assertEqual(len(sources), 38)  # Includes the closed cold-observation and interrupted-handoff protocols.
         for source in sources:
             self.assertRegex(source, r'^Sources/CEngineCore/[A-Za-z][A-Za-z0-9]*\.swift$')
             self.assertTrue((ROOT / source).is_file(), source)
         for name in ('NetworkHelperCapabilities', 'StorageLifecycleAdoptionProtocol',
                      'StorageLifecycleResumeProtocol', 'StorageLifecycleColdProtocol',
+                     'StorageLifecycleColdObservationProtocol',
                      'StorageLifecycleHandoffProtocol', 'StorageLifecycleHandoffRootProtocol',
                      'StorageLifecycleHandoffShimProtocol',
                      'CanonicalDataStoreLock', 'VMNetIPv4Configuration',

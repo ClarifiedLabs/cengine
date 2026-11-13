@@ -16,6 +16,7 @@ enum GuestAssetTestFixture {
             "storageServiceBootVersion": 2,
             "workloadStorageBootVersion": 1,
             "storageLifecycleVersion": 2,
+            "storageColdObservationVersion": 1,
             "containerInitramfsSHA256": try digest(directory.appending(path: "container-initramfs.cpio.gz")),
             "storageInitramfsSHA256": try digest(directory.appending(path: "storage-initramfs.cpio.gz")),
         ]
@@ -29,8 +30,8 @@ enum GuestAssetTestFixture {
 }
 
 @Suite struct GuestAssetInstallerTests {
-    @Test(arguments: ["storageServiceBootVersion", "workloadStorageBootVersion", "storageLifecycleVersion"])
-    func managedModeRequiresBothExplicitSupportedVersions(field: String) throws {
+    @Test(arguments: ["storageServiceBootVersion", "workloadStorageBootVersion", "storageLifecycleVersion", "storageColdObservationVersion"])
+    func managedModeRequiresExplicitSupportedVersions(field: String) throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = EnginePaths(home: root)
@@ -45,7 +46,7 @@ enum GuestAssetTestFixture {
         #expect(throws: (any Error).self) {
             try GuestAssetInstaller.diskBootstrapMetadata(paths: paths)
         }
-        for unsupported: Any in [NSNull(), 0, field == "workloadStorageBootVersion" ? 2 : 1, -1, true, "1"] {
+        for unsupported: Any in [NSNull(), 0, ["workloadStorageBootVersion", "storageColdObservationVersion"].contains(field) ? 2 : 1, -1, true, "1"] {
             var metadata = base
             metadata["storageServiceBootVersion"] = 2
             metadata["workloadStorageBootVersion"] = 1
@@ -65,13 +66,23 @@ enum GuestAssetTestFixture {
         try metadata.requireManagedStorageSupport()
         #expect(metadata.storageServiceBootVersion == 2)
         #expect(metadata.workloadStorageBootVersion == 1)
+        #expect(metadata.storageColdObservationVersion == 1)
         try Data("tampered".utf8).write(to: paths.containerInitialRamdisk)
         #expect(throws: (any Error).self) {
             try GuestAssetInstaller.diskBootstrapMetadata(paths: paths, requireManagedStorage: true)
         }
     }
 
-    @Test func ordinaryProvenanceDoesNotOverrideLifecycleVersionRequirements() throws {
+    @Test func missingDecodedColdObservationCapabilityNeverUsesMemberwiseDefault() throws {
+        let json = #"{"schemaVersion":1,"protocolVersion":1,"storageServiceBootVersion":2,"workloadStorageBootVersion":1,"storageLifecycleVersion":2,"containerInitramfsSHA256":"a","storageInitramfsSHA256":"b"}"#
+        let metadata = try JSONDecoder().decode(GuestAssetInstaller.DiskBootstrapMetadata.self, from: Data(json.utf8))
+        #expect(metadata.storageColdObservationVersion == nil)
+        #expect(throws: EngineError.self) { try metadata.requireManagedStorageSupport() }
+        #expect(throws: EngineError.self) { try metadata.requireLifecycleStorageSupport() }
+    }
+
+    @Test(arguments: ["storageServiceBootVersion", "storageColdObservationVersion"])
+    func ordinaryProvenanceDoesNotOverrideExplicitCapabilityRequirements(field: String) throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = EnginePaths(home: root)
@@ -84,11 +95,24 @@ enum GuestAssetTestFixture {
         try JSONSerialization.data(withJSONObject: metadata).write(to: file)
         #expect(GuestAssetInstaller.isInstalled(paths: paths))
         try GuestAssetInstaller.diskBootstrapMetadata(paths: paths).requireLifecycleStorageSupport()
-        metadata["storageServiceBootVersion"] = 1
+        for unsupported: Any in [NSNull(), 0, field == "storageServiceBootVersion" ? 1 : 2] {
+            metadata[field] = unsupported
+            try JSONSerialization.data(withJSONObject: metadata).write(to: file)
+            #expect(!GuestAssetInstaller.isInstalled(paths: paths))
+            #expect(throws: (any Error).self) {
+                try GuestAssetInstaller.diskBootstrapMetadata(paths: paths)
+            }
+            let destination = EnginePaths(home: root.appending(path: "rejected"))
+            #expect(throws: (any Error).self) {
+                try GuestAssetInstaller.install(paths: destination, source: assets)
+            }
+            #expect(!FileManager.default.fileExists(atPath: destination.kernel.path))
+        }
+        metadata.removeValue(forKey: field)
         try JSONSerialization.data(withJSONObject: metadata).write(to: file)
         #expect(!GuestAssetInstaller.isInstalled(paths: paths))
         #expect(throws: (any Error).self) {
-            try GuestAssetInstaller.diskBootstrapMetadata(paths: paths)
+            try GuestAssetInstaller.locateSourceDirectory(environment: ["CENGINE_GUEST_ASSET_DIR": assets.path])
         }
     }
 
@@ -126,7 +150,7 @@ enum GuestAssetTestFixture {
     private func lifecycleMetadata(_ fields: [String: Any] = [:]) throws -> GuestAssetInstaller.DiskBootstrapMetadata {
         var metadata: [String: Any] = [
             "schemaVersion": 1, "protocolVersion": 1, "storageLifecycleVersion": 2,
-            "storageServiceBootVersion": 2, "workloadStorageBootVersion": 1,
+            "storageServiceBootVersion": 2, "workloadStorageBootVersion": 1, "storageColdObservationVersion": 1,
             "containerInitramfsSHA256": String(repeating: "a", count: 64),
             "storageInitramfsSHA256": String(repeating: "b", count: 64),
         ]

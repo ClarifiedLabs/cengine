@@ -1,7 +1,7 @@
 # Downstream kernel patches
 
-Base: Linux **6.18.44**, commit
-`1efe5d048a391de3ead2804b2e7f86376c356cc5`, from
+Base: Linux **6.18.63**, commit
+`1cdda838e8475edf89b73ff0cc952005dd0b1fa7`, from
 <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git>.
 These are cengine changes, not upstream backports. They retain upstream copyright
 and license terms; modifications are GPL-2.0-only. See the pinned source's
@@ -9,7 +9,9 @@ and license terms; modifications are GPL-2.0-only. See the pinned source's
 
 ## Build and artifact boundaries
 
-- **`series` contains only `0001-virtiofs-host-close-to-open.patch`.**
+- **The default product `series` contains 0001 then 0002.** Host-bind
+  close-to-open and the managed request-credential/storage-session APIs are both
+  required; the historical `experimental` filename does not make 0002 optional.
   `make kernel-build` runs `Scripts/build-kernel.sh`: export the pinned commit to
   a disposable tree, apply `series` with `git apply --no-index --check` and
   `--whitespace=error-all`, then use Docker Buildx through
@@ -18,24 +20,29 @@ and license terms; modifications are GPL-2.0-only. See the pinned source's
   it as `vmlinux`. Source caches are never reset, cleaned or patched. The patch
   helper requires a disposable-export marker.
 - `Scripts/kernel-input-sha256.sh` hashes the pin, build configuration/scripts,
-  `series` order/content and **listed** patches. It does not include 0002.
-  `Scripts/check-guest-kernel.sh` checks this stamp and image presence, not managed
-  ABI support, runtime behavior or canonical release origin.
-- **Managed kernels additionally apply
-  `0002-fuse-request-credentials-experimental.patch` after 0001**, separately from
-  `series`; the historical `experimental` filename is not an activation status.
-  Use the isolated source procedure below when building this profile. Do not add
-  0002 to `series` or mistake an ordinary `make kernel-build` result for it.
+  `series` order/content and **all listed patches, including 0002**.
+  Successful source builds also write a schema-2 `local` origin receipt binding
+  the actual image and explicit `managedPatchSHA256`; changing or omitting the
+  managed patch invalidates the receipt. Old paired metadata/origin claims are
+  invalidated before the builder can replace kernel bytes.
+  `Scripts/check-guest-kernel.sh` checks the input stamp and image presence, not
+  runtime ABI support or canonical release origin. The release workflow checks
+  the full build receipt and required image markers before staging; those
+  necessary checks still do not prove runtime behavior.
 - `make kernel` defaults to release fetching through `Scripts/fetch-kernel.sh`;
-  `CENGINE_KERNEL_MODE=build` selects the series-only source build.
+  `CENGINE_KERNEL_MODE=build` selects the complete product source build.
   `CENGINE_LOCAL_KERNEL=/absolute/path/to/Image make guest-assets` installs a
-  separately built managed kernel and builds guest assets. The fetcher records
+  separately built kernel and builds guest assets. The fetcher records
   local/custom/canonical origin separately; a matching input stamp does not
   promote local bytes to canonical origin.
-- Local signed **production sole-v2 works with the local managed kernel**.
-  Canonical managed-kernel release publication is distinct and remains unverified;
-  local operation does not establish what a published release contains. Source
-  interfaces and local probe results alone are not production authorization proof.
+- Local managed-kernel operation and canonical release publication are distinct.
+  The 6.18.63 release candidate has been built and locally runtime-qualified;
+  see [the verification record](../../docs/compatibility-testing.md#local-guest-assets)
+  for image/patch hashes, scenarios and limitations. It has not been published.
+  Changing the source pin alone is not qualification, and local operation does
+  not establish what a published release contains. Origin and managed-patch
+  receipts describe trusted build/fetch recipes, not runtime ABI attestation or
+  production authorization proof.
 - `tools/build-managed-fuse-artifact.py` is a **Go test-fixture compiler, not a
   kernel builder**. It requires the direct parent's original compatibility lock,
   an explicit local daemon endpoint and approved cached builder image. It builds
@@ -295,7 +302,10 @@ fh, lock_owner or ctime value is serialized into this local structure.
 
 ## Isolated build and regression probe
 
-On a Linux build host, export committed source into a **new disposable tree**,
+The supported product build is `make kernel-build` (or
+`CENGINE_KERNEL_MODE=build make guest-assets` for paired assets), using the full
+series and recording its local receipt. For an expanded standalone probe kernel
+on a Linux build host, export committed source into a **new disposable tree**,
 never a source cache. Native arm64 example (set CROSS_COMPILE if needed):
 
 ```sh
@@ -303,7 +313,9 @@ repo=$PWD
 LINUX=/path/to/linux-stable-git
 scratch=$(mktemp -d)
 mkdir "$scratch/source"
-git -C "$LINUX" archive 1efe5d048a391de3ead2804b2e7f86376c356cc5 |
+# Also safe if the disposable tree is nested inside another Git checkout.
+export GIT_CEILING_DIRECTORIES="$scratch"
+git -C "$LINUX" archive 1cdda838e8475edf89b73ff0cc952005dd0b1fa7 |
   tar -x -C "$scratch/source"
 for patch in 0001-virtiofs-host-close-to-open.patch \
              0002-fuse-request-credentials-experimental.patch; do

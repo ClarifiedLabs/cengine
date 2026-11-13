@@ -55,6 +55,21 @@ final class StorageBootstrapLifecycleColdXPC: StorageLifecycleColdChecking, @unc
         let baseEpoch: UInt64
         let origin: StorageLifecycleShimOrigin
     }
+    private struct ObservationClaim {
+        let peer: Peer
+        let request: StorageLifecycleColdRootProtocol.Observe
+        let authorization: ColdObservation.SignedRequest
+    }
+    private final class ObservationResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: ColdObservation.Observation?
+        func set(_ result: ColdObservation.Observation) { lock.withLock { value = result } }
+        func get() throws -> ColdObservation.Observation {
+            try lock.withLock { guard let value else { throw BootstrapFailure(.unavailable) }; return value }
+        }
+    }
+    private var observations = StorageBootstrapLifecycleColdClaims<ObservationClaim>()
+    private let observationCounter = StorageBootstrapLifecycleChildCounter()
     private let worker: StorageBootstrapLifecycleChildWorker
     private let processes: StorageBootstrapProcesses
     private let bindings: StorageBootstrapBindings
@@ -119,8 +134,11 @@ final class StorageBootstrapLifecycleColdXPC: StorageLifecycleColdChecking, @unc
                 } else {
                     peers = peers.filter { $0.value.open }
                     guard peers.count < 128 else { throw BootstrapFailure(.capacityExceeded) }
-                    guard !peers.values.contains(where: { $0.shim.uniqueID == shim.uniqueID ||
-                        $0.greeting.channelID == greeting.channelID || $0.greeting.binding == greeting.binding }) else {
+                    guard !peers.values.contains(where: { existing in
+                        let departed = processes.liveness(existing.daemon) == .exited && processes.liveness(existing.shim) == .exited
+                        return existing.shim.uniqueID == shim.uniqueID || existing.greeting.channelID == greeting.channelID ||
+                            (existing.greeting.binding == greeting.binding && !departed)
+                    }) else {
                         throw BootstrapFailure(.unauthorized)
                     }
                     peers[ObjectIdentifier(peer)] = Peer(peer, greeting, daemon, shim)
@@ -141,6 +159,45 @@ final class StorageBootstrapLifecycleColdXPC: StorageLifecycleColdChecking, @unc
               try processes.storageShim(audit: Self.audit(peer.shim), daemon: peer.daemon) == peer.shim else {
             throw BootstrapFailure(.unauthorized)
         }
+    }
+    /// Independent observation lane: no candidate/grant, and no mounted-proof replay state.
+    func observe(request: StorageLifecycleColdRootProtocol.Observe, authorization: ColdObservation.SignedRequest,
+                 daemon: BootstrapProcess) throws -> ColdObservation.Observation {
+        try worker.requireCurrent(); try checkRecoveryRequest(); try request.validate(); try authorization.validate()
+        guard authorization.isValidSignature(using: root),
+              authorization.request.observationID == request.observationID,
+              authorization.request.observer == request.observerGreeting.launch else { throw BootstrapFailure(.unauthorized) }
+        let subject = try authorization.request.subjectOpen()
+        guard subject.request.operationID == request.operationID,
+              subject.request.takeover.grant.identity == request.identity,
+              request.signedOpenSHA256 == (try StorageLifecycleColdRootProtocol.signedOpenDigest(subject)) else { throw BootstrapFailure(.unauthorized) }
+        let peer = try lock.withLock {
+            let matches = peers.values.filter { $0.open && $0.daemon == daemon && $0.greeting == request.observerGreeting }
+            guard matches.count == 1, let peer = matches.first else { throw BootstrapFailure(.unauthorized) }; return peer
+        }
+        if let previous = observations[request.observationID] {
+            guard previous.peer === peer, previous.request == request, previous.authorization == authorization else { throw BootstrapFailure(.conflict) }
+        } else { try observations.checkCapacity(for: request.observationID) }
+        var nonce = Data(count: 32)
+        guard nonce.withUnsafeMutableBytes({ SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!) }) == errSecSuccess else { throw BootstrapFailure(.unavailable) }
+        let challenge = try Wire.ObservationChallenge(authorization: authorization, greeting: peer.greeting,
+            shimAudit: peer.shim.auditToken, shimUniqueID: peer.shim.uniqueID, daemonAudit: daemon.auditToken,
+            daemonUniqueID: daemon.uniqueID, counter: observationCounter.next(), nonce: nonce,
+            expiresUnixMS: UInt64(Date().timeIntervalSince1970 * 1000) + Wire.lifetimeMS)
+        let result = ObservationResult()
+        try exchange(peer, operation: "storage-lifecycle-cold-observation-challenge", bytes: Wire.encode(challenge)) { [self] response in
+            guard challenge.isFresh(at: UInt64(Date().timeIntervalSince1970 * 1000)) else { throw BootstrapFailure(.unavailable) }
+            let reply = try Lifecycle.decode(Wire.ObservationReply.self, from: Self.payload(response, key: "reply"))
+            try reply.validate(for: challenge)
+            try Self.withBacking(response) { fd in
+                try self.bindings.verify(peer.greeting.binding.value(), rootFD: self.rootFD, backingFD: fd,
+                    expectedBacking: peer.greeting.heldBackingIdentity.value())
+            }
+            result.set(reply.observation)
+        }
+        try checkRecoveryRequest()
+        observations[request.observationID] = ObservationClaim(peer: peer, request: request, authorization: authorization)
+        return try result.get()
     }
     func mounted(request: StorageLifecycleColdRootProtocol.Prepare, unsignedGrant: Lifecycle.Grant,
                  signedOpenDigest: String, baseEpoch: UInt64, daemon: BootstrapProcess) throws -> StorageLifecycleShimOrigin {
@@ -184,7 +241,9 @@ final class StorageBootstrapLifecycleColdXPC: StorageLifecycleColdChecking, @unc
     /// mounted() may retain a proof before L1 commits, so never reconcile there.
     func reconcileClaims(reachable: () throws -> Set<String>) throws {
         try worker.requireCurrent()
-        try claims.reconcile(reachable: reachable)
+        let retained = try reachable()
+        try claims.reconcile { retained }
+        try observations.reconcile { retained }
     }
     /// L3 must already be durable. A lost acknowledgement retries the same seed
     /// after authority.completeCold freshly reproves this exact retained claim.

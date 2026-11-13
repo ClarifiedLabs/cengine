@@ -66,6 +66,7 @@ class FullAssetsTests(unittest.TestCase):
             metadata = json.loads((root / 'disk-bootstrap.json').read_text())
             self.assertEqual(metadata['storageLifecycleVersion'], 2)
             self.assertEqual(metadata['storageServiceBootVersion'], 2)
+            self.assertEqual(metadata['storageColdObservationVersion'], 1)
             self.assertEqual(metadata['prepareCompatibilityProfile'], assets.FULL_PROFILE)
             self.assertEqual(metadata['prepareCompatibilitySourceSHA256'], 'a' * 64)
             self.assertNotIn('storageLifecycleQualification', metadata)

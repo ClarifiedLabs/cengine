@@ -31,12 +31,13 @@ type LifecycleColdLaunch struct {
 }
 
 type LifecycleColdOpenRequest struct {
-	OperationID     ID                       `json:"operation_id"`
-	Predecessor     LifecycleColdPredecessor `json:"predecessor"`
-	Takeover        SignedLifecycleGrant     `json:"takeover"`
-	Launch          LifecycleColdLaunch      `json:"launch"`
-	NowUnixSeconds  uint64                   `json:"now_unix_seconds"`
-	LifetimeSeconds uint64                   `json:"lifetime_seconds"`
+	OperationID     ID                              `json:"operation_id"`
+	Predecessor     LifecycleColdPredecessor        `json:"predecessor"`
+	Takeover        SignedLifecycleGrant            `json:"takeover"`
+	Launch          LifecycleColdLaunch             `json:"launch"`
+	NowUnixSeconds  uint64                          `json:"now_unix_seconds"`
+	LifetimeSeconds uint64                          `json:"lifetime_seconds"`
+	Observation     *SignedLifecycleColdObservation `json:"observation,omitempty"`
 }
 
 type SignedLifecycleColdOpen struct {
@@ -58,6 +59,20 @@ func (r LifecycleColdOpenRequest) Validate() error {
 		r.NowUnixSeconds == 0 || r.NowUnixSeconds > 253402300799 || r.LifetimeSeconds == 0 || r.LifetimeSeconds > 86400 ||
 		r.LifetimeSeconds > 253402300799-r.NowUnixSeconds {
 		return ErrInvalid
+	}
+	if r.Observation != nil {
+		o := r.Observation
+		if o.Validate() != nil {
+			return ErrInvalid
+		}
+		subject, err := o.Request.SubjectOpen()
+		if err != nil {
+			return err
+		}
+		old := subject.Request
+		if o.Request.Observer != l || g.Serial <= old.Takeover.Grant.Serial || g.NewKey == old.Takeover.Grant.NewKey || r.OperationID == old.OperationID || r.OperationID == o.Request.ObservationID || !observationProjection(p, old) {
+			return ErrInvalid
+		}
 	}
 	return nil
 }
@@ -106,6 +121,11 @@ func VerifyLifecycleColdOpen(root ed25519.PublicKey, signed SignedLifecycleColdO
 	if err := verifyLifecycle(root, signed.Request.Takeover); err != nil {
 		return err
 	}
+	if signed.Request.Observation != nil {
+		if err := VerifyLifecycleColdObservation(root, *signed.Request.Observation); err != nil {
+			return err
+		}
+	}
 	msg, err := LifecycleColdOpenSigningBytes(signed.Request)
 	if err != nil {
 		return err
@@ -127,6 +147,10 @@ func ColdOpenAndTakeover(c Config, signed SignedLifecycleColdOpen) (*Authority, 
 	// Own the signature slices before verification and request hashing.
 	signed.Signature = append([]byte(nil), signed.Signature...)
 	signed.Request.Takeover.Signature = append([]byte(nil), signed.Request.Takeover.Signature...)
+	if signed.Request.Observation != nil {
+		observation := signed.Request.Observation.Clone()
+		signed.Request.Observation = &observation
+	}
 	if err = VerifyLifecycleColdOpen(c.BootstrapKey, signed); err != nil {
 		return nil, err
 	}
@@ -149,6 +173,15 @@ func coldRequestDigest(r LifecycleColdOpenRequest) string {
 }
 
 func (a *Authority) admitColdOpen(r LifecycleColdOpenRequest) error {
+	if r.Observation != nil {
+		observed, err := a.observeColdLocked(r.Observation.Request)
+		if err != nil {
+			return err
+		}
+		if observed.Predecessor != r.Predecessor {
+			return ErrConflict
+		}
+	}
 	if m := a.s.Lifecycle.ColdApplied; m != nil && m.RequestSHA256 == coldRequestDigest(r) && a.s.Lifecycle.Latest.Grant == r.Takeover.Grant {
 		// An interrupted cold publication is NOT proven workload recovery.
 		if err := a.j.lifecycleNamespaceClean(); err != nil {

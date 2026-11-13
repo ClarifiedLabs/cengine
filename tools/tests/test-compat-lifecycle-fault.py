@@ -26,7 +26,7 @@ class LifecycleFaultTests(unittest.TestCase):
         self.assertEqual(fault.selection(self.selected()), fault.PROFILE)
         self.assertEqual(fault.build_settings({}), [fault.ENV + "=", fault.CONDITION_SETTING + "=",
                                                    fault.HELPER_CONDITION_SETTING + "=", fault.COLD_L2_SETTING + "="])
-        for profile in (fault.PROFILE, fault.REPLACEMENT_PROFILE, *fault.TAKEOVER_PROFILES, fault.FIRST_COLD_COMPLETION_PROFILE):
+        for profile in (fault.PROFILE, fault.FIRST_COLD_APPLY_PROFILE, fault.COLD_CONFIGURE_PROFILE, fault.REPLACEMENT_PROFILE, *fault.TAKEOVER_PROFILES, fault.FIRST_COLD_COMPLETION_PROFILE):
             self.assertEqual(fault.build_settings(self.selected(**{fault.ENV: profile})),
                              [fault.ENV + "=" + profile, fault.CONDITION_SETTING + "=" + fault.CONDITION,
                               fault.HELPER_CONDITION_SETTING + "=", fault.COLD_L2_SETTING + "="])
@@ -35,6 +35,51 @@ class LifecycleFaultTests(unittest.TestCase):
                       "after-replacement-before-completion-v2", "after-replacement-before-completion-v1 "):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 fault.selection(self.selected(**{fault.ENV: value}))
+
+    def test_cold_configure_is_engine_only_reject_only_and_exact(self):
+        profile = fault.COLD_CONFIGURE_PROFILE
+        self.assertEqual(profile, "before-cold-configure-v1")
+        for bad in (profile + " ", " " + profile, profile.replace("v1", "v2"), profile + "," + fault.PROFILE):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                fault.selection(self.selected(**{fault.ENV: bad}))
+        policy = (ROOT / "Sources/CEngineRuntime/StorageLifecycleCompatibilityFaultPolicy.swift").read_text()
+        selection = policy[policy.index("static func applies("):policy.index("/// The authenticated")]
+        self.assertIn("case .beforeConfigure: action == .initialize", selection)
+        self.assertIn("case .beforeColdConfigure: action == .coldOpenTakeover && !observed", selection)
+        self.assertIn("default: false", selection)
+        hook = policy[policy.index("static func beforeConfigure("):policy.index("/// Only the normal replacement")]
+        points = ["let profile = try currentProfile()", "guard applies(to: action, profile: profile, observed: observed)",
+                  "FileHandle.standardError.write", "throw EngineError"]
+        self.assertEqual([hook.index(point) for point in points], sorted(hook.index(point) for point in points))
+        for forbidden in ("Task.sleep", "persist(", "createFile", "ProcessInfo", "write(to:"):
+            self.assertNotIn(forbidden, hook)
+
+    def test_first_cold_apply_is_engine_only_closed_and_before_root_completion(self):
+        profile = fault.FIRST_COLD_APPLY_PROFILE
+        self.assertEqual(profile, 'after-first-cold-apply-v1')
+        for bad in (profile + ' ', ' ' + profile, profile.replace('v1', 'v2'), profile + ',' + fault.COLD_L2_PROFILE):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                fault.selection(self.selected(**{fault.ENV: bad}))
+        policy = (ROOT / 'Sources/CEngineRuntime/StorageLifecycleCompatibilityFaultPolicy.swift').read_text()
+        hook = policy[policy.index('static func afterFirstColdApply('):policy.index('/// Called only after checked ROOT completion')]
+        for point in ('StorageLifecycleColdRootProtocol.Prepared', 'try currentProfile() == .afterFirstColdApply',
+                      'prepared.signedOpen.request.takeover.grant.expectedEpoch',
+                      'observed: prepared.signedOpen.request.observation != nil',
+                      'cengine.compat.lifecycle.after-first-cold-apply-v1.injected\\n', 'throw EngineError'):
+            self.assertIn(point, hook)
+        self.assertIn('expectedEpoch == 1 && !observed', policy)
+        for forbidden in ('ProcessInfo', 'UserDefaults', 'createFile', 'persist(', 'Task.sleep', 'write(to:'):
+            self.assertNotIn(forbidden, hook)
+        source = (ROOT / 'Sources/CEngineRuntime/ManagedStorageLifecycleOwner.swift').read_text()
+        body = source[source.index('private func finishColdBoot('):source.index('func bootResume(')]
+        reconcile = body.index('reconcileController')
+        cut = body.index('try StorageLifecycleCompatibilityFaultPolicy.afterFirstColdApply(prepared)')
+        complete = body.index('checkedColdRequest(')
+        self.assertLess(reconcile, cut)
+        self.assertLess(cut, complete)
+        self.assertIn('#if CENGINE_COMPAT_LIFECYCLE_FAULT', body[reconcile:cut])
+        self.assertIn('#endif', body[cut:complete])
+        self.assertEqual(source.count('StorageLifecycleCompatibilityFaultPolicy.afterFirstColdApply('), 1)
 
     def test_first_cold_completion_is_engine_only_and_closed(self):
         profile = fault.FIRST_COLD_COMPLETION_PROFILE
@@ -48,8 +93,9 @@ class LifecycleFaultTests(unittest.TestCase):
                   '#if CENGINE_COMPAT_LIFECYCLE_FAULT',
                   'try StorageLifecycleCompatibilityFaultPolicy.afterFirstColdCompletion(result)',
                   '#endif', 'freshColdCompletion =']
-        offsets = [body.index(point) for point in points]
-        self.assertEqual(offsets, sorted(offsets))
+        offset = 0
+        for point in points:
+            offset = body.index(point, offset) + len(point)
         self.assertEqual(source.count('StorageLifecycleCompatibilityFaultPolicy.afterFirstColdCompletion('), 1)
         policy = (ROOT / 'Sources/CEngineRuntime/StorageLifecycleCompatibilityFaultPolicy.swift').read_text()
         hook = policy[policy.index('static func afterFirstColdCompletion('):policy.index('/// Only a successfully')]
@@ -221,6 +267,7 @@ class LifecycleFaultTests(unittest.TestCase):
         configure = source.index("try io.write(Wire.encode(.init(operation: .configure")
         self.assertLess(hello, fault_call)
         self.assertLess(fault_call, configure)
+        self.assertIn("observed: configuration.cold?.request.observation != nil", source[fault_call:configure])
         self.assertIn("#if CENGINE_COMPAT_LIFECYCLE_FAULT", source[hello:fault_call])
         self.assertIn("#endif", source[fault_call:configure])
         policy = (ROOT / "Sources/CEngineRuntime/StorageLifecycleCompatibilityFaultPolicy.swift").read_text()

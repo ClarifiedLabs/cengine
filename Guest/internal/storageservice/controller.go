@@ -135,9 +135,20 @@ func (s *commonService) ServeControl(ctx context.Context, raw net.Conn) error {
 	// Generation cannot be replaced while this worker owns its active count.
 	return s.control.Serve(ctx, raw)
 }
+func (s *commonService) reportDataFailure(err error) {
+	if s.config.ReportDataFailure != nil {
+		if line := d.HandshakeFailureDiagnostic(err); line != "" {
+			s.config.ReportDataFailure(line)
+		}
+	}
+}
+
 func (s *commonService) ServeData(ctx context.Context, raw net.Conn) (err error) {
 	ctx = s.consumer.Context(ctx)
-	defer func() { s.consumer.Finish(ctx, err) }()
+	defer func() {
+		s.consumer.Finish(ctx, err)
+		s.reportDataFailure(err)
+	}()
 	done, err := s.begin(raw, false)
 	if err != nil {
 		return err

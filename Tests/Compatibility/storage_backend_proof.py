@@ -303,7 +303,7 @@ def _checkpoint(state, manifest):
                 "serviceLinks", "intentRevision", "references", "pendingCold", "latestCold"}
     optional = {"current", "currentContext", "currentService", "observedWorker", "pendingService", "serviceReplacement",
                 "nativeReplacementAttempted", "latestServiceRequest", "latestServiceConfirmation", "pending", "pendingTakeover",
-                "adoptionRetry", "sealed", "terminal", "latestServiceChange"}
+                "adoptionRetry", "sealed", "terminal", "latestServiceChange", "observedCold"}
     _exact(state, required, optional)
     require(state["version"] == "storage-lifecycle.v2", "invalid checkpoint version")
     for field in ("identity", "rootPublicKey", "provenanceReference"):
@@ -504,7 +504,79 @@ def _adoption_request(value, manifest):
     return dict(id=value["id"], epoch=value["expectedEpoch"] + 1, nativeIdentitySHA256=base64.b64encode(digest).decode())
 
 
-def _cold_request(request, manifest, predecessor, service):
+def _protected_predecessor(service):
+    context = service["context"]
+    return dict(current_grant=service["grant"], service_epoch=context["service_epoch"],
+                controller_epoch=context["controller_epoch"], controller_key=context["controller_key"],
+                open_revision=service["open_revision"], bootstrap_key=service["boot"]["bootstrap_key"])
+
+
+def _observed_cold(observed, manifest, contexts, needed_contexts):
+    """One exact abandoned attempt and marker projection, never a controller/receipt."""
+    _exact(observed, {"attempted", "request", "requestID", "anchor", "anchorService"}, {"history"})
+    _uuid(observed["requestID"])
+    attempted, request, anchor = observed["attempted"], observed["request"], observed["anchor"]
+    _exact(attempted, {"request", "prepared", "bootAttempted"})
+    require(attempted["bootAttempted"] is True, "observed cold was not attempted")
+    _exact(anchor, {"context", "controller"}, {"serviceResult"})
+    root_key = _fingerprint(manifest["rootPublicKey"])
+    require(_service(observed["anchorService"], manifest["identity"], root_key) == anchor["context"],
+            "observed cold anchor mismatch")
+    anchor_key = _context(anchor["context"])
+    require(contexts.get(anchor_key) == anchor, "missing retained observed cold anchor")
+    needed_contexts.add(anchor_key)
+    _cold_request(attempted["request"], manifest, anchor["controller"], observed["anchorService"])
+    _cold_prepared(attempted["prepared"], attempted["request"], manifest)  # No nested history/bridge.
+    _exact(request, {"observationID", "identity", "operationID", "signedOpenSHA256", "observerGreeting"})
+    _uuid(request["observationID"]); _uuid(request["operationID"]); _digest(request["signedOpenSHA256"])
+    failed = attempted["prepared"]
+    require(request["identity"] == manifest["identity"] and request["operationID"] == attempted["request"]["prepare"]["operationID"]
+            and request["observationID"] != request["operationID"]
+            and request["signedOpenSHA256"] == _cold_signed_digest(failed), "observed cold request mismatch")
+    greeting = request["observerGreeting"]
+    _cold_greeting(greeting, manifest, failed["successorOrigin"], greeting["daemonUniqueID"])
+    if "history" not in observed:
+        return None
+    history = observed["history"]
+    _exact(history, {"request", "authorization", "observation", "anchor", "failedOrigin", "failedBaseEpoch"})
+    require(history["request"] == request and history["anchor"] == observed["anchorService"]
+            and history["failedOrigin"] == failed["successorOrigin"] and history["failedBaseEpoch"] == failed["baseEpoch"],
+            "observed cold history correlation mismatch")
+    authorization = history["authorization"]
+    _exact(authorization, {"request", "signature"}); _encoded(authorization["signature"], 64)
+    signed_request = authorization["request"]
+    _exact(signed_request, {"observation_id", "subject", "observer"})
+    subject = _canonical(failed["signedOpen"])
+    require(len(subject) <= 65536 and signed_request["subject"] == base64.b64encode(subject).decode()
+            and signed_request["observation_id"] == request["observationID"]
+            and signed_request["observer"] == greeting["launch"], "observed cold authorization mismatch")
+    # Swift signs Go declaration order, not sorted transport JSON. Keep old
+    # SignedOpen bytes intact in the bounded base64 subject (including signatures).
+    launch = {k: greeting["launch"][k] for k in ("shim_launch_uuid", "spec_sha256", "initramfs_sha256", "ext4_uuid", "bytes")}
+    signing = dict(observation_id=signed_request["observation_id"], subject=signed_request["subject"], observer=launch)
+    digest = hashlib.sha256(b"cengine.storageauthority.lifecycle-cold-observe.v1\0" +
+        json.dumps(signing, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    observation = history["observation"]
+    _exact(observation, {"request_sha256", "outcome", "predecessor"})
+    require(observation["request_sha256"] == digest and observation["outcome"] in ("unchanged", "applied"),
+            "observed cold outcome/digest mismatch")
+    precursor = observation["predecessor"]
+    _exact(precursor, {"current_grant", "service_epoch", "controller_epoch", "controller_key", "open_revision", "bootstrap_key"})
+    old = failed["signedOpen"]["request"]["predecessor"]
+    if observation["outcome"] == "unchanged":
+        require(precursor == old, "observed unchanged precursor mismatch")
+    else:
+        grant = failed["signedOpen"]["request"]["takeover"]["grant"]
+        _uuid(precursor["service_epoch"]); _uint(precursor["open_revision"], 1)
+        require(precursor == dict(current_grant=grant, service_epoch=precursor["service_epoch"],
+                controller_epoch=old["controller_epoch"] + 1, controller_key=grant["new_key"],
+                open_revision=precursor["open_revision"], bootstrap_key=root_key)
+                and precursor["service_epoch"] != old["service_epoch"]
+                and precursor["open_revision"] > old["open_revision"], "observed applied precursor mismatch")
+    return history
+
+
+def _cold_request(request, manifest, predecessor, service, observed=None):
     _exact(request, {"prepare", "recipient", "prepareRequestID", "completionRequestID"})
     for key in ("prepareRequestID", "completionRequestID"): _uuid(request[key])
     root_key = _fingerprint(manifest["rootPublicKey"])
@@ -513,7 +585,7 @@ def _cold_request(request, manifest, predecessor, service):
     recipient = request["recipient"]; key = _recipient(recipient, root_key)
     prepare = request["prepare"]
     _exact(prepare, {"operationID", "identity", "expectedPredecessor", "expectedOrigin", "expectedAllocatedEpoch", "candidate",
-                     "mountedGreeting", "nowUnixSeconds", "lifetimeSeconds"})
+                     "mountedGreeting", "nowUnixSeconds", "lifetimeSeconds"}, {"observationID"})
     _uuid(prepare["operationID"]); _uint(prepare["expectedAllocatedEpoch"], 1, 2**64 - 2)
     _uint(prepare["nowUnixSeconds"], 1, 253402300799); _uint(prepare["lifetimeSeconds"], 1, 86400)
     _origin(prepare["expectedOrigin"], manifest)
@@ -522,13 +594,25 @@ def _cold_request(request, manifest, predecessor, service):
             and old["controllerEpoch"] < 2**64 - 1 and service["grant"]["serial"] < 2**64 - 1
             and prepare["operationID"] != service["grant"]["id"]
             and recipient["incarnation"] != predecessor["original"]["recipient"]["incarnation"], "invalid cold predecessor/recipient")
-    require(prepare["expectedPredecessor"] == dict(current_grant=service["grant"], service_epoch=old["serviceEpoch"],
-            controller_epoch=old["controllerEpoch"], controller_key=old["controllerKey"], open_revision=service["open_revision"],
-            bootstrap_key=root_key), "cold protected predecessor mismatch")
+    expected = _protected_predecessor(service)
+    if observed is not None:
+        history = observed.get("history")
+        require(history is not None and prepare.get("observationID") == observed["request"]["observationID"]
+                and prepare["mountedGreeting"] == observed["request"]["observerGreeting"]
+                and prepare["operationID"] not in (observed["request"]["observationID"], observed["request"]["operationID"])
+                and recipient["publicKey"] != observed["attempted"]["request"]["recipient"]["publicKey"]
+                and history["anchor"] == service, "cold observation request mismatch")
+        expected = history["observation"]["predecessor"]
+    else:
+        require("observationID" not in prepare, "cold observation without history")
+    require(prepare["expectedPredecessor"] == expected, "cold protected predecessor mismatch")
     require(prepare["candidate"] == dict(spki=base64.b64encode(bytes.fromhex("302a300506032b6570032100") +
             _encoded(recipient["publicKey"], 32)).decode(), pid=recipient["childPID"], incarnation=recipient["incarnation"]),
             "cold candidate mismatch")
-    greeting = prepare["mountedGreeting"]
+    _cold_greeting(prepare["mountedGreeting"], manifest, prepare["expectedOrigin"], recipient["daemonUniqueID"])
+
+
+def _cold_greeting(greeting, manifest, origin, daemon_id):
     _exact(greeting, {"version", "channelID", "purpose", "daemonUniqueID", "rootPublicKey", "binding", "bootBinding", "launch", "heldBackingIdentity"})
     from managed_prepare_lifecycle_evidence import held_backing_identity
     held_backing_identity(greeting["heldBackingIdentity"], greeting["binding"]["backing"])
@@ -541,19 +625,21 @@ def _cold_request(request, manifest, predecessor, service):
     _exact(boot, {"shimLaunchUUID", "guestBootNonce", "ext4UUID", "bytes"}); _uuid(boot["guestBootNonce"])
     require(boot == dict(shimLaunchUUID=launch["shim_launch_uuid"], guestBootNonce=boot["guestBootNonce"], ext4UUID=manifest["ext4UUID"], bytes=manifest["bytes"])
             and type(boot["bytes"]) is int and greeting["version"] == "storage-lifecycle-cold-shim.v2" and greeting["purpose"] == "cold"
-            and greeting["daemonUniqueID"] == recipient["daemonUniqueID"] and greeting["rootPublicKey"] == manifest["rootPublicKey"]
-            and greeting["binding"] == prepare["expectedOrigin"]["binding"]
-            and launch["shim_launch_uuid"] != prepare["expectedOrigin"]["shimLaunchUUID"], "cold greeting mismatch")
+            and greeting["daemonUniqueID"] == daemon_id and greeting["rootPublicKey"] == manifest["rootPublicKey"]
+            and greeting["binding"] == origin["binding"]
+            and launch["shim_launch_uuid"] != origin["shimLaunchUUID"], "cold greeting mismatch")
 
 
-def _cold_prepared(prepared, request, manifest, bridge=None):
-    _exact(prepared, {"signedOpen", "successorOrigin", "baseEpoch"}, {"recoveryBridge"})
+def _cold_prepared(prepared, request, manifest, bridge=None, history=None):
+    _exact(prepared, {"signedOpen", "successorOrigin", "baseEpoch"}, {"recoveryBridge", "observedHistory"})
+    require(prepared.get("observedHistory") == history and not (bridge is not None and history is not None),
+            "cold prepared observation history mismatch")
     require(prepared.get("recoveryBridge") == bridge, "cold prepared recovery bridge mismatch")
     _origin(prepared["successorOrigin"], manifest); _uint(prepared["baseEpoch"], 2)
     signed = prepared["signedOpen"]
     _exact(signed, {"request", "signature"}); _encoded(signed["signature"], 64)
     value, prepare = signed["request"], request["prepare"]
-    _exact(value, {"operation_id", "predecessor", "takeover", "launch", "now_unix_seconds", "lifetime_seconds"})
+    _exact(value, {"operation_id", "predecessor", "takeover", "launch", "now_unix_seconds", "lifetime_seconds"}, {"observation"})
     original = dict(signed=value["takeover"], recipient=request["recipient"], requestID=request["completionRequestID"],
                     serviceEpoch=prepare["expectedPredecessor"]["service_epoch"])
     grant = _original(original, manifest["identity"], _fingerprint(manifest["rootPublicKey"]))
@@ -565,6 +651,16 @@ def _cold_prepared(prepared, request, manifest, bridge=None):
             and value["lifetime_seconds"] == prepare["lifetimeSeconds"]
             and value["lifetime_seconds"] <= 253402300799 - value["now_unix_seconds"]
             and prepared["baseEpoch"] == prepare["expectedAllocatedEpoch"] + 1, "cold prepared correlation mismatch")
+    require(value.get("observation") == (history["authorization"] if history is not None else None),
+            "cold signed observation mismatch")
+    if history is not None:
+        failed = history["authorization"]["request"]
+        subject = _decode(base64.b64decode(failed["subject"], validate=True), "observation subject")["request"]
+        require(value["predecessor"] == history["observation"]["predecessor"]
+                and value["launch"] == failed["observer"]
+                and prepared["baseEpoch"] == history["failedBaseEpoch"]
+                and grant["serial"] > subject["takeover"]["grant"]["serial"]
+                and grant["new_key"] != subject["takeover"]["grant"]["new_key"], "cold observed successor mismatch")
     launch = value["launch"]
     require(prepared["successorOrigin"] == dict(binding=prepare["expectedOrigin"]["binding"], rootPublicKey=manifest["rootPublicKey"],
             shimLaunchUUID=launch["shim_launch_uuid"], specSHA256=launch["spec_sha256"]), "cold successor origin mismatch")
@@ -657,19 +753,34 @@ def _cold_and_adoption(state, manifest, contexts, needed_contexts):
                     pending["expectedEpoch"] == status["committedEpoch"]), "invalid pending adoption")
         require(request["origin"] == status["origin"] and request["expectedEpoch"] == status["allocatedEpoch"]
                 and request["superseded"] == (_adoption_request(pending, manifest) if pending is not None else None), "adoption retry correlation mismatch")
+    observed = state.get("observedCold")
+    if observed is not None:
+        _observed_cold(observed, manifest, contexts, needed_contexts)
+        require(state["pendingCold"] is not None and state.get("current") == observed["anchor"]["controller"]
+                and state.get("currentContext") == observed["anchor"]["context"]
+                and state.get("currentService") == observed["anchorService"], "observed cold current anchor mismatch")
     pending = state["pendingCold"]
     if pending is not None:
         _exact(pending, {"request", "bootAttempted"}, {"prepared"})
         require(type(pending["bootAttempted"]) is bool and all(state.get(k) is None for k in
                 ("pending", "pendingTakeover", "pendingService", "sealed", "terminal"))
                 and state.get("current") is not None and state.get("currentService") is not None, "invalid pending cold fence")
-        _cold_request(pending["request"], manifest, state["current"], state["currentService"])
+        pending_observed = observed if observed is not None and pending != observed["attempted"] else None
+        _cold_request(pending["request"], manifest, state["current"], state["currentService"], pending_observed)
         require(state["latestCold"] is None or pending["request"]["prepare"]["operationID"] != state["latestCold"]["request"]["prepare"]["operationID"], "reused cold operation")
-        if "prepared" in pending: _cold_prepared(pending["prepared"], pending["request"], manifest)
+        if "prepared" in pending: _cold_prepared(pending["prepared"], pending["request"], manifest,
+                history=pending_observed.get("history") if pending_observed is not None else None)
         else: require(not pending["bootAttempted"], "cold boot attempted without authorization")
     cold = state["latestCold"]
     if cold is not None:
-        _exact(cold, {"request", "prepared", "completion", "predecessor", "predecessorService"}, {"deadPredecessor"})
+        _exact(cold, {"request", "prepared", "completion", "predecessor", "predecessorService"}, {"deadPredecessor", "observedPredecessor"})
+        require(not ("deadPredecessor" in cold and "observedPredecessor" in cold), "mixed cold history")
+        history = None
+        observed_predecessor = cold.get("observedPredecessor")
+        if observed_predecessor is not None:
+            history = _observed_cold(observed_predecessor, manifest, contexts, needed_contexts)
+            require(history is not None and cold["predecessor"] == observed_predecessor["anchor"]
+                    and cold["predecessorService"] == observed_predecessor["anchorService"], "cold observed predecessor mismatch")
         bridge = None
         if "deadPredecessor" in cold:
             resolved = cold["deadPredecessor"]
@@ -684,11 +795,12 @@ def _cold_and_adoption(state, manifest, contexts, needed_contexts):
                     "cold bridge successor correlation mismatch")
         old = cold["predecessor"]
         _exact(old, {"context", "controller"}, {"serviceResult"})
-        _cold_request(cold["request"], manifest, old["controller"], cold["predecessorService"])
-        _cold_prepared(cold["prepared"], cold["request"], manifest, bridge)
+        _cold_request(cold["request"], manifest, old["controller"], cold["predecessorService"], observed_predecessor)
+        _cold_prepared(cold["prepared"], cold["request"], manifest, bridge, history)
         completion, prepared = cold["completion"], cold["prepared"]
-        _exact(completion, {"operationID", "signedOpenSHA256", "successorOrigin", "baseEpoch", "receipt", "successor"}, {"recoveryBridge"})
+        _exact(completion, {"operationID", "signedOpenSHA256", "successorOrigin", "baseEpoch", "receipt", "successor"}, {"recoveryBridge", "observedHistory"})
         require(completion.get("recoveryBridge") == bridge, "cold completion recovery bridge mismatch")
+        require(completion.get("observedHistory") == history, "cold completion observation history mismatch")
         successor = completion["successor"]
         root_key = _fingerprint(manifest["rootPublicKey"])
         fresh = _service(successor, manifest["identity"], root_key)
@@ -699,9 +811,14 @@ def _cold_and_adoption(state, manifest, contexts, needed_contexts):
                 and completion["successorOrigin"] == prepared["successorOrigin"] and completion["baseEpoch"] == prepared["baseEpoch"]
                 and type(completion["baseEpoch"]) is int and completion["receipt"]["revision"] == successor["open_revision"]
                 and successor["grant"] == completion["receipt"]["grant"], "cold completion mismatch")
+        if history is not None:
+            precursor = history["observation"]["predecessor"]
+            require(successor["context"]["service_epoch"] != precursor["service_epoch"]
+                    and successor["open_revision"] > precursor["open_revision"], "observed cold successor did not advance")
         prior_service = cold["predecessorService"]
         require(_service(prior_service, manifest["identity"], root_key) == old["context"]
-                and fresh["controllerEpoch"] == old["context"]["controllerEpoch"] + 1
+                and fresh["controllerEpoch"] == old["context"]["controllerEpoch"] + (
+                    2 if history is not None and history["observation"]["outcome"] == "applied" else 1)
                 and successor["open_revision"] > max(prior_service["open_revision"], old["controller"]["directResult"]["revision"], old.get("serviceResult", {}).get("revision", 0))
                 and all(successor["boot"][k] != prior_service["boot"][k] for k in ("service_epoch", "tls_root_sha256", "server_spki")), "cold successor did not advance")
         if old.get("serviceResult") is not None:

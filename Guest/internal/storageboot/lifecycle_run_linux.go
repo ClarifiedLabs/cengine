@@ -4,6 +4,7 @@ package storageboot
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"net"
 	"os"
@@ -96,7 +97,15 @@ func runLifecycle(ctx context.Context, verified diskbootstrap.VerifiedBootResult
 		_ = conn.Close()
 		return err
 	}
-	return lifecycleSession(ctx, conn, binding, start, 30*time.Second)
+	return lifecycleSessionWithObservation(ctx, conn, binding, start, func(key ed25519.PublicKey, authorization a.SignedLifecycleColdObservation) (a.LifecycleColdObservation, error) {
+		// Ordinary mounted cold ext4 only, never the empty-store no-replay lease.
+		if probe || root == nil {
+			return a.LifecycleColdObservation{}, s.ErrConfiguration
+		}
+		return a.ObserveLifecycleColdReadOnly(a.Config{Root: root, DeviceID: binding.Ext4UUID, BootstrapKey: key,
+			Barrier: func(a.Binding, *os.File) error { return a.ErrInvalid },
+		}, authorization)
+	}, 30*time.Second)
 }
 
 // One accepted peer, no retries. Check the kernel's concrete CID before even the

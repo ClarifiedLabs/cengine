@@ -3,6 +3,7 @@ import Foundation
 import Security
 
 typealias Lifecycle = StorageLifecycleProtocol
+typealias ColdObservation = StorageLifecycleColdObservationProtocol
 
 /// Never interprets or compacts a retired v1 authority.
 protocol StorageLifecycleJournal: AnyObject {
@@ -10,6 +11,7 @@ protocol StorageLifecycleJournal: AnyObject {
     func lifecycleRootPublicKey() throws -> StorageIdentity.RootPublicKey
     func checkpoint(_ state: Data) throws
     func signLifecycle(_ grant: StorageLifecycleProtocol.Grant) throws -> StorageLifecycleProtocol.SignedGrant
+    func signColdObservation(_ request: ColdObservation.Request) throws -> ColdObservation.SignedRequest
     func signColdOpen(_ request: StorageLifecycleColdProtocol.Request) throws -> StorageLifecycleColdProtocol.SignedOpen
     func signHandoff(_ request: StorageLifecycleHandoffProtocol.Request) throws -> StorageLifecycleHandoffProtocol.SignedRequest
     func signResumeOpen(_ request: StorageLifecycleResumeProtocol.Request) throws -> StorageLifecycleResumeProtocol.SignedOpen
@@ -18,6 +20,9 @@ protocol StorageLifecycleJournal: AnyObject {
 
 // Existing non-cold test/adapter journals fail closed until explicitly implemented.
 extension StorageLifecycleJournal {
+    func signColdObservation(_ request: ColdObservation.Request) throws -> ColdObservation.SignedRequest {
+        throw BootstrapFailure(.unavailable)
+    }
     func signHandoff(_ request: StorageLifecycleHandoffProtocol.Request) throws -> StorageLifecycleHandoffProtocol.SignedRequest {
         throw BootstrapFailure(.unavailable)
     }
@@ -34,8 +39,17 @@ extension StorageLifecycleJournal {
 /// nonce/counter challenge. It receives NO signatures. Rechecks use the same channel,
 /// including after Open; neither a persisted Greeting nor caller DTO is evidence.
 protocol StorageLifecycleColdChecking {
+    func observe(request: StorageLifecycleColdRootProtocol.Observe, authorization: ColdObservation.SignedRequest,
+                 daemon: BootstrapProcess) throws -> ColdObservation.Observation
     func mounted(request: StorageLifecycleColdRootProtocol.Prepare, unsignedGrant: Lifecycle.Grant,
                  signedOpenDigest: String, baseEpoch: UInt64, daemon: BootstrapProcess) throws -> StorageLifecycleShimOrigin
+}
+
+extension StorageLifecycleColdChecking {
+    func observe(request: StorageLifecycleColdRootProtocol.Observe, authorization: ColdObservation.SignedRequest,
+                 daemon: BootstrapProcess) throws -> ColdObservation.Observation {
+        throw BootstrapFailure(.unavailable)
+    }
 }
 
 /// Mount-only proof for resuming initialization: the same channel framing as cold recovery
@@ -99,11 +113,11 @@ protocol StorageLifecycleFreshBindingChecking {
 /// when their recipients die.
 final class StorageBootstrapLifecycleAuthority {
     static let maximumStores = 128
-    // One resolved dead cold edge can coexist with its fresh successor through
-    // L2. The old 48-KiB usable budget did not fit that bounded pair when the
-    // predecessor also retained a completed adoption. History remains nonrecursive
-    // and is removed at L3; 128 stores still fit the checkpoint's aggregate bound.
-    private static let maximumStoreBytes = 96 * 1024
+    // One failed cold edge, signed observation, concrete projection and fresh
+    // successor can coexist through L2, including a completed old adoption.
+    // History remains nonrecursive and clears only at genuine L3. Even the full
+    // 128-store budget (24 MiB) fits the 32-MiB checkpoint aggregate bound.
+    private static let maximumStoreBytes = 192 * 1024
     private static let completionReservation = 16 * 1024
     private struct Intent: Codable, Equatable {
         let grant: Lifecycle.Grant
@@ -156,6 +170,18 @@ final class StorageBootstrapLifecycleAuthority {
         }
         func publishing() -> ResolvedDeadCold { .init(request: request, failed: failed, phase: .published) }
     }
+    /// Bounded pre-L2 observation. O1 retains the original exact signed attempt;
+    /// O2 adds only a read-only projection, never a service/receipt/TLS substitute.
+    private final class ObservedCold: Codable {
+        let failed: ColdTransaction
+        let request: StorageLifecycleColdRootProtocol.Observe
+        let authorization: ColdObservation.SignedRequest
+        let history: ColdObservation.History?
+        init(failed: ColdTransaction, request: StorageLifecycleColdRootProtocol.Observe,
+             authorization: ColdObservation.SignedRequest, history: ColdObservation.History? = nil) {
+            self.failed = failed; self.request = request; self.authorization = authorization; self.history = history
+        }
+    }
     /// Durable fresh publication phase. The first initialize commit stores the
     /// exact origin but remains `.unverified`; only the successful exact
     /// post-commit proof commits `.verified` BEFORE any signature release.
@@ -198,6 +224,7 @@ final class StorageBootstrapLifecycleAuthority {
         // Additive sole-v2 recovery extension. Omission means NO historical
         // resolution; preserve existing canonical bytes without rewriting on load.
         var resolvedDeadCold: ResolvedDeadCold?
+        var observedCold: ObservedCold?
         // Initialization-resume transaction, separate from cold recovery. Only an
         // unused protected fresh initialization (pending/current INIT C1, no
         // adopted store) may stage one; the fence clears only after the actual
@@ -212,7 +239,7 @@ final class StorageBootstrapLifecycleAuthority {
         // Explicit durable publication phase; never inferred from success or
         // inferred into one by retries, completion or initialization replies.
         var freshPhase: FreshPhase?
-        var coldFenced: Bool { resolvedDeadCold != nil || pendingCold != nil || latestCold?.enrollmentAcknowledged == false }
+        var coldFenced: Bool { observedCold != nil || resolvedDeadCold != nil || pendingCold != nil || latestCold?.enrollmentAcknowledged == false }
         var resumeFenced: Bool { pendingResume != nil || latestResume?.enrollmentAcknowledged == false }
         var fenced: Bool { coldFenced || resumeFenced || pendingHandoff != nil }
         init(binding: Data, identity: Lifecycle.Identity, pending: Intent,
@@ -223,7 +250,7 @@ final class StorageBootstrapLifecycleAuthority {
         private enum CodingKeys: String, CodingKey {
             case binding, identity, current, result, pending, sealed
             case currentService, pendingService, latestServiceChange, pendingCold, latestCold
-            case pendingResume, latestResume, freshOrigin, freshPhase, pendingHandoff, latestHandoff, resolvedDeadCold
+            case pendingResume, latestResume, freshOrigin, freshPhase, pendingHandoff, latestHandoff, resolvedDeadCold, observedCold
         }
         init(from decoder: any Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -240,6 +267,7 @@ final class StorageBootstrapLifecycleAuthority {
             pendingCold = try c.decode(ColdTransaction?.self, forKey: .pendingCold)
             latestCold = try c.decode(ColdTransaction?.self, forKey: .latestCold)
             resolvedDeadCold = try c.decodeIfPresent(ResolvedDeadCold.self, forKey: .resolvedDeadCold)
+            observedCold = try c.decodeIfPresent(ObservedCold.self, forKey: .observedCold)
             // Required nullable fields: a missing resume slot is never inferred.
             pendingResume = try c.decode(ResumeTransaction?.self, forKey: .pendingResume)
             latestResume = try c.decode(ResumeTransaction?.self, forKey: .latestResume)
@@ -260,6 +288,7 @@ final class StorageBootstrapLifecycleAuthority {
             try c.encode(pendingCold, forKey: .pendingCold)
             try c.encode(latestCold, forKey: .latestCold)
             try c.encodeIfPresent(resolvedDeadCold, forKey: .resolvedDeadCold)
+            try c.encodeIfPresent(observedCold, forKey: .observedCold)
             try c.encode(pendingResume, forKey: .pendingResume)
             try c.encode(latestResume, forKey: .latestResume)
             try c.encode(currentService, forKey: .currentService)
@@ -315,10 +344,12 @@ final class StorageBootstrapLifecycleAuthority {
     /// dead resolution needs history only, never the failed mounted channel.
     func retainedColdClaimOperationIDs() throws -> Set<String> {
         try healthy()
-        return Set(state.stores.values.compactMap { store in
-            if let pending = store.pendingCold { return pending.request.operationID }
-            if let latest = store.latestCold, !latest.enrollmentAcknowledged { return latest.request.operationID }
-            return nil
+        return Set(state.stores.values.flatMap { store -> [String] in
+            var retained: [String] = []
+            if let observed = store.observedCold { retained.append(observed.request.observationID) }
+            if let pending = store.pendingCold { retained.append(pending.request.operationID) }
+            if let latest = store.latestCold, !latest.enrollmentAcknowledged { retained.append(latest.request.operationID) }
+            return retained
         })
     }
 
@@ -908,6 +939,7 @@ final class StorageBootstrapLifecycleAuthority {
                   [store.current, store.pending].compactMap({ $0 }).contains { $0.grant.newKey == key }
                       || store.pendingCold?.prepared.signedOpen.request.takeover.grant.newKey == key
                       || store.resolvedDeadCold?.failed.prepared.signedOpen.request.takeover.grant.newKey == key
+                      || store.observedCold?.failed.prepared.signedOpen.request.takeover.grant.newKey == key
                       || store.pendingResume?.prepared.signedOpen.request.takeover.grant.newKey == key
               }) else { throw BootstrapFailure(.conflict) }
     }
@@ -941,10 +973,17 @@ final class StorageBootstrapLifecycleAuthority {
                   id == store.identity.store, store.identity.generation <= next.generation,
                   generations.insert(store.identity.generation).inserted,
                   !roots.contains(binding.root), !backings.contains(binding.backing.identity),
-                  try Lifecycle.encode(store).count <= Self.maximumStoreBytes - (store.sealed == nil ? Self.completionReservation : 0)
+                  try Self.encodeProtectedStore(store).count <= Self.maximumStoreBytes - (store.sealed == nil ? Self.completionReservation : 0)
             else { throw BootstrapFailure(.repairRequired) }
             try validateHandoff(store, serial: next.serial)
             try validateResolvedDeadCold(store, serial: next.serial)
+            try validateObservedCold(store, serial: next.serial)
+            if let observed = store.observedCold, store.pendingCold?.request.operationID != observed.failed.request.operationID {
+                let grant = observed.failed.prepared.signedOpen.request.takeover.grant
+                guard serials.insert(grant.serial).inserted, keys.insert(grant.newKey).inserted else {
+                    throw BootstrapFailure(.repairRequired)
+                }
+            }
             try validateCold(store, serial: next.serial)
             if let resolved = store.resolvedDeadCold, resolved.phase == .published {
                 let grant = resolved.failed.prepared.signedOpen.request.takeover.grant
@@ -1050,6 +1089,15 @@ final class StorageBootstrapLifecycleAuthority {
                   !generations.contains(old.intent.grant.identity.generation), !serials.contains(old.intent.grant.serial) else { throw BootstrapFailure(.repairRequired) }
         }
     }
+    /// Protected checkpoints have a separate budget from 64-KiB wire envelopes.
+    /// Keep canonical bytes without applying the public lifecycle transport cap.
+    private static func encodeProtectedStore(_ store: Store) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let bytes = try encoder.encode(store)
+        guard bytes.count <= maximumStoreBytes else { throw BootstrapFailure(.capacityExceeded) }
+        return bytes
+    }
     private static func encodeState(_ state: State) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -1099,7 +1147,7 @@ extension StorageBootstrapLifecycleAuthority {
     /// inventing enrollment, replaying its boot, or clearing the publication fence.
     private func requireColdPredecessor(_ store: Store) throws {
         guard store.coldFenced else { return }
-        guard store.pendingCold == nil, store.resolvedDeadCold == nil,
+        guard store.pendingCold == nil, store.resolvedDeadCold == nil, store.observedCold == nil,
               store.pending == nil, store.pendingService == nil, store.sealed == nil,
               store.pendingResume == nil, !store.resumeFenced, store.pendingHandoff == nil,
               let cold = store.latestCold, cold.completion != nil, !cold.enrollmentAcknowledged else {
@@ -1187,7 +1235,7 @@ extension StorageBootstrapLifecycleAuthority {
                          check: () throws -> Void = {}) throws -> StorageLifecycleColdRootProtocol.ResolvedDead {
         try check(); try healthy(); try request.validate()
         guard var store = state.stores[request.identity.store], store.identity == request.identity,
-              store.latestCold == nil else { throw BootstrapFailure(.blocked) }
+              store.latestCold == nil, store.observedCold == nil else { throw BootstrapFailure(.blocked) }
         let resolved: ResolvedDeadCold
         if let saved = store.resolvedDeadCold {
             guard saved.request == request else { throw BootstrapFailure(.conflict) }
@@ -1199,7 +1247,7 @@ extension StorageBootstrapLifecycleAuthority {
             resolved = saved
         } else {
             guard let failed = store.pendingCold, failed.completion != nil,
-                  failed.prepared.recoveryBridge == nil,
+                  failed.prepared.recoveryBridge == nil, failed.prepared.observedHistory == nil,
                   request.operationID == failed.request.operationID,
                   request.signedOpenSHA256 == (try failed.prepared.signedOpenSHA256) else {
                 throw BootstrapFailure(.blocked)
@@ -1224,8 +1272,115 @@ extension StorageBootstrapLifecycleAuthority {
         try proveResolvedDead(published, store: store, check: check)
         return try resolvedDeadValue(published)
     }
+    private func observationParticipantsDeparted(_ failed: ColdTransaction) throws {
+        try coldDeparted(failed)
+        for process in [failed.newPrincipal.daemon, failed.newPrincipal.child, failed.newOrigin.shim,
+                        failed.newOrigin.originalDaemon, failed.newOrigin.originalController] {
+            guard processes.liveness(process) == .exited else { throw BootstrapFailure(.blocked) }
+        }
+    }
+    private func proveObservation(_ observed: ObservedCold, daemon: BootstrapProcess,
+                                  check: () throws -> Void) throws {
+        try check(); try observationParticipantsDeparted(observed.failed)
+        let (adoption, mounted) = try coldDependencies()
+        try adoption.verifyColdPredecessor(snapshot: observed.failed.oldAdoption)
+        let result = try mounted.observe(request: observed.request, authorization: observed.authorization, daemon: daemon)
+        try result.validate(for: observed.authorization.request)
+        if let history = observed.history {
+            guard result == history.observation else { throw BootstrapFailure(.conflict) }
+        }
+        try observationParticipantsDeparted(observed.failed)
+        try adoption.verifyColdPredecessor(snapshot: observed.failed.oldAdoption); try check()
+    }
+    func observeCold(_ request: StorageLifecycleColdRootProtocol.Observe, daemon: BootstrapProcess,
+                     check: () throws -> Void = {}) throws -> ColdObservation.History {
+        try check(); try healthy(); try request.validate()
+        guard var store = state.stores[request.identity.store], store.identity == request.identity,
+              store.resolvedDeadCold == nil, store.latestCold == nil,
+              let failed = store.pendingCold, failed.completion == nil,
+              failed.prepared.recoveryBridge == nil, failed.prepared.observedHistory == nil,
+              request.operationID == failed.request.operationID,
+              request.signedOpenSHA256 == (try failed.prepared.signedOpenSHA256) else { throw BootstrapFailure(.blocked) }
+        let observed: ObservedCold
+        if let saved = store.observedCold {
+            guard saved.request == request else { throw BootstrapFailure(.conflict) }
+            observed = saved
+        } else {
+            try observationParticipantsDeparted(failed)
+            let (adoption, _) = try coldDependencies()
+            try adoption.verifyColdPredecessor(snapshot: failed.oldAdoption)
+            let authorizationRequest = try ColdObservation.Request(observationID: request.observationID,
+                subject: Lifecycle.encode(failed.prepared.signedOpen), observer: request.observerGreeting.launch)
+            let authorization = try journal.signColdObservation(authorizationRequest)
+            guard authorization.request == authorizationRequest, authorization.isValidSignature(using: root) else {
+                throw BootstrapFailure(.repairRequired)
+            }
+            observed = ObservedCold(failed: failed, request: request, authorization: authorization)
+            store.observedCold = observed
+            var next = state; next.stores[request.identity.store] = store
+            try commit(next, check: {
+                try check(); try self.observationParticipantsDeparted(failed)
+                try adoption.verifyColdPredecessor(snapshot: failed.oldAdoption)
+            }) // O1: signature durable before native release.
+        }
+        if let history = observed.history {
+            try proveObservation(observed, daemon: daemon, check: check)
+            return history
+        }
+        try check(); try observationParticipantsDeparted(failed)
+        let (adoption, mounted) = try coldDependencies()
+        try adoption.verifyColdPredecessor(snapshot: failed.oldAdoption)
+        let result = try mounted.observe(request: request, authorization: observed.authorization, daemon: daemon)
+        let history = try ColdObservation.History(request: request, authorization: observed.authorization,
+            observation: result, anchor: failed.predecessorService,
+            failedOrigin: failed.newOrigin.wire, failedBaseEpoch: failed.prepared.baseEpoch)
+        try history.validate(preparedFailed: failed.prepared, anchor: failed.predecessorService)
+        let completed = ObservedCold(failed: failed, request: request, authorization: observed.authorization, history: history)
+        store.observedCold = completed
+        var next = state; next.stores[request.identity.store] = store
+        try commit(next, check: { try self.proveObservation(completed, daemon: daemon, check: check) }) // O2
+        try proveObservation(completed, daemon: daemon, check: check)
+        return history
+    }
+    private func validateObservedCold(_ store: Store, serial: UInt64) throws {
+        guard let observed = store.observedCold else { return }
+        let failed = observed.failed
+        try observed.request.validate(); try observed.authorization.validate()
+        guard store.resolvedDeadCold == nil, store.latestCold == nil,
+              store.pending == nil, store.pendingService == nil, store.sealed == nil,
+              !store.resumeFenced, store.pendingHandoff == nil,
+              failed.completion == nil, !failed.enrollmentAcknowledged,
+              failed.prepared.recoveryBridge == nil, failed.prepared.observedHistory == nil,
+              observed.authorization.isValidSignature(using: root),
+              observed.request.identity == store.identity,
+              observed.request.observerGreeting.rootPublicKey == root.publicData,
+              try observed.request.observerGreeting.binding.value() == decodedBinding(store),
+              observed.request.operationID == failed.request.operationID,
+              observed.request.signedOpenSHA256 == (try failed.prepared.signedOpenSHA256),
+              observed.authorization.request.subject == (try Lifecycle.encode(failed.prepared.signedOpen)),
+              observed.authorization.request.observationID == observed.request.observationID,
+              observed.authorization.request.observer == observed.request.observerGreeting.launch else {
+            throw BootstrapFailure(.repairRequired)
+        }
+        var original = store; original.observedCold = nil; original.pendingCold = failed
+        try validateCold(original, serial: serial)
+        if let history = observed.history {
+            try history.validate(preparedFailed: failed.prepared, anchor: failed.predecessorService)
+            guard history.request == observed.request, history.authorization == observed.authorization else { throw BootstrapFailure(.repairRequired) }
+        }
+        guard let pending = store.pendingCold else { throw BootstrapFailure(.repairRequired) }
+        if pending.request.operationID == failed.request.operationID {
+            guard try Lifecycle.encode(pending) == Lifecycle.encode(failed) else { throw BootstrapFailure(.repairRequired) }
+        } else {
+            guard let history = observed.history, pending.prepared.observedHistory == history,
+                  pending.oldAdoption == failed.oldAdoption else { throw BootstrapFailure(.repairRequired) }
+        }
+    }
     private func coldMountedProof(_ cold: ColdTransaction, daemon: BootstrapProcess) throws {
         let (_, mounted) = try coldDependencies()
+        if let observed = state.stores[cold.request.identity.store]?.observedCold {
+            try observationParticipantsDeparted(observed.failed)
+        }
         let grant = cold.prepared.signedOpen.request.takeover.grant
         guard try processes.candidate(cold.request.candidate, daemon: daemon, grant: grant) == cold.newPrincipal,
               try mounted.mounted(request: cold.request, unsignedGrant: grant,
@@ -1243,6 +1398,19 @@ extension StorageBootstrapLifecycleAuthority {
             let value = try resolvedDeadValue(resolved)
             return try .init(predecessor: coldPredecessor(value.successor), origin: value.successorOrigin,
                 allocatedEpoch: value.baseEpoch, eligibility: .eligible)
+        }
+        if let store = state.stores[identity.store], store.identity == identity,
+           let failed = store.observedCold?.failed ?? store.pendingCold, failed.completion == nil {
+            guard store.pendingCold?.request.operationID == failed.request.operationID else { throw BootstrapFailure(.blocked) }
+            try observationParticipantsDeparted(failed)
+            try adoption.verifyColdPredecessor(snapshot: failed.oldAdoption)
+            guard failed.prepared.recoveryBridge == nil, failed.prepared.observedHistory == nil else {
+                throw BootstrapFailure(.blocked)
+            }
+            let history = store.observedCold?.history
+            return try .init(predecessor: history?.predecessor ?? coldPredecessor(failed.predecessorService),
+                origin: failed.oldAdoption.origin.wire, allocatedEpoch: failed.oldAdoption.allocatedEpoch,
+                eligibility: history == nil ? .observationRequired : .eligible)
         }
         guard let store = state.stores[identity.store], store.identity == identity,
               store.pendingService == nil, store.sealed == nil,
@@ -1283,7 +1451,8 @@ extension StorageBootstrapLifecycleAuthority {
         }
         guard store.resolvedDeadCold?.phase != .intent else { throw BootstrapFailure(.blocked) }
         if let cold = store.pendingCold ?? store.latestCold, cold.request.operationID == request.operationID {
-            guard cold.request == request else { throw BootstrapFailure(.conflict) }
+            guard cold.request == request,
+                  store.observedCold?.failed.request.operationID != request.operationID else { throw BootstrapFailure(.conflict) }
             if store.pendingCold == nil {
                 guard store.pending == nil, store.pendingService == nil, store.sealed == nil,
                       try coldRotated(cold, adoption: adoption) else { throw BootstrapFailure(.conflict) }
@@ -1295,7 +1464,15 @@ extension StorageBootstrapLifecycleAuthority {
             }
             return cold.prepared // Never reconstruct or re-sign either signature.
         }
-        guard store.pendingCold == nil, store.pending == nil, store.pendingService == nil, store.sealed == nil,
+        let observed = store.observedCold
+        if let observed {
+            guard let history = observed.history, request.observationID == observed.request.observationID,
+                  request.mountedGreeting == observed.request.observerGreeting,
+                  store.pendingCold?.request.operationID == observed.failed.request.operationID else { throw BootstrapFailure(.blocked) }
+            try proveObservation(observed, daemon: daemon, check: {})
+            guard request.expectedPredecessor == history.predecessor else { throw BootstrapFailure(.conflict) }
+        } else if request.observationID != nil { throw BootstrapFailure(.conflict) }
+        guard (store.pendingCold == nil || observed != nil), store.pending == nil, store.pendingService == nil, store.sealed == nil,
               let current = store.current, let committedService = store.currentService,
               let committedReceipt = store.result else { throw BootstrapFailure(.blocked) }
         let service: Lifecycle.ServiceState, receipt: Lifecycle.Receipt, predecessor: BootstrapPrincipal
@@ -1308,10 +1485,10 @@ extension StorageBootstrapLifecycleAuthority {
             let value = try resolvedDeadValue(resolved)
             service = value.successor; receipt = value.receipt; predecessor = resolved.failed.newPrincipal; bridge = value
         } else {
-            try requireColdPredecessor(store)
+            if observed == nil { try requireColdPredecessor(store) }
             service = committedService; receipt = committedReceipt; predecessor = current.recipient; bridge = nil
         }
-        guard try request.expectedPredecessor == coldPredecessor(service) else { throw BootstrapFailure(.conflict) }
+        guard try request.expectedPredecessor == (observed?.history?.predecessor ?? coldPredecessor(service)) else { throw BootstrapFailure(.conflict) }
         let snapshot = try adoption.coldSnapshot(store: request.identity.store)
         guard snapshot.origin.wire == request.expectedOrigin, snapshot.allocatedEpoch == request.expectedAllocatedEpoch,
               try snapshot.origin.wire.binding.value() == decodedBinding(store) else { throw BootstrapFailure(.conflict) }
@@ -1320,7 +1497,7 @@ extension StorageBootstrapLifecycleAuthority {
             guard processes.liveness(p) == .exited else { throw BootstrapFailure(.blocked) }
         }
         let grant = try Lifecycle.Grant(operation: .takeover, id: request.operationID, identity: request.identity,
-            serial: increment(state.serial), expectedEpoch: service.context.controllerEpoch,
+            serial: increment(state.serial), expectedEpoch: request.expectedPredecessor.controllerEpoch,
             newKey: request.candidate.publicKey.fingerprint.rawValue)
         try excludeLiveKey(grant.newKey)
         let principal = try processes.candidate(request.candidate, daemon: daemon, grant: grant)
@@ -1334,10 +1511,10 @@ extension StorageBootstrapLifecycleAuthority {
         guard inner.grant == grant, inner.isValidSignature(using: root) else { throw BootstrapFailure(.repairRequired) }
         let open = try StorageLifecycleColdProtocol.Request(operationID: request.operationID,
             predecessor: request.expectedPredecessor, takeover: inner, launch: request.mountedGreeting.launch,
-            nowUnixSeconds: request.nowUnixSeconds, lifetimeSeconds: request.lifetimeSeconds)
+            nowUnixSeconds: request.nowUnixSeconds, lifetimeSeconds: request.lifetimeSeconds, observation: observed?.authorization)
         let prepared = try StorageLifecycleColdRootProtocol.Prepared(signedOpen: journal.signColdOpen(open),
             successorOrigin: request.mountedGreeting.successorOrigin, baseEpoch: increment(snapshot.allocatedEpoch),
-            recoveryBridge: bridge)
+            recoveryBridge: bridge, observedHistory: observed?.history)
         try prepared.validate(for: request)
         guard prepared.signedOpen.request == open else { throw BootstrapFailure(.repairRequired) }
         let origin = try mounted.mounted(request: request, unsignedGrant: grant,
@@ -1347,7 +1524,10 @@ extension StorageBootstrapLifecycleAuthority {
             newOrigin: origin, prepared: prepared)
         store.pendingCold = cold; store.latestCold = nil
         var next = state; next.serial = grant.serial; next.stores[request.identity.store] = store
-        try commit(next) // L1: exact signatures durable BEFORE any release.
+        try commit(next, check: {
+            if let observed { try self.proveObservation(observed, daemon: daemon, check: {}) }
+            try adoption.verifyColdPredecessor(snapshot: snapshot); try self.coldDeparted(cold)
+        }) // L1: exact signatures durable BEFORE any release.
         try adoption.verifyColdPredecessor(snapshot: snapshot); try coldDeparted(cold)
         try coldMountedProof(cold, daemon: daemon)
         return prepared
@@ -1363,7 +1543,8 @@ extension StorageBootstrapLifecycleAuthority {
         guard matches.count == 1, var store = matches.first,
               var cold = store.pendingCold ?? store.latestCold,
               try cold.prepared.signedOpenSHA256 == signedOpenSHA256 else { throw BootstrapFailure(.conflict) }
-        guard store.resolvedDeadCold?.phase != .intent else { throw BootstrapFailure(.blocked) }
+        guard store.resolvedDeadCold?.phase != .intent,
+              store.observedCold?.failed.request.operationID != operationID else { throw BootstrapFailure(.blocked) }
         let rotated = try coldRotated(cold, adoption: adoption)
         if store.pendingCold == nil {
             guard store.pending == nil, store.pendingService == nil, store.sealed == nil,
@@ -1382,7 +1563,7 @@ extension StorageBootstrapLifecycleAuthority {
         // Also fences pending L2 retries. Only protected resolved-dead recovery
         // may bypass this cut; no request, environment or marker selects it.
         try StorageBootstrapCompatibilityColdL2FaultPolicy.afterColdL2BeforeA1(
-            hasRecoveryBridge: cold.prepared.recoveryBridge != nil)
+            hasRecoveryBridge: cold.prepared.recoveryBridge != nil || cold.prepared.observedHistory != nil)
         #endif
         // Reprove after L2, before crossing the separate adoption checkpoint.
         _ = try proveCold(cold, daemon: daemon)
@@ -1394,7 +1575,8 @@ extension StorageBootstrapLifecycleAuthority {
         store.current = Intent(grant: completion.receipt.grant, recipient: cold.newPrincipal)
         store.result = cold.completion!.receipt; store.currentService = completion.successor
         store.latestServiceChange = nil; store.pendingCold = nil; store.latestCold = cold; store.latestHandoff = nil
-        store.resolvedDeadCold = nil // Only actual new live C13 publication clears dead history.
+        store.resolvedDeadCold = nil // Only actual new live publication clears dead history.
+        store.observedCold = nil
         // Completed cold successor: the historical fresh anchor is cleared too.
         store.freshOrigin = nil; store.freshPhase = nil
         var next = state; next.stores[store.identity.store] = store; try commit(next) // L3
@@ -1454,7 +1636,7 @@ extension StorageBootstrapLifecycleAuthority {
         let completion = try StorageLifecycleColdRootProtocol.Completed(operationID: cold.request.operationID,
             signedOpenSHA256: cold.prepared.signedOpenSHA256, successorOrigin: cold.newOrigin.wire,
             baseEpoch: cold.prepared.baseEpoch, receipt: receipt, successor: live.state(boot: boot),
-            recoveryBridge: cold.prepared.recoveryBridge)
+            recoveryBridge: cold.prepared.recoveryBridge, observedHistory: cold.prepared.observedHistory)
         try validateColdCompletion(completion, cold: cold)
         if let previous = cold.completion {
             guard sameResult(previous.receipt, completion.receipt), previous.successor == completion.successor else {
@@ -1477,11 +1659,14 @@ extension StorageBootstrapLifecycleAuthority {
         guard let cold = store.pendingCold ?? store.latestCold else { return }
         try cold.prepared.validate(for: cold.request)
         try cold.predecessorService.validate(); try cold.predecessorReceipt.validate()
+        if let history = cold.prepared.observedHistory {
+            guard history.anchor == cold.predecessorService else { throw BootstrapFailure(.repairRequired) }
+        }
         let grant = cold.prepared.signedOpen.request.takeover.grant
         try validatePrincipal(cold.newPrincipal, key: grant.newKey)
         try validatePrincipal(cold.predecessorPrincipal, key: cold.predecessorService.grant.newKey)
         guard cold.request.identity == store.identity, grant.serial <= serial,
-              cold.request.expectedPredecessor == (try coldPredecessor(cold.predecessorService)),
+              cold.request.expectedPredecessor == (try cold.prepared.observedHistory?.predecessor ?? coldPredecessor(cold.predecessorService)),
               cold.predecessorReceipt.grant == cold.predecessorService.grant,
               cold.oldAdoption.origin.wire == cold.request.expectedOrigin,
               cold.oldAdoption.allocatedEpoch == cold.request.expectedAllocatedEpoch,
@@ -1510,6 +1695,10 @@ extension StorageBootstrapLifecycleAuthority {
                       cold.oldAdoption.origin == resolved.failed.newOrigin,
                       cold.oldAdoption.allocatedEpoch == bridge.baseEpoch else { throw BootstrapFailure(.repairRequired) }
             } else {
+                if let history = cold.prepared.observedHistory {
+                    guard let observed = store.observedCold, observed.history == history,
+                          cold.oldAdoption == observed.failed.oldAdoption else { throw BootstrapFailure(.repairRequired) }
+                }
                 guard store.current?.recipient == cold.predecessorPrincipal,
                       store.currentService == cold.predecessorService, store.result == cold.predecessorReceipt else {
                     throw BootstrapFailure(.repairRequired)

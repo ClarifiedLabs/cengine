@@ -331,6 +331,218 @@ class BackendProofTests(unittest.TestCase):
         # Do not let shared fixture dictionaries silently correlate mutations.
         return json.loads(canonical(state))
 
+    def observed_cold_state(self, applied=False):
+        """Retain failed authorization and marker fields, never an old receipt."""
+        failed = self.completed_cold_state()['latestCold']
+        state = self.completed_cold_state()
+        cold = state['latestCold']
+        request, prepared = cold['request'], cold['prepared']
+        operation = str(uuid.uuid4())
+        observation_id = str(uuid.uuid4())
+        # Fresh controller must differ from both the committed and abandoned keys.
+        recipient = request['recipient']
+        recipient['publicKey'] = base64.b64encode(b'y' * 32).decode()
+        request['prepare']['candidate']['spki'] = base64.b64encode(
+            bytes.fromhex('302a300506032b6570032100') + b'y' * 32).decode()
+        grant = prepared['signedOpen']['request']['takeover']['grant']
+        grant.update(id=operation, serial=3, new_key=proof._fingerprint(recipient['publicKey']))
+        request['prepare'].update(operationID=operation, observationID=observation_id)
+        # Direct adoption of the original failed rotation, not failedBaseEpoch + 1.
+        request['prepare']['expectedAllocatedEpoch'] = failed['prepared']['baseEpoch'] - 1
+        observed_request = dict(observationID=observation_id, identity=self.record['identity'],
+            operationID=failed['request']['prepare']['operationID'],
+            signedOpenSHA256=proof._cold_signed_digest(failed['prepared']),
+            observerGreeting=request['prepare']['mountedGreeting'])
+        launch = observed_request['observerGreeting']['launch']
+        auth_request = dict(observation_id=observation_id,
+            subject=base64.b64encode(canonical(failed['prepared']['signedOpen'])).decode(), observer=launch)
+        signing = dict(observation_id=observation_id, subject=auth_request['subject'], observer={k: launch[k]
+            for k in ('shim_launch_uuid', 'spec_sha256', 'initramfs_sha256', 'ext4_uuid', 'bytes')})
+        request_digest = hashlib.sha256(b'cengine.storageauthority.lifecycle-cold-observe.v1\0' +
+            json.dumps(signing, separators=(',', ':')).encode()).hexdigest()
+        precursor = copy.deepcopy(failed['request']['prepare']['expectedPredecessor'])
+        if applied:
+            failed_grant = failed['prepared']['signedOpen']['request']['takeover']['grant']
+            precursor.update(current_grant=failed_grant, controller_epoch=precursor['controller_epoch'] + 1,
+                controller_key=failed_grant['new_key'], service_epoch=str(uuid.uuid4()), open_revision=2)
+        authorization = dict(request=auth_request, signature=base64.b64encode(b'a' * 64).decode())
+        history = dict(request=observed_request, authorization=authorization,
+            observation=dict(request_sha256=request_digest, outcome='applied' if applied else 'unchanged', predecessor=precursor),
+            anchor=failed['predecessorService'], failedOrigin=failed['prepared']['successorOrigin'],
+            failedBaseEpoch=failed['prepared']['baseEpoch'])
+        observed = dict(attempted=dict(request=failed['request'], prepared=failed['prepared'], bootAttempted=True),
+            request=observed_request, requestID=str(uuid.uuid4()), anchor=failed['predecessor'],
+            anchorService=failed['predecessorService'], history=history)
+        cold['observedPredecessor'] = observed
+        request['prepare']['expectedPredecessor'] = precursor
+        prepared['observedHistory'] = history
+        signed = prepared['signedOpen']['request']
+        signed.update(operation_id=operation, predecessor=precursor, observation=authorization)
+        grant['expected_epoch'] = precursor['controller_epoch']
+        current = state['current']
+        current['original'].update(signed=signed['takeover'], recipient=recipient)
+        current['directResult']['grant'] = grant
+        current['directResult']['revision'] = precursor['open_revision'] + 1
+        state['currentContext'].update(controllerEpoch=grant['expected_epoch'] + 1, controllerKey=grant['new_key'])
+        state['currentService']['grant'] = grant
+        state['currentService']['context'].update(controller_epoch=grant['expected_epoch'] + 1, controller_key=grant['new_key'])
+        state['currentService']['open_revision'] = current['directResult']['revision']
+        cold['completion'].update(operationID=operation, observedHistory=history, receipt=current['directResult'],
+            successor=state['currentService'], signedOpenSHA256=proof._cold_signed_digest(prepared))
+        state['contexts'][-1] = dict(context=state['currentContext'], controller=current)
+        state['observedWorker']['context'] = state['currentContext']
+        return json.loads(canonical(state))
+
+    def test_observed_cold_unchanged_and_applied_only_complete_real_successor(self):
+        for applied in (False, True):
+            state = self.observed_cold_state(applied)
+            self.state_path.write_bytes(canonical(state))
+            with self.subTest(applied=applied):
+                proof.verify_backend(self.root, 'shared', mounts())
+                self.assertEqual(len(state['contexts']), 2)
+                self.assertEqual(state['currentContext']['controllerEpoch'], 3 if applied else 2)
+                observed = state['latestCold']['observedPredecessor']
+                self.assertNotIn('receipt', observed['history'])
+                self.assertNotIn('directResult', observed['attempted'])
+                self.assertEqual(observed['anchor']['controller'], self.state['current'])
+                self.assertEqual(state['latestCold']['prepared']['baseEpoch'], observed['history']['failedBaseEpoch'])
+
+    def test_observed_cold_pending_preserves_committed_anchor(self):
+        for applied in (False, True):
+            completed = self.observed_cold_state(applied)
+            cold = completed['latestCold']
+            observed = cold['observedPredecessor']
+            for fresh in (False, True):
+                state = copy.deepcopy(self.state)
+                state['observedCold'] = observed
+                state['pendingCold'] = dict(request=cold['request'], prepared=cold['prepared'], bootAttempted=True) if fresh else observed['attempted']
+                self.state_path.write_bytes(canonical(state))
+                with self.subTest(applied=applied, fresh=fresh): proof.verify_backend(self.root, 'shared', mounts())
+
+    def test_observed_cold_tampered_frozen_bytes_and_correlations_fail(self):
+        for applied in (False, True):
+            state = self.observed_cold_state(applied)
+            observed = ('latestCold', 'observedPredecessor')
+            history = observed + ('history',)
+            mutations = [
+                (observed + ('request', 'identity', 'generation'), 2),
+                (observed + ('request', 'operationID'), str(uuid.uuid4())),
+                (observed + ('request', 'observationID'), str(uuid.uuid4())),
+                (observed + ('request', 'signedOpenSHA256'), '0' * 64),
+                (observed + ('request', 'observerGreeting', 'rootPublicKey'), base64.b64encode(b'r' * 32).decode()),
+                (observed + ('anchorService', 'open_revision'), 99),
+                (observed + ('anchor', 'controller', 'directResult', 'nonce'), base64.b64encode(b'x' * 32).decode()),
+                (observed + ('attempted', 'bootAttempted'), False),
+                (observed + ('attempted', 'prepared', 'signedOpen', 'signature'), base64.b64encode(b'x' * 64).decode()),
+                (observed + ('attempted', 'prepared', 'signedOpen', 'request', 'takeover', 'signature'), base64.b64encode(b'x' * 64).decode()),
+                (history + ('authorization', 'request', 'subject'), base64.b64encode(b'{}').decode()),
+                (history + ('authorization', 'signature'), base64.b64encode(b'x' * 64).decode()),
+                (history + ('authorization', 'request', 'observer', 'shim_launch_uuid'), str(uuid.uuid4())),
+                (history + ('failedBaseEpoch',), 99),
+                (history + ('failedOrigin', 'shimLaunchUUID'), str(uuid.uuid4())),
+                (history + ('observation', 'request_sha256'), '0' * 64),
+                (history + ('observation', 'outcome'), 'unchanged' if applied else 'applied'),
+                (history + ('observation', 'predecessor', 'controller_key'), '0' * 64),
+                (history + ('observation', 'predecessor', 'controller_epoch'), 99),
+                (history + ('observation', 'predecessor', 'bootstrap_key'), '0' * 64),
+                (history + ('observation', 'predecessor', 'open_revision'), 0),
+                (('latestCold', 'request', 'prepare', 'observationID'), str(uuid.uuid4())),
+                (('latestCold', 'prepared', 'baseEpoch'), 3),
+                (('latestCold', 'prepared', 'signedOpen', 'request', 'observation', 'signature'), base64.b64encode(b'x' * 64).decode()),
+            ]
+            for path, value in mutations:
+                bad = copy.deepcopy(state); cursor = bad
+                for key in path[:-1]: cursor = cursor[key]
+                cursor[path[-1]] = value
+                self.state_path.write_bytes(canonical(bad))
+                with self.subTest(applied=applied, path=path): self.reject('.')
+
+    def test_observed_cold_history_is_validated_even_when_all_copies_match(self):
+        for applied in (False, True):
+            state = self.observed_cold_state(applied)
+            mutations = [
+                (('request', 'identity', 'generation'), 2),
+                (('request', 'signedOpenSHA256'), '0' * 64),
+                (('authorization', 'request', 'subject'), base64.b64encode(b'{}').decode()),
+                (('authorization', 'request', 'subject'), base64.b64encode(b'x' * 65537).decode()),
+                (('authorization', 'request', 'observation_id'), str(uuid.uuid4())),
+                (('authorization', 'request', 'observer', 'spec_sha256'), '0' * 64),
+                (('authorization', 'signature'), base64.b64encode(b'x' * 63).decode()),
+                (('anchor', 'boot', 'bootstrap_key'), '0' * 64),
+                (('failedOrigin', 'rootPublicKey'), base64.b64encode(b'r' * 32).decode()),
+                (('failedBaseEpoch',), 3),
+                (('observation', 'request_sha256'), '0' * 64),
+                (('observation', 'outcome'), 'unknown'),
+                (('observation', 'predecessor', 'current_grant', 'serial'), 99),
+                (('observation', 'predecessor', 'service_epoch'), self.state['currentContext']['serviceEpoch'] if applied else str(uuid.uuid4())),
+                (('observation', 'predecessor', 'controller_key'), '0' * 64),
+                (('observation', 'predecessor', 'controller_epoch'), 99),
+                (('observation', 'predecessor', 'bootstrap_key'), '0' * 64),
+                (('observation', 'predecessor', 'open_revision'), 1 if applied else 99),
+                (('observation', 'receipt'), {}),
+                (('authorization', 'request', 'history'), {}),
+            ]
+            for path, value in mutations:
+                bad = copy.deepcopy(state); cold = bad['latestCold']
+                history = cold['observedPredecessor']['history']; cursor = history
+                for key in path[:-1]: cursor = cursor[key]
+                cursor[path[-1]] = value
+                cold['prepared']['observedHistory'] = copy.deepcopy(history)
+                cold['completion']['observedHistory'] = copy.deepcopy(history)
+                cold['prepared']['signedOpen']['request']['observation'] = copy.deepcopy(history['authorization'])
+                cold['completion']['signedOpenSHA256'] = proof._cold_signed_digest(cold['prepared'])
+                self.state_path.write_bytes(canonical(bad))
+                with self.subTest(applied=applied, path=path): self.reject('.')
+
+    def test_observed_cold_unrecorded_history_and_promotion_are_closed(self):
+        completed = self.observed_cold_state(True)
+        observed = completed['latestCold']['observedPredecessor']
+        pending = copy.deepcopy(self.state)
+        pending.update(observedCold=copy.deepcopy(observed), pendingCold=copy.deepcopy(observed['attempted']))
+        del pending['observedCold']['history']
+        self.state_path.write_bytes(canonical(pending))
+        proof.verify_backend(self.root, 'shared', mounts())
+        for field, value in [('current', completed['current']), ('currentContext', completed['currentContext']),
+                ('currentService', completed['currentService']), ('pendingCold', None)]:
+            bad = copy.deepcopy(pending); bad[field] = value
+            self.state_path.write_bytes(canonical(bad))
+            with self.subTest(field=field): self.reject('.')
+        for path in [('latestCold', 'prepared', 'observedHistory'), ('latestCold', 'completion', 'observedHistory'),
+                ('latestCold', 'prepared', 'signedOpen', 'request', 'observation')]:
+            bad = copy.deepcopy(completed); cursor = bad
+            for key in path[:-1]: cursor = cursor[key]
+            del cursor[path[-1]]
+            self.state_path.write_bytes(canonical(bad))
+            with self.subTest(path=path): self.reject('.')
+        for key in ('observedCold',):
+            bad = copy.deepcopy(self.state); bad[key] = None
+            self.state_path.write_bytes(canonical(bad)); self.reject('null optional')
+
+    def test_observed_cold_closed_schema_and_bounded_history(self):
+        state = self.observed_cold_state(True)
+        observed = ('latestCold', 'observedPredecessor')
+        paths = [observed, observed + ('attempted',), observed + ('request',), observed + ('history',),
+            observed + ('history', 'authorization'), observed + ('history', 'authorization', 'request'),
+            observed + ('history', 'observation'), observed + ('history', 'observation', 'predecessor')]
+        for path in paths:
+            node = state
+            for key in path: node = node[key]
+            for field in list(node) + ['unexpected']:
+                for action in ('null', 'delete') if field in node else ('extra',):
+                    bad = copy.deepcopy(state); cursor = bad
+                    for key in path: cursor = cursor[key]
+                    if action == 'delete': del cursor[field]
+                    else: cursor[field] = None if action == 'null' else {}
+                    self.state_path.write_bytes(canonical(bad))
+                    with self.subTest(path=path, field=field, action=action): self.reject('.')
+        for field, value in [('observedHistory', state['latestCold']['prepared']['observedHistory']), ('recoveryBridge', {})]:
+            bad = copy.deepcopy(state)
+            bad['latestCold']['observedPredecessor']['attempted']['prepared'][field] = value
+            self.state_path.write_bytes(canonical(bad)); self.reject('.')
+        bad = copy.deepcopy(state)
+        bad['contexts'].insert(1, copy.deepcopy(bad['latestCold']['observedPredecessor']['anchor']))
+        self.state_path.write_bytes(canonical(bad)); self.reject('.')
+
     def correlate_dead_cold(self, state):
         """Keep redundant history, digests, and bridge copies equal after mutations."""
         cold = state['latestCold']

@@ -16,6 +16,9 @@ public enum GuestAssetInstaller {
         /// Storage ownership protocol version supported by the storage initramfs.
         /// Required for startup.
         public var storageLifecycleVersion: Int? = nil
+        /// Explicit guest support for observed cold recovery; absent on older assets.
+        /// The memberwise fixture default does not apply to missing decoded fields.
+        public var storageColdObservationVersion: Int? = 1
         /// Qualification-only assets; never accepted as production capability.
         public var storageLifecycleQualification: String? = nil
 
@@ -48,8 +51,9 @@ public enum GuestAssetInstaller {
         /// Checks that both guest images support the required storage protocols.
         public func requireManagedStorageSupport() throws {
             guard schemaVersion == 1, protocolVersion == 1, storageLifecycleVersion == 2,
-                  storageServiceBootVersion == 2, workloadStorageBootVersion == 1 else {
-                throw EngineError(.unsupported, "managed storage requires storageLifecycleVersion 2, storageServiceBootVersion 2 and workloadStorageBootVersion 1 in disk-bootstrap.json; rebuild paired guest assets")
+                  storageServiceBootVersion == 2, workloadStorageBootVersion == 1,
+                  storageColdObservationVersion == 1 else {
+                throw EngineError(.unsupported, "managed storage requires storageLifecycleVersion 2, storageServiceBootVersion 2, workloadStorageBootVersion 1 and explicit storageColdObservationVersion 1 in disk-bootstrap.json; rebuild paired guest assets for observed cold recovery")
             }
         }
         public let containerInitramfsSHA256: String

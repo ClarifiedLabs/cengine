@@ -2,18 +2,20 @@
 
 Uses conftest's owned Daemon, isolated root, pre-retention and cleanup. The only
 daemon signal is Daemon.stop(kill=True), targeting its actual Popen child.
-RTM-124/129/130/132 additionally use positively receipted, birth-fenced owned storage SIGKILL
+RTM-124/129/130 additionally use positively receipted, birth-fenced owned storage SIGKILL
 only after workload drain/native exit. No receipt injection, runtime fault
 environment, or backing-store cleanup is used.
 """
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -34,6 +36,10 @@ FAULT = "before-configure-v1"
 REPLACEMENT_FAULT = "after-replacement-before-completion-v1"
 REPLACEMENT_PAUSED = "cengine.compat.lifecycle.after-replacement-before-completion-v1.paused"
 COLD_L2_FAULT = "after-cold-l2-before-a1-v1"
+COLD_CONFIGURE_FAULT = "before-cold-configure-v1"
+FIRST_COLD_APPLY_FAULT = "after-first-cold-apply-v1"
+FIRST_COLD_APPLY_REACHED = "cengine.compat.lifecycle.after-first-cold-apply-v1.injected"
+COLD_CONFIGURE_REACHED = "cengine.compat.lifecycle.before-cold-configure-v1.injected"
 FIRST_COLD_COMPLETION_FAULT = "after-first-cold-completion-v1"
 FIRST_COLD_COMPLETION_REACHED = "cengine.compat.lifecycle.after-first-cold-completion-v1.injected"
 TAKEOVER_FAULTS = ("before-takeover-apply-v1", "after-takeover-apply-v1")
@@ -48,10 +54,10 @@ def selected(environment, *, fault=False):
         if key in environment:
             raise ValueError(f"{key} is retired; lifecycle is the default")
     profile = environment.get(FAULT_ENV, "")
-    if profile not in ("", FAULT, REPLACEMENT_FAULT, COLD_L2_FAULT, FIRST_COLD_COMPLETION_FAULT, *TAKEOVER_FAULTS):
+    if profile not in ("", FAULT, REPLACEMENT_FAULT, COLD_L2_FAULT, FIRST_COLD_COMPLETION_FAULT, FIRST_COLD_APPLY_FAULT, COLD_CONFIGURE_FAULT, *TAKEOVER_FAULTS):
         raise ValueError("unknown lifecycle fault profile")
     expected = FAULT if fault is True else fault
-    if expected not in (False, FAULT, REPLACEMENT_FAULT, COLD_L2_FAULT, FIRST_COLD_COMPLETION_FAULT, *TAKEOVER_FAULTS):
+    if expected not in (False, FAULT, REPLACEMENT_FAULT, COLD_L2_FAULT, FIRST_COLD_COMPLETION_FAULT, FIRST_COLD_APPLY_FAULT, COLD_CONFIGURE_FAULT, *TAKEOVER_FAULTS):
         raise ValueError("unknown requested lifecycle fault profile")
     if any(environment.get(name) for name in (
         "CENGINE_STORAGE_LIFECYCLE_QUALIFICATION",
@@ -105,7 +111,8 @@ def prerequisites(environment):
 def image_cache(image_cache, request):
     case = request.node.get_closest_marker("compat").args
     fault = {("RTM-119",): FAULT, ("RTM-121",): REPLACEMENT_FAULT, ("RTM-129",): COLD_L2_FAULT,
-             ("RTM-130",): COLD_L2_FAULT, ("RTM-132",): FIRST_COLD_COMPLETION_FAULT}.get(case, False)
+             ("RTM-130",): COLD_L2_FAULT, ("RTM-132",): FIRST_COLD_COMPLETION_FAULT,
+             ("RTM-135",): COLD_CONFIGURE_FAULT, ("RTM-136",): FIRST_COLD_APPLY_FAULT}.get(case, False)
     if case == ("RTM-125",):
         fault = os.environ.get(FAULT_ENV) or TAKEOVER_FAULTS[0]
         if fault not in TAKEOVER_FAULTS:
@@ -699,7 +706,7 @@ def frozen_cold_proof(before, frozen):
     pending = frozen["pendingCold"]
     assert pending["bootAttempted"] is True and pending.get("resolutionRequest") is None
     request, prepared = pending["request"], pending["prepared"]
-    assert prepared.get("recoveryBridge") is None
+    assert prepared.get("recoveryBridge") is None and prepared.get("observedHistory") is None
     prepare, signed = request["prepare"], prepared["signedOpen"]
     opened = signed["request"]
     assert opened["operation_id"] == prepare["operationID"] == opened["takeover"]["grant"]["id"]
@@ -925,11 +932,13 @@ def observe_cold_controller(daemon, record):
     return child
 
 
-def observe_cold_births(daemon, initial, *, timeout=60):
+def observe_cold_births(daemon, initial, *, timeout=60, reject_api=False):
     """Synchronous on_spawn observer: no readiness, signals or journal writes."""
     seen = {}
     deadline = time.monotonic() + timeout
     while True:
+        if reject_api:
+            assert not daemon.socket.exists(), "failed startup must never admit the API"
         for process in compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,)):
             replacement.native_proof(process)
             assert all(process.identity != old.identity for old in initial), "old native birth survived strict shutdown"
@@ -1118,6 +1127,301 @@ def interrupted_cold_l2_recovery(client, daemon, shared, *, guest_update=False):
         exchange(*peers, "cold-l2-recovered-" + uuid.uuid4().hex)
 
 
+def natural_cold_exit(daemon, births):
+    """Acceptance requires native exits before any fixture cleanup; never signal an orphan."""
+    assert births
+    for target in births:
+        replacement.native_proof(target)
+        wait_for_value(lambda: replacement.exact_exit(target, _kernel_process(target.pid)), bool,
+                       timeout=30, description="failed cold native birth naturally exited")
+    assert not compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,)), "unowned orphan; fail retained"
+
+
+def cold_fault_log_snapshot(daemon, outcome):
+    """Pin the exact emitter before startup; logs are diagnostics, never authority."""
+    assert outcome in ("unchanged", "applied")
+    # Before configure runs inside the owned storage VM shim; after apply runs on HOST.
+    path = daemon.root / "infrastructure/shim.log" if outcome == "unchanged" else daemon.log_path
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode), "cold fault log is not a regular file"
+    identity = (info.st_dev, info.st_ino)
+    offset = info.st_size
+    # Retain a bounded boundary window to reject truncate-and-regrow as well as shrinkage.
+    with path.open("rb") as log:
+        opened = os.fstat(log.fileno())
+        assert (opened.st_dev, opened.st_ino, opened.st_size) == (*identity, offset), "cold fault log changed"
+        log.seek(max(0, offset - 65536))
+        boundary = log.read(65536)
+    assert len(boundary) == min(offset, 65536), "cold fault log changed"
+    return path, identity, offset, boundary
+
+
+def cold_fault_diagnostic(snapshot):
+    """Read only bounded new UTF-8 bytes from the same, untruncated log."""
+    path, identity, offset, boundary = snapshot
+    named = path.lstat()
+    assert stat.S_ISREG(named.st_mode) and (named.st_dev, named.st_ino) == identity, "cold fault log replaced"
+    with path.open("rb") as log:
+        opened = os.fstat(log.fileno())
+        assert (opened.st_dev, opened.st_ino) == identity, "cold fault log replaced"
+        assert opened.st_size >= offset, "cold fault log truncated"
+        assert opened.st_size - offset <= 65536, "unbounded cold fault diagnostic"
+        log.seek(offset - len(boundary))
+        assert log.read(len(boundary)) == boundary, "cold fault log truncated or rewritten"
+        raw = log.read(65537)
+        assert len(raw) <= 65536, "unbounded cold fault diagnostic"
+        final = os.fstat(log.fileno())
+    named = path.lstat()
+    assert (final.st_dev, final.st_ino, final.st_size) == (*identity, offset + len(raw)), "cold fault log changed"
+    assert (named.st_dev, named.st_ino, named.st_size) == (final.st_dev, final.st_ino, final.st_size), "cold fault log replaced"
+    return raw.decode("utf-8", errors="strict")
+
+
+def failed_cold_configure_proof(before, frozen, diagnostic):
+    """Pre-configure rejection proves no L2 completion; HOST attempted is not protected success."""
+    assert diagnostic.splitlines().count(COLD_CONFIGURE_REACHED) == 1
+    assert FIRST_COLD_COMPLETION_REACHED not in diagnostic
+    return frozen_cold_proof(before, frozen)
+
+
+def cold_observation_digest(request):
+    launch = request["observer"]
+    ordered = dict(observation_id=request["observation_id"], subject=request["subject"],
+        observer={key: launch[key] for key in ("shim_launch_uuid", "spec_sha256", "initramfs_sha256", "ext4_uuid", "bytes")})
+    return hashlib.sha256(b"cengine.storageauthority.lifecycle-cold-observe.v1\0" +
+        json.dumps(ordered, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def recovered_observed_cold_proof(before, frozen, after, outcome):
+    """Require returned ROOT history and a genuinely new completion, not HOST pending metadata."""
+    from managed_prepare_lifecycle_evidence import encoded
+    assert outcome in ("unchanged", "applied")
+    failed = frozen_cold_proof(before, frozen)
+    lifecycle_owner(after)
+    assert after["revision"] > frozen["revision"]
+    for field in ("version", "identity", "rootPublicKey", "provenanceReference"):
+        assert after[field] == before[field]
+    for field in ("pending", "pendingService", "pendingTakeover", "pendingCold", "resolvedDeadCold", "observedCold", "sealed", "terminal"):
+        assert after.get(field) is None
+    cold = after["latestCold"]
+    retained = cold["observedPredecessor"]
+    assert cold.get("deadPredecessor") is None
+    assert retained["attempted"] == failed, "exact abandoned request and signatures must survive"
+    assert retained["anchor"] == cold["predecessor"] == dict(controller=before["current"], context=before["currentContext"])
+    assert retained["anchorService"] == cold["predecessorService"] == before["currentService"]
+    request, prepared, completion = cold["request"], cold["prepared"], cold["completion"]
+    assert prepared.get("recoveryBridge") is None and completion.get("recoveryBridge") is None
+    history = completion["observedHistory"]
+    assert type(history) is dict and set(history) == {"request", "authorization", "observation", "anchor", "failedOrigin", "failedBaseEpoch"}, "ROOT observation must not invent an old receipt/completion"
+    assert set(history["observation"]) == {"request_sha256", "outcome", "predecessor"}
+    assert history == prepared["observedHistory"] == retained["history"]
+    assert history["request"] == retained["request"]
+    assert history["anchor"] == before["currentService"]
+    assert history["failedOrigin"] == failed["prepared"]["successorOrigin"]
+    assert history["failedBaseEpoch"] == failed["prepared"]["baseEpoch"]
+    authorization = history["authorization"]
+    encoded(authorization["signature"], 64)
+    subject = base64.b64decode(authorization["request"]["subject"], validate=True)
+    original = failed["prepared"]["signedOpen"]
+    assert subject == json.dumps(original, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    observed = history["observation"]
+    assert observed["outcome"] == outcome
+    assert observed["request_sha256"] == cold_observation_digest(authorization["request"])
+    evidence = history["request"]
+    replacement.uuid4(retained["requestID"])
+    replacement.uuid4(evidence["observationID"])
+    assert evidence["identity"] == before["identity"]
+    assert evidence["operationID"] == original["request"]["operation_id"]
+    assert evidence["signedOpenSHA256"] == cold_signed_digest(original)
+    assert evidence["observationID"] == authorization["request"]["observation_id"] == request["prepare"]["observationID"]
+    opened = prepared["signedOpen"]["request"]
+    assert opened["observation"] == authorization
+    assert opened["launch"] == authorization["request"]["observer"] == evidence["observerGreeting"]["launch"]
+    assert opened["launch"]["shim_launch_uuid"] != original["request"]["launch"]["shim_launch_uuid"]
+    predecessor = observed["predecessor"]
+    assert predecessor == opened["predecessor"] == request["prepare"]["expectedPredecessor"]
+    old = original["request"]["predecessor"]
+    old_grant = original["request"]["takeover"]["grant"]
+    if outcome == "unchanged":
+        assert predecessor == old
+    else:
+        assert predecessor["current_grant"] == old_grant
+        assert predecessor["controller_epoch"] == old["controller_epoch"] + 1
+        assert predecessor["controller_key"] == old_grant["new_key"]
+        assert predecessor["service_epoch"] != old["service_epoch"]
+        assert predecessor["open_revision"] > old["open_revision"]
+        assert predecessor["bootstrap_key"] == old["bootstrap_key"]
+    grant = opened["takeover"]["grant"]
+    assert grant["operation"] == "takeover" and grant["identity"] == before["identity"]
+    assert grant["expected_epoch"] == predecessor["controller_epoch"]
+    assert grant["serial"] > old_grant["serial"]
+    assert grant["new_key"] not in (old_grant["new_key"], predecessor["controller_key"])
+    assert grant["id"] == opened["operation_id"] == request["prepare"]["operationID"] == completion["operationID"]
+    assert grant["id"] not in (old_grant["id"], evidence["observationID"])
+    assert completion["signedOpenSHA256"] == cold_signed_digest(prepared["signedOpen"])
+    assert completion["signedOpenSHA256"] != evidence["signedOpenSHA256"], "old receipt cannot qualify"
+    assert completion["baseEpoch"] == prepared["baseEpoch"] == history["failedBaseEpoch"] == request["prepare"]["expectedAllocatedEpoch"] + 1
+    origin = completion["successorOrigin"]
+    assert origin == prepared["successorOrigin"]
+    assert origin["binding"] == history["failedOrigin"]["binding"] == evidence["observerGreeting"]["binding"]
+    assert origin["rootPublicKey"] == before["rootPublicKey"] == evidence["observerGreeting"]["rootPublicKey"]
+    assert origin["shimLaunchUUID"] == opened["launch"]["shim_launch_uuid"]
+    assert origin["specSHA256"] == opened["launch"]["spec_sha256"]
+    receipt, service = completion["receipt"], completion["successor"]
+    assert service == after["currentService"]
+    assert receipt["grant"] == service["grant"] == grant
+    assert receipt["revision"] == service["open_revision"] > predecessor["open_revision"]
+    context = service["context"]
+    assert context["controller_epoch"] == grant["expected_epoch"] + 1
+    assert context["controller_key"] == grant["new_key"]
+    assert receipt["service_epoch"] == context["service_epoch"] == service["boot"]["service_epoch"]
+    assert context["service_epoch"] not in (old["service_epoch"], predecessor["service_epoch"])
+    assert after["currentContext"] == dict(serviceEpoch=context["service_epoch"], controllerEpoch=context["controller_epoch"], controllerKey=context["controller_key"])
+    assert after["current"]["original"]["signed"] == opened["takeover"]
+    assert after["current"]["original"]["recipient"] == request["recipient"]
+    assert after["current"]["original"]["requestID"] == request["completionRequestID"]
+    assert after["current"]["original"]["serviceEpoch"] == receipt["service_epoch"]
+    assert after["current"]["directResult"] == receipt
+    assert after["observedWorker"]["workerUUID"] != before["observedWorker"]["workerUUID"]
+    assert service["boot"]["identity"] == before["identity"]
+    assert service["boot"]["bootstrap_key"] == old["bootstrap_key"]
+    for field in ("tls_root_sha256", "server_spki"):
+        assert service["boot"][field] != before["currentService"]["boot"][field]
+    for field in ("prepareRequestID", "completionRequestID"):
+        replacement.uuid4(request[field])
+        assert request[field] != failed["request"][field]
+    assert request["prepareRequestID"] != request["completionRequestID"]
+    encoded(prepared["signedOpen"]["signature"], 64)
+    encoded(opened["takeover"]["signature"], 64)
+    return cold
+
+
+def cold_seed_proof(actual, seed):
+    assert set(actual) == {"left", "right"}
+    for side in ("left", "right"):
+        assert actual[side] == (seed + "-" + side).encode(), "persisted DATA seed changed"
+
+
+@pytest.mark.compat("RTM-135")
+def test_lifecycle_v2_failed_cold_start_reaps_unenrolled_shim(client, daemon, shared):
+    observed_cold_recovery(client, daemon, shared, outcome="unchanged")
+
+
+@pytest.mark.compat("RTM-136")
+def test_lifecycle_v2_applied_cold_without_helper_completion_recovers(client, daemon, shared):
+    observed_cold_recovery(client, daemon, shared, outcome="applied")
+
+
+def observed_cold_recovery(client, daemon, shared, *, outcome):
+    from managed_prepare_lifecycle_evidence import storage_target
+    from test_managed_storage_recovery import parent_deadline
+
+    with parent_deadline(time.monotonic() + 420):
+        peers = [create_peer(client, shared, side) for side in ("left", "right")]
+        for peer in peers:
+            peer.update(restart_policy={"Name": "always"})
+            peer.start()
+            mount_proof(daemon, peer)
+        ids = {peer.id for peer in peers}
+        mounts = {peer.id: peer.attrs["HostConfig"]["Mounts"] for peer in peers}
+        volume_id = shared.id
+        seed = "failed-cold-seed-" + uuid.uuid4().hex
+        exchange(*peers, seed)
+        for peer, side in zip(peers, ("left", "right")):
+            _exec(peer, "sh", "-ec", f"cp /data/{side} /data/seed-{side}; sync")
+        for peer in peers:
+            cold_seed_proof({side: _exec(peer, "cat", "/data/seed-" + side) for side in ("left", "right")}, seed)
+        disk = disk_identity(daemon.root)
+        info = daemon.root.stat()
+        root_identity = (info.st_dev, info.st_ino)
+        binary = daemon.binary
+        initial, _, _ = replacement.lifecycle_owner(daemon.root)
+        before, manifest = initial["checkpoint"], initial["manifest"]
+        assert before["currentContext"]["controllerEpoch"] == 1
+        assert before.get("latestCold") is None
+        native = native_snapshot(daemon, ids)
+        census = compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,))
+        daemon.process.terminate()
+        assert daemon.process.wait(timeout=15) == 0
+        daemon.stop()  # Already joined, so this cannot signal or escalate.
+        assert native_snapshot(daemon, ids) == native
+        _strict_shutdown(daemon)
+        natural_cold_exit(daemon, census)
+        path = daemon.root / "managed-storage-owner/state.json"
+        attempted_births = []
+        frozen = None
+        log_snapshot = cold_fault_log_snapshot(daemon, outcome)
+
+        def preserved(*, failed=True):
+            assert daemon.root_retained
+            assert daemon.binary == binary == daemon.owner_binary
+            info = daemon.root.stat()
+            assert (info.st_dev, info.st_ino) == root_identity
+            assert disk_identity(daemon.root) == disk
+            assert replacement.read_public(daemon.root / "managed-storage-owner/manifest.json")[0] == manifest
+            if failed:
+                assert not daemon.socket.exists(), "failed startup must not admit the API"
+
+        def observe():
+            attempted_births.extend(observe_cold_births(daemon, census, reject_api=True))
+
+        def qualify(failed):
+            nonlocal frozen
+            assert failed is daemon and daemon.process.poll() > 0
+            preserved()
+            frozen, _ = replacement.read_public(path)
+            diagnostic = cold_fault_diagnostic(log_snapshot)
+            if outcome == "unchanged":
+                failed_cold_configure_proof(before, frozen, diagnostic)
+            else:
+                assert diagnostic.splitlines().count(FIRST_COLD_APPLY_REACHED) == 1
+                assert COLD_CONFIGURE_REACHED not in diagnostic and FIRST_COLD_COMPLETION_REACHED not in diagnostic
+                frozen_cold_proof(before, frozen)
+            return True
+
+        daemon.start(on_spawn=observe, qualify_lifecycle_fault=qualify)
+        assert frozen is not None
+        pending = frozen["pendingCold"]
+        owner = {**manifest, **pending["prepared"]["successorOrigin"]}
+        target = storage_target(daemon, owner, attempted_births, replacement.read_public)
+        committed_cold_births(daemon.process.pid, pending, attempted_births, target)
+        natural_cold_exit(daemon, attempted_births)
+        assert replacement.read_public(path)[0] == frozen
+        preserved()
+        # Cold observation, fresh enrollment and service proof can exceed the ordinary readiness budget.
+        daemon.start(readiness_timeout=240)  # Only authenticated observation bypasses the original cut.
+        assert client.ping()
+
+        def running():
+            for peer in peers:
+                peer.reload()
+            return all(peer.status == "running" and peer.attrs["State"]["Running"] for peer in peers)
+
+        wait_for_value(running, bool, timeout=120, description="observed cold automatic always-policy recovery")
+        after, _ = replacement.read_public(path)
+        cold = recovered_observed_cold_proof(before, frozen, after, outcome)
+        preserved(failed=False)
+        fresh = native_snapshot(daemon, ids)
+        for key in native:
+            assert fresh[key]["native"][1] != native[key]["native"][1]
+            assert fresh[key]["status"]["shimLaunchUUID"] != native[key]["status"]["shimLaunchUUID"]
+            assert all(fresh[key]["native"][1] != p.identity for p in attempted_births)
+        origin = cold["completion"]["successorOrigin"]
+        assert fresh["storage"]["status"]["shimLaunchUUID"] == origin["shimLaunchUUID"]
+        recovered_target = storage_target(daemon, {**manifest, **origin},
+            compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,)), replacement.read_public)
+        assert (recovered_target.pid, recovered_target.identity, recovered_target.pidversion) == fresh["storage"]["native"]
+        assert {peer.id for peer in client.containers.list(all=True) if peer.id in ids} == ids
+        shared.reload()
+        assert shared.id == volume_id
+        for peer in peers:
+            assert peer.attrs["HostConfig"]["Mounts"] == mounts[peer.id]
+            assert peer.attrs["HostConfig"]["RestartPolicy"]["Name"] == "always"
+            mount_proof(daemon, peer)  # Durable lifecycle + actual shared FUSE proof; never pending metadata.
+            cold_seed_proof({side: _exec(peer, "cat", "/data/seed-" + side) for side in ("left", "right")}, seed)
+        exchange(*peers, "observed-cold-recovered-" + uuid.uuid4().hex)
+
+
 @pytest.mark.compat("RTM-132")
 def test_lifecycle_v2_committed_unenrolled_cold_recovery(client, daemon, shared):
     from managed_prepare_lifecycle_evidence import storage_target
@@ -1189,29 +1493,7 @@ def test_lifecycle_v2_committed_unenrolled_cold_recovery(client, daemon, shared)
         owner = {**manifest, **cold['completion']['successorOrigin']}
         target = storage_target(daemon, owner, attempted_births, replacement.read_public)
         committed_cold_births(daemon.process.pid, cold, attempted_births, target)
-        # Natural cleanup first; only an exact, positively observed storage orphan may be retired.
-        deadline = time.monotonic() + 15
-        while not replacement.exact_exit(target, _kernel_process(target.pid)) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if not replacement.exact_exit(target, _kernel_process(target.pid)):
-            live = compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,))
-            current = storage_target(daemon, owner, live, replacement.read_public)
-            assert live == [current], 'unknown live native birth; do not signal'
-            assert (current.pid, current.identity, current.pidversion) == (target.pid, target.identity, target.pidversion)
-
-            def before_signal():
-                preserved()
-                assert daemon.process.poll() > 0
-                assert replacement.read_public(path)[0] == frozen
-                assert compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,)) == live
-                assert _kernel_process(current.pid) == current
-                assert storage_target(daemon, owner, live, replacement.read_public) == current
-            delivery = replacement.signal_storage(current, before_signal=before_signal)
-            assert delivery['native_result'] == 0 and delivery['signal'] == 'SIGKILL'
-        for target in attempted_births:
-            wait_for_value(lambda: replacement.exact_exit(target, _kernel_process(target.pid)), bool,
-                           timeout=30, description='failed attempted native birth positively gone')
-        assert not compatibility_runtime_processes(daemon.owner_binary, roots=(daemon.root,)), 'unowned orphan; fail retained'
+        natural_cold_exit(daemon, attempted_births)
         assert replacement.read_public(path)[0] == frozen
         preserved()
         # Same engine/helper pair and profile: the authenticated C2-only cut is inert at C3.

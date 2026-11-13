@@ -69,7 +69,7 @@ class PrepareTests(unittest.TestCase):
         # Execute the actual fixture guard without importing pytest/docker or starting a VM.
         guard = compile(ast.Expression(body=guards[0]), "fixture-asset-metadata", "eval")
         metadata = dict(schemaVersion=1, protocolVersion=1, storageServiceBootVersion=2,
-                        storageLifecycleVersion=2, workloadStorageBootVersion=1,
+                        storageLifecycleVersion=2, workloadStorageBootVersion=1, storageColdObservationVersion=1,
                         prepareCompatibilityProfile=p.PROFILE, prepareCompatibilitySourceSHA256="a" * 64)
         namespace = dict(proof=p, profile=p.PROFILE, source_sha256="a" * 64)
         eval(guard, {**namespace, "metadata": metadata})

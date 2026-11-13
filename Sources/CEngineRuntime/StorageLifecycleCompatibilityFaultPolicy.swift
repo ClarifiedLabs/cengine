@@ -10,18 +10,29 @@ import Security
 enum StorageLifecycleCompatibilityFaultPolicy {
     enum Profile: String {
         case beforeConfigure = "before-configure-v1"
+        case beforeColdConfigure = "before-cold-configure-v1"
         case afterReplacement = "after-replacement-before-completion-v1"
         case beforeTakeoverApply = "before-takeover-apply-v1"
         case afterTakeoverApply = "after-takeover-apply-v1"
+        case afterFirstColdApply = "after-first-cold-apply-v1"
         case afterFirstColdCompletion = "after-first-cold-completion-v1"
     }
-    static func applies(to action: StorageLifecycleServiceBootProtocol.Configuration.Action) -> Bool {
-        action == .initialize
+    static func applies(to action: StorageLifecycleServiceBootProtocol.Configuration.Action,
+                        profile: Profile = .beforeConfigure, observed: Bool = false) -> Bool {
+        switch profile {
+        case .beforeConfigure: action == .initialize
+        case .beforeColdConfigure: action == .coldOpenTakeover && !observed
+        default: false
+        }
     }
 
     /// The authenticated takeover from C1 commits C2. Later cold successors must recover normally.
     static func isFirstColdCompletion(expectedEpoch: UInt64) -> Bool {
         expectedEpoch == 1
+    }
+
+    static func isFirstColdApply(expectedEpoch: UInt64, observed: Bool) -> Bool {
+        expectedEpoch == 1 && !observed
     }
 
     // Values alone cannot authorize a fault: the compiled caller below obtains
@@ -74,6 +85,15 @@ enum StorageLifecycleCompatibilityFaultPolicy {
     }
 
     #if CENGINE_COMPAT_LIFECYCLE_FAULT
+    /// After actual Guest apply/reconciliation, before any ROOT completion.
+    static func afterFirstColdApply(_ prepared: StorageLifecycleColdRootProtocol.Prepared) throws {
+        guard try currentProfile() == .afterFirstColdApply,
+              isFirstColdApply(expectedEpoch: prepared.signedOpen.request.takeover.grant.expectedEpoch,
+                  observed: prepared.signedOpen.request.observation != nil) else { return }
+        FileHandle.standardError.write(Data("cengine.compat.lifecycle.after-first-cold-apply-v1.injected\n".utf8))
+        throw EngineError(.conflict, "controlled compatibility first-cold apply failure before ROOT completion")
+    }
+
     /// Called only after checked ROOT completion and HOST completeCold persistence,
     /// before enrollment. No additional disk/state writes or runtime selectors.
     static func afterFirstColdCompletion(_ completion: StorageLifecycleColdRootProtocol.Completed) throws {
@@ -101,11 +121,12 @@ enum StorageLifecycleCompatibilityFaultPolicy {
     /// Called only after the real bound Guest4106 hello and before any configure
     /// bytes. Throwing uses the coordinator's normal close and positive Guest exit
     /// cleanup; there is no runtime environment, file, wire or command selector.
-    static func beforeConfigure(action: StorageLifecycleServiceBootProtocol.Configuration.Action) throws {
-        guard applies(to: action) else { return } // Resume/open paths are unchanged.
-        guard try currentProfile() == .beforeConfigure else { return }
-        FileHandle.standardError.write(Data("cengine.compat.lifecycle.before-configure-v1.injected\n".utf8))
-        throw EngineError(.conflict, "controlled compatibility first-init failure before configure")
+    static func beforeConfigure(action: StorageLifecycleServiceBootProtocol.Configuration.Action, observed: Bool = false) throws {
+        guard action == .initialize || action == .coldOpenTakeover else { return }
+        let profile = try currentProfile()
+        guard applies(to: action, profile: profile, observed: observed) else { return }
+        FileHandle.standardError.write(Data("cengine.compat.lifecycle.\(profile.rawValue).injected\n".utf8))
+        throw EngineError(.conflict, "controlled compatibility failure before configure")
     }
 
     /// Only the normal replacement path calls this, after actual successful native

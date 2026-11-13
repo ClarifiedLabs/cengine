@@ -9,6 +9,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+BASE_PATCH = "0001-virtiofs-host-close-to-open.patch"
+MANAGED_PATCH = "0002-fuse-request-credentials-experimental.patch"
+KERNEL_CLAIMS = ("disk-bootstrap.json", "SHA256SUMS", "kernel-origin.json", "kernel-input.sha256")
 
 
 class GuestBuildScriptTests(unittest.TestCase):
@@ -50,6 +53,7 @@ class GuestBuildScriptTests(unittest.TestCase):
                 "storageServiceBootVersion": 2,
                 "workloadStorageBootVersion": 1,
                 "storageLifecycleVersion": 2,
+                "storageColdObservationVersion": 1,
                 "containerInitramfsSHA256": hashlib.sha256(images["container-initramfs.cpio.gz"]).hexdigest(),
                 "storageInitramfsSHA256": hashlib.sha256(images["storage-initramfs.cpio.gz"]).hexdigest(),
             }
@@ -277,6 +281,11 @@ class GuestBuildScriptTests(unittest.TestCase):
             self.assertIn("cpu-quota=800000", limited_arguments)
             self.assertIn("memory=16g", limited_arguments)
 
+    def test_product_kernel_series_has_base_then_managed_patch(self) -> None:
+        series = (ROOT / "Configuration/kernel-patches/series").read_text().splitlines()
+        self.assertEqual([name for name in series if name and not name.startswith("#")],
+                         [BASE_PATCH, MANAGED_PATCH])
+
     def kernel_fixture(self, root: Path) -> tuple[Path, Path, dict[str, str]]:
         for name in ("Scripts", "Configuration"):
             shutil.copytree(ROOT / name, root / name)
@@ -293,15 +302,19 @@ class GuestBuildScriptTests(unittest.TestCase):
         commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True)
         (root / "Configuration/kernel-commit").write_text(commit)
         patches = root / "Configuration/kernel-patches"
-        (patches / "series").write_text("first.patch\nsecond.patch\n")
-        for name, before, after in (("first", "original", "intermediate"), ("second", "intermediate", "patched")):
-            (patches / f"{name}.patch").write_text(
+        (patches / "series").write_text(f"{BASE_PATCH}\n{MANAGED_PATCH}\n")
+        for name, before, after in ((BASE_PATCH, "original", "intermediate"),
+                                    (MANAGED_PATCH, "intermediate", "patched")):
+            (patches / name).write_text(
                 "From: cengine test\nSubject: [PATCH] fixture\n\n"
                 "diff --git a/Makefile b/Makefile\n"
                 f"--- a/Makefile\n+++ b/Makefile\n@@ -1 +1 @@\n-{before}\n+{after}\n"
             )
         (root / "Scripts/build-kernel-linux.sh").write_text(
             '#!/bin/sh\nset -eu\n'
+            'for name in disk-bootstrap.json SHA256SUMS kernel-origin.json kernel-input.sha256; do\n'
+            '    test ! -e "$CENGINE_GUEST_OUTPUT/$name"\n'
+            'done\n'
             'printf "%s\\n" "$KERNEL_SOURCE" > "$CENGINE_GUEST_OUTPUT/build-source"\n'
             'test "$(cat "$KERNEL_SOURCE/Makefile")" = patched\n'
             'cp "$KERNEL_SOURCE/Makefile" "$CENGINE_GUEST_OUTPUT/vmlinux"\n'
@@ -315,6 +328,16 @@ class GuestBuildScriptTests(unittest.TestCase):
         })
         return source, patches, environment
 
+    def seed_kernel_output(self, root: Path) -> dict[str, bytes]:
+        output = root / "output"
+        output.mkdir()
+        assets = {name: f"old {name}\n".encode() for name in (
+            *KERNEL_CLAIMS, "vmlinux", "container-initramfs.cpio.gz", "storage-initramfs.cpio.gz",
+        )}
+        for name, data in assets.items():
+            (output / name).write_bytes(data)
+        return assets
+
     def test_kernel_patches_apply_in_order_without_touching_dirty_source(self) -> None:
         # Nest under a Git repository, as real .build/ is: git apply must not
         # discover that parent and silently skip all kernel-relative paths.
@@ -322,7 +345,8 @@ class GuestBuildScriptTests(unittest.TestCase):
             parent = Path(temporary)
             subprocess.run(["git", "init", "-q", str(parent)], check=True)
             root = parent / "project"
-            source, _, environment = self.kernel_fixture(root)
+            source, patches, environment = self.kernel_fixture(root)
+            old_assets = self.seed_kernel_output(root)
             (source / "Makefile").write_text("developer changes\n")
             (source / "untracked").write_text("preserve me\n")
             subprocess.run([str(root / "Scripts/build-kernel.sh")], env=environment,
@@ -333,27 +357,46 @@ class GuestBuildScriptTests(unittest.TestCase):
             self.assertEqual((source / "untracked").read_text(), "preserve me\n")
             self.assertNotEqual(Path((output / "build-source").read_text().strip()), source)
             self.assertFalse(Path((output / "build-source").read_text().strip()).exists())
-            self.assertEqual(len((output / "kernel-input.sha256").read_text().strip()), 64)
+            expected_input = subprocess.check_output(
+                [str(root / "Scripts/kernel-input-sha256.sh")], text=True,
+            ).strip()
+            self.assertEqual((output / "kernel-input.sha256").read_text(), expected_input + "\n")
+            self.assertEqual(json.loads((output / "kernel-origin.json").read_text()), {
+                "schemaVersion": 2,
+                "origin": "local",
+                "release": (root / "Configuration/kernel-release").read_text().strip(),
+                "sha256": hashlib.sha256((output / "vmlinux").read_bytes()).hexdigest(),
+                "inputSHA256": expected_input,
+                "managedPatchSHA256": hashlib.sha256((patches / MANAGED_PATCH).read_bytes()).hexdigest(),
+            })
+            subprocess.run([
+                "python3", str(root / "Scripts/guest_asset_provenance.py"), "check-kernel",
+                str(root), str(output / "vmlinux"), str(output / "kernel-origin.json"), "local",
+            ], check=True, capture_output=True, text=True)
+            for name in ("disk-bootstrap.json", "SHA256SUMS"):
+                self.assertFalse((output / name).exists(), name)
+            for name in ("container-initramfs.cpio.gz", "storage-initramfs.cpio.gz"):
+                self.assertEqual((output / name).read_bytes(), old_assets[name])
             self.assertEqual(list((root / "cache").glob("kernel-build.*")), [])
 
     def test_kernel_rejected_patch_does_not_build_or_stamp(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source, patches, environment = self.kernel_fixture(root)
-            (patches / "second.patch").write_text(
-                "--- a/Makefile\n+++ b/Makefile\n@@ -1 +1 @@\n-not present\n+bad\n"
-            )
-            output = root / "output"
-            output.mkdir()
-            (output / "kernel-input.sha256").write_text("old stamp\n")
-            result = subprocess.run([str(root / "Scripts/build-kernel.sh")], env=environment,
-                                    capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("patch does not apply", result.stderr)
-            self.assertFalse((output / "vmlinux").exists())
-            self.assertEqual((output / "kernel-input.sha256").read_text(), "old stamp\n")
-            self.assertEqual((source / "Makefile").read_text(), "original\n")
-            self.assertEqual(list((root / "cache").glob("kernel-build.*")), [])
+        for existing_output in (False, True):
+            with self.subTest(existing_output=existing_output), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, patches, environment = self.kernel_fixture(root)
+                (patches / MANAGED_PATCH).write_text(
+                    "--- a/Makefile\n+++ b/Makefile\n@@ -1 +1 @@\n-not present\n+bad\n"
+                )
+                output = root / "output"
+                old_assets = self.seed_kernel_output(root) if existing_output else {}
+                result = subprocess.run([str(root / "Scripts/build-kernel.sh")], env=environment,
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("patch does not apply", result.stderr)
+                self.assertFalse((output / "build-source").exists())
+                self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, old_assets)
+                self.assertEqual((source / "Makefile").read_text(), "original\n")
+                self.assertEqual(list((root / "cache").glob("kernel-build.*")), [])
 
     def test_kernel_patch_helper_refuses_an_ordinary_source_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -369,14 +412,48 @@ class GuestBuildScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, patches, environment = self.kernel_fixture(root)
+            self.seed_kernel_output(root)
             builder = root / "Scripts/build-kernel-linux.sh"
             with builder.open("a") as stream:
-                stream.write(f'printf "changed\\n" >> "{patches / "first.patch"}"\n')
+                stream.write(f'printf "changed\\n" >> "{patches / MANAGED_PATCH}"\n')
             result = subprocess.run([str(root / "Scripts/build-kernel.sh")], env=environment,
                                     capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("inputs changed during build", result.stderr)
-            self.assertFalse((root / "output/kernel-input.sha256").exists())
+            self.assertEqual((root / "output/vmlinux").read_text(), "patched\n")
+            for name in KERNEL_CLAIMS:
+                self.assertFalse((root / "output" / name).exists(), name)
+            self.assertEqual(list((root / "cache").glob("kernel-build.*")), [])
+
+    def test_failed_kernel_builder_removes_old_metadata_receipt_and_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, _, environment = self.kernel_fixture(root)
+            self.seed_kernel_output(root)
+            builder = root / "Scripts/build-kernel-linux.sh"
+            with builder.open("a") as stream:
+                stream.write('echo "fixture compile failed" >&2\nexit 17\n')
+            result = subprocess.run([str(root / "Scripts/build-kernel.sh")], env=environment,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 17, result.stderr)
+            self.assertIn("fixture compile failed", result.stderr)
+            self.assertEqual((root / "output/vmlinux").read_text(), "patched\n")
+            for name in KERNEL_CLAIMS:
+                self.assertFalse((root / "output" / name).exists(), name)
+            self.assertEqual((source / "Makefile").read_text(), "original\n")
+            self.assertEqual(list((root / "cache").glob("kernel-build.*")), [])
+
+    def test_actual_managed_patch_bytes_change_kernel_input_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, patches, _ = self.kernel_fixture(root)
+            managed = patches / MANAGED_PATCH
+            shutil.copyfile(ROOT / "Configuration/kernel-patches" / MANAGED_PATCH, managed)
+            script = root / "Scripts/kernel-input-sha256.sh"
+            before = subprocess.check_output([str(script)], text=True).strip()
+            managed.write_bytes(managed.read_bytes() + b"\n")
+            after = subprocess.check_output([str(script)], text=True).strip()
+            self.assertNotEqual(before, after)
 
     def test_kernel_stamp_covers_patch_content_order_and_application_logic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -386,7 +463,8 @@ class GuestBuildScriptTests(unittest.TestCase):
             def digest() -> str:
                 return subprocess.check_output([str(script)], text=True).strip()
             previous = digest()
-            for path, extra in ((patches / "first.patch", "\n"),
+            for path, extra in ((patches / BASE_PATCH, "\n"),
+                                (patches / MANAGED_PATCH, "\n"),
                                 (root / "Scripts/build-kernel.sh", "\n# change\n"),
                                 (root / "Scripts/apply-kernel-patches.sh", "\n# change\n")):
                 with path.open("a") as stream:
@@ -394,9 +472,9 @@ class GuestBuildScriptTests(unittest.TestCase):
                 current = digest()
                 self.assertNotEqual(current, previous, str(path))
                 previous = current
-            (patches / "series").write_text("second.patch\nfirst.patch\n")
+            (patches / "series").write_text(f"{MANAGED_PATCH}\n{BASE_PATCH}\n")
             self.assertNotEqual(digest(), previous)
-            (patches / "first.patch").unlink()
+            (patches / BASE_PATCH).unlink()
             result = subprocess.run([str(script)], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")

@@ -47,13 +47,15 @@ import Testing
         #expect(waits == 10 && instant == 10 && forces == 1 && abort.usedFallback)
     }
 
-    @Test func attemptedStartCannotRegainNeverStartedProofOrReleaseLease() async throws {
+    @Test(arguments: [RawDiskBootTransaction.Policy.journalDriven, .requireInitializedStorage, .resumeReadOnly])
+    func attemptedStartCannotRegainNeverStartedProofOrReleaseLease(policy: RawDiskBootTransaction.Policy) async throws {
         var starts = StorageLifecycleVMStartLifetime()
         try starts.beginStart() // VZ may throw or later report .stopped; count stays one.
         let neverStarted = starts.freezeForAbort()
         let owner = VMShimMachineOwner<FakeMachine>(), machine = FakeMachine()
         owner.machine = machine
-        let abort = StorageLifecycleFreshAbort()
+        let abort = StorageLifecycleFreshAbort(), control = StorageLifecycleControlLifetime()
+        #expect(abort.terminationDecision(policy: policy, control: control) == .beginAbort)
         var forces = 0
         abort.begin(exit: StorageLifecycleGuestExit(), neverStarted: neverStarted, timeout: 0,
                     close: { _ in }, fallback: { forces += 1 })
@@ -73,7 +75,9 @@ import Testing
         #expect(throws: CancellationError.self) { try starts.beginStart() }
     }
 
-    @Test func enrolledLostDaemonACKPreservesVMAndDoesNotFreezeStartup() throws {
+    @Test(arguments: [RawDiskBootTransaction.Policy.journalDriven, .requireInitializedStorage, .resumeReadOnly], [false, true])
+    func enrolledLostDaemonACKPreservesVMAndDoesNotFreezeStartup(policy: RawDiskBootTransaction.Policy,
+                                                               failedDaemonRequest: Bool) throws {
         var starts = StorageLifecycleVMStartLifetime()
         try starts.beginStart()
         let control = StorageLifecycleControlLifetime(), abort = StorageLifecycleFreshAbort()
@@ -81,12 +85,11 @@ import Testing
         try control.beginEnrollment(); try control.enroll()
         let owner = VMShimMachineOwner<FakeMachine>(), machine = FakeMachine()
         owner.machine = machine
-        if control.detach(generation) == .terminateUnenrolled {
-            let neverStarted = starts.freezeForAbort()
-            abort.begin(exit: StorageLifecycleGuestExit(), neverStarted: neverStarted,
-                        close: { _ in Issue.record("enrolled DATA was closed") },
-                        fallback: { Issue.record("enrolled VM was forced") })
-        }
+        // Failed requests fence first; a lost daemon reply may call terminate directly.
+        // Neither can undo the already accepted ROOT enrollment ACK.
+        if failedDaemonRequest { #expect(control.detach(generation) == .preserved) }
+        #expect(abort.terminationDecision(policy: policy, control: control) == .preserveOwner)
+        #expect(!abort.permitsProcessExit(control: control, privateStopRequested: false))
         #expect(control.preservesOwner && owner.machine === machine)
         #expect(abort.task == nil && starts.frozenAttemptCount == nil)
     }
@@ -169,19 +172,33 @@ import Testing
         #expect(abort.usedFallback)
     }
 
-    @Test func concurrentCleanupJoinsSingleFlightDespiteCallerCancellation() async {
+    @Test(arguments: [RawDiskBootTransaction.Policy.journalDriven, .requireInitializedStorage, .resumeReadOnly])
+    func concurrentCleanupJoinsSingleFlightDespiteCallerCancellation(policy: RawDiskBootTransaction.Policy) async throws {
         let exit = StorageLifecycleGuestExit(), abort = StorageLifecycleFreshAbort()
-        var closes = 0, forces = 0
+        let control = StorageLifecycleControlLifetime()
+        var starts = StorageLifecycleVMStartLifetime()
+        try starts.beginStart() // Failed cold/fresh/resume attempt, not a no-VM proof.
+        var closes = 0, forces = 0, aborts = 0
+        let cleanup = {
+            if abort.terminationDecision(policy: policy, control: control) == .beginAbort {
+                aborts += 1
+                let neverStarted = starts.freezeForAbort()
+                abort.begin(exit: exit, neverStarted: neverStarted, timeout: 0.02,
+                            close: { _ in closes += 1 }, fallback: { forces += 1 })
+            }
+        }
         let caller = Task {
-            abort.begin(exit: exit, timeout: 0.02, close: { _ in closes += 1 }, fallback: { forces += 1 })
+            cleanup()
             return await abort.task?.value
         }
         caller.cancel()
         await Task.yield()
-        abort.begin(exit: exit, timeout: 0.02, close: { _ in closes += 1 }, fallback: { forces += 1 })
+        cleanup()
         #expect(await caller.value == false)
         #expect(await abort.task?.value == false)
-        #expect(closes == 1 && forces == 1)
+        cleanup() // Repeated terminal callback after the joined abort also cannot restart it.
+        #expect(aborts == 1 && closes == 1 && forces == 1 && abort.usedFallback)
+        #expect(starts.frozenAttemptCount == 1 && !abort.neverStarted)
     }
 
     @Test func rollbackRequiresCleanResultOrPositiveForcedExit() {
@@ -202,7 +219,24 @@ import Testing
         #expect(firstClaim && !secondClaim)
         #expect(StorageLifecycleFreshAbort.eligible(.journalDriven))
         #expect(StorageLifecycleFreshAbort.eligible(.resumeReadOnly))
-        #expect(!StorageLifecycleFreshAbort.eligible(.requireInitializedStorage))
+        #expect(StorageLifecycleFreshAbort.eligible(.requireInitializedStorage))
+    }
+
+    @Test(arguments: [RawDiskBootTransaction.Policy.journalDriven, .requireInitializedStorage, .resumeReadOnly])
+    func terminationDecisionHonorsPrivateReplyAndVMExitGates(policy: RawDiskBootTransaction.Policy) throws {
+        for preservingReply in [false, true] {
+            let abort = StorageLifecycleFreshAbort(), control = StorageLifecycleControlLifetime()
+            #expect(abort.terminationDecision(policy: policy, control: control,
+                                              preservingStopReply: preservingReply,
+                                              privateStopRequested: !preservingReply) == .terminate)
+            #expect(abort.task == nil)
+            // Bypassing initializer abort must not itself detach private-stop control.
+            try control.withAdmission {}
+        }
+        let abort = StorageLifecycleFreshAbort(), control = StorageLifecycleControlLifetime()
+        try control.beginEnrollment(); try control.enroll()
+        #expect(abort.terminationDecision(policy: policy, control: control, vmDidTerminate: true) == .terminate)
+        #expect(abort.task == nil)
     }
 
     @Test func enrollmentEOFSelectsTerminationButLostDaemonACKPreserves() throws {

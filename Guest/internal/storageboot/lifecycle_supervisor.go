@@ -75,6 +75,10 @@ func copyLifecycleConfiguration(c LifecycleConfiguration) LifecycleConfiguration
 		cold := *c.Cold
 		cold.Signature = bytes.Clone(cold.Signature)
 		cold.Request.Takeover = copyLifecycleSigned(cold.Request.Takeover)
+		if cold.Request.Observation != nil {
+			observation := cold.Request.Observation.Clone()
+			cold.Request.Observation = &observation
+		}
 		c.Cold = &cold
 	}
 	if c.Resume != nil {

@@ -71,6 +71,8 @@ struct StoragePreflightSnapshot: Equatable {
         func prepareReplacementRecovery() async throws -> Bool { try step("replacementCheck"); return replacementPending }
         func recoverReplacement() async throws { try step("replacementComplete") }
         func coldStatus() async throws -> StorageLifecycleColdRootProtocol.Eligibility { try step("coldStatus"); return eligibility }
+        func prepareColdObservation() async throws { try step("observationPrepare") }
+        func observeCold() async throws { try step("observe") }
         func prepareTakeover() async throws { try step("prepareTakeover") }
         func freezeColdLaunch() throws { try step("freeze") }
         func launchColdShim() async throws { try step("coldSpawn") }
@@ -136,6 +138,21 @@ struct StoragePreflightSnapshot: Equatable {
         try await ManagedLifecycleStartup.run(recorder)
         #expect(recorder.calls == ["classify", "open", "generationPreflight", "bind", "replacementCheck", "coldStatus", "prepareTakeover", "freeze",
             "coldSpawn", "coldDisk", "coldBoot", "enroll", "recover", "adopt"])
+    }
+    @Test @MainActor func observationPrecedesChildSelectionAndReusesColdLaunch() async throws {
+        let recorder = Recorder(); recorder.format = .existingV2; recorder.eligibility = .observationRequired
+        try await ManagedLifecycleStartup.run(recorder)
+        #expect(recorder.calls == ["classify", "open", "generationPreflight", "bind", "replacementCheck", "coldStatus",
+            "observationPrepare", "freeze", "coldSpawn", "coldDisk", "observe", "prepareTakeover", "coldBoot", "enroll", "recover", "adopt"])
+    }
+    @Test(arguments: ["observationPrepare", "freeze", "coldSpawn", "coldDisk", "observe", "prepareTakeover", "coldBoot", "enroll", "recover"])
+    @MainActor func observationFailuresNeverAdmitOrFallBack(stage: String) async {
+        let recorder = Recorder(); recorder.format = .existingV2; recorder.eligibility = .observationRequired; recorder.failAt = stage
+        await #expect(throws: EngineError.self) { try await ManagedLifecycleStartup.run(recorder) }
+        #expect(recorder.calls.suffix(2) == [stage, "abandon"])
+        for forbidden in ["disk", "spawn", "freshDisk", "provision", "boot", "adopt", "adoptShim", "reattach"] {
+            #expect(!recorder.calls.contains(forbidden))
+        }
     }
     @Test @MainActor func unknownColdStatusRefusesWithoutLaunchingOrAdopting() async {
         let recorder = Recorder(); recorder.format = .existingV2; recorder.eligibility = .unavailable
@@ -439,7 +456,7 @@ struct StoragePreflightSnapshot: Equatable {
 
     private func metadata(_ extra: String) throws -> GuestAssetInstaller.DiskBootstrapMetadata {
         let hash = String(repeating: "a", count: 64)
-        let json = #"{"schemaVersion":1,"protocolVersion":1,"storageServiceBootVersion":2,"workloadStorageBootVersion":1,"containerInitramfsSHA256":"\#(hash)","storageInitramfsSHA256":"\#(hash)"\#(extra)}"#
+        let json = #"{"schemaVersion":1,"protocolVersion":1,"storageServiceBootVersion":2,"workloadStorageBootVersion":1,"storageColdObservationVersion":1,"containerInitramfsSHA256":"\#(hash)","storageInitramfsSHA256":"\#(hash)"\#(extra)}"#
         return try JSONDecoder().decode(GuestAssetInstaller.DiskBootstrapMetadata.self, from: Data(json.utf8))
     }
     @Test func lifecycleAssetCapabilityIsExplicitAndNotQualification() throws {

@@ -70,6 +70,7 @@ class EarlyAssetsTests(unittest.TestCase):
             data = json.loads((output / "disk-bootstrap.json").read_bytes())
             self.assertEqual(data["storageServiceBootVersion"], 2)
             self.assertEqual(data["storageLifecycleVersion"], 2)
+            self.assertEqual(data["storageColdObservationVersion"], 1)
             self.assertEqual(data[assets.PROFILE_FIELD], assets.EARLY_PROFILE)
             self.assertEqual(data[assets.SOURCE_FIELD], "a" * 64)
 

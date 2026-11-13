@@ -208,6 +208,45 @@ provenance is valid for development/testing, not canonical release qualification
 Use a matching `CENGINE_DEVELOPER_ID_APPLICATION` signing identity for the daemon,
 controller and test helper. See [Development](development.md) for kernel commands.
 
+The default product kernel includes both host-bind and managed-storage patches,
+as described in
+[the downstream kernel notes](../Configuration/kernel-patches/README.md#build-and-artifact-boundaries).
+`make kernel-build` applies the complete ordered series. Schema-2 kernel receipts
+also bind the managed patch hash; a receipt describes the build recipe, not a
+runtime storage-session ABI probe. Older series-only kernels are incompatible.
+A DATA mount EOF accompanied by
+`cengine storage-data-handshake-failure phase=root-factory category=enotty` in the
+storage shim log identifies an unsupported ioctl during root setup. Check the
+actual kernel's managed ABI before retrying or changing network configuration.
+The diagnostic uses closed phase/category tokens and never prints paths, keys,
+certificates or DATA payloads; it does not authorize recovery or cleanup.
+
+On 2026-11-12, RTM-135 and RTM-136 passed separately with paired current Guest
+assets and a local Linux 6.18.44 kernel applying 0001 then 0002 (image SHA-256
+`b409102c1fb7638701c26527d8a31146d9fc1610466d6cbd0fa11728f4acb988`).
+This establishes local unchanged/applied observed-cold recovery, not canonical
+managed-kernel publication, installed-production OS reboot acceptance or a full
+compatibility-suite pass. Each scenario uses its exact sealed fault profile.
+The successful recovery start alone allows a 240-second fixture readiness wait
+for the separate bootstrap/enrollment/service proofs; runtime deadlines and the
+420-second scenario deadline are unchanged.
+
+The Linux 6.18.63 upgrade was also locally qualified on 2026-11-12 using the
+actual `make kernel-build` output and paired current Guest assets. Image SHA-256:
+`08384a9d36f277fb0c8524f8a8b02dcd8e4f4cef49131c76edd2b2a3efdcedc3`;
+managed-patch SHA-256:
+`4c5b8c2f1dbf0cf3ec0425d3354bbf4ab4f957d44c56b7bd4af005ee7b11946b`.
+RTM-117 (ordinary fresh shared FUSE DATA), RTM-071 (host-bind cache coherence),
+RTM-054 (caller permissions/groups), and separate sealed-profile RTM-135/136
+runs passed with clean compatibility teardown. Native credential probes passed
+for zero and 65,536 supplementary groups, forbidden INIT/mount combinations,
+storage-session and killpriv behavior; the stateful FUSE probe passed its required
+assertions. Global FUSE io_uring was enabled for the rejection checks. The optional
+Landlock truncate-LSM subcase was skipped because Landlock is disabled in the
+product configuration; fanotify denial/reentrancy and lease-break checks passed.
+These are local-origin results, not publication of `kernel-v6.18.63-1`, a full
+compatibility-suite pass, or attended installed-production OS reboot acceptance.
+
 Fixture images are fetched into a versioned immutable seed content store and
 APFS-cloned into each fresh root; mutable engine metadata is never shared. Override
 the fixture image with `CENGINE_TEST_IMAGE` and its source mirror with

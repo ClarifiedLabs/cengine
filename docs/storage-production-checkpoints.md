@@ -26,7 +26,7 @@ reset them. A separate authority namespace cannot bypass this check.
   principals, latest exact completed retry, and bounded pending/fenced state.
   Limits apply to active or unresolved registrations, not cumulative completed use.
 - ROOT permits at most 128 active/unresolved bindings. The per-store checkpoint is
-  bounded to 96 KiB with a 16-KiB completion reservation; aggregate publication
+  bounded to 192 KiB with a 16-KiB completion reservation; aggregate publication
   limits remain independent.
 - Exact pending/current retries are idempotent only for the independently proven
   original recipient. Superseded epochs/generations are not re-signed from history.
@@ -88,9 +88,31 @@ reformatting. Clean abort retains the backing lease through worker reap, sync,
 plain unmount and positive Guest shutdown. Partial or uncertain initialization
 is not permission to reset the disk.
 
-Cold work shares one absolute 120-second default/maximum deadline through nested
-proofs/retries. Adoption and resume retain 30-second budgets. Expiry cancels and
-joins owned work; it does not prove death, drain, or safe retry.
+Cold bootstrap work shares one absolute 120-second default/maximum deadline
+through nested proofs/retries; resume bootstrap retains its 30-second budget.
+Native fresh adoption has 30 seconds, cold/resume enrollment has 90 seconds, and
+adoption reconnect has 5 seconds, inside the daemon/shim channel's 110-second
+request budget. The RTM-135/136 successful-recovery readiness wait is separately
+bounded at 240 seconds to cover bootstrap, enrollment and fresh service proofs;
+other fixture starts keep their 60-second default. A harness wait never extends
+runtime authority or protocol deadlines. Expiry cancels and joins owned work;
+it does not prove death, drain, or safe retry.
+
+Failed **unenrolled cold launches** use the same bounded, single-flight shutdown
+as failed initialization/resume. Initial-channel EOF starts cleanup; it is not exit
+evidence. The shim exits only after joined teardown positively stops the VM and
+releases its machine/disk ownership. An enrollment ACK published by ROOT wins
+atomically over detachment, including when the daemon never receives its reply;
+that enrolled VM survives. RTM-135 covers failed cold configure, natural native
+exit and unchanged observed recovery; RTM-136 covers Guest application without
+helper completion and applied observed recovery. Both passed locally with paired
+current Guest assets and a separately built managed kernel.
+RTM-132 no longer uses test-side SIGKILL to mask missing cleanup.
+
+Cold startup failures emit secret-free phase, public operation ID, concrete error
+type and closed error code breadcrumbs. These do not wrap the underlying error or
+change retry/authorization decisions. They distinguish Guest configure/transport
+failure from controller authentication and protected ROOT completion failure.
 
 ### Interrupted committed-cold recovery
 
@@ -116,12 +138,72 @@ and exact physical HOST intent census must all pass before historical settlement
 Workload credentials remain current-controller-only. Unreferenced audit context
 folds through the existing census rather than accumulating forever.
 
-This exception does **not** resolve missing L2, uncertain Guest journal commits, a
-failed recovery edge already containing a bridge, live pre-enrollment orphans, or
-ordinary L3/L4 uncertainty. Those states preserve data and remain fenced. No reset,
-formatting, fsck or checkpoint surgery is authorized. A normal host reboot can
-establish native death, but does not itself prove transaction recovery. Helper
-admission requires `lifecycle-v2-cold-dead-resolution-v1`.
+This L2-only exception does **not** resolve a missing L2; that case has the separate
+observed path below. Uncertain Guest application-journal commits, failed recovery
+edges already containing a bridge, live pre-enrollment orphans and ordinary L3/L4
+uncertainty preserve data and remain fenced. No reset, formatting, fsck or checkpoint
+surgery is authorized. A normal host reboot can establish native death, but does not
+itself prove transaction recovery. Dead-resolution helper admission requires
+`lifecycle-v2-cold-dead-resolution-v1`.
+
+### Observed pre-L2 cold recovery
+
+A frozen attempted cold edge without protected helper L2 completion can now recover
+only through an exact read-only Guest registry observation. ROOT independently
+proves positive native exit of all original and failed-successor daemon, controller
+and shim participants, and verifies that the original adoption snapshot is still
+committed. HOST retains the exact abandoned request, signatures and
+`bootAttempted=true`; it never reruns that boot or invents its completion.
+
+1. **O1 — protected intent.** HOST records the exact observation request before ROOT
+   IO. ROOT durably retains the failed transaction and signed observation
+   authorization before release. It binds a distinct observation ID, the canonical
+   original signed-open bytes and a fresh observer launch on the same store/backing.
+2. **Native observer proof.** ROOT challenges the independently authenticated native
+   observer shim over its private channel, with exact daemon/shim births, fresh
+   nonce, counter, expiry and held-backing verification. Guest verifies ROOT's
+   authorization, opens only existing application-journal files read-only and takes
+   the real exclusive registry `flock`. It validates schema-4 identity, roots,
+   lifecycle state, volume roots and clean artifact namespace. This is not a HOST
+   checkpoint inference or a caller-supplied projection.
+3. **Exact projection only.** `unchanged` equals the original signed predecessor in
+   full. `applied` requires the exact original takeover grant/key at C+1, a new
+   service epoch, increased open revision and unchanged bootstrap key, plus the
+   matching durable `ColdApplied` request digest/grant/service/revision marker.
+   Any other registry state or uncertain publication/artifact residue refuses.
+4. **O2 — protected result.** ROOT durably records the concrete projection and its
+   original committed anchor after repeated native observation/death/adoption
+   checks; HOST persists the returned history before child selection/configure.
+   Cached O2 is not fresh proof: this owner must freshly observe it again. The new
+   Guest takeover repeats projection admission under its actual journal `flock`,
+   before startup cleanup, recovery or publication writes.
+5. **Genuine new cold transaction.** Select the observed predecessor with a new
+   operation ID, nonexporting child key and higher grant serial, fresh native births
+   and service epoch. `unchanged` advances Guest C once from the original predecessor;
+   `applied` advances once from its observed C+1. ROOT/HOST keep the original committed
+   receipt/service/controller anchor until real new completion. Adoption rotates
+   directly from the original committed snapshot to the new successor: there is no
+   synthetic failed enrollment, failed-edge receipt or intermediate adoption rotation.
+   Actual new L2/A1/L3 completion and L4 native enrollment, this owner's fresh ROOT
+   service proof, full authenticated schema-4 Guest Query and exact physical HOST
+   intent census gate reconciliation, historical settlement and normal admission.
+
+Observation/history is never a `Receipt`, `ServiceState`, TLS trust, enrollment or
+standalone recovery authority. There is one bounded observed bridge, not recursive
+recovery: a failed new observed recovery edge or uncertain nested state remains
+fenced with data/evidence preserved. This path does not repair application journals,
+remove uncertain artifacts, format, reset or authorize fsck/checkpoint surgery.
+
+The observer and subsequent configure use the **same mounted ordinary cold ext4**
+store. Normal kernel ext4 journal replay on mount is allowed; read-only application
+journal loading does not mean a read-only filesystem or a no-replay mount. This is
+not unused-store initialization resume or its clean-only/no-replay probe. Kernel
+replay is not proof that an uncertain application publication completed.
+
+Admission requires helper capability `lifecycle-v2-cold-observed-recovery-v1` and
+paired Guest metadata `storageColdObservationVersion: 1` in `disk-bootstrap.json`.
+Older helpers or assets missing this explicit version fail closed, with no fallback
+to replaying the abandoned attempt.
 
 ## Explicit datastore retirement
 
@@ -175,10 +257,22 @@ is not permission to dispose of the backing.
 Cross-language sustained checkpoint tests establish bounded logical state, not
 thousands of native VM lifecycles. Native fresh/retry/refusal, live daemon adoption,
 service/VM replacement, interrupted-cold recovery and host reboot have distinct
-contracts. Installed production reboot acceptance does not certify arbitrary
-power-loss or repair of uncertain disk writes.
+contracts. RTM-135/136 in `Tests/Compatibility/test_storage_lifecycle_v2_runtime.py`
+passed local native verification with the managed kernel: their harness requires
+automatic retained `always` peers,
+unchanged store/disk/manifest/volume identity, saved seeds and new bidirectional shared
+DATA. It does not directly capture Query evidence; the runtime Query/census gates
+have unit coverage, while actual shared DATA demonstrates end-to-end admission only.
+These cases do not establish actual OS reboot acceptance, power-loss durability or
+a full VM-suite pass. Attended installed-production reboot acceptance remains a
+separate gate, not certification of arbitrary power loss or uncertain disk repair.
 
 Publication relies on Linux [fsync](https://man7.org/linux/man-pages/man2/fsync.2.html)
-and [rename](https://man7.org/linux/man-pages/man2/rename.2.html); native death relies
-on observed process lifecycle, not EOF or a timeout. Known/ambiguous I/O fences
+(including directory synchronization for namespace durability),
+[syncfs](https://man7.org/linux/man-pages/man2/syncfs.2.html),
+[rename](https://man7.org/linux/man-pages/man2/rename.2.html) and
+[ext4 journal recovery](https://docs.kernel.org/filesystems/ext4/journal.html).
+Ordinary ext4 kernel replay is distinct from application-journal repair; neither
+observation nor a later sync erases an uncertain application commit. Native death
+relies on observed process lifecycle, not EOF or a timeout. Known/ambiguous I/O fences
 remain governed by [Write-ahead obligations](../Guest/internal/storageauthority/DURABILITY.md).

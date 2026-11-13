@@ -63,6 +63,62 @@ public enum StorageLifecycleColdShimProtocol {
         }
     }
 
+    /// Separate replay domain from mounted-takeover challenges. No grant or child.
+    public struct ObservationChallenge: Codable, Equatable, Sendable {
+        public let authorization: StorageLifecycleColdObservationProtocol.SignedRequest
+        public let greeting: Greeting
+        public let shimAudit: Data
+        public let shimUniqueID: UInt64
+        public let daemonAudit: Data
+        public let daemonUniqueID: UInt64
+        public let counter: UInt64
+        public let nonce: Data
+        public let expiresUnixMS: UInt64
+        public init(authorization: StorageLifecycleColdObservationProtocol.SignedRequest, greeting: Greeting,
+                    shimAudit: Data, shimUniqueID: UInt64, daemonAudit: Data, daemonUniqueID: UInt64,
+                    counter: UInt64, nonce: Data, expiresUnixMS: UInt64) throws {
+            self.authorization = authorization; self.greeting = greeting
+            self.shimAudit = shimAudit; self.shimUniqueID = shimUniqueID
+            self.daemonAudit = daemonAudit; self.daemonUniqueID = daemonUniqueID
+            self.counter = counter; self.nonce = nonce; self.expiresUnixMS = expiresUnixMS; try validate()
+        }
+        public func validate() throws {
+            try authorization.validate(); try greeting.validate()
+            let root = try StorageIdentity.RootPublicKey(publicData: greeting.rootPublicKey)
+            let subject = try authorization.request.subjectOpen().request
+            guard greeting.purpose == .cold, greeting.launch == authorization.request.observer,
+                  authorization.isValidSignature(using: root),
+                  try subject.takeover.grant.identity == Lifecycle.Identity(binding: greeting.binding.value(), generation: subject.takeover.grant.identity.generation),
+                  shimAudit.count == 32, daemonAudit.count == 32, shimAudit != daemonAudit,
+                  shimUniqueID > 0, daemonUniqueID == greeting.daemonUniqueID, shimUniqueID != daemonUniqueID,
+                  counter > 0, nonce.count == 32, expiresUnixMS > 0 else { throw Lifecycle.ValidationError.invalidValue }
+        }
+        public func isFresh(at unixMS: UInt64) -> Bool {
+            expiresUnixMS > unixMS && expiresUnixMS - unixMS <= StorageLifecycleColdShimProtocol.lifetimeMS
+        }
+        public var digest: Data {
+            get throws { try validate(); return try StorageLifecycleColdShimProtocol.digest(self, domain: "observation-challenge") }
+        }
+    }
+    public struct ObservationReply: Codable, Equatable, Sendable {
+        public let challengeSHA256: Data
+        public let observation: StorageLifecycleColdObservationProtocol.Observation
+        public init(challengeSHA256: Data, observation: StorageLifecycleColdObservationProtocol.Observation) throws {
+            self.challengeSHA256 = challengeSHA256; self.observation = observation; try validate()
+        }
+        public func validate() throws {
+            guard challengeSHA256.count == 32 else { throw Lifecycle.ValidationError.invalidValue }
+            try observation.validate()
+        }
+        public func validate(for challenge: ObservationChallenge) throws {
+            try validate(); try challenge.validate(); try observation.validate(for: challenge.authorization.request)
+            guard challengeSHA256 == (try challenge.digest) else { throw StorageIdentity.ValidationError.correlationMismatch }
+        }
+        public func verifies(_ challenge: ObservationChallenge) throws -> Bool {
+            try validate(for: challenge); return true
+        }
+    }
+
     public struct Challenge: Codable, Equatable, Sendable {
         public let version: String
         public let greeting: Greeting
@@ -203,6 +259,12 @@ public enum StorageLifecycleColdShimProtocol {
     public static func encode<T: Encodable>(_ value: T) throws -> Data { try Lifecycle.encode(value) }
     public static func decodeGreeting(_ bytes: Data) throws -> Greeting {
         let value = try Lifecycle.decode(Greeting.self, from: bytes); try value.validate(); return value
+    }
+    public static func decodeObservationChallenge(_ bytes: Data) throws -> ObservationChallenge {
+        let value = try Lifecycle.decode(ObservationChallenge.self, from: bytes); try value.validate(); return value
+    }
+    public static func decodeObservationReply(_ bytes: Data, for challenge: ObservationChallenge) throws -> ObservationReply {
+        let value = try Lifecycle.decode(ObservationReply.self, from: bytes); try value.validate(for: challenge); return value
     }
     public static func decodeChallenge(_ bytes: Data) throws -> Challenge {
         let value = try Lifecycle.decode(Challenge.self, from: bytes); try value.validate(); return value

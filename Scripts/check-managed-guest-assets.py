@@ -73,7 +73,8 @@ def validate(directory: Path) -> None:
         else:
             assert_current(Path(__file__).resolve().parents[1], directory)
     validate_prepare_metadata(metadata, Path(__file__).resolve().parents[1])
-    for name in ('schemaVersion', 'protocolVersion', 'storageServiceBootVersion', 'workloadStorageBootVersion'):
+    for name in ('schemaVersion', 'protocolVersion', 'storageServiceBootVersion', 'workloadStorageBootVersion',
+                 'storageColdObservationVersion'):
         version = 2 if name == 'storageServiceBootVersion' else 1
         if type(metadata.get(name)) is not int or metadata[name] != version:
             raise ValueError(f'managed guest assets require {name}: {version}')

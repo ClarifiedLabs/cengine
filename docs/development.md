@@ -54,11 +54,13 @@ CENGINE_KERNEL_BUILD_CPUS=8 CENGINE_KERNEL_BUILD_MEMORY=16g make kernel-build
 Local builds and custom kernel URLs do not establish canonical release origin.
 Application releases require the configured immutable kernel release to be
 published and fetched through the canonical path; see [Release](release.md).
-The ordinary kernel series currently includes only the host-bind patch. Shared
-managed storage also requires the request-credential patch and matching ABI; a
-plain source build alone is not sufficient. See
-[Kernel patches](../Configuration/kernel-patches/README.md) for the managed-kernel
-build procedure and required compatibility checks.
+The product kernel series includes the host-bind patch followed by the managed
+request-credential/storage-session patch. Both are required by the default
+storage runtime; `make kernel-build` builds this complete series and records a
+local-origin receipt including the managed patch hash. A successful compile is
+not runtime ABI qualification. See
+[Kernel patches](../Configuration/kernel-patches/README.md) for the build boundary
+and required compatibility checks.
 
 ## Tests
 

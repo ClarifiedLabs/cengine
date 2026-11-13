@@ -32,6 +32,9 @@ type Config struct {
 	AuthorityLimits a.Limits
 	DataLimits      d.Limits
 	ControlLimits   c.Limits
+	// ReportDataFailure receives only storageserver's closed diagnostic tokens.
+	// It must be nonblocking and never provides authority or changes retirement.
+	ReportDataFailure func(string)
 }
 
 // Ready is public, detached metadata, never a readiness/activation certificate.
@@ -153,7 +156,10 @@ func constructAuthority(cfg Config, expected a.Controller, open func(a.Config) (
 		return nil, err
 	}
 	// Claim the resource owner only after all other construction has succeeded.
-	s.data, err = d.NewPKIWithResources(resources, authority, d.PKIConfig{Identity: identity, ClientRoot: issuer.Root(), Store: meta.Store.ID, ServiceEpoch: meta.Epoch, Limits: cfg.DataLimits, RequestRetirement: func(h a.DataHello, _ error) { s.notifications <- RetirementNotification{Hello: h} }})
+	s.data, err = d.NewPKIWithResources(resources, authority, d.PKIConfig{Identity: identity, ClientRoot: issuer.Root(), Store: meta.Store.ID, ServiceEpoch: meta.Epoch, Limits: cfg.DataLimits, RequestRetirement: func(h a.DataHello, cause error) {
+		s.reportDataFailure(cause) // Before a possibly slow retirement join hides setup failure.
+		s.notifications <- RetirementNotification{Hello: h}
+	}})
 	if err != nil {
 		return nil, err
 	}

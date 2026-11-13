@@ -119,6 +119,8 @@ struct ManagedLifecycleStartupRoot: Sendable {
     func prepareReplacementRecovery() async throws -> Bool
     func recoverReplacement() async throws
     func coldStatus() async throws -> StorageLifecycleColdRootProtocol.Eligibility
+    func prepareColdObservation() async throws
+    func observeCold() async throws
     func prepareTakeover() async throws
     func freezeColdLaunch() throws
     func launchColdShim() async throws
@@ -153,6 +155,8 @@ extension ManagedLifecycleStartupSteps {
     func prepareReplacementRecovery() async throws -> Bool { false }
     func recoverReplacement() async throws { throw ManagedStorageLifecycleOwner.Failure.blocked }
     func coldStatus() async throws -> StorageLifecycleColdRootProtocol.Eligibility { throw ManagedStorageLifecycleOwner.Failure.blocked }
+    func prepareColdObservation() async throws { throw ManagedStorageLifecycleOwner.Failure.blocked }
+    func observeCold() async throws { throw ManagedStorageLifecycleOwner.Failure.blocked }
     func freezeColdLaunch() throws { throw ManagedStorageLifecycleOwner.Failure.blocked }
     func launchColdShim() async throws { throw ManagedStorageLifecycleOwner.Failure.blocked }
     func prepareColdDisk() async throws { throw ManagedStorageLifecycleOwner.Failure.blocked }
@@ -286,6 +290,18 @@ extension ManagedLifecycleStartupSteps {
                 let status = try await steps.coldStatus()
                 try steps.validateRetainedDirectories()
                 guard status != .unavailable else { throw ManagedLifecycleStartupError.existingStore() }
+                if status == .observationRequired {
+                    try await steps.prepareColdObservation()
+                    try steps.validateRetainedDirectories()
+                    try steps.freezeColdLaunch()
+                    try steps.validateRetainedDirectories()
+                    try await steps.launchColdShim()
+                    try steps.validateRetainedDirectories()
+                    try await steps.prepareColdDisk()
+                    try steps.validateRetainedDirectories()
+                    try await steps.observeCold()
+                    try steps.validateRetainedDirectories()
+                }
                 try await steps.prepareTakeover()
                 try steps.validateRetainedDirectories()
                 switch status {
@@ -303,6 +319,12 @@ extension ManagedLifecycleStartupSteps {
                     try steps.validateRetainedDirectories()
                     try await steps.prepareColdDisk()
                     try steps.validateRetainedDirectories()
+                    try await steps.bootCold()
+                    try steps.validateRetainedDirectories()
+                    try await steps.enrollAdoption()
+                    try steps.validateRetainedDirectories()
+                case .observationRequired:
+                    // Same observer VM/4106 session, now with a fresh child/key.
                     try await steps.bootCold()
                     try steps.validateRetainedDirectories()
                     try await steps.enrollAdoption()
@@ -370,6 +392,7 @@ extension ManagedLifecycleStartupSteps {
     private var resuming = false
     private var restarting = false
     private var coldEligibility: StorageLifecycleColdRootProtocol.Eligibility?
+    private var observationRootPublicKey: StorageIdentity.RootPublicKey?
     private var coldLaunch: RawStorageShimRecovery.PreparedLaunch?
     private var coldGreeting: StorageLifecycleColdShimProtocol.Greeting?
     private var survivingGeneration: RawStorageShimRecovery.Generation?
@@ -537,20 +560,30 @@ extension ManagedLifecycleStartupSteps {
         }
         return status.eligibility
     }
+    func prepareColdObservation() async throws {
+        guard let owner, coldEligibility == .observationRequired else { throw RawManagedStorageBackend.failure() }
+        observationRootPublicKey = try await owner.prepareColdObservation()
+    }
+    func observeCold() async throws {
+        guard let owner, let coldGreeting else { throw RawManagedStorageBackend.failure() }
+        _ = try await owner.observeCold(greeting: coldGreeting, storeLock: storeLock)
+    }
     func prepareTakeover() async throws {
         guard let owner else { throw RawManagedStorageBackend.failure() }
         preparation = try await owner.prepareTakeover(storeLock: storeLock)
     }
     func freezeColdLaunch() throws {
-        guard coldEligibility == .eligible, coldLaunch == nil, let diskIdentity else { throw RawManagedStorageBackend.failure() }
+        guard coldEligibility == .eligible || coldEligibility == .observationRequired,
+              coldLaunch == nil, let diskIdentity else { throw RawManagedStorageBackend.failure() }
         var proposed = specification
         proposed.rootDiskIdentity = diskIdentity.shimIdentity
         coldLaunch = try RawStorageShimRecovery.prepareLaunch(proposed)
     }
     func launchColdShim() async throws {
-        guard let coldLaunch, let preparation, let binding, shim == nil else { throw RawManagedStorageBackend.failure() }
+        guard let coldLaunch, let rootPublicKey = observationRootPublicKey ?? preparation?.rootPublicKey,
+              let binding, shim == nil else { throw RawManagedStorageBackend.failure() }
         let launched = try await VMShimClient.launchLifecycleStorage(preparedLaunch: coldLaunch,
-            rootPublicKey: preparation.rootPublicKey, binding: binding, storeLock: storeLock)
+            rootPublicKey: rootPublicKey, binding: binding, storeLock: storeLock)
         shim = launched.shim; connection = launched.connection
     }
     func prepareColdDisk() async throws {

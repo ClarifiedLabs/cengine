@@ -299,7 +299,10 @@ class Daemon:
             "process": self.process,
         }[key]
 
-    def start(self, *, on_spawn=None, qualify_lifecycle_fault=None) -> None:
+    def start(self, *, on_spawn=None, qualify_lifecycle_fault=None, readiness_timeout=60) -> None:
+        # Refuse invalid budgets before environment validation or any startup I/O.
+        if type(readiness_timeout) not in (int, float) or not 0 < readiness_timeout <= 300:
+            raise ValueError("readiness_timeout must be an int or float in (0, 300]")
         # pytest_sessionstart verifies runner ownership before any daemon fixture.
         # Validate before opening logs or removing a socket, including on restart.
         storage_arguments = managed_storage_arguments(os.environ)
@@ -311,7 +314,8 @@ class Daemon:
             from harness import compatibility_root_owned_by
             profile = os.environ.get("CENGINE_COMPAT_LIFECYCLE_FAULT")
             takeover_fault = profile in ("before-takeover-apply-v1", "after-takeover-apply-v1")
-            cold_fault = profile in ("after-cold-l2-before-a1-v1", "after-first-cold-completion-v1")
+            cold_fault = profile in ("after-cold-l2-before-a1-v1", "after-first-cold-completion-v1",
+                                     "before-cold-configure-v1", "after-first-cold-apply-v1")
             if takeover_fault or cold_fault:
                 if not (
                     not self._manual_lifecycle_start and self.process is not None
@@ -398,7 +402,7 @@ class Daemon:
                     self._log.close()
                     self._log = None
                 return
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + readiness_timeout
             last_error = "socket not created"
             while time.monotonic() < deadline and self.process.poll() is None:
                 if self.socket.exists():

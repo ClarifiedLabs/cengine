@@ -8,7 +8,7 @@ import Testing
     @Test func ordinaryCompatibilityAdvertisesOnlyCurrentLifecycleContracts() throws {
         let value = try #require(StorageBootstrapCapabilities.advertisement(namespace: .compatibility, profile: .ordinary))
         #expect(value.profile == .ordinary)
-        #expect(value.storageContracts == [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
+        #expect(value.storageContracts == [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
         #expect(value.securityRevision == C.securityRevision)
         try C.validate(value, for: .lifecycleV2)
         #expect(throws: (any Error).self) { try C.validate(value, for: .lifecycleQualification) }
@@ -16,14 +16,14 @@ import Testing
 
     @Test func productionDoesNotAdvertiseBootstrap() throws {
         let value = try #require(StorageBootstrapCapabilities.advertisement(namespace: .production, profile: .ordinary))
-        #expect(value.storageContracts == [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
+        #expect(value.storageContracts == [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
         try C.validate(value, for: .lifecycleV2)
     }
 
     @Test func qualificationIsSeparateAndLifecycleOnly() throws {
         let value = try #require(StorageBootstrapCapabilities.advertisement(namespace: .compatibility, profile: .lifecycleQualification))
         #expect(value.profile == .lifecycleQualification)
-        #expect(value.storageContracts == [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
+        #expect(value.storageContracts == [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
         try C.validate(value, for: .lifecycleQualification)
         #expect(throws: (any Error).self) { try C.validate(value, for: .lifecycleV2) }
         #expect(StorageBootstrapCapabilities.advertisement(namespace: .production, profile: .lifecycleQualification) == nil)

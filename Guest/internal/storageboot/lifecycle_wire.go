@@ -51,6 +51,10 @@ type LifecycleReady struct {
 	ServerSPKI      string              `json:"server_spki"`
 }
 type LifecycleFrame struct {
+	ObservationAuthorization *a.SignedLifecycleColdObservation `json:"observation_authorization,omitempty"`
+	ColdObservation          *a.LifecycleColdObservation       `json:"cold_observation,omitempty"`
+	// The key is authenticated by the subject and the existing journal pin.
+	ObservationRootPublicKey           []byte                       `json:"observation_root_public_key,omitempty"`
 	IsolationRequest                   *s.IsolationRequest          `json:"isolationRequest,omitempty"`
 	IsolationProof                     *s.IsolationProof            `json:"isolationProof,omitempty"`
 	ConsumerObservationArm             *cc.Arm                      `json:"consumerObservationArm,omitempty"`
@@ -260,6 +264,16 @@ func (f *LifecycleFrame) validate() error {
 	}
 	switch f.Operation {
 	case "hello":
+	case "observe-cold":
+		add("observation_authorization", "observation_root_public_key")
+		if f.ObservationAuthorization == nil || len(f.ObservationRootPublicKey) != ed25519.PublicKeySize || a.VerifyLifecycleColdObservation(f.ObservationRootPublicKey, *f.ObservationAuthorization) != nil {
+			return errFrame
+		}
+	case "cold-observed":
+		add("cold_observation")
+		if f.ColdObservation == nil || !pin(f.ColdObservation.RequestSHA256) || (f.ColdObservation.Outcome != "unchanged" && f.ColdObservation.Outcome != "applied") {
+			return errFrame
+		}
 	case "configure":
 		add("configuration")
 		if f.Configuration.validate() != nil {

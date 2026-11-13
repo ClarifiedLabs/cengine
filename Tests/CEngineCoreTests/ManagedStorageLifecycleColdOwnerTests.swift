@@ -15,6 +15,7 @@ import Testing
     typealias Cold = StorageLifecycleColdProtocol
     typealias RPC = StorageLifecycleColdRootProtocol
     typealias Boot = StorageLifecycleServiceBootProtocol
+    typealias Observation = StorageLifecycleColdObservationProtocol
 
     nonisolated final class Peer: @unchecked Sendable {
         struct State {
@@ -26,6 +27,11 @@ import Testing
             var interruptComplete = false
             var resolved: RPC.ResolvedDead?
             var loseResolution = true
+            var observationEnabled = false
+            var appliedObservation = false
+            var observationFault: String? = nil
+            var loseObservation = true
+            var history: Observation.History?
         }
         let state = Mutex(State())
         let base: Base.Peer
@@ -49,7 +55,19 @@ import Testing
                 bootstrapKey: service.boot.bootstrapKey), origin: resolved.successorOrigin,
                 allocatedEpoch: resolved.baseEpoch, eligibility: .eligible)
         }
-        var currentStatus: RPC.Status { get throws { try state.withLock { try effectiveStatus($0.resolved) } } }
+        func observationStatus(_ s: State) throws -> RPC.Status {
+            guard s.observationEnabled, let prepared = s.prepared,
+                  prepared.observedHistory == nil else { return try effectiveStatus(s.resolved) }
+            return try .init(predecessor: s.history?.predecessor ?? status.predecessor, origin: status.origin,
+                allocatedEpoch: status.allocatedEpoch, eligibility: s.history == nil ? .observationRequired : .eligible)
+        }
+        var currentStatus: RPC.Status { get throws { try state.withLock { s in
+            if let history = s.history {
+                return try .init(predecessor: history.predecessor, origin: status.origin,
+                    allocatedEpoch: status.allocatedEpoch, eligibility: .eligible)
+            }
+            return try effectiveStatus(s.resolved)
+        } } }
         func pending() throws -> Checkpoint.PendingCold {
             let object = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
             return try JSONDecoder().decode(Checkpoint.PendingCold.self,
@@ -60,62 +78,118 @@ import Testing
             return try state.withLock { s in
                 s.requests.append(envelope)
                 switch envelope.body {
-                case .status: return try .init(for: envelope, body: .status(effectiveStatus(s.resolved)))
-                case .prepare(let request):
-                    let durable = try pending()
-                    #expect(durable.request.prepare == request)
-                    #expect(durable.request.prepareRequestID == envelope.requestID.rawValue)
-                    if s.prepared == nil {
-                        let grant = try L.Grant(operation: .takeover, id: request.operationID,
-                            identity: request.identity, serial: request.expectedPredecessor.currentGrant.serial + 1,
-                            expectedEpoch: request.expectedPredecessor.controllerEpoch,
-                            newKey: request.candidate.publicKey.fingerprint.rawValue)
-                        let signed = try L.SignedGrant(grant: grant, signature: base.rootPrivate.signature(for: grant.signingBytes))
-                        let open = try Cold.Request(operationID: grant.id, predecessor: request.expectedPredecessor,
-                            takeover: signed, launch: request.mountedGreeting.launch,
-                            nowUnixSeconds: request.nowUnixSeconds, lifetimeSeconds: request.lifetimeSeconds)
-                        s.prepared = try .init(signedOpen: .init(request: open,
-                            signature: base.rootPrivate.signature(for: open.signingBytes)),
-                            successorOrigin: request.mountedGreeting.successorOrigin, baseEpoch: request.expectedAllocatedEpoch + 1,
-                            recoveryBridge: s.resolved)
-                        base.state.withLock { $0.grants[grant.id] = signed }
-                    }
-                    if s.losePrepare { s.losePrepare = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
-                    return try .init(for: envelope, body: .prepared(#require(s.prepared)))
-                case .complete:
-                    let durable = try pending(), prepared = try #require(s.prepared)
-                    #expect(durable.bootAttempted && durable.prepared == prepared)
-                    #expect(durable.request.completionRequestID == envelope.requestID.rawValue)
-                    #expect(base.state.withLock { $0.childTakeovers } > 0)
-                    if s.completed == nil {
-                        let grant = prepared.signedOpen.request.takeover.grant
-                        let ready = try base.ready(grant)
-                        s.completed = try .init(operationID: grant.id, signedOpenSHA256: prepared.signedOpenSHA256,
-                            successorOrigin: prepared.successorOrigin, baseEpoch: prepared.baseEpoch,
-                            receipt: .init(grant: grant, nonce: Data(repeating: 8, count: 32),
-                                serviceEpoch: ready.serviceEpoch, revision: ready.openRevision),
-                            successor: base.live(grant, ready).state(boot: base.trust(ready)), recoveryBridge: prepared.recoveryBridge)
-                    }
-                    if s.interruptComplete { throw StorageLifecycleRootClient.Failure(.blocked) }
-                    if s.loseComplete { s.loseComplete = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
-                    return try .init(for: envelope, body: .completed(#require(s.completed)))
-                case .resolveDead(let request):
-                    guard let completed = s.completed else { throw StorageLifecycleRootClient.Failure(.blocked) }
-                    let durable = try pending(), prepared = try #require(durable.prepared)
-                    #expect(durable.resolutionRequest?.value == request)
-                    #expect(durable.resolutionRequest?.requestID == envelope.requestID.rawValue)
-                    if s.resolved == nil {
-                        let data = try Data(contentsOf: stateURL)
-                        let metadata = try JSONDecoder().decode(Checkpoint.Metadata.self, from: data)
-                        s.resolved = try .init(request: request, anchor: #require(metadata.currentService),
-                            receipt: completed.receipt, successor: completed.successor,
-                            successorOrigin: completed.successorOrigin, baseEpoch: completed.baseEpoch)
-                        try #require(s.resolved).validate(prepared: prepared, anchor: #require(metadata.currentService))
-                    }
-                    if s.loseResolution { s.loseResolution = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
-                    return try .init(for: envelope, body: .resolvedDead(#require(s.resolved)))
+                case .status: return try requestStatus(envelope, state: &s)
+                case .observe(let request): return try observe(request, envelope: envelope, state: &s)
+                case .prepare(let request): return try prepare(request, envelope: envelope, state: &s)
+                case .complete: return try complete(envelope, state: &s)
+                case .resolveDead(let request): return try resolveDead(request, envelope: envelope, state: &s)
                 }
             }
+        }
+
+        private func requestStatus(_ envelope: RPC.Request, state s: inout State) throws -> RPC.Reply {
+            return try .init(for: envelope, body: .status(observationStatus(s)))
+        }
+
+        private func observe(_ request: RPC.Observe, envelope: RPC.Request, state s: inout State) throws -> RPC.Reply {
+            let metadata = try JSONDecoder().decode(Checkpoint.Metadata.self, from: Data(contentsOf: stateURL))
+            let frozen = try #require(metadata.observedCold)
+            #expect(frozen.request == request && frozen.requestID == envelope.requestID.rawValue)
+            #expect(frozen.attempted == metadata.pendingCold)
+            #expect(metadata.currentService == frozen.anchorService)
+            if s.observationFault == "failed" { throw StorageLifecycleRootClient.Failure(.blocked) }
+            if s.history == nil {
+                let failed = try #require(frozen.attempted.prepared)
+                let observationID = s.observationFault == "stale" ? Base.id() : request.observationID
+                let actual = try RPC.Observe(observationID: observationID, identity: request.identity,
+                    operationID: request.operationID, signedOpenSHA256: request.signedOpenSHA256,
+                    observerGreeting: request.observerGreeting)
+                let authRequest = try Observation.Request(observationID: observationID,
+                    subject: L.encode(failed.signedOpen), observer: request.observerGreeting.launch)
+                let auth = try Observation.SignedRequest(request: authRequest,
+                    signature: s.observationFault == "bad" ? Data(repeating: 0, count: 64)
+                        : base.rootPrivate.signature(for: authRequest.signingBytes))
+                let predecessor: Cold.Predecessor
+                if s.appliedObservation {
+                    let grant = failed.signedOpen.request.takeover.grant
+                    predecessor = try .init(currentGrant: grant, serviceEpoch: Base.id(),
+                        controllerEpoch: grant.expectedEpoch + 1, controllerKey: grant.newKey,
+                        openRevision: status.predecessor.openRevision + 1,
+                        bootstrapKey: base.rootKey.fingerprint.rawValue)
+                } else { predecessor = status.predecessor }
+                s.history = try .init(request: actual, authorization: auth,
+                    observation: .init(requestSHA256: authRequest.digest,
+                        outcome: s.appliedObservation ? .applied : .unchanged, predecessor: predecessor),
+                    anchor: frozen.anchorService, failedOrigin: failed.successorOrigin, failedBaseEpoch: failed.baseEpoch)
+            }
+            if s.loseObservation { s.loseObservation = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
+            return try .init(for: envelope, body: .observed(#require(s.history)))
+        }
+
+        private func prepare(_ request: RPC.Prepare, envelope: RPC.Request, state s: inout State) throws -> RPC.Reply {
+            let durable = try pending()
+            #expect(durable.request.prepare == request)
+            #expect(durable.request.prepareRequestID == envelope.requestID.rawValue)
+            if s.prepared == nil || s.prepared?.signedOpen.request.operationID != request.operationID {
+                let grant = try L.Grant(operation: .takeover, id: request.operationID,
+                    identity: request.identity, serial: max(request.expectedPredecessor.currentGrant.serial,
+                        s.prepared?.signedOpen.request.takeover.grant.serial ?? 0) + 1,
+                    expectedEpoch: request.expectedPredecessor.controllerEpoch,
+                    newKey: request.candidate.publicKey.fingerprint.rawValue)
+                let signed = try L.SignedGrant(grant: grant, signature: base.rootPrivate.signature(for: grant.signingBytes))
+                let open = try Cold.Request(operationID: grant.id, predecessor: request.expectedPredecessor,
+                    takeover: signed, launch: request.mountedGreeting.launch,
+                    nowUnixSeconds: request.nowUnixSeconds, lifetimeSeconds: request.lifetimeSeconds,
+                    observation: s.history?.authorization)
+                if let history = s.history {
+                    // Observation retains the old allocation anchor, reusing the failed base epoch.
+                    #expect(request.expectedAllocatedEpoch + 1 == history.failedBaseEpoch)
+                }
+                s.prepared = try .init(signedOpen: .init(request: open,
+                    signature: base.rootPrivate.signature(for: open.signingBytes)),
+                    successorOrigin: request.mountedGreeting.successorOrigin, baseEpoch: request.expectedAllocatedEpoch + 1,
+                    recoveryBridge: s.resolved, observedHistory: s.history)
+                base.state.withLock { $0.grants[grant.id] = signed }
+            }
+            if s.losePrepare { s.losePrepare = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
+            return try .init(for: envelope, body: .prepared(#require(s.prepared)))
+        }
+
+        private func complete(_ envelope: RPC.Request, state s: inout State) throws -> RPC.Reply {
+            let durable = try pending(), prepared = try #require(s.prepared)
+            #expect(durable.bootAttempted && durable.prepared == prepared)
+            #expect(durable.request.completionRequestID == envelope.requestID.rawValue)
+            #expect(base.state.withLock { $0.childTakeovers } > 0)
+            if s.completed == nil {
+                let grant = prepared.signedOpen.request.takeover.grant
+                let ready = try base.ready(grant)
+                s.completed = try .init(operationID: grant.id, signedOpenSHA256: prepared.signedOpenSHA256,
+                    successorOrigin: prepared.successorOrigin, baseEpoch: prepared.baseEpoch,
+                    receipt: .init(grant: grant, nonce: Data(repeating: 8, count: 32),
+                        serviceEpoch: ready.serviceEpoch, revision: ready.openRevision),
+                    successor: base.live(grant, ready).state(boot: base.trust(ready)), recoveryBridge: prepared.recoveryBridge,
+                    observedHistory: prepared.observedHistory)
+            }
+            if s.interruptComplete { throw StorageLifecycleRootClient.Failure(.blocked) }
+            if s.loseComplete { s.loseComplete = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
+            return try .init(for: envelope, body: .completed(#require(s.completed)))
+        }
+
+        private func resolveDead(_ request: RPC.ResolveDead, envelope: RPC.Request, state s: inout State) throws -> RPC.Reply {
+            guard let completed = s.completed else { throw StorageLifecycleRootClient.Failure(.blocked) }
+            let durable = try pending(), prepared = try #require(durable.prepared)
+            #expect(durable.resolutionRequest?.value == request)
+            #expect(durable.resolutionRequest?.requestID == envelope.requestID.rawValue)
+            if s.resolved == nil {
+                let data = try Data(contentsOf: stateURL)
+                let metadata = try JSONDecoder().decode(Checkpoint.Metadata.self, from: data)
+                s.resolved = try .init(request: request, anchor: #require(metadata.currentService),
+                    receipt: completed.receipt, successor: completed.successor,
+                    successorOrigin: completed.successorOrigin, baseEpoch: completed.baseEpoch)
+                try #require(s.resolved).validate(prepared: prepared, anchor: #require(metadata.currentService))
+            }
+            if s.loseResolution { s.loseResolution = false; throw StorageLifecycleRootClient.Failure(.unavailable) }
+            return try .init(for: envelope, body: .resolvedDead(#require(s.resolved)))
         }
     }
     @MainActor final class Transport: ManagedStorageLifecycleServiceTransport {
@@ -184,6 +258,59 @@ import Testing
         }
         return try Owner(isolatedTestExisting: seam, root: disk.root, backingDescriptor: disk.backing, binding: disk.binding,
             afterWorkloadDecode: afterWorkloadDecode)
+    }
+
+    /// Match the bounded host-owner worker, not the much larger main-thread stack.
+    nonisolated static func decodeOnOwnerStack(_ bytes: Data, stackBytes: Int = 512 * 1024) throws -> Checkpoint.Metadata {
+        let result = Mutex<Result<Checkpoint.Metadata, any Error>?>(nil)
+        let done = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            defer { done.signal() }
+            result.withLock { $0 = Result { try JSONDecoder().decode(Checkpoint.Metadata.self, from: bytes) } }
+        }
+        thread.stackSize = stackBytes
+        thread.start()
+        done.wait()
+        return try #require(result.withLock { $0 }).get()
+    }
+
+    @Test func checkpointMetadataDecodesOnOwnerSizedStack() async throws {
+        let disk = try Base.Disk(); defer { disk.remove() }
+        let base = try Base.Peer(disk.binding)
+        _ = try await ManagedStorageLifecycleRestartTests().freshStore(disk, base)
+        let bytes = try Data(contentsOf: disk.url.appending(path: "managed-storage-owner/state.json"))
+        // Leave room for the owner's enclosing ROOT/peer call frames. The old
+        // inline observation graph overflowed this budget even when absent.
+        let decoded = try Self.decodeOnOwnerStack(bytes, stackBytes: 320 * 1024)
+        #expect(try Checkpoint.encode(decoded) == bytes)
+        #expect(try decoded == JSONDecoder().decode(Checkpoint.Metadata.self, from: bytes))
+        let object = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        for key in ["version", "identity", "rootPublicKey", "provenanceReference", "revision",
+                    "pendingCold", "latestCold", "contexts", "serviceLinks", "intentRevision", "references"] {
+            var missing = object
+            missing.removeValue(forKey: key)
+            let malformed = try JSONSerialization.data(withJSONObject: missing)
+            #expect(throws: DecodingError.self) { try JSONDecoder().decode(Checkpoint.Metadata.self, from: malformed) }
+        }
+        for key in ["current", "currentContext", "currentService", "observedWorker", "pendingService",
+                    "serviceReplacement", "nativeReplacementAttempted", "latestServiceRequest",
+                    "latestServiceConfirmation", "pending", "pendingTakeover", "adoptionRetry", "handoffRetry",
+                    "resolvedDeadCold", "observedCold", "sealed", "terminal", "latestServiceChange"] {
+            for explicitNull in [false, true] {
+                var optional = object
+                optional[key] = explicitNull ? NSNull() : nil
+                let value = try JSONDecoder().decode(Checkpoint.Metadata.self,
+                    from: JSONSerialization.data(withJSONObject: optional))
+                let encoded = try #require(JSONSerialization.jsonObject(with: Checkpoint.encode(value)) as? [String: Any])
+                #expect(encoded[key] == nil)
+            }
+            var malformed = object
+            malformed[key] = [] as [Int]
+            let malformedBytes = try JSONSerialization.data(withJSONObject: malformed)
+            #expect(throws: DecodingError.self) { try JSONDecoder().decode(Checkpoint.Metadata.self, from: malformedBytes) }
+        }
+        #expect(object["pendingCold"] is NSNull)
+        #expect(object["latestCold"] is NSNull)
     }
 
     @Test func coldRetriesExactDurableTuplesAndDoesNotAdmitBeforeQuery() async throws {
@@ -291,6 +418,128 @@ import Testing
         }
     }
 
+    @Test(arguments: [false, true], ["valid", "query", "census", "cached", "failed", "stale", "bad", "recovery-failed"])
+    func preL2ObservationRetainsExactAttemptAndRequiresFreshCompletionAndQuery(applied: Bool, fault: String) async throws {
+        let disk = try Base.Disk(); defer { disk.remove() }
+        let base = try Base.Peer(disk.binding), lock = try CanonicalDataStoreLock(root: disk.url)
+        let retained = try await retainedStore(disk, base)
+        let peer = try Peer(base: base, grant: retained.grant, stateURL: disk.url.appending(path: "managed-storage-owner/state.json"))
+        let attempted: Checkpoint.PendingCold, anchor: Checkpoint.Completed
+        do {
+            let first = try owner(disk, base, peer)
+            _ = try await first.statusCold(storeLock: lock)
+            _ = try await first.prepareTakeover()
+            let g = try greeting(base, backingDescriptor: disk.backing)
+            let t = Transport(inner: Base.Transport(peer: base, root: disk.root), greeting: g, peer: peer)
+            t.failConfigure = true
+            await Base().fails { try await first.bootCold(using: t, greeting: g, storeLock: lock,
+                nowUnixSeconds: 1_800_000_000, lifetimeSeconds: 3600) }
+            attempted = try #require(first.snapshot().pendingCold)
+            anchor = try #require(first.snapshot().current)
+            #expect(peer.state.withLock { $0.completed == nil })
+            await first.close()
+        }
+        peer.state.withLock {
+            $0.observationEnabled = true; $0.appliedObservation = applied
+            $0.observationFault = fault; $0.losePrepare = false; $0.loseComplete = false
+        }
+        let epoch: UInt64 = applied ? 2 : 1
+        base.state.withLock { $0.binds = Int(epoch - 1) }
+        var holder: Owner?
+        var next: Owner! = try owner(disk, base, peer, afterWorkloadDecode: { @MainActor in
+            if fault == "census" { try #require(holder?.isolatedTestIntents).reconciled() }
+        }, epoch: epoch)
+        holder = next
+        defer { holder = nil }
+        let bytes = try Data(contentsOf: disk.url.appending(path: "disk"))
+        #expect(try await next.statusCold(storeLock: lock).eligibility == .observationRequired)
+        await Base().fails { _ = try await next.prepareTakeover() }
+        #expect(try await next.prepareColdObservation() == base.rootKey)
+        let g = try greeting(base, backingDescriptor: disk.backing)
+        if fault == "failed" || fault == "stale" || fault == "bad" {
+            await Base().fails { _ = try await next.observeCold(greeting: g, storeLock: lock) }
+            #expect(try next.snapshot().observedCold?.history == nil)
+            #expect(try next.snapshot().pendingCold == attempted)
+            await Base().fails { _ = try await next.prepareTakeover() }
+            #expect(!next.hasRecoveryPermission)
+            await next.close()
+            return
+        }
+        let history = try await next.observeCold(greeting: g, storeLock: lock)
+        #expect(history.predecessor.controllerEpoch == epoch)
+        if fault == "valid" {
+            let original = try next.snapshot(), canonical = try Checkpoint.encode(original)
+            let decoded = try Self.decodeOnOwnerStack(canonical)
+            #expect(decoded == original)
+            #expect(try Checkpoint.encode(decoded) == canonical)
+            var copy = decoded
+            copy.observedCold?.history = nil
+            #expect(copy.observedCold?.history == nil)
+            #expect(decoded.observedCold?.history == history)
+            #expect(copy != decoded)
+            let object = try #require(JSONSerialization.jsonObject(with: Checkpoint.encode(copy)) as? [String: Any])
+            let observed = try #require(object["observedCold"] as? [String: Any])
+            #expect(Set(observed.keys) == ["attempted", "request", "requestID", "anchor", "anchorService"])
+        }
+        #expect(try next.snapshot().observedCold?.attempted == attempted)
+        #expect(try next.snapshot().current == anchor && next.snapshot().pendingCold == attempted)
+        #expect(!next.hasRecoveryPermission)
+        let requests = peer.state.withLock { $0.requests.filter { if case .observe = $0.body { true } else { false } } }
+        #expect(requests.count == 2 && requests[0] == requests[1])
+        #expect(peer.state.withLock { !$0.requests.contains { if case .resolveDead = $0.body { true } else { false } } })
+        #expect(try await next.prepareTakeover(storeLock: lock).greeting.expectedEpoch == epoch)
+        let t = Transport(inner: Base.Transport(peer: base, root: disk.root), greeting: g, peer: peer)
+        t.failConfigure = fault == "recovery-failed"
+        if fault == "recovery-failed" {
+            await Base().fails { try await next.bootCold(using: t, greeting: g, storeLock: lock,
+                nowUnixSeconds: 1_800_000_100, lifetimeSeconds: 3600) }
+            #expect(try next.snapshot().observedCold?.attempted == attempted)
+            await next.close(); holder = nil; next = nil
+            let restarted = try owner(disk, base, peer, epoch: epoch)
+            await Base().fails { _ = try await restarted.statusCold(storeLock: lock) }
+            #expect(!restarted.hasRecoveryPermission)
+            await restarted.close()
+            return
+        }
+        try await next.bootCold(using: t, greeting: g, storeLock: lock,
+            nowUnixSeconds: 1_800_000_100, lifetimeSeconds: 3600)
+        let completed = try next.snapshot()
+        #expect(completed.currentContext?.controllerEpoch == epoch + 1)
+        #expect(completed.latestCold?.observedPredecessor?.attempted == attempted)
+        #expect(completed.latestCold?.predecessor.controller == anchor)
+        #expect(completed.latestCold?.prepared.observedHistory == history)
+        #expect(completed.pendingCold == nil && completed.observedCold == nil)
+        if fault == "valid" {
+            let canonical = try Checkpoint.encode(completed)
+            let decoded = try Self.decodeOnOwnerStack(canonical)
+            #expect(decoded == completed)
+            #expect(try Checkpoint.encode(decoded) == canonical)
+            var copy = decoded
+            copy.latestCold?.observedPredecessor?.history = nil
+            #expect(copy.latestCold?.observedPredecessor?.history == nil)
+            #expect(decoded.latestCold?.observedPredecessor?.history == history)
+            #expect(copy != decoded)
+        }
+        #expect(!completed.contexts.contains { $0.controller.original.signed.grant == attempted.prepared?.signedOpen.request.takeover.grant })
+        #expect(!next.hasRecoveryPermission && t.configurations == 1)
+        if fault == "query" {
+            base.state.withLock { $0.workloadResponder = { _ in try Self.query(base, intent: retained.intent, fault: "epoch") } }
+        }
+        if fault == "valid" { try await next.recoverWorkload(); #expect(next.hasRecoveryPermission) }
+        else if fault != "cached" { await Base().fails { try await next.recoverWorkload() }; #expect(!next.hasRecoveryPermission) }
+        #expect(try Data(contentsOf: disk.url.appending(path: "disk")) == bytes)
+        await next.close(); holder = nil; next = nil
+        if fault == "cached" {
+            let restarted = try ManagedStorageLifecycleRestartTests().existing(disk, base, epoch: epoch + 1, daemon: 11)
+            _ = try await restarted.prepareTakeover()
+            try await restarted.takeover(using: LiveTakeoverTransport(base, disk),
+                current: .init(binding: base.bootBinding, ready: base.ready(#require(completed.current).original.signed.grant)))
+            await Base().fails { try await restarted.recoverWorkload() }
+            #expect(!restarted.hasRecoveryPermission)
+            await restarted.close()
+        }
+    }
+
     @Test func coldNestedProofsHaveOneBoundedBudgetIncludingLostReplies() async throws {
         let disk = try Base.Disk(); defer { disk.remove() }
         let base = try Base.Peer(disk.binding), lock = try CanonicalDataStoreLock(root: disk.url)
@@ -305,7 +554,7 @@ import Testing
         let budgets = Mutex<[TimeInterval]>([])
         let owner = try owner(disk, base, peer, timing: timing, beforeRequest: { request, remaining in
             switch request.body {
-            case .status, .resolveDead: break
+            case .status, .resolveDead, .observe: break
             case .prepare:
                 budgets.withLock { $0.append(remaining) }
                 clock.withLock { $0 += 10 }

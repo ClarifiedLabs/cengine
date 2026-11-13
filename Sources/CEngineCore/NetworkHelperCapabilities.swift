@@ -20,6 +20,9 @@ public enum NetworkHelperCapabilities {
         /// A completed but unenrolled cold owner can precede a new cold operation
         /// only after all retained native births positively exit; no synthetic ACK.
         case lifecycleV2ColdUnenrolledRecovery = "lifecycle-v2-cold-unenrolled-recovery-v1"
+        /// Native ROOT-authorized observation distinguishes an unapplied cold open
+        /// from its exact committed journal marker without inventing a live receipt.
+        case coldObservedRecovery = "lifecycle-v2-cold-observed-recovery-v1"
     }
 
     public enum Requirement: String, Sendable, CaseIterable {
@@ -83,7 +86,7 @@ public enum NetworkHelperCapabilities {
     public static func validate(_ value: Advertisement, for requirement: Requirement) throws {
         try validateShape(value)
         let profile: Profile = requirement == .lifecycleQualification ? .lifecycleQualification : .ordinary
-        let requiredContracts: Set<StorageContract> = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery]
+        let requiredContracts: Set<StorageContract> = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery]
         guard value.profile == profile, requiredContracts.isSubset(of: Set(value.storageContracts)) else {
             throw ValidationError.incompatible
         }
@@ -91,7 +94,7 @@ public enum NetworkHelperCapabilities {
 
     private static func validateShape(_ value: Advertisement) throws {
         let contracts = Set(value.storageContracts)
-        let lifecycleContracts: Set<StorageContract> = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery]
+        let lifecycleContracts: Set<StorageContract> = [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery]
         guard value.schemaVersion == 1,
               value.securityRevision >= minimumSecurityRevision,
               !value.storageContracts.isEmpty,
@@ -100,6 +103,7 @@ public enum NetworkHelperCapabilities {
               !contracts.contains(.lifecycleV2StableHostIdentity) || contracts.contains(.lifecycleV2),
               !contracts.contains(.lifecycleV2ColdDeadResolution) || contracts.contains(.lifecycleV2),
               !contracts.contains(.lifecycleV2ColdUnenrolledRecovery) || contracts.contains(.lifecycleV2),
+              !contracts.contains(.coldObservedRecovery) || contracts.contains(.lifecycleV2),
               value.profile != .lifecycleQualification ||
                 (contracts.contains(.lifecycleV2) && contracts.isSubset(of: lifecycleContracts)) else {
             throw ValidationError.incompatible

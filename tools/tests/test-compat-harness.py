@@ -501,6 +501,104 @@ def test_upgrade_finally_cleanup() -> None:
             )
 
 
+def test_daemon_readiness_budget() -> None:
+    # Execute the real harness class without importing pytest/Docker or spawning a daemon.
+    from dataclasses import dataclass, field
+    from unittest.mock import Mock
+
+    path = REPO_ROOT / "Tests/Compatibility/conftest.py"
+    tree = ast.parse(path.read_text())
+    definition = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Daemon")
+    code = compile(ast.Module(body=[definition], type_ignores=[]), str(path), "exec")
+
+    class StartupFailure(Exception):
+        pass
+
+    def fail(message, **kwargs):
+        assert kwargs == {"pytrace": False}
+        raise StartupFailure(message)
+
+    process_api = SimpleNamespace(Popen=Mock(), run=Mock())
+    arguments = Mock(side_effect=AssertionError("environment validation before budget validation"))
+    namespace = dict(__name__="__main__", dataclass=dataclass, field=field,
+                     pathlib=pathlib, subprocess=process_api, os=SimpleNamespace(),
+                     managed_storage_arguments=arguments)
+    exec(code, namespace)
+    # No constructor, paths, environment, or process state are available: invalid
+    # budgets must fail before touching any of them, even when the environment is invalid.
+    uninitialized = object.__new__(namespace["Daemon"])
+
+    class FloatBudget(float):
+        pass
+
+    for invalid in (True, False, None, "240", 0, 0.0, -1, -0.5, 301, 300.01,
+                    float("nan"), float("inf"), -float("inf"), 10 ** 1000,
+                    complex(240), object(), FloatBudget(240)):
+        try:
+            uninitialized.start(readiness_timeout=invalid)
+        except ValueError as error:
+            assert "readiness_timeout" in str(error)
+        else:
+            raise AssertionError("invalid readiness budget accepted")
+    arguments.assert_not_called()
+    process_api.Popen.assert_not_called()
+    process_api.run.assert_not_called()
+
+    for options, budget in (({}, 60), ({"readiness_timeout": 240}, 240),
+                            ({"readiness_timeout": 240.0}, 240),
+                            ({"readiness_timeout": 300}, 300),
+                            ({"readiness_timeout": 0.25}, 0.25)):
+        for ready in (True, False):
+            with tempfile.TemporaryDirectory(prefix="cengine-compat-readiness-") as temporary:
+                work = pathlib.Path(temporary)
+                child = SimpleNamespace(returncode=None)
+                child.poll = lambda: child.returncode
+                child.terminate = Mock(side_effect=lambda: setattr(child, "returncode", -15))
+                child.kill = Mock()
+                child.wait = Mock(return_value=-15)
+                process_api = SimpleNamespace(Popen=Mock(return_value=child),
+                    run=Mock(return_value=SimpleNamespace(returncode=0 if ready else 1,
+                                                          stdout="OK" if ready else "", stderr="")),
+                    DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT, PIPE=subprocess.PIPE,
+                    TimeoutExpired=subprocess.TimeoutExpired)
+                clock = SimpleNamespace(monotonic=Mock(side_effect=[100, 100 + budget - 0.01, 100 + budget]),
+                                        sleep=Mock())
+                cleanup = Mock()
+                namespace.update(os=SimpleNamespace(environ={}), subprocess=process_api, time=clock,
+                    managed_storage_arguments=Mock(return_value=[]), compatibility_environment=lambda: {},
+                    COMPATIBILITY_OWNER_FILE=COMPATIBILITY_OWNER_FILE,
+                    compatibility_root_retained=compatibility_root_retained,
+                    retain_compatibility_root=retain_compatibility_root,
+                    terminate_compatibility_runtime=cleanup, pytest=SimpleNamespace(fail=fail))
+                daemon = namespace["Daemon"](binary=work / "cengine", kernel=work / "kernel",
+                    container_initramfs=work / "container", storage_initramfs=work / "storage", work=work)
+                harness.preretain_compatibility_root(work, daemon.owner_binary)
+                daemon._managed_fixture_retention = True
+                backend = SimpleNamespace(capture_backend_root=Mock())
+                with patch.dict(sys.modules, storage_backend_proof=backend):
+                    try:
+                        daemon.start(on_spawn=daemon.socket.touch, **options)
+                    except StartupFailure as error:
+                        assert not ready and "root retained" in str(error)
+                        assert daemon._retain_root and compatibility_root_retained(work)
+                        daemon._managed_fixture_retention = False
+                        assert daemon.root_retained  # Expiration is permanent, not fixture pre-retention.
+                        cleanup.assert_called_once_with(daemon.owner_binary, roots=(daemon.root,))
+                        child.terminate.assert_called_once_with()
+                        assert daemon._log is None
+                        assert clock.monotonic.call_count == 3
+                        clock.sleep.assert_called_once_with(0.1)
+                    else:
+                        assert ready and not daemon._retain_root
+                        assert clock.monotonic.call_count == 2
+                        clock.sleep.assert_not_called()
+                        cleanup.assert_not_called()
+                        daemon.stop()
+                process_api.Popen.assert_called_once()
+                process_api.run.assert_called_once()  # Exactly one actual readiness probe before the deadline.
+                child.kill.assert_not_called()
+
+
 def test_daemon_lifecycle_fault_callbacks() -> None:
     # Execute the real start/stop/retention paths without importing Docker/pytest,
     # launching native processes, or contacting the helper.
@@ -1609,6 +1707,7 @@ def main() -> None:
     test_upgrade_expected_refusal_preserves_old_runtime()
     test_upgrade_replacement_preserves_signing_mode()
     test_upgrade_finally_cleanup()
+    test_daemon_readiness_budget()
     test_daemon_lifecycle_fault_callbacks()
     check_disk_observation()
     check_owned_disk_claims()

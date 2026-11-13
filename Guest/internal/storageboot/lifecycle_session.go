@@ -1,6 +1,7 @@
 package storageboot
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -44,7 +45,8 @@ func lifecycleConstruct(root *os.File, b diskbootstrap.StorageBinding, c Lifecyc
 	if err != nil || !ed25519.Verify(ed25519.PublicKey(c.RootPublicKey), msg, c.Signed.Signature) {
 		return nil, a.ErrUnauthorized
 	}
-	cfg := s.Config{Root: root, DeviceUUID: b.Ext4UUID, Store: c.Signed.Grant.Identity.Store, Bootstrap: pub, Now: time.Unix(int64(c.NowUnixSeconds), 0), Lifetime: time.Duration(c.LifetimeSeconds) * time.Second}
+	cfg := s.Config{Root: root, DeviceUUID: b.Ext4UUID, Store: c.Signed.Grant.Identity.Store, Bootstrap: pub, Now: time.Unix(int64(c.NowUnixSeconds), 0), Lifetime: time.Duration(c.LifetimeSeconds) * time.Second,
+		ReportDataFailure: reportLifecycleDataFailure}
 	if c.Action == "initialize" {
 		if fresh == nil {
 			return nil, errors.New("configuration")
@@ -113,7 +115,17 @@ func lifecycleColdBindingValid(c LifecycleConfiguration, b diskbootstrap.Storage
 // closes the supervisor (kill + positive Wait + close) and is not a drain or
 // retirement receipt. An uncertain Wait is terminal containment: keep PID1 and
 // every retained root/lease alive for host hard fallback.
-func lifecycleSession(ctx context.Context, conn net.Conn, binding diskbootstrap.StorageBinding, start lifecycleWorkerStarter, budget time.Duration) (err error) {
+type lifecycleColdObserver func(ed25519.PublicKey, a.SignedLifecycleColdObservation) (a.LifecycleColdObservation, error)
+
+// Matches the native observation replay bound; observation never spends the
+// later mounted takeover's independent claim budget.
+const maximumColdObservationExchanges = 128
+
+func lifecycleSession(ctx context.Context, conn net.Conn, binding diskbootstrap.StorageBinding, start lifecycleWorkerStarter, budget time.Duration) error {
+	return lifecycleSessionWithObservation(ctx, conn, binding, start, nil, budget)
+}
+
+func lifecycleSessionWithObservation(ctx context.Context, conn net.Conn, binding diskbootstrap.StorageBinding, start lifecycleWorkerStarter, observe lifecycleColdObserver, budget time.Duration) (err error) {
 	if ctx == nil || conn == nil {
 		return errFrame
 	}
@@ -138,9 +150,50 @@ func lifecycleSession(ctx context.Context, conn net.Conn, binding diskbootstrap.
 	if err = WriteLifecycleFrame(conn, &hello); err != nil {
 		return err
 	}
-	config, err := ReadLifecycleFrame(conn)
-	if err != nil {
-		return err
+	var observed *a.SignedLifecycleColdObservation
+	var config *LifecycleFrame
+	for exchanges := 0; ; exchanges++ {
+		config, err = ReadLifecycleFrame(conn)
+		if err != nil {
+			return err
+		}
+		if config.Operation != "observe-cold" {
+			break
+		}
+		if exchanges >= maximumColdObservationExchanges || observe == nil || config.Binding != binding {
+			return errFrame
+		}
+		auth := config.ObservationAuthorization
+		l := auth.Request.Observer
+		if string(l.ShimLaunchUUID) != binding.ShimLaunchUUID || l.Ext4UUID != binding.Ext4UUID || l.Bytes != binding.Bytes {
+			return errFrame
+		}
+		if observed != nil && (!bytes.Equal(observed.Request.Subject, auth.Request.Subject) || observed.Request.Observer != l || observed.Request.ObservationID != auth.Request.ObservationID || !bytes.Equal(observed.Signature, auth.Signature)) {
+			return errFrame
+		}
+		result, e := observe(config.ObservationRootPublicKey, *auth)
+		if e != nil {
+			return e
+		}
+		if result.ValidateFor(auth.Request) != nil {
+			return errFrame
+		}
+		observed = auth
+		reply := lifecycleFrame("cold-observed", binding)
+		reply.ColdObservation = &result
+		if err = WriteLifecycleFrame(conn, &reply); err != nil {
+			return err
+		}
+	}
+	if observed != nil {
+		c := config.Configuration
+		if c == nil || c.Cold == nil || c.Cold.Request.Observation == nil {
+			return errFrame
+		}
+		auth := c.Cold.Request.Observation
+		if auth.Request.Digest() != observed.Request.Digest() || !bytes.Equal(auth.Signature, observed.Signature) {
+			return errFrame
+		}
 	}
 	if config.Operation != "configure" || config.Binding != binding || !lifecycleColdBindingValid(*config.Configuration, binding) {
 		return errFrame

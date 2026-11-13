@@ -117,16 +117,99 @@ class ProvenanceTests(unittest.TestCase):
             P.audit_selected([])
 
     def fixture(self, root):
+        patches = root / "Configuration/kernel-patches"
+        patches.mkdir(parents=True)
+        (patches / "series").write_text(f"{P.BASE_PATCH}\n{P.MANAGED_PATCH}\n")
+        (patches / P.BASE_PATCH).write_bytes(b"base patch")
+        (patches / P.MANAGED_PATCH).write_bytes(b"managed patch")
         output = root / "output"
         output.mkdir()
         for name in P.ASSETS[:3]:
             (output / name).write_bytes(b"kernel" if name == "vmlinux" else archive())
         return output
 
+    def test_managed_recipe_requires_safe_unique_ordered_series_and_actual_patch_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.fixture(root)
+            patches = root / "Configuration/kernel-patches"
+            series = patches / "series"
+            valid = f"# managed recipe\n\n{P.BASE_PATCH}\n{P.MANAGED_PATCH}"
+            series.write_text(valid)
+            self.assertEqual(P.managed_patch_sha256(root), P.digest(b"managed patch"))
+            (patches / P.MANAGED_PATCH).write_bytes(b"changed managed patch")
+            self.assertEqual(P.managed_patch_sha256(root), P.digest(b"changed managed patch"))
+            invalid = [f"{P.BASE_PATCH}\n", f"{P.MANAGED_PATCH}\n", "# no patches\n",
+                       f"{P.MANAGED_PATCH}\n{P.BASE_PATCH}\n",
+                       valid + f"\n{P.MANAGED_PATCH}\n", valid + f"\n{P.BASE_PATCH}\n",
+                       valid + "\nother.patch\nother.patch\n"]
+            invalid.extend(valid + "\n" + name for name in (
+                "../outside.patch", "/absolute.patch", "subdir/patch", ".hidden.patch",
+                "patch with spaces", "patch\tname", "patch\r", "patch\\name"))
+            for value in invalid:
+                series.write_text(value)
+                with self.subTest(series=value), self.assertRaises(ValueError):
+                    P.managed_patch_sha256(root)
+            series.write_text(valid)
+            managed = patches / P.MANAGED_PATCH
+            managed.unlink()
+            with self.assertRaises(OSError):
+                P.managed_patch_sha256(root)
+            managed.symlink_to(patches / P.BASE_PATCH)
+            with self.assertRaises(OSError):
+                P.managed_patch_sha256(root)
+
+    def test_kernel_receipts_bind_managed_patch_without_promoting_local_origins(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(P, "kernel_config", return_value=("kernel-v1", "b" * 64)):
+            root = Path(temp)
+            output = self.fixture(root)
+            binary, receipt = output / "vmlinux", output / P.RECEIPT
+            for origin in ("canonical-release", "custom-release", "local", "unverified"):
+                P.main(["record-kernel", str(root), str(binary), str(receipt), origin])
+                value = P.check_kernel(root, binary, receipt, origin)
+                self.assertEqual(value, {"schemaVersion": 2, "origin": origin, "sha256": P.digest(b"kernel"),
+                                         "release": "kernel-v1", "inputSHA256": "b" * 64,
+                                         "managedPatchSHA256": P.digest(b"managed patch")})
+                P.main(["check-kernel", str(root), str(binary), str(receipt), origin])
+                if origin != "canonical-release":
+                    with self.assertRaises(ValueError):
+                        P.check_kernel(root, binary, receipt, "canonical-release")
+                mutations = [dict(value, schemaVersion=1), dict(value, schemaVersion=True),
+                             dict(value, managedPatchSHA256="c" * 64), dict(value, managedPatchSHA256=True),
+                             dict(value, managedPatchSHA256="not-a-hash"), dict(value, extra="field")]
+                legacy = dict(value, schemaVersion=1)
+                del legacy["managedPatchSHA256"]
+                missing = dict(value)
+                del missing["managedPatchSHA256"]
+                for bad in [*mutations, legacy, missing]:
+                    P.atomic_json(receipt, bad)
+                    with self.subTest(origin=origin, receipt=bad), self.assertRaises(ValueError):
+                        P.check_kernel(root, binary, receipt, origin)
+                P.atomic_json(receipt, value)
+            (root / "Configuration/kernel-patches" / P.MANAGED_PATCH).write_bytes(b"changed patch")
+            with self.assertRaisesRegex(ValueError, "mismatch"):
+                P.check_kernel(root, binary, receipt)
+
+    def test_old_sidecar_is_not_silently_upgraded_to_unverified(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(P, "source_pin", return_value="a" * 64), \
+                patch.object(P, "kernel_config", return_value=("kernel-v1", "b" * 64)), \
+                patch.object(P, "binary_info", return_value={"sha256": "c" * 64, "goVersion": "go1.26.5"}):
+            root = Path(temp)
+            output = self.fixture(root)
+            value = P.provenance(root, output, Path("go"), "a" * 64)
+            self.assertEqual(value["kernel"]["origin"], "unverified")
+            legacy = dict(value["kernel"], schemaVersion=1)
+            del legacy["managedPatchSHA256"]
+            P.atomic_json(output / P.RECEIPT, legacy)
+            with self.assertRaisesRegex(ValueError, "unexpected provenance fields"):
+                P.provenance(root, output, Path("go"), "a" * 64)
+            self.assertEqual(json.loads((output / P.RECEIPT).read_text()), legacy)
+
     def publish(self, output, provenance):
         metadata: dict[str, Any] = {key: 1 for key in ("schemaVersion", "protocolVersion", "storageServiceBootVersion", "workloadStorageBootVersion")}
         metadata["storageServiceBootVersion"] = 2
         metadata["storageLifecycleVersion"] = 2
+        metadata["storageColdObservationVersion"] = 1
         metadata.update({f"{kind}InitramfsSHA256": P.digest((output / f"{kind}-initramfs.cpio.gz").read_bytes()) for kind in ("container", "storage")})
         metadata["ordinaryProvenance"] = provenance
         self.write_metadata(output, metadata)
@@ -162,6 +245,8 @@ class ProvenanceTests(unittest.TestCase):
                        ((), "storageServiceBootVersion", 1), ((), "storageServiceBootVersion", True),
                        ((), "storageLifecycleVersion", 1), ((), "storageLifecycleVersion", 3),
                        ((), "storageLifecycleVersion", True), ((), "storageLifecycleVersion", "2"),
+                       *[((), "storageColdObservationVersion", value) for value in (None, 0, 2, True, "1", 1.0)],
+                       ((), "storageColdObservationUnknownVersion", 1),
                        (("ordinaryProvenance",), "sourceSHA256", "c" * 64),
                        (("ordinaryProvenance",), "policy", "relabeled-full-nine"),
                        (("ordinaryProvenance", "kernel"), "origin", "local"),
@@ -170,6 +255,11 @@ class ProvenanceTests(unittest.TestCase):
                        (("ordinaryProvenance", "kernel"), "sha256", "d" * 64),
                        (("ordinaryProvenance", "kernel"), "release", "other"),
                        (("ordinaryProvenance", "kernel"), "inputSHA256", "d" * 64),
+                       (("ordinaryProvenance", "kernel"), "schemaVersion", 1),
+                       (("ordinaryProvenance", "kernel"), "schemaVersion", True),
+                       *[(("ordinaryProvenance", "kernel"), "managedPatchSHA256", value)
+                         for value in ("d" * 64, "invalid", "D" * 64, None, True)],
+                       (("ordinaryProvenance", "kernel"), "unexpected", "field"),
                        (("ordinaryProvenance", "containerBinary"), "goVersion", "go1.25.0"),
                        (("ordinaryProvenance", "storageBinary"), "sha256", "d" * 64),
                        (("ordinaryProvenance",), "mke2fsSHA256", "d" * 64),
@@ -185,6 +275,18 @@ class ProvenanceTests(unittest.TestCase):
                 self.write_metadata(output, bad)
                 with self.subTest(path=path, key=key), self.assertRaises(ValueError):
                     P.validate(root, output, Path("go"))
+            for version in (1, 2):
+                missing_managed = copy.deepcopy(metadata)
+                missing_managed["ordinaryProvenance"]["kernel"]["schemaVersion"] = version
+                del missing_managed["ordinaryProvenance"]["kernel"]["managedPatchSHA256"]
+                self.write_metadata(output, missing_managed)
+                with self.subTest(kernel_version=version), self.assertRaises(ValueError):
+                    P.validate(root, output, Path("go"), require_release_kernel=False)
+            missing_observation = copy.deepcopy(metadata)
+            del missing_observation["storageColdObservationVersion"]
+            self.write_metadata(output, missing_observation)
+            with self.assertRaises(ValueError):
+                P.validate(root, output, Path("go"))
             self.write_metadata(output, metadata)
             (output / "container-initramfs.cpio.gz").write_bytes(archive(init=b"changed"))
             with self.assertRaises(ValueError):
@@ -337,6 +439,9 @@ class FetchTests(unittest.TestCase):
             root = Path(temp)
             for name in ("Scripts", "Configuration"):
                 shutil.copytree(ROOT / name, root / name)
+            # Keep this fetch fixture self-contained while the product series
+            # is updated separately; production receipts require both patches.
+            (root / "Configuration/kernel-patches/series").write_text(f"{P.BASE_PATCH}\n{P.MANAGED_PATCH}\n")
             downloads = root / "downloads"
             downloads.mkdir()
             _, inputs = P.kernel_config(root)

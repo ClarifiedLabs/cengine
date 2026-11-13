@@ -739,6 +739,9 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
                             case .prepare(let prepare):
                                 try scope.directory.requireIdentity(prepare.identity)
                                 try scope.directory.requireBinding(prepare.mountedGreeting.binding.value(), establish: false)
+                            case .observe(let value):
+                                try scope.directory.requireIdentity(value.identity)
+                                try scope.directory.requireBinding(value.observerGreeting.binding.value(), establish: false)
                             case .resolveDead(let value): try scope.directory.requireIdentity(value.identity)
                             case .complete: break // Scope-local authority resolves the protected operation.
                             }

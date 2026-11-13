@@ -76,6 +76,7 @@ final class RawDiskBootTransaction: Sendable {
         let specificationSHA256: String
         let policy: Policy
         private let coldState = Mutex(StorageLifecycleColdClaimState())
+        private let observationState = Mutex(StorageLifecycleColdObservationClaimState())
         private let disk: VMShimHeldDisk
         private let initializationOperation: String?
         // Owned by the BOOT, not a wrapper: minting another capability cannot
@@ -202,6 +203,19 @@ final class RawDiskBootTransaction: Sendable {
             }
             return try .init(challengeSHA256: challenge.digest)
         }
+        func acceptColdObservation(_ challenge: StorageLifecycleColdShimProtocol.ObservationChallenge) throws {
+            try observationState.withLock { try $0.accept(challenge, now: UInt64(Date().timeIntervalSince1970 * 1000)) }
+            try validateColdObservationBacking(challenge)
+        }
+        func validateColdObservationBacking(_ challenge: StorageLifecycleColdShimProtocol.ObservationChallenge) throws {
+            let g = challenge.greeting
+            let held = try validateColdMount()
+            guard g.purpose == .cold, g.bootBinding == binding,
+                  g.launch.specSHA256 == specificationSHA256, g.launch.initramfsSHA256 == initramfsSHA256,
+                  g.heldBackingIdentity.device == held.device, g.heldBackingIdentity.inode == held.inode,
+                  g.heldBackingIdentity.volumeUUID == held.volumeUUID?.uuidString.lowercased(),
+                  challenge.isFresh(at: UInt64(Date().timeIntervalSince1970 * 1000)) else { throw RawDiskBootTransaction.failure() }
+        }
         func validateColdSeed(_ seed: StorageLifecycleColdShimProtocol.ColdEnrollmentSeed) throws {
             try coldState.withLock { try $0.validate(seed) }
             _ = try validateRecoveryDisk(purpose: seed.purpose)
@@ -217,11 +231,9 @@ final class RawDiskBootTransaction: Sendable {
             }
             try coldState.withLock { state in
                 guard let claim = state.first, claim.greeting.purpose == .cold else { throw RawDiskBootTransaction.failure() }
-                let prepared = try StorageLifecycleColdRootProtocol.Prepared(signedOpen: signed,
-                    successorOrigin: claim.greeting.successorOrigin, baseEpoch: claim.baseEpoch)
                 guard configuration.rootPublicKey == claim.greeting.rootPublicKey,
                       configuration.signed.grant == claim.unsignedGrant,
-                      try prepared.signedOpenSHA256 == claim.signedOpenSHA256,
+                      try StorageLifecycleColdRootProtocol.signedOpenDigest(signed) == claim.signedOpenSHA256,
                       signed.request.launch == claim.greeting.launch else { throw RawDiskBootTransaction.failure() }
             }
             _ = try validateColdMount()

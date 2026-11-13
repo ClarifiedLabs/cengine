@@ -52,7 +52,7 @@ def assets(root, pin, suffix=b""):
     root.mkdir(parents=True, exist_ok=True)
     for name in ("vmlinux", "container-initramfs.cpio.gz", "storage-initramfs.cpio.gz"):
         (root / name).write_bytes(name.encode() + suffix)
-    metadata: dict[str, object] = dict(schemaVersion=1, protocolVersion=1, storageServiceBootVersion=2, workloadStorageBootVersion=1, storageLifecycleVersion=2,
+    metadata: dict[str, object] = dict(schemaVersion=1, protocolVersion=1, storageServiceBootVersion=2, workloadStorageBootVersion=1, storageLifecycleVersion=2, storageColdObservationVersion=1,
                     storageLifecycleQualification=Q.PROFILE, storageLifecycleSourcePin=pin)
     metadata.update({kind + "InitramfsSHA256": hashlib.sha256((root / (kind + "-initramfs.cpio.gz")).read_bytes()).hexdigest()
                      for kind in ("container", "storage")})
@@ -271,6 +271,7 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(metadata[Q.SOURCE_FIELD], "a" * 64)
             self.assertEqual(metadata["storageServiceBootVersion"], 2)
             self.assertEqual(metadata["storageLifecycleVersion"], 2)
+            self.assertEqual(metadata["storageColdObservationVersion"], 1)
             self.assertNotIn("ordinaryProvenance", metadata)
 
     def test_unknown_and_incompatible_guest_profiles_fail_before_mutation(self):

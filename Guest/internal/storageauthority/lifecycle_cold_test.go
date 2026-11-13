@@ -21,7 +21,7 @@ func coldRequest(t *testing.T, f *fixture, current SignedLifecycleGrant, expecte
 		LifecycleColdPredecessor{current.Grant, expected.Epoch, expected.Controller.Epoch, expected.Controller.Key, expected.OpenRevision, fp(t, f.bootstrap)},
 		signLifecycle(t, f.bootstrap, g),
 		LifecycleColdLaunch{mustID(t), strings.Repeat("a", 64), strings.Repeat("b", 64), "cccccccc-cccc-1ccc-accc-cccccccccccc", 1 << 30},
-		1700000000, 3600}
+		1700000000, 3600, nil}
 }
 
 func signCold(t *testing.T, key ed25519.PrivateKey, r LifecycleColdOpenRequest) SignedLifecycleColdOpen {

@@ -129,6 +129,96 @@ final class PrivateStorageLifecycleBootCoordinator: @unchecked Sendable {
         try StorageLifecycleBootTrust(identity: ready.identity, serviceEpoch: ready.serviceEpoch,
             tlsRootSHA256: digest(ready.tlsRootDER), serverSPKI: ready.serverSPKI, bootstrapKey: ready.bootstrapKey)
     }
+    /// Owns the actual observer 4106 stream and its single consumed hello. Only
+    /// this live object can transfer a preobserved stream into configure.
+    final class ColdObservationSession: @unchecked Sendable {
+        private let verified: RawDiskBootTransaction.VerifiedStorageDiskBoot
+        private let root: StorageIdentity.RootPublicKey
+        private let descriptor: Int32
+        private let closeConnection: @Sendable () -> Void
+        private let gate = NSLock()
+        private let cancelled = Mutex(false)
+        private var closed = false
+        private var transferred = false
+        private var helloConsumed = false
+        private var authorization: StorageLifecycleColdObservationProtocol.SignedRequest?
+        private var observation: StorageLifecycleColdObservationProtocol.Observation?
+        init(verified: RawDiskBootTransaction.VerifiedStorageDiskBoot, root: StorageIdentity.RootPublicKey,
+             descriptor: Int32, closeConnection: @escaping @Sendable () -> Void = {}) throws {
+            _ = try verified.validateColdMount()
+            let owned = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+            guard owned >= 0 else { throw failure() }
+            var yes: Int32 = 1
+            let flags = fcntl(owned, F_GETFL)
+            guard flags >= 0, fcntl(owned, F_SETFL, flags | O_NONBLOCK) == 0,
+                  setsockopt(owned, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                Darwin.close(owned); throw failure()
+            }
+            self.verified = verified; self.root = root; self.descriptor = owned; self.closeConnection = closeConnection
+        }
+        func observe(_ signed: StorageLifecycleColdObservationProtocol.SignedRequest,
+                     deadline: TimeInterval) throws -> StorageLifecycleColdObservationProtocol.Observation {
+            try gate.withLock {
+                do {
+                    guard ProcessInfo.processInfo.systemUptime < deadline else { throw Transport.Deadline.expired }
+                    guard !closed, !transferred, !cancelled.withLock({ $0 }), signed.isValidSignature(using: root),
+                          authorization == nil || authorization == signed else { throw failure() }
+                    let launch = signed.request.observer, binding = verified.binding
+                    guard launch.shimLaunchUUID == binding.shimLaunchUUID, launch.ext4UUID == binding.ext4UUID,
+                          launch.bytes == binding.bytes, launch.specSHA256 == verified.specificationSHA256,
+                          launch.initramfsSHA256 == verified.initramfsSHA256 else { throw failure() }
+                    _ = try verified.validateColdMount()
+                    // Every native proof must reobserve Guest on this same stream.
+                    // The retained value pins evidence; it is never a cached reply.
+                    let io = Transport(descriptor: descriptor, deadline: deadline,
+                        isCancelled: { [self] in cancelled.withLock { $0 } })
+                    if !helloConsumed {
+                        let hello = try Wire.decode(io.readFrame())
+                        guard hello.operation == .hello, hello.binding == binding else { throw failure() }
+                        helloConsumed = true
+                    }
+                    var request = Wire.Frame(operation: .observeCold, binding: binding)
+                    request.observationAuthorization = signed
+                    request.observationRootPublicKey = root.publicData
+                    try io.write(Wire.encode(request))
+                    let reply = try Wire.decode(io.readFrame())
+                    guard reply.operation == .coldObserved, reply.binding == binding,
+                          let observed = reply.coldObservation else { throw failure() }
+                    try observed.validate(for: signed.request)
+                    _ = try verified.validateColdMount()
+                    guard !cancelled.withLock({ $0 }) else { throw CancellationError() }
+                    guard ProcessInfo.processInfo.systemUptime < deadline else { throw Transport.Deadline.expired }
+                    guard observation == nil || observation == observed else { throw failure() }
+                    authorization = signed; observation = observed
+                    return observed
+                } catch { terminateLocked(); throw error }
+            }
+        }
+        fileprivate func transfer(verified expected: RawDiskBootTransaction.VerifiedStorageDiskBoot,
+                                  configuration: Wire.Configuration) throws -> (Int32, @Sendable () -> Void) {
+            try gate.withLock {
+                guard !closed, !transferred, !cancelled.withLock({ $0 }), helloConsumed,
+                      expected === verified, configuration.action == .coldOpenTakeover,
+                      configuration.rootPublicKey == root.publicData, let cold = configuration.cold,
+                      cold.isValidSignature(using: root),
+                      let authorization, cold.request.observation == authorization,
+                      let observation, cold.request.predecessor == observation.predecessor else { throw failure() }
+                transferred = true
+                return (descriptor, closeConnection)
+            }
+        }
+        func cancel() { cancelled.withLock { $0 = true } }
+        func close() {
+            cancel()
+            gate.withLock { if !transferred { terminateLocked() } }
+        }
+        private func terminateLocked() {
+            guard !closed, !transferred else { return }; closed = true
+            _ = Darwin.shutdown(descriptor, SHUT_RDWR); Darwin.close(descriptor); closeConnection()
+        }
+        deinit { close() }
+    }
+
     private let verified: RawDiskBootTransaction.VerifiedStorageDiskBoot
     private let configuration: Wire.Configuration
     private let descriptor: Int32
@@ -156,18 +246,28 @@ final class PrivateStorageLifecycleBootCoordinator: @unchecked Sendable {
     // Keep one exact ROOT-signed tuple until an actual result is fully validated.
     private var logicalHandoff: StorageLifecycleHandoffProtocol.SignedRequest?
     private var terminalReplacement: (request: Wire.ReplacementRequest, reply: Wire.Frame)?
+    private let helloConsumed: Bool
     private var attempted = false
     private var closed = false
     private var sequence: UInt64 = 0
 
     init(verified: RawDiskBootTransaction.VerifiedStorageDiskBoot, configuration: Wire.Configuration,
-         descriptor: Int32, closeConnection: @escaping @Sendable () -> Void = {}) throws {
+         descriptor: Int32, closeConnection: @escaping @Sendable () -> Void = {},
+         observedSession: ColdObservationSession? = nil) throws {
         try configuration.validate()
         _ = try verified.validateHeldDisk()
         if configuration.action == .initialize { _ = try verified.freshInitialization() }
         try Self.validateColdLaunch(configuration, verified: verified)
         let root = try StorageIdentity.RootPublicKey(publicData: configuration.rootPublicKey)
         guard configuration.signed.isValidSignature(using: root) else { throw Self.failure() }
+        if let observedSession {
+            let transferred = try observedSession.transfer(verified: verified, configuration: configuration)
+            self.verified = verified; self.configuration = configuration; self.descriptor = transferred.0
+            self.closeConnection = transferred.1; helloConsumed = true
+            return
+        }
+        guard configuration.cold?.request.observation == nil else { throw Self.failure() }
+        helloConsumed = false
         let owned = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
         guard owned >= 0 else { throw Self.failure() }
         var yes: Int32 = 1
@@ -193,10 +293,13 @@ final class PrivateStorageLifecycleBootCoordinator: @unchecked Sendable {
                 if configuration.action == .initialize { _ = try verified.freshInitialization() }
                 try Self.validateColdLaunch(configuration, verified: verified)
                 let io = transport()
-                let hello = try read(io)
-                guard hello.operation == .hello else { throw Self.failure() }
+                if !helloConsumed {
+                    let hello = try read(io)
+                    guard hello.operation == .hello else { throw Self.failure() }
+                }
                 #if CENGINE_COMPAT_LIFECYCLE_FAULT
-                try StorageLifecycleCompatibilityFaultPolicy.beforeConfigure(action: configuration.action)
+                try StorageLifecycleCompatibilityFaultPolicy.beforeConfigure(action: configuration.action,
+                    observed: configuration.cold?.request.observation != nil)
                 #endif
                 try io.write(Wire.encode(.init(operation: .configure, binding: verified.binding, configuration: configuration)))
                 let response = try read(io)

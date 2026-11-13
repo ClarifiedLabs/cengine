@@ -5,6 +5,7 @@ package storageservice
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -140,11 +141,11 @@ func TestSameEReconnectActualRetireAndRejections(t *testing.T) {
 			if serverErr == nil {
 				t.Fatal("missing real rejection")
 			}
-			if kind == "active-conflict" && serverErr != a.ErrConflict {
+			if kind == "active-conflict" && !errors.Is(serverErr, a.ErrConflict) {
 				t.Fatal("not real active conflict", serverErr)
 			}
 			if kind == "retired" || kind == "duplicate" || kind == "wrong-digest" || kind == "foreign-retired" {
-				if serverErr != a.ErrBlocked {
+				if !errors.Is(serverErr, a.ErrBlocked) {
 					t.Fatal("not actual blocked auth", serverErr)
 				}
 			}

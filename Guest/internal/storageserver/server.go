@@ -208,7 +208,9 @@ func (s *Server) Serve(ctx context.Context, authority *a.Authority, raw net.Conn
 		delete(s.peers, p)
 		s.dispatch.Unlock()
 		p.joinRetirement()
-		return p.failure()
+		// A deadline or queue refusal may have failed the peer first. Keep
+		// it inside the concrete observation envelope, not outside that API.
+		return joinHandshakeFailure(err, p.failure())
 	}
 	writerDone := make(chan struct{})
 	go func() { defer close(writerDone); p.writeLoop() }()
@@ -218,11 +220,12 @@ func (s *Server) Serve(ctx context.Context, authority *a.Authority, raw net.Conn
 	case <-p.rootWritten:
 	case <-p.done:
 		<-writerDone
+		err = p.failure()
 		s.dispatch.Lock()
 		delete(s.peers, p)
 		s.dispatch.Unlock()
 		p.joinRetirement()
-		return p.failure()
+		return err
 	}
 	if p.consumer != nil {
 		p.consumer.established = time.Now()
@@ -291,34 +294,42 @@ func (s *Server) Serve(ctx context.Context, authority *a.Authority, raw net.Conn
 	return p.failure()
 }
 
-func (p *peer) handshake(ctx context.Context, authority *a.Authority, observation *tlsFailureReadObserver) error {
+func (p *peer) handshake(ctx context.Context, authority *a.Authority, observation *tlsFailureReadObserver) (err error) {
+	phase := handshakeDeadline
+	defer func() { err = wrapHandshakeFailure(phase, err) }()
 	if err := p.conn.SetDeadline(time.Now().Add(p.server.config.Limits.HandshakeTimeout)); err != nil {
 		return err
 	}
+	phase = handshakeTLS
 	if err := p.conn.HandshakeContext(ctx); err != nil {
 		// Snapshot the actual raw read prefix before fail closes this transport.
 		return observation.failure(err)
 	}
 	defer observation.stop()
+	phase = handshakeTLSState
 	state := p.conn.ConnectionState()
 	if !state.HandshakeComplete || state.Version != tls.VersionTLS13 || state.DidResume || len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
 		return a.ErrUnauthorized
 	}
 	p.consumerLeaf = sha256.Sum256(state.PeerCertificates[0].Raw)
 	hello := w.ServerHello{Epoch: authority.Epoch(), Version: w.Version, Profile: w.RequiredProfile()}
+	phase = handshakeServerHelloWrite
 	if err := w.WriteFrame(p.conn, &hello); err != nil {
 		return err
 	}
+	phase = handshakeClientHelloRead
 	var client w.ClientHello
 	if err := w.ReadFrame(p.conn, &client); err != nil {
 		return err
 	}
+	phase = handshakePeerPolicy
 	if p.server.pki != nil {
 		if err := p.server.pki.verifyPeer(state, client.Authority); err != nil {
 			return observation.peerFailure(state, client.Authority, err)
 		}
 	}
 	observation.stop()
+	phase = handshakeAuthenticate
 	principal, err := authority.AuthenticateData(ctx, p.conn, client.Authority)
 	if p.server.pki != nil {
 		// Passive result boundary: verified current TLS/PKI, before any root grant.
@@ -327,6 +338,7 @@ func (p *peer) handshake(ctx context.Context, authority *a.Authority, observatio
 	if err != nil {
 		return err
 	}
+	phase = handshakeBinding
 	binding, err := principal.Binding()
 	if err != nil {
 		return err
@@ -341,6 +353,7 @@ func (p *peer) handshake(ctx context.Context, authority *a.Authority, observatio
 		// Charged by the existing connection bound; not a timeout increase.
 		p.prepareReceive = make(chan struct{}, 1)
 	}
+	phase = handshakeAdmission
 	// A deadline may race successful authentication: still retire the exact binding.
 	if err = p.failure(); err != nil {
 		p.requestRetirement()
@@ -352,6 +365,7 @@ func (p *peer) handshake(ctx context.Context, authority *a.Authority, observatio
 	}
 	p.server.dispatch.Lock()
 	defer p.server.dispatch.Unlock()
+	phase = handshakeRootFactory
 	exec, root, err := p.server.factory(g, principal, binding)
 	g.Release()
 	if err != nil {
@@ -361,7 +375,8 @@ func (p *peer) handshake(ctx context.Context, authority *a.Authority, observatio
 	if p.consumer != nil {
 		p.consumer.rootNode = root.Node
 	}
-	if err = p.enqueueMessage(&w.RootReply{Root: root}); err != nil {
+	phase = handshakeRootReplyQueue
+	if err = p.enqueueRootReply(root); err != nil {
 		return err
 	}
 	p.server.peers[p] = struct{}{}

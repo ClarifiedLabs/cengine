@@ -143,7 +143,7 @@ class PrepareLifecycleAssetValidatorTests(unittest.TestCase):
             (self.assets / name).write_bytes(name.encode())
         self.pin = module.source_pin(self.root)
         self.metadata = dict(schemaVersion=1, protocolVersion=1, storageServiceBootVersion=2,
-                             workloadStorageBootVersion=1, storageLifecycleVersion=2,
+                             workloadStorageBootVersion=1, storageLifecycleVersion=2, storageColdObservationVersion=1,
                              prepareCompatibilityProfile=FULL, prepareCompatibilitySourceSHA256=self.pin)
         for kind in ("container", "storage"):
             self.metadata[f"{kind}InitramfsSHA256"] = self.digest(f"{kind}-initramfs.cpio.gz")
@@ -209,6 +209,14 @@ class PrepareLifecycleAssetValidatorTests(unittest.TestCase):
                 self.assert_refused(message="storageLifecycleVersion: 2")
         self.publish({key: value for key, value in self.metadata.items() if key != "storageLifecycleVersion"})
         self.assert_refused(message="storageLifecycleVersion: 2")
+
+    def test_cold_observation_requires_explicit_integer_one_without_fallback(self):
+        for version in (None, True, False, "1", 1.0, 0, 2):
+            with self.subTest(version=version):
+                self.publish({**self.metadata, "storageColdObservationVersion": version})
+                self.assert_refused(message="storageColdObservationVersion: 1")
+        self.publish({key: value for key, value in self.metadata.items() if key != "storageColdObservationVersion"})
+        self.assert_refused(message="storageColdObservationVersion: 1")
 
     def test_stale_service_boot_version_is_not_relabelled_as_lifecycle(self):
         for value in (None, 1, True, "2", 2.0, 3):

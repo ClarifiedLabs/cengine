@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "Tests/Compatibility/test_storage_lifecycle_v2_runtime.py"
 FUNCTIONS = {
+    "cold_fault_log_snapshot", "cold_fault_diagnostic", "natural_cold_exit", "failed_cold_configure_proof", "cold_observation_digest", "recovered_observed_cold_proof", "cold_seed_proof",
     "committed_cold_edge", "frozen_committed_cold_proof", "recovered_committed_cold_proof", "committed_cold_births",
     "cold_signed_digest", "cold_predecessor", "frozen_cold_proof", "recovered_cold_proof", "observe_cold_births", "observe_cold_controller", "cold_attempt_births",
     "takeover_observation_shape", "takeover_pause_observation", "frozen_takeover_proof", "recovered_takeover_proof",
@@ -25,8 +26,8 @@ FUNCTIONS = {
     "pending_replacement_artifacts", "frozen_replacement_proof",
     "wait_replacement_pause", "recovered_replacement_proof", "settled_replacement_proof",
 }
-CONSTANTS = {"FIRST_COLD_COMPLETION_FAULT", "FIRST_COLD_COMPLETION_REACHED", "COLD_L2_FAULT", "TAKEOVER_FAULTS", "ROOT", "FAULT_ENV", "FAULT", "FAULT_REACHED", "FAULT_STOPPED", "REPLACEMENT_FAULT", "REPLACEMENT_PAUSED"}
-STDLIB_IMPORTS = {"__future__", "os", "pathlib", "re", "subprocess", "json", "uuid", "time", "hashlib"}
+CONSTANTS = {"FIRST_COLD_APPLY_FAULT", "FIRST_COLD_APPLY_REACHED", "COLD_CONFIGURE_FAULT", "COLD_CONFIGURE_REACHED", "FIRST_COLD_COMPLETION_FAULT", "FIRST_COLD_COMPLETION_REACHED", "COLD_L2_FAULT", "TAKEOVER_FAULTS", "ROOT", "FAULT_ENV", "FAULT", "FAULT_REACHED", "FAULT_STOPPED", "REPLACEMENT_FAULT", "REPLACEMENT_PAUSED"}
+STDLIB_IMPORTS = {"base64", "__future__", "os", "pathlib", "re", "subprocess", "json", "uuid", "time", "hashlib", "stat"}
 
 # Execute the real helpers, constants and imports, not copies or SDK stubs.
 # Never load pytest/Docker imports, decorated fixtures or compatibility tests.
@@ -1460,8 +1461,8 @@ class LifecycleRuntimeTests(unittest.TestCase):
         self.assertIn('daemon.start(on_spawn=observe, qualify_lifecycle_fault=qualify)', code)
         self.assertLess(code.index('_strict_shutdown(daemon)'), code.index('daemon.start('))
         for proof in ('observe_cold_births', 'frozen_committed_cold_proof', 'recovered_committed_cold_proof',
-                      'committed_cold_births', 'storage_target', 'replacement.exact_exit', 'replacement.signal_storage',
-                      'before_signal', 'native_result', 'root_identity', 'manifest', 'disk_identity', 'seed-',
+                      'committed_cold_births', 'storage_target', 'natural_cold_exit',
+                      'root_identity', 'manifest', 'disk_identity', 'seed-',
                       'exchange', 'mount_proof', 'log_offset', '65537', 'volume_id', 'mounts[peer.id]'):
             self.assertIn(proof, code)
         for forbidden in ('kill=True', 'terminate_compatibility_runtime', 'peer.stop(', 'peer.remove(',
@@ -1476,14 +1477,308 @@ class LifecycleRuntimeTests(unittest.TestCase):
         cold = next(n for n in ast.walk(start) if isinstance(n, ast.Assign)
                     and any(isinstance(t, ast.Name) and t.id == 'cold_fault' for t in n.targets)
                     and isinstance(n.value, ast.Compare))
-        self.assertEqual(ast.literal_eval(cold.value.comparators[0]), (R.COLD_L2_FAULT, profile))
+        self.assertEqual(ast.literal_eval(cold.value.comparators[0]), (R.COLD_L2_FAULT, profile, R.COLD_CONFIGURE_FAULT, R.FIRST_COLD_APPLY_FAULT))
         for guard in ('self.binary.resolve() == self.owner_binary', 'compatibility_root_owned_by',
                       'compatibility_root_retained', 'returncode <= 0', 'retained_identity'):
             self.assertIn(guard, ast.unparse(start))
 
+    def qualify_cold_log(self, daemon, outcome, snapshot, *, corrupt_checkpoint=False):
+        # Run the actual nested qualifier, including each outcome's frozen proof.
+        recovery = next(n for n in ast.parse(SOURCE.read_text()).body
+                        if getattr(n, 'name', '') == 'observed_cold_recovery')
+        qualify = copy.deepcopy(next(n for n in ast.walk(recovery)
+                                     if isinstance(n, ast.FunctionDef) and n.name == 'qualify'))
+        qualify.body = [n for n in qualify.body if not isinstance(n, ast.Nonlocal)]
+        before, frozen, _ = self.cold_fixture()
+        if corrupt_checkpoint:
+            frozen['currentService'] = {}
+        namespace = dict(R.__dict__, daemon=daemon, outcome=outcome, log_snapshot=snapshot,
+                         before=before, frozen=None, path=daemon.root / 'state.json', preserved=Mock())
+        exec(compile(ast.Module(body=[qualify], type_ignores=[]), str(SOURCE), 'exec'), namespace)
+        with patch.object(R.replacement, 'read_public', return_value=(frozen, None)):
+            return namespace['qualify'](daemon)
+
+    def cold_log_fixture(self, root):
+        (root / 'infrastructure').mkdir()
+        daemon = SimpleNamespace(root=root, log_path=root / 'daemon.log',
+                                 process=SimpleNamespace(poll=lambda: 71))
+        shim = root / 'infrastructure/shim.log'
+        daemon.log_path.write_bytes(b'old daemon output\n')
+        shim.write_bytes(b'old shim output\n')
+        return daemon, shim
+
+    def test_cold_fault_qualifies_only_new_marker_from_exact_emitter(self):
+        for outcome, marker in (('unchanged', R.COLD_CONFIGURE_REACHED), ('applied', R.FIRST_COLD_APPLY_REACHED)):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp:
+                daemon, shim = self.cold_log_fixture(Path(temp))
+                proper = shim if outcome == 'unchanged' else daemon.log_path
+                # A large retained prefix, including a stale marker and invalid UTF-8,
+                # is not new diagnostic evidence and is never decoded or rewritten.
+                old = b'\xff' * 70000 + b'\n' + marker.encode() + b'\n'
+                proper.write_bytes(old)
+                snapshot = R.cold_fault_log_snapshot(daemon, outcome)
+                self.assertEqual(snapshot[:3], (proper, (proper.stat().st_dev, proper.stat().st_ino), len(old)))
+                new = (marker + '\n').encode()
+                new += b'x' * (65536 - len(new))
+                with proper.open('ab') as log:
+                    log.write(new)
+                self.assertEqual(R.cold_fault_diagnostic(snapshot).encode(), new)
+                self.assertTrue(self.qualify_cold_log(daemon, outcome, snapshot))
+                self.assertEqual(proper.read_bytes(), old + new)
+                # Correct logs cannot replace protected frozen-checkpoint evidence.
+                with self.assertRaises(AssertionError):
+                    self.qualify_cold_log(daemon, outcome, snapshot, corrupt_checkpoint=True)
+
+    def test_cold_fault_rejects_wrong_log_stale_and_duplicate_markers(self):
+        for outcome, marker in (('unchanged', R.COLD_CONFIGURE_REACHED), ('applied', R.FIRST_COLD_APPLY_REACHED)):
+            for scenario in ('wrong-log', 'stale', 'duplicate'):
+                with self.subTest(outcome=outcome, scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                    daemon, shim = self.cold_log_fixture(Path(temp))
+                    proper, wrong = (shim, daemon.log_path) if outcome == 'unchanged' else (daemon.log_path, shim)
+                    line = (marker + '\n').encode()
+                    if scenario == 'stale':
+                        with proper.open('ab') as log:
+                            log.write(line)
+                    snapshot = R.cold_fault_log_snapshot(daemon, outcome)
+                    target = proper if scenario == 'duplicate' else wrong
+                    with target.open('ab') as log:
+                        log.write(line * (2 if scenario == 'duplicate' else 1))
+                    with self.assertRaises(AssertionError):
+                        self.qualify_cold_log(daemon, outcome, snapshot)
+
+    def test_cold_fault_rejects_truncated_replaced_unbounded_and_non_utf8_logs(self):
+        for outcome, marker in (('unchanged', R.COLD_CONFIGURE_REACHED), ('applied', R.FIRST_COLD_APPLY_REACHED)):
+            for mutation in ('truncate', 'truncate-regrow', 'replace', 'missing', 'unbounded', 'utf8'):
+                with self.subTest(outcome=outcome, mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                    daemon, shim = self.cold_log_fixture(Path(temp))
+                    proper = shim if outcome == 'unchanged' else daemon.log_path
+                    old = b'original prefix\n' * 100
+                    proper.write_bytes(old)
+                    snapshot = R.cold_fault_log_snapshot(daemon, outcome)
+                    line = (marker + '\n').encode()
+                    if mutation == 'truncate':
+                        proper.write_bytes(line)
+                    elif mutation == 'truncate-regrow':
+                        proper.write_bytes(b'x' * len(old) + line)
+                    elif mutation == 'replace':
+                        next_log = proper.with_suffix('.next')
+                        next_log.write_bytes(old + line)
+                        next_log.replace(proper)
+                    elif mutation == 'missing':
+                        proper.unlink()
+                    else:
+                        with proper.open('ab') as log:
+                            log.write(line + (b'x' * 65537 if mutation == 'unbounded' else b'\xff'))
+                    with self.assertRaises((AssertionError, FileNotFoundError, UnicodeDecodeError)):
+                        self.qualify_cold_log(daemon, outcome, snapshot)
+
+    def test_cold_fault_snapshot_is_read_only_and_precedes_attempt(self):
+        tree = ast.parse(SOURCE.read_text())
+        recovery = next(n for n in tree.body if getattr(n, 'name', '') == 'observed_cold_recovery')
+        code = ast.unparse(recovery)
+        self.assertLess(code.index('cold_fault_log_snapshot(daemon, outcome)'), code.index('daemon.start('))
+        self.assertIn('diagnostic = cold_fault_diagnostic(log_snapshot)', code)
+        self.assertNotIn('daemon.log_path.open', code)
+        for name in ('cold_fault_log_snapshot', 'cold_fault_diagnostic'):
+            node = next(n for n in tree.body if getattr(n, 'name', '') == name)
+            opens = [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute) and n.func.attr == 'open']
+            self.assertEqual([ast.literal_eval(n.args[0]) for n in opens], ['rb'])
+        with tempfile.TemporaryDirectory() as temp:
+            daemon, shim = self.cold_log_fixture(Path(temp))
+            with self.assertRaises(AssertionError):
+                R.cold_fault_log_snapshot(daemon, 'unknown')
+            shim.unlink()
+            shim.symlink_to(daemon.log_path)
+            with self.assertRaises(AssertionError):
+                R.cold_fault_log_snapshot(daemon, 'unchanged')
+
+    def test_failed_cold_configure_selector_and_frozen_evidence(self):
+        profile = R.COLD_CONFIGURE_FAULT
+        self.assertFalse(R.selected({}, fault=profile))
+        self.assertTrue(R.selected({R.FAULT_ENV: profile}, fault=profile))
+        for other in (R.FAULT, R.COLD_L2_FAULT, R.FIRST_COLD_COMPLETION_FAULT,
+                      R.REPLACEMENT_FAULT, *R.TAKEOVER_FAULTS, profile + " "):
+            with self.subTest(other=other), self.assertRaises(ValueError):
+                R.selected({R.FAULT_ENV: other}, fault=profile)
+        with self.assertRaises(ValueError): R.selected({R.FAULT_ENV: profile})
+        before, frozen, _ = self.cold_fixture()
+        R.failed_cold_configure_proof(before, frozen, R.COLD_CONFIGURE_REACHED)
+        for diagnostic in ("", R.COLD_CONFIGURE_REACHED + " ", "prefix " + R.COLD_CONFIGURE_REACHED,
+                           R.COLD_CONFIGURE_REACHED + "\n" + R.COLD_CONFIGURE_REACHED,
+                           R.COLD_CONFIGURE_REACHED + "\n" + R.FIRST_COLD_COMPLETION_REACHED):
+            with self.subTest(diagnostic=diagnostic), self.assertRaises(AssertionError):
+                R.failed_cold_configure_proof(before, frozen, diagnostic)
+        for field in ("current", "currentContext", "currentService", "latestCold", "resolvedDeadCold"):
+            changed = copy.deepcopy(frozen); changed[field] = {}
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                R.failed_cold_configure_proof(before, changed, R.COLD_CONFIGURE_REACHED)
+
+    def observed_cold_fixture(self, outcome):
+        before, frozen, after = self.cold_fixture()
+        failed = frozen['pendingCold']
+        cold = after['latestCold']
+        cold.pop('deadPredecessor')
+        cold['prepared'].pop('recoveryBridge')
+        cold['completion'].pop('recoveryBridge')
+        cold['predecessor'] = dict(controller=before['current'], context=before['currentContext'])
+        cold['predecessorService'] = before['currentService']
+        old = failed['prepared']['signedOpen']
+        signed = cold['prepared']['signedOpen']
+        opened = signed['request']
+        observer = opened['launch']
+        observation_id = str(R.uuid.uuid4())
+        auth_request = dict(observation_id=observation_id, observer=observer,
+            subject=R.base64.b64encode(R.json.dumps(old, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).decode())
+        authorization = dict(request=auth_request, signature=old['signature'])
+        if outcome == 'unchanged':
+            predecessor = copy.deepcopy(old['request']['predecessor'])
+        else:
+            predecessor = copy.deepcopy(opened['predecessor'])
+        opened['observation'] = authorization
+        opened['predecessor'] = predecessor
+        grant = opened['takeover']['grant']
+        grant['expected_epoch'] = predecessor['controller_epoch']
+        cold['request']['prepare']['expectedPredecessor'] = predecessor
+        cold['request']['prepare']['observationID'] = observation_id
+        greeting = dict(launch=observer, binding=failed['prepared']['successorOrigin']['binding'], rootPublicKey=before['rootPublicKey'])
+        evidence = dict(observationID=observation_id, operationID=old['request']['operation_id'],
+            identity=before['identity'], signedOpenSHA256=R.cold_signed_digest(old), observerGreeting=greeting)
+        history = dict(request=evidence, authorization=authorization,
+            observation=dict(outcome=outcome, predecessor=predecessor, request_sha256=R.cold_observation_digest(auth_request)),
+            anchor=before['currentService'], failedOrigin=failed['prepared']['successorOrigin'], failedBaseEpoch=failed['prepared']['baseEpoch'])
+        cold['observedPredecessor'] = dict(attempted=failed, request=evidence, requestID=str(R.uuid.uuid4()),
+            anchor=cold['predecessor'], anchorService=before['currentService'], history=history)
+        cold['prepared']['observedHistory'] = history
+        cold['completion']['observedHistory'] = history
+        cold['prepared']['baseEpoch'] = cold['completion']['baseEpoch'] = history['failedBaseEpoch']
+        cold['request']['prepare']['expectedAllocatedEpoch'] = history['failedBaseEpoch'] - 1
+        cold['completion']['signedOpenSHA256'] = R.cold_signed_digest(signed)
+        service = after['currentService']
+        service['grant'] = grant
+        service['context']['controller_epoch'] = grant['expected_epoch'] + 1
+        cold['completion']['receipt']['grant'] = grant
+        after['current']['original']['signed'] = opened['takeover']
+        after['current']['directResult'] = cold['completion']['receipt']
+        after['currentContext']['controllerEpoch'] = service['context']['controller_epoch']
+        after['observedWorker']['context'] = after['currentContext']
+        return R.json.loads(R.json.dumps((before, frozen, after)))
+
+    def test_observed_recovery_requires_exact_root_history_and_fresh_completion(self):
+        for outcome in ('unchanged', 'applied'):
+            with self.subTest(outcome=outcome):
+                values = self.observed_cold_fixture(outcome)
+                R.recovered_observed_cold_proof(*values, outcome)
+                # No completion, wrong outcome, changed original bytes/signatures, or cached old result cannot pass.
+                mutations = [
+                    ('latestCold.observedPredecessor.attempted.prepared.signedOpen.signature', 'changed'),
+                    ('latestCold.observedPredecessor.attempted.request.completionRequestID', str(R.uuid.uuid4())),
+                    ('latestCold.completion.observedHistory', None),
+                    ('latestCold.completion.observedHistory.receipt', {}),
+                    ('latestCold.prepared.observedHistory', None),
+                    ('latestCold.observedPredecessor.history', None),
+                    ('latestCold.completion.receipt', {}),
+                    ('latestCold.completion.signedOpenSHA256', '0'*64),
+                    ('latestCold.completion.operationID', values[1]['pendingCold']['request']['prepare']['operationID']),
+                    ('latestCold.completion.baseEpoch', 99),
+                    ('currentContext.controllerEpoch', 99),
+                    ('pendingCold', values[1]['pendingCold']), ('observedCold', {}),
+                ]
+                for path, value in mutations:
+                    rows = copy.deepcopy(values)
+                    row = rows[2]
+                    fields = path.split('.')
+                    for field in fields[:-1]: row = row[field]
+                    row[fields[-1]] = value
+                    with self.subTest(outcome=outcome, path=path), self.assertRaises((AssertionError, KeyError, TypeError)):
+                        R.recovered_observed_cold_proof(*rows, outcome)
+                for field, value in [('outcome', 'applied' if outcome == 'unchanged' else 'unchanged'),
+                                     ('request_sha256', '0'*64), ('predecessor', {})]:
+                    rows = self.observed_cold_fixture(outcome)
+                    cold = rows[2]['latestCold']
+                    for history in (cold['prepared']['observedHistory'], cold['completion']['observedHistory'], cold['observedPredecessor']['history']):
+                        history['observation'][field] = value
+                    with self.subTest(outcome=outcome, history_field=field), self.assertRaises((AssertionError, KeyError)):
+                        R.recovered_observed_cold_proof(*rows, outcome)
+                with self.assertRaises((AssertionError, KeyError)):
+                    R.recovered_observed_cold_proof(values[0], values[1], values[1], outcome)
+
+    def test_cold_seed_requires_saved_bytes_both_directions(self):
+        R.cold_seed_proof(dict(left=b'seed-left', right=b'seed-right'), 'seed')
+        for actual in ({}, dict(left=b'seed-left'), dict(left=b'seed-left', right=b'new-right'),
+                       dict(left=b'seed-right', right=b'seed-left'), dict(left=False, right=b'seed-right')):
+            with self.subTest(actual=actual), self.assertRaises(AssertionError):
+                R.cold_seed_proof(actual, 'seed')
+
+    def test_observed_recovery_profiles_and_wrappers_are_closed(self):
+        for outcome, name, profile in (
+            ('unchanged', 'test_lifecycle_v2_failed_cold_start_reaps_unenrolled_shim', R.COLD_CONFIGURE_FAULT),
+            ('applied', 'test_lifecycle_v2_applied_cold_without_helper_completion_recovers', R.FIRST_COLD_APPLY_FAULT)):
+            self.assertTrue(R.selected({R.FAULT_ENV: profile}, fault=profile))
+            self.assertFalse(R.selected({}, fault=profile))
+            for bad in (profile + ' ', profile.replace('v1', 'v2')):
+                with self.assertRaises(ValueError): R.selected({R.FAULT_ENV: bad}, fault=profile)
+            node = next(n for n in ast.parse(SOURCE.read_text()).body if getattr(n, 'name', '') == name)
+            self.assertIn('outcome=' + repr(outcome), ast.unparse(node))
+        node = next(n for n in ast.parse(SOURCE.read_text()).body if getattr(n, 'name', '') == 'observed_cold_recovery')
+        code = ast.unparse(node)
+        for evidence in ('recovered_observed_cold_proof', 'cold_seed_proof', 'client.ping()', 'mount_proof',
+                         'exchange', 'storage_target', 'committed_cold_births', 'natural_cold_exit', 'observed-cold-recovered-'):
+            self.assertIn(evidence, code)
+        self.assertEqual(code.count('peer.start()'), 1)  # Never manually restart peers after failure.
+        starts = [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                  and isinstance(n.func, ast.Attribute) and n.func.attr == 'start'
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == 'daemon']
+        starts.sort(key=lambda n: n.lineno)
+        self.assertEqual([kw.arg for kw in starts[0].keywords], ['on_spawn', 'qualify_lifecycle_fault'])
+        self.assertEqual(ast.unparse(starts[1]), 'daemon.start(readiness_timeout=240)')
+        self.assertIn('parent_deadline(time.monotonic() + 420)', code)
+        opt_ins = [n for n in ast.walk(ast.parse(SOURCE.read_text())) if isinstance(n, ast.Call)
+                   and any(kw.arg == 'readiness_timeout' for kw in n.keywords)]
+        self.assertEqual([n.lineno for n in opt_ins], [starts[1].lineno])
+        callers = [n.name for n in ast.parse(SOURCE.read_text()).body if isinstance(n, ast.FunctionDef)
+                   and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                           and call.func.id == 'observed_cold_recovery' for call in ast.walk(n))]
+        self.assertEqual(callers, ['test_lifecycle_v2_failed_cold_start_reaps_unenrolled_shim',
+                                  'test_lifecycle_v2_applied_cold_without_helper_completion_recovers'])
+        self.assertIn("('RTM-136',): FIRST_COLD_APPLY_FAULT", ast.unparse(next(n for n in ast.parse(SOURCE.read_text()).body if getattr(n, 'name', '') == 'image_cache')))
+
+    def test_natural_cold_exit_never_masks_orphan_with_signal(self):
+        birth = SimpleNamespace(pid=13, identity=(100, 3, 103), pidversion=3)
+        daemon = SimpleNamespace(owner_binary=Path("/engine"), root=Path("/root"))
+        def wait(probe, predicate, **kwargs):
+            if not predicate(probe()): raise TimeoutError("orphan retained")
+        with patch.object(R, "wait_for_value", side_effect=wait, create=True), \
+                patch.object(R, "_kernel_process", return_value=None, create=True), \
+                patch.object(R, "compatibility_runtime_processes", return_value=[], create=True):
+            R.natural_cold_exit(daemon, [birth])
+            with patch.object(R, "_kernel_process", return_value=birth), self.assertRaises(TimeoutError):
+                R.natural_cold_exit(daemon, [birth])
+            with patch.object(R, "compatibility_runtime_processes", return_value=[birth]), self.assertRaises(AssertionError):
+                R.natural_cold_exit(daemon, [birth])
+        tree = ast.parse(SOURCE.read_text())
+        by_name = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        code = ast.unparse(by_name["observed_cold_recovery"])
+        fixture = ast.unparse(by_name["image_cache"])
+        self.assertIn("('RTM-135',): COLD_CONFIGURE_FAULT", fixture)
+        for proof in ("_strict_shutdown(daemon)", "root_retained", "disk_identity", "manifest", "root_identity",
+                      "observe_cold_births", "reject_api=True", "failed_cold_configure_proof", "storage_target",
+                      "committed_cold_births", "natural_cold_exit", "recovered_observed_cold_proof", "qualify_lifecycle_fault",
+                      "seed-", "mount_proof", "exchange", "process.poll() > 0", "socket.exists()"):
+            self.assertIn(proof, code)
+        for name in ("natural_cold_exit", "observed_cold_recovery", "test_lifecycle_v2_failed_cold_start_reaps_unenrolled_shim",
+                     "test_lifecycle_v2_committed_unenrolled_cold_recovery"):
+            body = ast.unparse(by_name[name])
+            for forbidden in ("SIGKILL", "signal_storage", "before_signal", "kill=True", "terminate_compatibility_runtime",
+                              "write_bytes", "write_text", "unlink", "rmtree"):
+                self.assertNotIn(forbidden, body)
+        self.assertLess(code.index("_strict_shutdown(daemon)"), code.index("daemon.start("))
+        self.assertEqual(code.count("daemon.start("), 2)
+
     def test_cold_signed_digest_matches_native_domain_and_canonical_bytes(self):
         source = (ROOT / 'Sources/CEngineCore/StorageLifecycleColdRootProtocol.swift').read_text()
-        self.assertIn('hash(signedOpen, domain: "signed-open")', source)
+        self.assertIn('public static func signedOpenDigest(_ value: Cold.SignedOpen) throws -> String { try hash(value, domain: "signed-open") }', source)
+        self.assertIn('return try signedOpenDigest(signedOpen)', source)
         self.assertIn('cengine.storage-lifecycle-cold-root.\\(domain).v1\\0', source)
         wire = (ROOT / 'Sources/CEngineCore/StorageLifecycleProtocol.swift').read_text()
         self.assertIn('.sortedKeys', wire)
@@ -1566,6 +1861,13 @@ class LifecycleRuntimeTests(unittest.TestCase):
                     patch.object(R.replacement, 'read_public', return_value=({}, 'stamp')), self.assertRaises(AssertionError):
                 R.observe_cold_births(daemon, old)
 
+    def test_failed_cold_observer_refuses_any_api_socket_before_acceptance(self):
+        daemon = SimpleNamespace(owner_binary=Path("/engine"), root=Path("/root"),
+                                 socket=SimpleNamespace(exists=Mock(return_value=True)))
+        with patch.object(R, "compatibility_runtime_processes", create=True) as census, self.assertRaises(AssertionError):
+            R.observe_cold_births(daemon, [], reject_api=True)
+        census.assert_not_called()
+
     def test_cold_controller_is_observed_outside_scoped_engine_census(self):
         with tempfile.TemporaryDirectory() as temporary:
             binary = Path(temporary) / 'cengine'
@@ -1634,7 +1936,7 @@ class LifecycleRuntimeTests(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "compat":
                 ids.append(ast.literal_eval(node.args[0]))
-        self.assertEqual(sorted(ids), ["RTM-117", "RTM-118", "RTM-119", "RTM-120", "RTM-121", "RTM-122", "RTM-123", "RTM-124", "RTM-125", "RTM-127", "RTM-128", "RTM-129", "RTM-130", "RTM-131", "RTM-132", "RTM-133"])
+        self.assertEqual(sorted(ids), ["RTM-117", "RTM-118", "RTM-119", "RTM-120", "RTM-121", "RTM-122", "RTM-123", "RTM-124", "RTM-125", "RTM-127", "RTM-128", "RTM-129", "RTM-130", "RTM-131", "RTM-132", "RTM-133", "RTM-135", "RTM-136"])
         ledger = (ROOT / "docs/docker-compatibility.md").read_text()
         for case in ids:
             self.assertEqual(ledger.count("| `" + case + "` |"), 1)

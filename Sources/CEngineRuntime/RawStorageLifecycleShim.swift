@@ -311,7 +311,20 @@ struct StorageLifecycleBootPortOwnership {
         clean || forcedExit || neverStarted
     }
     static func eligible(_ policy: RawDiskBootTransaction.Policy) -> Bool {
-        policy == .journalDriven || policy == .resumeReadOnly
+        policy == .journalDriven || policy == .requireInitializedStorage || policy == .resumeReadOnly
+    }
+    enum TerminationDecision { case preserveOwner, beginAbort, terminate }
+    /// Share the actual termination policy with no-VM tests. Detach must decide
+    /// atomically with ROOT enrollment publication, not from an enrollment snapshot.
+    func terminationDecision(policy: RawDiskBootTransaction.Policy, control: StorageLifecycleControlLifetime,
+                             preservingStopReply: Bool = false, privateStopRequested: Bool = false,
+                             vmDidTerminate: Bool = false) -> TerminationDecision {
+        guard !preservingStopReply, !privateStopRequested, task == nil, Self.eligible(policy) else {
+            return .terminate
+        }
+        let retained = control.detach()
+        if !retained { return .beginAbort }
+        return vmDidTerminate ? .terminate : .preserveOwner
     }
     /// Only a failed, unenrolled initializer can retire its executable. This is
     /// eligibility, not stop evidence: the host must still join full teardown.
@@ -351,6 +364,59 @@ struct StorageLifecycleBootPortOwnership {
     }
 }
 
+/// Bounded sync-XPC to async-MainActor bridge. The native worker may wait; the
+/// MainActor never does. Cancellation revokes the exact retained stream, including
+/// a connection arriving after the native deadline.
+final class StorageLifecycleColdObservationBridge: @unchecked Sendable {
+    typealias Observation = StorageLifecycleColdObservationProtocol.Observation
+    private final class Pending: @unchecked Sendable {
+        let ready = DispatchSemaphore(value: 0)
+        let result = Mutex<Result<Observation, any Error>?>(nil)
+    }
+    private let lock = NSLock()
+    private var closed = false
+    private var task: Task<Void, Never>?
+    private var pending: Pending?
+    private var session: PrivateStorageLifecycleBootCoordinator.ColdObservationSession?
+    func install(_ session: PrivateStorageLifecycleBootCoordinator.ColdObservationSession) throws {
+        let accepted = lock.withLock {
+            guard !closed, self.session == nil else { return false }
+            self.session = session; return true
+        }
+        guard accepted else { session.close(); throw CancellationError() }
+    }
+    func read(_ operation: @escaping @Sendable () async throws -> Observation) throws -> Observation {
+        guard !Thread.isMainThread else { throw CancellationError() }
+        let pending = Pending()
+        try lock.withLock {
+            guard !closed, self.pending == nil else { throw CancellationError() }
+            self.pending = pending
+            task = Task {
+                let result: Result<Observation, any Error>
+                do { result = .success(try await operation()) } catch { result = .failure(error) }
+                pending.result.withLock { $0 = result }; pending.ready.signal()
+            }
+        }
+        guard pending.ready.wait(timeout: .now() + 4) == .success else { close(); throw CancellationError() }
+        try lock.withLock {
+            guard !closed else { throw CancellationError() }
+            self.pending = nil; task = nil
+        }
+        guard let result = pending.result.withLock({ $0 }) else { throw CancellationError() }
+        return try result.get()
+    }
+    func close() {
+        let held = lock.withLock {
+            closed = true; task?.cancel(); task = nil
+            pending?.ready.signal(); pending = nil
+            let held = session; session = nil; return held
+        }
+        held?.cancel()
+        if let held { Thread.detachNewThread { held.close() } }
+    }
+    deinit { close() }
+}
+
 /// Owns the storage VM's boot and private service session inside the signed shim.
 /// The shim server retains this owner and its authenticated control channel.
 /// Returned Ready values and greetings are public metadata, not permission to
@@ -380,6 +446,8 @@ struct StorageLifecycleBootPortOwnership {
     private var qualificationServiceProofRevoked = false
     #endif
     private var coordinator: PrivateStorageLifecycleBootCoordinator?
+    private var observationSession: PrivateStorageLifecycleBootCoordinator.ColdObservationSession?
+    private var observationBridge: StorageLifecycleColdObservationBridge?
     private let freshAbort = StorageLifecycleFreshAbort()
     private var bootPort = StorageLifecycleBootPortOwnership()
     private var bootPortAttempt: Task<SendableVirtioSocketConnection, Error>?
@@ -476,10 +544,19 @@ struct StorageLifecycleBootPortOwnership {
             try Task.checkCancellation()
             guard state.phase == .diskStarting else { throw Self.failure() }
             let disk = try await machine.startStorageLifecycleDisk(bootstrap: bootstrap, mode: purpose == .cold ? .open : .resumeReadOnly)
+            self.disk = disk
+            let bridge = StorageLifecycleColdObservationBridge()
+            observationBridge = bridge
             let root = root, binding = binding, revocation = revocation, control = controlLifetime
-            let responder = try await Self.worker {
+            let responder = try await Self.worker { [weak self] in
                 let responder = try StorageLifecycleColdShim(capability: disk, binding: binding,
-                    pinnedRoot: root, parentBorrowedFD: parent.fileDescriptor, policy: policy, purpose: purpose)
+                    pinnedRoot: root, parentBorrowedFD: parent.fileDescriptor, policy: policy, purpose: purpose,
+                    readGuest: { [weak self] authorization in
+                        try bridge.read { [weak self] in
+                            guard let self else { throw CancellationError() }
+                            return try await self.observeCold(authorization, bridge: bridge)
+                        }
+                    }, closeObserver: { bridge.close() })
                 try revocation.hold(.cold) { responder.close() }
                 try control.hold(.cold) { responder.close() }
                 try responder.start()
@@ -528,13 +605,19 @@ struct StorageLifecycleBootPortOwnership {
                 guard cold != nil else { throw Self.failure() }
                 try Self.validateLifecycleCold(configuration, disk: disk, root: root, binding: binding)
             }
-            let connection = try await connectBootPort()
-            let held = SendableVirtioSocketConnection(connection)
             let coordinator: PrivateStorageLifecycleBootCoordinator
-            do {
+            if let observationSession {
                 coordinator = try PrivateStorageLifecycleBootCoordinator(verified: disk, configuration: configuration,
-                    descriptor: connection.fileDescriptor, closeConnection: { held.connection.close() })
-            } catch { connection.close(); throw error }
+                    descriptor: -1, observedSession: observationSession)
+                self.observationSession = nil // Ownership transferred, never reconnect.
+            } else {
+                let connection = try await connectBootPort()
+                let held = SendableVirtioSocketConnection(connection)
+                do {
+                    coordinator = try PrivateStorageLifecycleBootCoordinator(verified: disk, configuration: configuration,
+                        descriptor: connection.fileDescriptor, closeConnection: { held.connection.close() })
+                } catch { connection.close(); throw error }
+            }
             self.coordinator = coordinator
             // PID1 owns DATA through this private session. It is not daemon control.
             let verified = try await Self.worker { try coordinator.bootstrap() }
@@ -785,25 +868,26 @@ struct StorageLifecycleBootPortOwnership {
         let preserve = preservingStopReply || stopReply.preservesReply
         // ROOT ACK, not the daemon's later reply ACK, is the cutoff. detach is
         // atomic with ROOT publication; stale initial-generation callbacks preserve.
-        if !preserve, !privateStopRequested, freshAbort.task == nil,
-           StorageLifecycleFreshAbort.eligible(bootstrap.policy) {
-            let retained = controlLifetime.detach()
-            if retained && !vmDidTerminate { return }
-            if !retained {
-                let neverStarted = machine.beginFreshStorageAbort()
-                freshAbort.begin(exit: machine.storageLifecycleExit, neverStarted: neverStarted, close: { [self] deadline in
-                    await closeFreshStorageBoot(deadline: deadline)
-                }, fallback: { [self] in
-                    // A fallback is never a clean receipt, even after a late callback.
-                    try? await machine.stopAfterFreshStorageAbort()
-                })
-            }
+        switch freshAbort.terminationDecision(policy: bootstrap.policy, control: controlLifetime,
+                                              preservingStopReply: preserve, privateStopRequested: privateStopRequested,
+                                              vmDidTerminate: vmDidTerminate) {
+        case .preserveOwner: return
+        case .beginAbort:
+            let neverStarted = machine.beginFreshStorageAbort()
+            freshAbort.begin(exit: machine.storageLifecycleExit, neverStarted: neverStarted, close: { [self] deadline in
+                await closeFreshStorageBoot(deadline: deadline)
+            }, fallback: { [self] in
+                // A fallback is never a clean receipt, even after a late callback.
+                try? await machine.stopAfterFreshStorageAbort()
+            })
+        case .terminate: break
         }
         controlLifetime.terminate(revokeTransport: !preserve)
         state.terminate()
         // Adoption retains native socket authentication solely for this terminal
         // response. Closed coordinator/terminal control cannot prove service/attach.
         if !preserve { revocation.close(); adoption?.close() }
+        observationBridge?.close()
         fresh?.close(); cold?.close(); service?.close(); coordinator?.close()
         for stream in streams.removeAll() {
             StorageLifecycleShimRevocation.revokeStream(stream.connection.fileDescriptor)
@@ -835,6 +919,7 @@ struct StorageLifecycleBootPortOwnership {
     }
 
     private func closeFreshStorageBoot(deadline: TimeInterval) async {
+        observationBridge?.close()
         coordinator?.close() // Exact existing 4106; no new wire command or ACPI.
         if let attempt = bootPortAttempt {
             if let connection = try? await attempt.value { connection.connection.close() }
@@ -862,11 +947,40 @@ struct StorageLifecycleBootPortOwnership {
         terminate(preservingStopReply: true)
         try await machine.forceStop()
     }
-    private func connectBootPort() async throws -> VZVirtioSocketConnection {
+    private func observeCold(_ authorization: StorageLifecycleColdObservationProtocol.SignedRequest,
+                             bridge: StorageLifecycleColdObservationBridge) async throws -> StorageLifecycleColdObservationProtocol.Observation {
+        guard state.phase == .diskStarting || state.phase == .diskReady, let disk,
+              authorization.isValidSignature(using: root) else { throw Self.failure() }
+        try Task.checkCancellation()
+        if observationSession == nil {
+            let connection = try await connectBootPort(observing: true)
+            let held = SendableVirtioSocketConnection(connection), root = root
+            let session: PrivateStorageLifecycleBootCoordinator.ColdObservationSession
+            do {
+                session = try await Self.worker {
+                    try PrivateStorageLifecycleBootCoordinator.ColdObservationSession(verified: disk, root: root,
+                        descriptor: held.connection.fileDescriptor, closeConnection: { held.connection.close() })
+                }
+            } catch { connection.close(); throw error }
+            // Session now owns both its duplicate and the VZ connection close.
+            // install closes it on a late/cancelled connection; never close twice.
+            try bridge.install(session)
+            observationSession = session
+            try Task.checkCancellation()
+        }
+        guard let session = observationSession else { throw Self.failure() }
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        return try await Self.worker { try session.observe(authorization, deadline: deadline) }
+    }
+
+    private func connectBootPort(observing: Bool = false) async throws -> VZVirtioSocketConnection {
+        let permitsConnection = { [self] in
+            observing ? (state.phase == .diskStarting || state.phase == .diskReady) : state.phase == .serviceStarting
+        }
         var lastError: (any Error)?
         for attempt in 0..<100 {
             try Task.checkCancellation()
-            guard state.phase == .serviceStarting else { throw Self.failure() }
+            guard permitsConnection() else { throw Self.failure() }
             guard !bootPort.consumed else { throw Self.failure() }
             let machine = machine
             let pending = Task { @MainActor in
@@ -886,7 +1000,7 @@ struct StorageLifecycleBootPortOwnership {
                 let held = try await pending.value
                 bootPort.connectedOrUncertain() // BEFORE coordinator construction, including its failures.
                 bootPortAttempt = nil
-                guard state.phase == .serviceStarting else { held.connection.close(); throw Self.failure() }
+                guard permitsConnection(), !Task.isCancelled else { held.connection.close(); throw Self.failure() }
                 return held.connection
             } catch {
                 bootPortAttempt = nil

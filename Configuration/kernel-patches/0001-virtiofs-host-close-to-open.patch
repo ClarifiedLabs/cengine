@@ -1,7 +1,7 @@
 From: cengine maintainers
 Subject: [PATCH] virtiofs: opt in to host-bind close-to-open revalidation
 
-Based on Linux 6.18.44, commit 1efe5d048a391de3ead2804b2e7f86376c356cc5.
+Based on Linux 6.18.63, commit 1cdda838e8475edf89b73ff0cc952005dd0b1fa7.
 Downstream cengine change; not an upstream Linux backport.
 SPDX-License-Identifier: GPL-2.0-only
 

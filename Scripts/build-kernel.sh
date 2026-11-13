@@ -40,6 +40,11 @@ printf '%s\n' cengine-kernel-build-v1 > "$work/source/.cengine-disposable-kernel
 "$ROOT/Scripts/apply-kernel-patches.sh" "$work/source"
 rm "$work/source/.cengine-disposable-kernel"
 
+# The builder can replace kernel bytes. Invalidate paired assets and prior
+# origin claims before it starts, but preserve old output on patch rejection.
+rm -f "$OUTPUT/disk-bootstrap.json" "$OUTPUT/SHA256SUMS" \
+    "$OUTPUT/kernel-origin.json" "$OUTPUT/kernel-input.sha256"
+
 case "$HOST_OS" in
     Linux|Darwin)
         KERNEL_SOURCE="$work/source" \
@@ -58,6 +63,8 @@ test "$("$ROOT/Scripts/kernel-input-sha256.sh")" = "$EXPECTED_INPUT" || {
     echo "kernel inputs changed during build; refusing to stamp output" >&2
     exit 2
 }
+python3 "$ROOT/Scripts/guest_asset_provenance.py" record-kernel \
+    "$ROOT" "$OUTPUT/vmlinux" "$OUTPUT/kernel-origin.json" local
 printf '%s\n' "$EXPECTED_INPUT" > "$OUTPUT/kernel-input.sha256.next"
 mv "$OUTPUT/kernel-input.sha256.next" "$OUTPUT/kernel-input.sha256"
 echo "Built pinned Linux $VERSION ($COMMIT) at $OUTPUT/vmlinux"

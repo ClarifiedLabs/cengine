@@ -140,6 +140,8 @@ final class StorageBootstrapLifecycleXPC: @unchecked Sendable {
         switch request.body {
         case .status(let identity): return try .status(authority.statusCold(identity: identity))
         case .prepare(let prepare): return try .prepared(authority.prepareCold(prepare, daemon: daemon))
+        case .observe(let value):
+            return try .observed(authority.observeCold(value, daemon: daemon, check: cold.checkRecoveryRequest))
         case .resolveDead(let value):
             return try .resolvedDead(authority.resolveDeadCold(value, check: cold.checkRecoveryRequest))
         case .complete(let id, let digest):

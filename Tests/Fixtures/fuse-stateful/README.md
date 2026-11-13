@@ -7,15 +7,14 @@ does not establish cross-VM or full filesystem conformance.
 
 ## Required kernel and build
 
-Use Linux **6.18.44**, commit
-`1efe5d048a391de3ead2804b2e7f86376c356cc5`, with
+Use Linux **6.18.63**, commit
+`1cdda838e8475edf89b73ff0cc952005dd0b1fa7`, with
 `Configuration/kernel-patches/0001-virtiofs-host-close-to-open.patch` **then**
 `Configuration/kernel-patches/0002-fuse-request-credentials-experimental.patch`.
-`series` contains **0001 only**; managed kernels apply 0002 separately afterward.
-Its historical `experimental` filename is not an activation status. Ordinary
-`make kernel-build` does not include it. Local signed production sole-v2 works
-with a local managed kernel; canonical release publication is a separate,
-unverified boundary. See the
+Both patches are in the **default product series**; `make kernel-build` applies
+them in that order. Do not apply 0002 a second time. Its historical `experimental`
+filename does not make it optional. Local runtime verification and canonical
+release publication remain separate boundaries. See the
 [kernel build and ABI contracts](../../../Configuration/kernel-patches/README.md).
 Build against **that patched** `include/uapi/linux/fuse.h` (prefer the generated
 `out/usr/include` tree). No copied private ABI definitions or stock fallback.
@@ -24,7 +23,7 @@ From the repository root, on a Linux build host:
 
 ```sh
 sh Tests/Fixtures/fuse-stateful/build.sh \
-  /path/to/experimental-kernel/out/usr/include \
+  /path/to/managed-kernel/out/usr/include \
   Tests/Fixtures/fuse-stateful/probe-linux
 ```
 
@@ -57,7 +56,7 @@ Example using a cached patched source, without mutating it:
 uapi=$(mktemp -d Tests/Fixtures/fuse-stateful/probe-uapi.XXXXXX)
 trap 'rm -rf "$uapi"' EXIT
 mkdir "$uapi/linux"
-cp /path/to/experimental-kernel/source/include/uapi/linux/fuse.h "$uapi/linux/fuse.h"
+cp /path/to/managed-kernel/source/include/uapi/linux/fuse.h "$uapi/linux/fuse.h"
 for target in aarch64-linux-musl x86_64-linux-musl; do
   ZIG_TARGET="$target" sh Tests/Fixtures/fuse-stateful/build.sh "$uapi" \
     "Tests/Fixtures/fuse-stateful/probe-$target"

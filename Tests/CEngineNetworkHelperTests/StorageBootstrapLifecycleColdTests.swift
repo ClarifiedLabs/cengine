@@ -39,6 +39,9 @@ private final class ColdJournal: StorageLifecycleJournal, StorageLifecycleAdopti
     func signColdOpen(_ request: StorageLifecycleColdProtocol.Request) throws -> StorageLifecycleColdProtocol.SignedOpen {
         signs += 1; return try .init(request: request, signature: key.signature(for: request.signingBytes))
     }
+    func signColdObservation(_ request: StorageLifecycleColdObservationProtocol.Request) throws -> StorageLifecycleColdObservationProtocol.SignedRequest {
+        signs += 1; return try .init(request: request, signature: key.signature(for: request.signingBytes))
+    }
     func signServiceChange(_ request: L.ServiceChangeRequest) throws -> L.SignedServiceChange {
         try .init(request: request, signature: key.signature(for: request.signingBytes))
     }
@@ -51,6 +54,24 @@ private final class ColdChecks: StorageLifecycleProcessChecking, StorageLifecycl
     var revision: UInt64 = 1
     var lives: [Int32: BootstrapLiveness] = [:]
     var nonces: [Data] = []
+    var observationCalls = 0
+    var observationAllowed = true
+    var observationApplied = false
+    var beforeObservation: (() throws -> Void)?
+    func observe(request: C.Observe, authorization: StorageLifecycleColdObservationProtocol.SignedRequest,
+                 daemon: BootstrapProcess) throws -> StorageLifecycleColdObservationProtocol.Observation {
+        observationCalls += 1; try beforeObservation?()
+        guard observationAllowed else { throw BootstrapFailure(.unavailable) }
+        let old = try authorization.request.subjectOpen().request
+        let predecessor: StorageLifecycleColdProtocol.Predecessor
+        if observationApplied {
+            predecessor = try .init(currentGrant: old.takeover.grant, serviceEpoch: service,
+                controllerEpoch: old.predecessor.controllerEpoch + 1, controllerKey: old.takeover.grant.newKey,
+                openRevision: revision, bootstrapKey: old.predecessor.bootstrapKey)
+        } else { predecessor = old.predecessor }
+        return try .init(requestSHA256: authorization.request.digest,
+            outcome: observationApplied ? .applied : .unchanged, predecessor: predecessor)
+    }
     var mountedCalls = 0
     var mountedAllowed = true
     var mountedPID: Int32 = 22
@@ -228,6 +249,26 @@ private final class ColdFixture {
             expectedOrigin: completion.successorOrigin, expectedAllocatedEpoch: completion.baseEpoch,
             candidate: candidate, mountedGreeting: greeting, nowUnixSeconds: 101, lifetimeSeconds: 100)
     }
+    func observer(_ prepared: C.Prepared) throws -> C.Observe {
+        let old = request.mountedGreeting, oldLaunch = old.launch
+        let launch = try StorageLifecycleColdProtocol.Launch(shimLaunchUUID: uuid(), specSHA256: oldLaunch.specSHA256,
+            initramfsSHA256: oldLaunch.initramfsSHA256, ext4UUID: oldLaunch.ext4UUID, bytes: oldLaunch.bytes)
+        let greeting = try StorageLifecycleColdShimProtocol.Greeting(channelID: uuid(), daemonUniqueID: 30,
+            rootPublicKey: old.rootPublicKey, binding: old.binding,
+            bootBinding: .init(shimLaunchUUID: launch.shimLaunchUUID, guestBootNonce: uuid(), ext4UUID: launch.ext4UUID, bytes: launch.bytes),
+            launch: launch, heldBackingIdentity: old.heldBackingIdentity)
+        return try .init(observationID: uuid(), identity: grant.identity, operationID: request.operationID,
+            signedOpenSHA256: prepared.signedOpenSHA256, observerGreeting: greeting)
+    }
+    func observedPrepare(_ history: StorageLifecycleColdObservationProtocol.History) throws -> C.Prepare {
+        let candidate = try StorageIdentity.Candidate(publicKey: .init(rawPublicKey: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation),
+            childPIDHint: 31, incarnationID: .init(uuid()))
+        return try .init(operationID: uuid(), identity: grant.identity, expectedPredecessor: history.predecessor,
+            expectedOrigin: request.expectedOrigin, expectedAllocatedEpoch: request.expectedAllocatedEpoch,
+            candidate: candidate, mountedGreeting: history.request.observerGreeting, nowUnixSeconds: 102, lifetimeSeconds: 100,
+            observationID: history.request.observationID)
+    }
+    func killFailed() { for pid: Int32 in [20, 21, 22] { checks.lives[pid] = .exited } }
     func reload() throws {
         authority = try .init(journal: journal, processes: checks, bindings: checks)
         adoption = try .init(journal: adoptionJournal, processes: checks)
@@ -236,6 +277,316 @@ private final class ColdFixture {
 }
 
 @Suite struct StorageBootstrapLifecycleColdTests {
+    @Test(arguments: [false, true]) func observedRecoveryUsesConcretePredecessorAndOriginalAnchor(_ applied: Bool) throws {
+        let f = try ColdFixture(), failed = try f.prepare()
+        if applied { f.open(); f.checks.observationApplied = true }
+        f.killFailed()
+        #expect(try f.authority.statusCold(identity: f.grant.identity).eligibility == .observationRequired)
+        #expect(throws: (any Error).self) { try f.authority.resolveDeadCold(f.resolution(failed)) }
+        let observation = try f.observer(failed), before = f.adoptionJournal.bytes
+        let history = try f.authority.observeCold(observation, daemon: process(30))
+        #expect(history.authorization.request.subject == (try L.encode(failed.signedOpen)))
+        #expect(history.observation.outcome == (applied ? .applied : .unchanged))
+        #expect(f.adoptionJournal.bytes == before)
+        #expect(try f.authority.statusCold(identity: f.grant.identity).predecessor == history.predecessor)
+        let signs = f.journal.signs
+        try f.reload()
+        #expect(try f.authority.observeCold(observation, daemon: process(30)) == history)
+        #expect(f.journal.signs == signs)
+        let request = try f.observedPrepare(history)
+        f.checks.mountedPID = 32
+        let prepared = try f.authority.prepareCold(request, daemon: process(30))
+        #expect(prepared.observedHistory == history && prepared.recoveryBridge == nil)
+        #expect(prepared.signedOpen.request.takeover.grant.serial > failed.signedOpen.request.takeover.grant.serial)
+        #expect(prepared.signedOpen.request.takeover.grant.expectedEpoch == history.predecessor.controllerEpoch)
+        #expect(prepared.baseEpoch == failed.baseEpoch) // No abandoned enrollment allocation.
+        f.checks.service = uuid(); f.checks.revision = applied ? 3 : 2
+        f.checks.ca = String(repeating: "3", count: 64); f.checks.server = String(repeating: "4", count: 64)
+        let completed = try f.authority.completeCold(operationID: request.operationID,
+            signedOpenSHA256: prepared.signedOpenSHA256, daemon: process(30))
+        #expect(completed.observedHistory == history)
+        #expect(try f.adoption.status(store: f.disk.storeID.rawValue).origin == completed.successorOrigin)
+        #expect(completed.successor.context.controllerEpoch == history.predecessor.controllerEpoch + 1)
+        try f.reload()
+        #expect(throws: (any Error).self) { try f.authority.guardColdPublication(store: f.disk.storeID.rawValue) }
+        let (origin, principal, epoch, _) = try f.authority.coldOriginPrincipal(binding: f.disk)
+        let seed = try StorageLifecycleColdShimProtocol.ColdEnrollmentSeed(operationID: request.operationID,
+            signedOpenSHA256: prepared.signedOpenSHA256, successorOrigin: origin.wire, baseEpoch: epoch)
+        try f.authority.completeColdEnrollment(seed: seed, origin: origin, nativePrincipal: principal)
+        try f.authority.guardColdPublication(store: f.disk.storeID.rawValue)
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func observedRecoveryCapacityKeepsProtectedStoreAndWireBudgetsSeparate(_ applied: Bool, _ adoptedBeforeCold: Bool) throws {
+        let f = try ColdFixture(adoptedBeforeCold: adoptedBeforeCold), failed = try f.prepare()
+        if applied { f.open(); f.checks.observationApplied = true }
+        f.killFailed()
+        func storeBytes() throws -> Int {
+            let bytes = try #require(f.journal.bytes)
+            let state = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            let stores = try #require(state["stores"] as? [String: Any])
+            return try JSONSerialization.data(withJSONObject: #require(stores[f.grant.identity.store]),
+                options: [.sortedKeys, .withoutEscapingSlashes]).count
+        }
+        var peakStoreBytes = try storeBytes()
+        f.journal.afterWrite = { peakStoreBytes = max(peakStoreBytes, try storeBytes()) }
+        defer { f.journal.afterWrite = nil }
+        func roundTrip(_ request: C.Request, _ body: C.ResultBody) throws {
+            #expect(try C.decodeRequest(C.encode(request)) == request)
+            let reply = try C.Reply(for: request, body: body)
+            let bytes = try C.encode(reply)
+            #expect(C.maximumPayloadBytes == 64 * 1024)
+            #expect(bytes.count <= 64 * 1024)
+            #expect(try C.decodeReply(bytes, for: request) == reply)
+            print("observed capacity applied=\(applied) adopted=\(adoptedBeforeCold) \(reply.operation) wire=\(bytes.count)")
+        }
+        let observe = try f.observer(failed)
+        let history = try f.authority.observeCold(observe, daemon: process(30))
+        try roundTrip(C.Request(requestID: .init(uuid()), body: .observe(observe)), .observed(history))
+        let request = try f.observedPrepare(history)
+        f.checks.mountedPID = 32
+        let prepared = try f.authority.prepareCold(request, daemon: process(30))
+        try roundTrip(C.Request(requestID: .init(uuid()), body: .prepare(request)), .prepared(prepared))
+        try f.reload()
+        f.checks.service = uuid(); f.checks.revision = applied ? 3 : 2
+        f.checks.ca = String(repeating: "3", count: 64); f.checks.server = String(repeating: "4", count: 64)
+        let completed = try f.authority.completeCold(operationID: request.operationID,
+            signedOpenSHA256: prepared.signedOpenSHA256, daemon: process(30))
+        try roundTrip(C.Request(requestID: .init(uuid()), body: .complete(operationID: request.operationID,
+            signedOpenSHA256: prepared.signedOpenSHA256)), .completed(completed))
+        // L2 retains both the failed attempt and genuine successor. It exceeds
+        // the transport budget, but fits the independent protected-store budget
+        // including its completion reservation. L3 retires the paired history.
+        #expect(peakStoreBytes > 64 * 1024)
+        #expect(peakStoreBytes <= (192 - 16) * 1024)
+        #expect(try storeBytes() < peakStoreBytes)
+        print("observed capacity applied=\(applied) adopted=\(adoptedBeforeCold) protected peak=\(peakStoreBytes)")
+        try f.reload()
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func observedSuccessorWriteCutsPreserveOriginalAnchor(_ applied: Bool, _ after: Bool) throws {
+        // Unlike O1/O2 cuts, these cross both journals with the frozen attempt retained.
+        for cut in 0..<4 { // L1, L2, A1, L3
+            let f = try ColdFixture(), failed = try f.prepare()
+            if applied { f.open(); f.checks.observationApplied = true }
+            f.killFailed()
+            let history = try f.authority.observeCold(f.observer(failed), daemon: process(30))
+            let request = try f.observedPrepare(history)
+            let oldAdoption = f.adoptionJournal.bytes
+            f.checks.mountedPID = 32
+            var prepared: C.Prepared?
+            if cut > 0 { prepared = try f.authority.prepareCold(request, daemon: process(30)) }
+            let target = cut == 2 ? f.adoptionJournal : f.journal
+            let failAt = target.writes + (cut == 3 ? 2 : 1)
+            if after { target.afterWrite = { if target.writes == failAt { throw BootstrapFailure(.unavailable) } } }
+            else { target.failAt = failAt }
+            if cut == 0 {
+                #expect(throws: (any Error).self) { try f.authority.prepareCold(request, daemon: process(30)) }
+            } else {
+                f.checks.service = uuid(); f.checks.revision = applied ? 3 : 2
+                f.checks.ca = String(repeating: "3", count: 64); f.checks.server = String(repeating: "4", count: 64)
+                #expect(throws: (any Error).self) {
+                    try f.authority.completeCold(operationID: request.operationID,
+                        signedOpenSHA256: prepared!.signedOpenSHA256, daemon: process(30))
+                }
+            }
+            target.failAt = nil; target.afterWrite = nil
+            let bytes = try #require(f.journal.bytes)
+            let state = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+            let stores = try #require(state["stores"] as? [String: [String: Any]])
+            let store = try #require(stores[f.disk.storeID.rawValue])
+            let published = cut == 3 && after
+            #expect((store["observedCold"] == nil) == published)
+            if !published {
+                let current = try #require(store["current"] as? [String: Any])
+                let grant = try #require(current["grant"] as? [String: Any])
+                #expect(grant["id"] as? String == f.grant.id) // Never publish the abandoned controller.
+            }
+            let transaction = try #require(store[published ? "latestCold" : "pendingCold"] as? [String: Any])
+            var durablePrepared: C.Prepared?
+            if cut != 0 || after {
+                durablePrepared = try JSONDecoder().decode(C.Prepared.self,
+                    from: JSONSerialization.data(withJSONObject: #require(transaction["prepared"])))
+            }
+            var durableCompletion: C.Completed?
+            if let value = transaction["completion"], !(value is NSNull) {
+                durableCompletion = try JSONDecoder().decode(C.Completed.self,
+                    from: JSONSerialization.data(withJSONObject: value))
+            }
+            if cut < 2 || (cut == 2 && !after) { #expect(f.adoptionJournal.bytes == oldAdoption) }
+            let signs = f.journal.signs
+            try f.reload()
+            #expect(throws: (any Error).self) { try f.authority.guardColdPublication(store: f.disk.storeID.rawValue) }
+            let retry = try f.authority.prepareCold(request, daemon: process(30))
+            if let durablePrepared {
+                #expect(retry == durablePrepared)
+                #expect(f.journal.signs == signs) // A lost L1 reply must not re-sign either envelope.
+            }
+            #expect(retry.observedHistory == history && retry.baseEpoch == failed.baseEpoch)
+            #expect(retry.signedOpen.request.takeover.grant.serial > failed.signedOpen.request.takeover.grant.serial)
+            #expect(retry.signedOpen.request.takeover.grant.expectedEpoch == history.predecessor.controllerEpoch)
+            if cut == 0 {
+                f.checks.service = uuid(); f.checks.revision = applied ? 3 : 2
+                f.checks.ca = String(repeating: "3", count: 64); f.checks.server = String(repeating: "4", count: 64)
+            }
+            let completed = try f.authority.completeCold(operationID: request.operationID,
+                signedOpenSHA256: retry.signedOpenSHA256, daemon: process(30))
+            if let durableCompletion {
+                #expect(completed.successor == durableCompletion.successor)
+                #expect(completed.receipt.grant == durableCompletion.receipt.grant)
+                #expect(completed.receipt.nonce != durableCompletion.receipt.nonce) // Fresh proof, same result.
+            }
+            #expect(completed.observedHistory == history)
+            let adopted = try f.adoption.status(store: f.disk.storeID.rawValue)
+            #expect(adopted.origin == completed.successorOrigin && adopted.baseEpoch == failed.baseEpoch)
+            #expect(throws: (any Error).self) { try f.authority.prepareCold(f.request, daemon: f.daemon) }
+            try f.reload()
+            #expect(throws: (any Error).self) { try f.authority.guardColdPublication(store: f.disk.storeID.rawValue) }
+            let (origin, principal, epoch, _) = try f.authority.coldOriginPrincipal(binding: f.disk)
+            let seed = try StorageLifecycleColdShimProtocol.ColdEnrollmentSeed(operationID: request.operationID,
+                signedOpenSHA256: retry.signedOpenSHA256, successorOrigin: origin.wire, baseEpoch: epoch)
+            try f.authority.completeColdEnrollment(seed: seed, origin: origin, nativePrincipal: principal)
+            try f.authority.guardColdPublication(store: f.disk.storeID.rawValue)
+            #expect(try f.authority.adoptedService(identity: f.grant.identity) == completed.successor)
+        }
+    }
+
+    @Test(arguments: ["frozen-attempt", "history-base-epoch", "observer-correlation", "request-correlation",
+                      "successor-history", "base-epoch", "serial", "controller-epoch"])
+    func observedProtectedStateCorruptionRefusesLoadWithoutRewriting(_ corruption: String) throws {
+        let f = try ColdFixture(), failed = try f.prepare()
+        f.open(); f.checks.observationApplied = true; f.killFailed()
+        let history = try f.authority.observeCold(f.observer(failed), daemon: process(30))
+        if ["successor-history", "base-epoch", "serial", "controller-epoch"].contains(corruption) {
+            f.checks.mountedPID = 32
+            _ = try f.authority.prepareCold(f.observedPrepare(history), daemon: process(30))
+        }
+        try f.reload() // The starting protected snapshot is valid, not already fenced by corruption.
+        let original = try #require(f.journal.bytes)
+        var state = try #require(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        func replace(_ object: inout [String: Any], path: ArraySlice<String>, with value: Any) throws {
+            let key = try #require(path.first)
+            _ = try #require(object[key]) // Never silently add an ignored JSON field.
+            if path.count == 1 { object[key] = value; return }
+            var child = try #require(object[key] as? [String: Any])
+            try replace(&child, path: path.dropFirst(), with: value)
+            object[key] = child
+        }
+        let prefix = ["stores", f.disk.storeID.rawValue]
+        var path: [String], value: Any
+        switch corruption {
+        case "frozen-attempt":
+            // A valid candidate incarnation substitution must still fail exact frozen/pending equality.
+            path = prefix + ["observedCold", "failed", "request", "candidate", "incarnation"]; value = uuid()
+        case "history-base-epoch":
+            path = prefix + ["observedCold", "history", "failedBaseEpoch"]; value = failed.baseEpoch + 1
+        case "observer-correlation":
+            path = prefix + ["observedCold", "request", "observerGreeting"]
+            value = try JSONSerialization.jsonObject(with: L.encode(f.observer(failed).observerGreeting))
+        case "request-correlation":
+            path = prefix + ["observedCold", "request", "observationID"]; value = uuid()
+        case "successor-history":
+            path = prefix + ["pendingCold", "prepared", "observedHistory", "failedBaseEpoch"]; value = failed.baseEpoch + 1
+        case "base-epoch":
+            // No allocation for the abandoned launch: successor must use equality, not +1.
+            path = prefix + ["pendingCold", "prepared", "baseEpoch"]; value = failed.baseEpoch + 1
+        case "serial":
+            path = ["serial"]; value = failed.signedOpen.request.takeover.grant.serial
+        default:
+            // Structurally valid old C1 cannot replace the applied observation's concrete C2.
+            path = prefix + ["pendingCold", "request", "expectedPredecessor"]
+            value = try JSONSerialization.jsonObject(with: L.encode(failed.signedOpen.request.predecessor))
+        }
+        try replace(&state, path: path[...], with: value)
+        f.journal.bytes = try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys, .withoutEscapingSlashes])
+        let bytes = f.journal.bytes, adoptionBytes = f.adoptionJournal.bytes
+        let writes = f.journal.writes, adoptionWrites = f.adoptionJournal.writes, signs = f.journal.signs
+        let observations = f.checks.observationCalls, mounts = f.checks.mountedCalls
+        #expect(throws: (any Error).self) { try f.reload() }
+        #expect(f.journal.bytes == bytes && f.journal.writes == writes && f.journal.signs == signs)
+        #expect(f.adoptionJournal.bytes == adoptionBytes && f.adoptionJournal.writes == adoptionWrites)
+        #expect(f.checks.observationCalls == observations && f.checks.mountedCalls == mounts)
+    }
+
+    @Test(arguments: [20, 21, 22]) func observationRequiresPositiveDeathOfEveryFailedBirth(_ pid: Int) throws {
+        for life: BootstrapLiveness in [.alive, .unknown] {
+            let f = try ColdFixture(), failed = try f.prepare(); f.killFailed()
+            f.checks.lives[Int32(pid)] = life
+            #expect(throws: (any Error).self) { try f.authority.observeCold(f.observer(failed), daemon: process(30)) }
+            #expect(f.checks.observationCalls == 0)
+        }
+    }
+
+    @Test func authorizedObservationReprovesNativeAndCannotReplayOldConfigure() throws {
+        let f = try ColdFixture(), failed = try f.prepare(); f.killFailed()
+        let request = try f.observer(failed)
+        f.checks.observationAllowed = false
+        #expect(throws: (any Error).self) { try f.authority.observeCold(request, daemon: process(30)) }
+        let signs = f.journal.signs
+        try f.reload()
+        #expect(throws: (any Error).self) { try f.authority.observeCold(request, daemon: process(30)) }
+        #expect(f.journal.signs == signs)
+        #expect(throws: (any Error).self) { try f.authority.prepareCold(f.request, daemon: f.daemon) }
+        #expect(throws: (any Error).self) { try f.authority.completeCold(operationID: f.request.operationID,
+            signedOpenSHA256: failed.signedOpenSHA256, daemon: f.daemon) }
+        #expect(throws: (any Error).self) { try f.authority.observeCold(f.observer(failed), daemon: process(30)) }
+        f.checks.observationAllowed = true
+        let history = try f.authority.observeCold(request, daemon: process(30))
+        f.checks.observationAllowed = false
+        #expect(throws: (any Error).self) { try f.authority.observeCold(request, daemon: process(30)) }
+        #expect(throws: (any Error).self) { try f.authority.prepareCold(f.observedPrepare(history), daemon: process(30)) }
+    }
+
+    @Test(arguments: [1, 2], [false, true]) func observationWriteCutsRetainExactOriginal(_ cut: Int, _ after: Bool) throws {
+        let f = try ColdFixture(), failed = try f.prepare(); f.killFailed()
+        let request = try f.observer(failed), write = f.journal.writes + cut
+        if after { f.journal.afterWrite = { if f.journal.writes == write { throw BootstrapFailure(.unavailable) } } }
+        else { f.journal.failAt = write }
+        #expect(throws: (any Error).self) { try f.authority.observeCold(request, daemon: process(30)) }
+        f.journal.failAt = nil; f.journal.afterWrite = nil
+        try f.reload()
+        let history = try f.authority.observeCold(request, daemon: process(30))
+        #expect(history.authorization.request.subject == (try L.encode(failed.signedOpen)))
+        #expect(throws: (any Error).self) { try f.authority.guardColdPublication(store: f.disk.storeID.rawValue) }
+    }
+
+    @Test func observedHistoryCorruptionRefusesLoadWithoutRewriting() throws {
+        let f = try ColdFixture(), failed = try f.prepare(); f.killFailed()
+        _ = try f.authority.observeCold(f.observer(failed), daemon: process(30))
+        let original = try #require(f.journal.bytes)
+        var object = try #require(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        var stores = try #require(object["stores"] as? [String: Any])
+        var store = try #require(stores[f.disk.storeID.rawValue] as? [String: Any])
+        var observed = try #require(store["observedCold"] as? [String: Any])
+        var authorization = try #require(observed["authorization"] as? [String: Any])
+        authorization["signature"] = Data(repeating: 0, count: 64).base64EncodedString()
+        observed["authorization"] = authorization; store["observedCold"] = observed
+        stores[f.disk.storeID.rawValue] = store; object["stores"] = stores
+        f.journal.bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        let bytes = f.journal.bytes, writes = f.journal.writes
+        #expect(throws: (any Error).self) { try f.reload() }
+        #expect(f.journal.bytes == bytes && f.journal.writes == writes)
+    }
+
+    @Test func observationRechecksDeathAfterNativeReplyBeforeO2() throws {
+        let f = try ColdFixture(), failed = try f.prepare(); f.killFailed()
+        let request = try f.observer(failed)
+        f.checks.beforeObservation = { f.checks.lives[21] = .unknown }
+        #expect(throws: (any Error).self) { try f.authority.observeCold(request, daemon: process(30)) }
+        f.checks.beforeObservation = nil; f.killFailed()
+        try f.reload()
+        _ = try f.authority.observeCold(request, daemon: process(30))
+    }
+
+    @Test func nativeResultMustStayExactAcrossO2AndRetries() throws {
+        let f = try ColdFixture(), failed = try f.prepare(); f.killFailed()
+        let request = try f.observer(failed)
+        _ = try f.authority.observeCold(request, daemon: process(30))
+        f.open(); f.checks.observationApplied = true
+        #expect(throws: (any Error).self) { try f.authority.observeCold(request, daemon: process(30)) }
+    }
+
     @Test func protectedClaimReachabilityRetainsL1ThroughL3ButNotL4() throws {
         let f = try ColdFixture()
         #expect(try f.authority.retainedColdClaimOperationIDs().isEmpty)

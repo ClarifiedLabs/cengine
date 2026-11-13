@@ -136,6 +136,51 @@ import Foundation
         let anchor: Historical
         let anchorService: Wire.ServiceState
     }
+    /// One bounded pre-L2 observation. The exact abandoned attempt remains audit
+    /// metadata; neither its grant nor an observed projection is a completion.
+    struct ObservedCold: Codable, Equatable, Sendable {
+        // Metadata retains this graph both directly and inside CompletedCold.
+        // Keep it off synthesized decoder stacks without sharing mutable state:
+        // every history assignment replaces an immutable snapshot. Payload keeps
+        // the original flat Codable keys, including omission of absent history.
+        private struct Payload: Codable, Equatable, Sendable {
+            let attempted: PendingCold
+            let request: ColdRoot.Observe
+            let requestID: String
+            let anchor: Historical
+            let anchorService: Wire.ServiceState
+            var history: StorageLifecycleColdObservationProtocol.History?
+        }
+        private final class Snapshot: Sendable {
+            let value: Payload
+            init(_ value: Payload) { self.value = value }
+        }
+        private var snapshot: Snapshot
+        var attempted: PendingCold { snapshot.value.attempted }
+        var request: ColdRoot.Observe { snapshot.value.request }
+        var requestID: String { snapshot.value.requestID }
+        var anchor: Historical { snapshot.value.anchor }
+        var anchorService: Wire.ServiceState { snapshot.value.anchorService }
+        var history: StorageLifecycleColdObservationProtocol.History? {
+            get { snapshot.value.history }
+            set {
+                var value = snapshot.value
+                value.history = newValue
+                snapshot = Snapshot(value)
+            }
+        }
+        init(attempted: PendingCold, request: ColdRoot.Observe, requestID: String,
+             anchor: Historical, anchorService: Wire.ServiceState,
+             history: StorageLifecycleColdObservationProtocol.History? = nil) {
+            snapshot = Snapshot(Payload(attempted: attempted, request: request, requestID: requestID,
+                anchor: anchor, anchorService: anchorService, history: history))
+        }
+        init(from decoder: any Decoder) throws {
+            snapshot = Snapshot(try Payload(from: decoder))
+        }
+        func encode(to encoder: any Encoder) throws { try snapshot.value.encode(to: encoder) }
+        static func == (lhs: Self, rhs: Self) -> Bool { lhs.snapshot.value == rhs.snapshot.value }
+    }
     /// One folded cross-E edge, not a recursive cold history or fresh authority.
     struct CompletedCold: Codable, Equatable, Sendable {
         let request: ColdRequest
@@ -144,6 +189,7 @@ import Foundation
         let predecessor: Historical
         let predecessorService: Wire.ServiceState
         var deadPredecessor: ResolvedDeadCold? = nil
+        var observedPredecessor: ObservedCold? = nil
     }
     /// Unlike synthesized Optional coding, missing keys are rejected and nil is
     /// encoded explicitly. Old checkpoints cannot silently acquire cold fields.
@@ -194,6 +240,7 @@ import Foundation
         @RequiredNullable var latestCold: CompletedCold? = nil
         // Omitted in existing sole-v2 bytes: absent means unresolved, not success.
         var resolvedDeadCold: ResolvedDeadCold? = nil
+        var observedCold: ObservedCold? = nil
         var sealed: Wire.Receipt?
         var terminal: Wire.Receipt?
         var contexts: [Historical]
@@ -205,6 +252,8 @@ import Foundation
     enum Change {
         case stageHandoff(HandoffRetry)
         case recoverHandoff(StorageLifecycleHandoffRootProtocol.Completed)
+        case stageColdObservation(ObservedCold)
+        case observeCold(StorageLifecycleColdObservationProtocol.History)
         case stageColdResolution(ColdResolutionRequest)
         case resolveDeadCold(ColdRoot.ResolvedDead)
         case stageColdRequest(ColdRequest)
@@ -293,6 +342,12 @@ import Foundation
             default: throw Failure.blocked
             }
         }
+        if prior.observedCold != nil {
+            switch change {
+            case .stageColdObservation, .observeCold, .stageColdRequest, .authorizeCold, .attemptColdBoot, .completeCold: break
+            default: throw Failure.blocked
+            }
+        }
         if prior.resolvedDeadCold != nil {
             switch change {
             case .resolveDeadCold, .stageColdRequest, .authorizeCold, .attemptColdBoot, .completeCold: break
@@ -301,7 +356,7 @@ import Foundation
         }
         if prior.pendingCold != nil {
             switch change {
-            case .stageColdResolution, .resolveDeadCold, .stageColdRequest, .authorizeCold, .attemptColdBoot, .completeCold: break
+            case .stageColdObservation, .observeCold, .stageColdResolution, .resolveDeadCold, .stageColdRequest, .authorizeCold, .attemptColdBoot, .completeCold: break
             default: throw Failure.blocked
             }
         }
@@ -359,6 +414,22 @@ import Foundation
                 // Only the exact abandoned lane checked above is cleared, after
                 // the owner supplies independently authenticated native ROOT proof.
                 next.pending = nil; next.pendingTakeover = nil; next.adoptionRetry = nil; next.handoffRetry = nil
+            case .stageColdObservation(let observed):
+                try validate(observed, in: prior)
+                guard observed.history == nil, prior.pendingCold == observed.attempted,
+                      prior.resolvedDeadCold == nil else { throw Failure.blocked }
+                if let retained = prior.observedCold {
+                    guard retained == observed else { throw Failure.blocked }
+                } else { next.observedCold = observed }
+            case .observeCold(let history):
+                guard var observed = prior.observedCold, prior.pendingCold == observed.attempted,
+                      let prepared = observed.attempted.prepared else { throw Failure.blocked }
+                try history.validate(preparedFailed: prepared, anchor: observed.anchorService)
+                guard history.request == observed.request,
+                      observed.history == nil || observed.history == history else { throw Failure.invalid }
+                observed.history = history
+                try validate(observed, in: prior)
+                next.observedCold = observed
             case .stageColdResolution(let request):
                 guard var pending = prior.pendingCold, pending.bootAttempted, let prepared = pending.prepared,
                       prior.resolvedDeadCold == nil, prior.pending == nil, prior.pendingTakeover == nil,
@@ -395,8 +466,15 @@ import Foundation
                 // adoptionRetry is retained even after successful adoption; it is
                 // not a pending-operation flag. Owner serializes IO, and ROOT must
                 // independently establish cold eligibility before authorization.
-                try validateColdRequest(request, predecessor: current, service: service, in: prior)
-                if let pending = prior.pendingCold {
+                try validateColdRequest(request, predecessor: current, service: service, observed: prior.observedCold, in: prior)
+                if let pending = prior.pendingCold, pending.request != request,
+                   let observed = prior.observedCold {
+                    // Consume ONLY the original exact pending lane after durable O2.
+                    // Keep that lane in observedCold through the real fresh completion.
+                    guard observed.history != nil, pending == observed.attempted,
+                          request.prepare.observationID == observed.request.observationID else { throw Failure.blocked }
+                    next.pendingCold = PendingCold(request: request, prepared: nil, bootAttempted: false)
+                } else if let pending = prior.pendingCold {
                     guard pending.request == request else { throw Failure.blocked }
                 } else {
                     guard request.prepare.operationID != prior.latestCold?.request.prepare.operationID,
@@ -408,6 +486,7 @@ import Foundation
                 guard var pending = prior.pendingCold else { throw Failure.blocked }
                 try prepared.validate(for: pending.request.prepare)
                 guard prepared.recoveryBridge == prior.resolvedDeadCold?.value,
+                      prepared.observedHistory == prior.observedCold?.history,
                       pending.resolutionRequest == nil else { throw Failure.blocked }
                 if let existing = pending.prepared {
                     guard prepared == existing else { throw Failure.blocked }
@@ -427,14 +506,15 @@ import Foundation
                     let service = try coldPredecessorService(in: prior)
                     let predecessor = try coldPredecessor(in: prior)
                     let cold = CompletedCold(request: pending.request, prepared: prepared, completion: completion,
-                        predecessor: predecessor, predecessorService: service, deadPredecessor: prior.resolvedDeadCold)
+                        predecessor: predecessor, predecessorService: service, deadPredecessor: prior.resolvedDeadCold,
+                        observedPredecessor: prior.observedCold)
                     try validate(cold, in: prior)
                     let completed = coldController(cold)
                     let live = try controllerContext(completed)
                     guard !prior.contexts.contains(where: { $0.context == live }) else { throw Failure.invalid }
                     next.current = completed; next.currentContext = live; next.currentService = completion.successor
                     next.contexts.append(Historical(context: live, controller: completed))
-                    next.latestCold = cold; next.pendingCold = nil; next.resolvedDeadCold = nil
+                    next.latestCold = cold; next.pendingCold = nil; next.resolvedDeadCold = nil; next.observedCold = nil
                     next.latestServiceChange = nil; next.latestServiceRequest = nil; next.latestServiceConfirmation = nil
                     next.serviceReplacement = nil; next.nativeReplacementAttempted = nil
                     next.adoptionRetry = nil
@@ -605,13 +685,23 @@ import Foundation
     }
 
     private static func validateColdRequest(_ request: ColdRequest, predecessor: Completed,
-                                           service: Wire.ServiceState, in state: Metadata) throws {
+                                           service: Wire.ServiceState, observed: ObservedCold? = nil, in state: Metadata) throws {
         let prepare = request.prepare, recipient = request.recipient
         try prepare.validate(); try service.validate()
         try validate(predecessor.original, in: state); try match(predecessor.directResult, predecessor.original)
         try uuid(request.prepareRequestID); try uuid(request.completionRequestID); try uuid(recipient.incarnation)
         let key = try StorageIdentity.Ed25519SPKI(rawPublicKey: recipient.publicKey)
         let protected = prepare.expectedPredecessor
+        let expected = try observed?.history?.predecessor ?? coldProtectedPredecessor(service)
+        if let observed {
+            guard let history = observed.history,
+                  prepare.observationID == observed.request.observationID,
+                  prepare.mountedGreeting == observed.request.observerGreeting,
+                  prepare.operationID != observed.attempted.request.prepare.operationID,
+                  prepare.operationID != observed.request.observationID,
+                  recipient.publicKey != observed.attempted.request.recipient.publicKey,
+                  history.anchor == service else { throw Failure.invalid }
+        } else { guard prepare.observationID == nil else { throw Failure.invalid } }
         guard request.prepareRequestID != request.completionRequestID,
               prepare.identity == state.identity, prepare.expectedOrigin.rootPublicKey == state.rootPublicKey,
               prepare.mountedGreeting.rootPublicKey == state.rootPublicKey,
@@ -622,11 +712,25 @@ import Foundation
               recipient.daemonUniqueID == prepare.mountedGreeting.daemonUniqueID,
               recipient.incarnation != predecessor.original.recipient.incarnation,
               service.grant == predecessor.original.signed.grant,
-              protected.currentGrant == service.grant, protected.serviceEpoch == service.context.serviceEpoch,
-              protected.controllerEpoch == service.context.controllerEpoch,
-              protected.controllerKey == service.context.controllerKey,
-              protected.openRevision == service.openRevision, protected.bootstrapKey == service.boot.bootstrapKey else {
+              protected == expected else {
             throw Failure.invalid
+        }
+    }
+    private static func validate(_ observed: ObservedCold, in state: Metadata) throws {
+        let pending = observed.attempted
+        guard pending.bootAttempted, let prepared = pending.prepared,
+              prepared.recoveryBridge == nil, prepared.observedHistory == nil,
+              pending.resolutionRequest == nil, observed.request.identity == state.identity,
+              observed.request.operationID == pending.request.prepare.operationID,
+              observed.request.signedOpenSHA256 == (try prepared.signedOpenSHA256),
+              observed.anchor.context == context(observed.anchorService.context),
+              observed.request.observerGreeting.rootPublicKey == state.rootPublicKey else { throw Failure.invalid }
+        try uuid(observed.requestID); try observed.request.validate()
+        try prepared.validate(for: pending.request.prepare)
+        try validateColdRequest(pending.request, predecessor: observed.anchor.controller, service: observed.anchorService, in: state)
+        if let history = observed.history {
+            try history.validate(preparedFailed: prepared, anchor: observed.anchorService)
+            guard history.request == observed.request else { throw Failure.invalid }
         }
     }
     private static func validate(_ request: ColdResolutionRequest, for pending: PendingCold, in state: Metadata) throws {
@@ -657,6 +761,11 @@ import Foundation
             serviceEpoch: resolved.value.receipt.serviceEpoch), directResult: resolved.value.receipt)
         return try Historical(context: controllerContext(completed), controller: completed)
     }
+    static func coldProtectedPredecessor(_ service: Wire.ServiceState) throws -> StorageLifecycleColdProtocol.Predecessor {
+        try .init(currentGrant: service.grant, serviceEpoch: service.context.serviceEpoch,
+            controllerEpoch: service.context.controllerEpoch, controllerKey: service.context.controllerKey,
+            openRevision: service.openRevision, bootstrapKey: service.boot.bootstrapKey)
+    }
     /// Epoch/key selection ONLY. Dead history never replaces the committed owner.
     static func coldPredecessor(in state: Metadata) throws -> Historical {
         if let resolved = state.resolvedDeadCold { return try deadColdHistorical(resolved) }
@@ -677,7 +786,7 @@ import Foundation
     }
     private static func validate(_ cold: CompletedCold, in state: Metadata) throws {
         try validateColdRequest(cold.request, predecessor: cold.predecessor.controller,
-            service: cold.predecessorService, in: state)
+            service: cold.predecessorService, observed: cold.observedPredecessor, in: state)
         try cold.prepared.validate(for: cold.request.prepare)
         try cold.completion.validate(prepared: cold.prepared)
         if let resolved = cold.deadPredecessor {
@@ -688,9 +797,15 @@ import Foundation
         } else {
             guard cold.prepared.recoveryBridge == nil else { throw Failure.invalid }
         }
+        if let observed = cold.observedPredecessor {
+            try validate(observed, in: state)
+            guard cold.deadPredecessor == nil, cold.prepared.observedHistory == observed.history,
+                  observed.history != nil, cold.predecessor == observed.anchor,
+                  cold.predecessorService == observed.anchorService else { throw Failure.invalid }
+        } else { guard cold.prepared.observedHistory == nil else { throw Failure.invalid } }
         let old = cold.predecessorService, new = cold.completion.successor
         guard cold.predecessor.context == context(old.context),
-              new.context.controllerEpoch == old.context.controllerEpoch + 1,
+              new.context.controllerEpoch == cold.request.prepare.expectedPredecessor.controllerEpoch + 1,
               new.context.controllerKey == cold.prepared.signedOpen.request.takeover.grant.newKey,
               new.openRevision > old.openRevision,
               new.openRevision > cold.predecessor.controller.directResult.revision,
@@ -771,7 +886,7 @@ import Foundation
         if state.pendingCold != nil || state.resolvedDeadCold != nil {
             // Reserve the exact signed authorization, completion and folded edge,
             // plus possible census growth before any external cold IO.
-            return try 98_304 + maximumReferenceBytes - encode(state.references).count
+            return try 196_608 + maximumReferenceBytes - encode(state.references).count
         }
         guard state.pendingService != nil else { return 16_384 }
         // Confirmation may consume its 16 KiB result allowance and fold a newer
@@ -1020,15 +1135,24 @@ import Foundation
                   state.contexts.contains(resolved.anchor),
                   state.contexts.contains(try deadColdHistorical(resolved)) else { throw Failure.invalid }
         }
+        if let observed = state.observedCold {
+            try validate(observed, in: state)
+            guard state.resolvedDeadCold == nil, state.pendingCold != nil,
+                  state.current == observed.anchor.controller, state.currentContext == observed.anchor.context,
+                  state.currentService == observed.anchorService, state.contexts.contains(observed.anchor),
+                  state.handoffRetry == nil else { throw Failure.invalid }
+        }
         if let pending = state.pendingCold {
             guard state.pending == nil, state.pendingTakeover == nil, state.pendingService == nil,
                   state.sealed == nil, state.terminal == nil,
                   pending.request.prepare.operationID != state.latestCold?.request.prepare.operationID else { throw Failure.invalid }
             let predecessor = try coldPredecessor(in: state), service = try coldPredecessorService(in: state)
-            try validateColdRequest(pending.request, predecessor: predecessor.controller, service: service, in: state)
+            let observed = state.observedCold.flatMap { $0.attempted == pending ? nil : $0 }
+            try validateColdRequest(pending.request, predecessor: predecessor.controller, service: service, observed: observed, in: state)
             if let prepared = pending.prepared {
                 try prepared.validate(for: pending.request.prepare)
-                guard prepared.recoveryBridge == state.resolvedDeadCold?.value else { throw Failure.invalid }
+                guard prepared.recoveryBridge == state.resolvedDeadCold?.value,
+                      prepared.observedHistory == observed?.history else { throw Failure.invalid }
             } else if pending.bootAttempted { throw Failure.invalid }
             if let request = pending.resolutionRequest {
                 guard state.resolvedDeadCold == nil else { throw Failure.invalid }
@@ -1395,6 +1519,62 @@ import Foundation
             if create { guard fsync(fd) == 0 else { throw Failure.repairRequired }; try directory.synchronize() }
             return fd
         } catch { Darwin.close(fd); throw error }
+    }
+}
+
+extension ManagedStorageLifecycleCheckpoint.Metadata {
+    // Preserve synthesized CodingKeys/encode and the memberwise initializer, but
+    // avoid its large Debug decode temporaries on the bounded host-owner worker.
+    init(from decoder: any Decoder) throws {
+        typealias Owner = ManagedStorageLifecycleCheckpoint
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(String.self, forKey: .version)
+        identity = try container.decode(Owner.Wire.Identity.self, forKey: .identity)
+        rootPublicKey = try container.decode(Data.self, forKey: .rootPublicKey)
+        provenanceReference = try container.decode(String.self, forKey: .provenanceReference)
+        revision = try container.decode(UInt64.self, forKey: .revision)
+        // Finish initializing self before decoding fields in place. Direct
+        // assignments still reserve a separate large temporary for every field
+        // in Debug; the generic helpers keep only one field's temporary live.
+        contexts = []
+        serviceLinks = []
+        intentRevision = 0
+        references = []
+        try Self.decodeOptional(&current, from: container, forKey: .current)
+        try Self.decodeOptional(&currentContext, from: container, forKey: .currentContext)
+        try Self.decodeOptional(&currentService, from: container, forKey: .currentService)
+        try Self.decodeOptional(&observedWorker, from: container, forKey: .observedWorker)
+        try Self.decodeOptional(&pendingService, from: container, forKey: .pendingService)
+        try Self.decodeOptional(&serviceReplacement, from: container, forKey: .serviceReplacement)
+        try Self.decodeOptional(&nativeReplacementAttempted, from: container, forKey: .nativeReplacementAttempted)
+        try Self.decodeOptional(&latestServiceRequest, from: container, forKey: .latestServiceRequest)
+        try Self.decodeOptional(&latestServiceConfirmation, from: container, forKey: .latestServiceConfirmation)
+        try Self.decodeOptional(&pending, from: container, forKey: .pending)
+        try Self.decodeOptional(&pendingTakeover, from: container, forKey: .pendingTakeover)
+        try Self.decodeOptional(&adoptionRetry, from: container, forKey: .adoptionRetry)
+        try Self.decodeOptional(&handoffRetry, from: container, forKey: .handoffRetry)
+        // Decode wrappers, not optionals: missing cold keys must still fail.
+        try Self.decodeRequired(&_pendingCold, from: container, forKey: .pendingCold)
+        try Self.decodeRequired(&_latestCold, from: container, forKey: .latestCold)
+        try Self.decodeOptional(&resolvedDeadCold, from: container, forKey: .resolvedDeadCold)
+        try Self.decodeOptional(&observedCold, from: container, forKey: .observedCold)
+        try Self.decodeOptional(&sealed, from: container, forKey: .sealed)
+        try Self.decodeOptional(&terminal, from: container, forKey: .terminal)
+        try Self.decodeRequired(&contexts, from: container, forKey: .contexts)
+        try Self.decodeRequired(&serviceLinks, from: container, forKey: .serviceLinks)
+        try Self.decodeOptional(&latestServiceChange, from: container, forKey: .latestServiceChange)
+        try Self.decodeRequired(&intentRevision, from: container, forKey: .intentRevision)
+        try Self.decodeRequired(&references, from: container, forKey: .references)
+    }
+
+    private static func decodeOptional<Value: Decodable>(_ value: inout Value?,
+        from container: KeyedDecodingContainer<CodingKeys>, forKey key: CodingKeys) throws {
+        value = try container.decodeIfPresent(Value.self, forKey: key)
+    }
+
+    private static func decodeRequired<Value: Decodable>(_ value: inout Value,
+        from container: KeyedDecodingContainer<CodingKeys>, forKey key: CodingKeys) throws {
+        value = try container.decode(Value.self, forKey: key)
     }
 }
 #endif

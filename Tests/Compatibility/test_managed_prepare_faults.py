@@ -631,6 +631,7 @@ def _run_prepare_case(daemon, *, profile, staged, fault_case, early, probe, prob
                 and all(type(metadata.get(key)) is int and metadata[key] == version for key, version in {
                     "schemaVersion": 1, "protocolVersion": 1, "storageServiceBootVersion": 2,
                     "storageLifecycleVersion": 2, "workloadStorageBootVersion": 1,
+                    "storageColdObservationVersion": 1,
                 }.items()), "exact explicit compatible asset metadata")
             for path, key in ((daemon.container_initramfs, "containerInitramfsSHA256"), (daemon.storage_initramfs, "storageInitramfsSHA256")):
                 # Observation only; runtime independently verifies signed/profile capabilities.

@@ -69,6 +69,34 @@ def main() -> None:
     ):
         require_contains(kernel_release, needle, "kernel-release.yml")
     require_absent(kernel_release, "--clobber", "kernel-release.yml")
+    # Validate the actual shell gates, not just a step label or a comment.
+    kernel_gates = (
+        "make kernel-build CENGINE_HOST_OS=Linux",
+        "python3 Scripts/guest_asset_provenance.py check-kernel \\\n"
+        '            "$PWD" .build/guest/vmlinux .build/guest/kernel-origin.json local',
+        "for marker in cengine-storage request_cred managed_close_to_open host_close_to_open; do",
+        'LC_ALL=C grep -aFq "$marker" .build/guest/vmlinux',
+        'install -m 0644 .build/guest/vmlinux "$OUTPUT/cengine-kernel-arm64"',
+        'install -m 0644 .build/guest/kernel-input.sha256 "$OUTPUT/kernel-input.sha256"',
+        "uses: actions/upload-artifact@",
+        'gh release create "$GITHUB_REF_NAME"',
+    )
+    positions = []
+    for gate in kernel_gates:
+        require_contains(kernel_release, gate, "kernel-release.yml")
+        positions.append(kernel_release.index(gate))
+    if positions != sorted(positions):
+        raise AssertionError("kernel release must check local receipt and ABI markers before staging/upload/publish")
+    prepare = kernel_release.split("      - name: Prepare kernel release assets\n", 1)[1].split("      - name:", 1)[0]
+    require_contains(prepare, "set -euo pipefail", "kernel-release.yml preparation")
+    for gate in kernel_gates[1:6]:
+        require_contains(prepare, gate, "kernel-release.yml preparation")
+    guest_release = release.split("  guest-assets:\n", 1)[1].split("\n  require-tests:", 1)[0]
+    require_contains(guest_release, "CENGINE_KERNEL_MODE: release", "release.yml guest assets")
+    require_contains(guest_release, "make guest-assets", "release.yml guest assets")
+    for forbidden in ("CENGINE_KERNEL_RELEASE_BASE_URL", "CENGINE_LOCAL_KERNEL", "make kernel-build"):
+        require_absent(guest_release, forbidden, "release.yml canonical kernel fetch")
+    require_contains(makefile, "else ifeq ($(CENGINE_KERNEL_MODE),release)\nkernel:\n\t./Scripts/fetch-kernel.sh", "Makefile")
     require_contains(
         release,
         'installed="/Applications/cengine.app/Contents/MacOS/cengine-engine"',

@@ -154,7 +154,19 @@ final class StorageBootstrapCheckpointJournal {
         try request.validate()
         let root = try StorageIdentity.RootPublicKey(publicData: publicKey)
         guard request.predecessor.bootstrapKey == root.fingerprint.rawValue,
-              request.takeover.isValidSignature(using: root) else { throw Failure.repairRequired }
+              request.takeover.isValidSignature(using: root),
+              request.observation.map({ $0.isValidSignature(using: root) }) ?? true else { throw Failure.repairRequired }
+        do {
+            let key = try Curve25519.Signing.PrivateKey(rawRepresentation: rootKey)
+            return try .init(request: request, signature: key.signature(for: request.signingBytes))
+        } catch { poisoned = true; throw Failure.repairRequired }
+    }
+
+    /// Closed read-only observation domain; the exact abandoned authorization is ROOT-pinned.
+    func signColdObservation(_ request: StorageLifecycleColdObservationProtocol.Request) throws -> StorageLifecycleColdObservationProtocol.SignedRequest {
+        try checkedValidation(); try request.validate()
+        let root = try StorageIdentity.RootPublicKey(publicData: publicKey)
+        guard try request.subjectOpen().isValidSignature(using: root) else { throw Failure.repairRequired }
         do {
             let key = try Curve25519.Signing.PrivateKey(rawRepresentation: rootKey)
             return try .init(request: request, signature: key.signature(for: request.signingBytes))

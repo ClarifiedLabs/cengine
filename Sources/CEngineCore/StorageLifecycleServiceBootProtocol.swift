@@ -16,7 +16,10 @@ public enum StorageLifecycleServiceBootProtocol {
     public typealias IsolationRequest = StorageServiceTypes.IsolationRequest
     public typealias IsolationProof = StorageServiceTypes.IsolationProof
     public enum ValidationError: Error, Sendable { case invalidFrame }
-    public enum Operation: String, Codable, Sendable { case hello, configure, ready, command, reply, error }
+    public enum Operation: String, Codable, Sendable {
+        case hello, configure, ready, command, reply, error
+        case observeCold = "observe-cold", coldObserved = "cold-observed"
+    }
     public enum Command: String, Codable, Sendable {
         case issueController = "issue-controller", authorizeSuccessor = "authorize-successor"
         case authorizeRetirement = "authorize-retirement", reconcileController = "reconcile-controller", query
@@ -237,6 +240,17 @@ public enum StorageLifecycleServiceBootProtocol {
             get { _ready.value }
             set { _ready.value = newValue }
         }
+        private var _observationAuthorization = Carrier<StorageLifecycleColdObservationProtocol.SignedRequest>()
+        public var observationRootPublicKey: Data?
+        public var observationAuthorization: StorageLifecycleColdObservationProtocol.SignedRequest? {
+            get { _observationAuthorization.value }
+            set { _observationAuthorization.value = newValue }
+        }
+        private var _coldObservation = Carrier<StorageLifecycleColdObservationProtocol.Observation>()
+        public var coldObservation: StorageLifecycleColdObservationProtocol.Observation? {
+            get { _coldObservation.value }
+            set { _coldObservation.value = newValue }
+        }
         public var sequence: UInt64?
         public var serviceEpoch: String?
         public var command: Command?
@@ -375,8 +389,13 @@ public enum StorageLifecycleServiceBootProtocol {
                     prepareCompatibilityStatus: ManagedPrepareCompatibilityProtocol.StorageStatus? = nil,
                     prepareCompatibilityWorkerWait: ManagedPrepareCompatibilityProtocol.StorageWorkerWait? = nil,
                     prepareCompatibilityCheckpointAck: ManagedPrepareWorkerCheckpointProtocol.WorkerCheckpointExit? = nil,
-                    prepareCompatibilityCheckpointWait: ManagedPrepareWorkerCheckpointProtocol.WorkerCheckpointWait? = nil) {
+                    prepareCompatibilityCheckpointWait: ManagedPrepareWorkerCheckpointProtocol.WorkerCheckpointWait? = nil,
+                    observationAuthorization: StorageLifecycleColdObservationProtocol.SignedRequest? = nil,
+                    coldObservation: StorageLifecycleColdObservationProtocol.Observation? = nil,
+                    observationRootPublicKey: Data? = nil) {
             self.operation = operation; self.binding = binding; self.configuration = configuration; self.ready = ready
+            self.observationAuthorization = observationAuthorization; self.coldObservation = coldObservation
+            self.observationRootPublicKey = observationRootPublicKey
             self.sequence = sequence; self.serviceEpoch = serviceEpoch; self.command = command; self.csr = csr
             self.signed = signed; self.controller = controller; self.certificate = certificate; self.ok = ok; self.code = code
             self.workerUUID = workerUUID; self.replacementRequest = replacementRequest; self.status = status; self.replacement = replacement
@@ -399,6 +418,8 @@ public enum StorageLifecycleServiceBootProtocol {
         enum CodingKeys: String, CodingKey {
             case version, operation, binding, configuration, ready, sequence, command, csr, signed, controller, certificate, ok, code
             case handoff, nonce, handoffResult = "handoff_result"
+            case observationAuthorization = "observation_authorization", coldObservation = "cold_observation"
+            case observationRootPublicKey = "observation_root_public_key"
             case serviceEpoch = "service_epoch"
             case workerUUID = "worker_uuid", replacementRequest = "replacement_request", status, replacement, notifications
             // Preserve the v1 carrier spelling; envelope identity keys stay snake_case.
@@ -423,6 +444,9 @@ public enum StorageLifecycleServiceBootProtocol {
             self.version = try fields.decode(String.self, forKey: .version)
             self.operation = try fields.decode(Operation.self, forKey: .operation)
             self.binding = try fields.decode(Binding.self, forKey: .binding)
+            self.observationRootPublicKey = try fields.decodeIfPresent(Data.self, forKey: .observationRootPublicKey)
+            self.observationAuthorization = try fields.decodeIfPresent(StorageLifecycleColdObservationProtocol.SignedRequest.self, forKey: .observationAuthorization)
+            self.coldObservation = try fields.decodeIfPresent(StorageLifecycleColdObservationProtocol.Observation.self, forKey: .coldObservation)
             self.configuration = try fields.decodeIfPresent(Configuration.self, forKey: .configuration)
             self.ready = try fields.decodeIfPresent(Ready.self, forKey: .ready)
             self.sequence = try fields.decodeIfPresent(UInt64.self, forKey: .sequence)
@@ -462,6 +486,9 @@ public enum StorageLifecycleServiceBootProtocol {
             try fields.encode(version, forKey: .version)
             try fields.encode(operation, forKey: .operation)
             try fields.encode(binding, forKey: .binding)
+            try fields.encodeIfPresent(observationRootPublicKey, forKey: .observationRootPublicKey)
+            try fields.encodeIfPresent(observationAuthorization, forKey: .observationAuthorization)
+            try fields.encodeIfPresent(coldObservation, forKey: .coldObservation)
             try fields.encodeIfPresent(configuration, forKey: .configuration)
             try fields.encodeIfPresent(ready, forKey: .ready)
             try fields.encodeIfPresent(sequence, forKey: .sequence)
@@ -501,6 +528,8 @@ public enum StorageLifecycleServiceBootProtocol {
                   StorageServiceTypes.validID(binding.shimLaunchUUID), StorageServiceTypes.validID(binding.guestBootNonce),
                   StorageServiceTypes.validUUID(binding.ext4UUID), binding.bytes > 0, binding.bytes <= UInt64(Int64.max) else { throw ValidationError.invalidFrame }
             let present: Set<String> = Set([
+                observationAuthorization == nil ? nil : "observation_authorization", coldObservation == nil ? nil : "cold_observation",
+                observationRootPublicKey == nil ? nil : "observation_root_public_key",
                 configuration == nil ? nil : "configuration", ready == nil ? nil : "ready", sequence == nil ? nil : "sequence",
                 serviceEpoch == nil ? nil : "service_epoch", command == nil ? nil : "command", csr == nil ? nil : "csr",
                 signed == nil ? nil : "signed", controller == nil ? nil : "controller", certificate == nil ? nil : "certificate",
@@ -526,6 +555,19 @@ public enum StorageLifecycleServiceBootProtocol {
             var expected: Set<String> = []
             switch operation {
             case .hello: break
+            case .observeCold:
+                expected = ["observation_authorization", "observation_root_public_key"]
+                guard let observationRootPublicKey, let authorization = observationAuthorization,
+                      authorization.isValidSignature(using: try .init(publicData: observationRootPublicKey)) else {
+                    throw ValidationError.invalidFrame
+                }
+                try authorization.validate()
+                if let launch = observationAuthorization?.request.observer {
+                    guard launch.shimLaunchUUID == binding.shimLaunchUUID, launch.ext4UUID == binding.ext4UUID,
+                          launch.bytes == binding.bytes else { throw ValidationError.invalidFrame }
+                }
+            case .coldObserved:
+                expected = ["cold_observation"]; try coldObservation?.validate()
             case .configure: expected = ["configuration"]; try configuration?.validate()
             case .ready: expected = ["ready"]; try ready?.validate()
             case .error: expected = ["code"]

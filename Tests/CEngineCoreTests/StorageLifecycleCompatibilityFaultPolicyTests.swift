@@ -30,11 +30,54 @@ import Testing
         }
     }
 
+    @Test func firstColdApplyOnlyAndObservedRecoveryBypasses() throws {
+        #expect(Policy.isFirstColdApply(expectedEpoch: 1, observed: false))
+        for epoch in [UInt64(0), 1, 2, 3, .max] {
+            #expect(!Policy.isFirstColdApply(expectedEpoch: epoch, observed: true))
+            if epoch != 1 { #expect(!Policy.isFirstColdApply(expectedEpoch: epoch, observed: false)) }
+        }
+        let valid: [String: Any] = ["CEngineCompatLifecycleFault": "after-first-cold-apply-v1"]
+        #expect(try Policy.validateFields(namespace: .compatibility, isQualification: false,
+            plist: valid) == .afterFirstColdApply)
+        #expect(throws: (any Error).self) {
+            try Policy.validateFields(namespace: .production, isQualification: false, plist: valid)
+        }
+        #expect(throws: (any Error).self) {
+            try Policy.validateFields(namespace: .compatibility, isQualification: true, plist: valid)
+        }
+    }
+
     @Test func freshOnly() {
         #expect(Policy.applies(to: .initialize))
         #expect(!Policy.applies(to: .resumeOpenTakeover))
         #expect(!Policy.applies(to: .coldOpenTakeover))
         #expect(!Policy.applies(to: .open))
+    }
+
+    @Test func coldConfigureOnlyAndSealedMetadata() throws {
+        for action in [StorageLifecycleServiceBootProtocol.Configuration.Action.initialize, .open, .resumeOpenTakeover, .coldOpenTakeover] {
+            #expect(Policy.applies(to: action, profile: .beforeColdConfigure) == (action == .coldOpenTakeover))
+            #expect(!Policy.applies(to: action, profile: .beforeColdConfigure, observed: true))
+            for profile in [Policy.Profile.afterFirstColdApply, .afterReplacement, .beforeTakeoverApply, .afterTakeoverApply, .afterFirstColdCompletion] {
+                #expect(!Policy.applies(to: action, profile: profile))
+            }
+        }
+        let valid: [String: Any] = ["CEngineCompatLifecycleFault": "before-cold-configure-v1"]
+        #expect(try Policy.validateFields(namespace: .compatibility, isQualification: false,
+            plist: valid) == .beforeColdConfigure)
+        #expect(throws: (any Error).self) {
+            try Policy.validateFields(namespace: .production, isQualification: false, plist: valid)
+        }
+        #expect(throws: (any Error).self) {
+            try Policy.validateFields(namespace: .compatibility, isQualification: true, plist: valid)
+        }
+        for key in ["CEngineStorageLifecycleQualification", "CEngineStorageLifecycleSourcePin", "CEngineStorageLifecycleAssetsSHA256"] {
+            var mixed = valid
+            mixed[key] = "selected"
+            #expect(throws: (any Error).self) {
+                try Policy.validateFields(namespace: .compatibility, isQualification: false, plist: mixed)
+            }
+        }
     }
 
     @Test func replacementDiagnosticIsBoundedPublicObservation() throws {
@@ -104,6 +147,8 @@ import Testing
             try Policy.validateFields(namespace: .compatibility, isQualification: true, plist: valid)
         }
         for value: Any in ["", "before-configure-v2", " before-configure-v1", "before-takeover-apply-v2", "after-takeover-apply-v1 ",
+                           "before-cold-configure-v2", "before-cold-configure-v1 ", " before-cold-configure-v1",
+                           "after-first-cold-apply-v2", "after-first-cold-apply-v1 ",
                            "after-first-cold-completion-v2", "after-first-cold-completion-v1 ", 1, true] {
             #expect(throws: (any Error).self) {
                 try Policy.validateFields(namespace: .compatibility, isQualification: false,

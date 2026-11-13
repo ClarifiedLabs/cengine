@@ -4,14 +4,14 @@ import Testing
 
 @Suite struct NetworkHelperCapabilitiesTests {
     private typealias C = NetworkHelperCapabilities
-    private let ordinary = C.Advertisement(profile: .ordinary, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
-    private let canonical = "{\"profile\":\"ordinary\",\"schemaVersion\":1,\"securityRevision\":1,\"storageContracts\":[\"lifecycle-v2\",\"lifecycle-v2-adopted-service-change-v1\",\"lifecycle-v2-stable-host-identity-v1\",\"lifecycle-v2-cold-dead-resolution-v1\",\"lifecycle-v2-cold-unenrolled-recovery-v1\"]}"
+    private let ordinary = C.Advertisement(profile: .ordinary, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
+    private let canonical = "{\"profile\":\"ordinary\",\"schemaVersion\":1,\"securityRevision\":1,\"storageContracts\":[\"lifecycle-v2\",\"lifecycle-v2-adopted-service-change-v1\",\"lifecycle-v2-stable-host-identity-v1\",\"lifecycle-v2-cold-dead-resolution-v1\",\"lifecycle-v2-cold-unenrolled-recovery-v1\",\"lifecycle-v2-cold-observed-recovery-v1\"]}"
 
     @Test func canonicalRoundTrip() throws {
         #expect(try C.encode(ordinary) == Data(canonical.utf8))
         #expect(try C.decode(Data(canonical.utf8)) == ordinary)
         for revision in [C.minimumSecurityRevision, 2, UInt64.max] {
-            let value = C.Advertisement(securityRevision: revision, profile: .ordinary, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
+            let value = C.Advertisement(securityRevision: revision, profile: .ordinary, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
             #expect(try C.decode(C.encode(value)) == value)
             try C.validate(value, for: .lifecycleV2)
         }
@@ -20,11 +20,11 @@ import Testing
     @Test func exactProfilesAndIndependentContracts() throws {
         try C.validate(ordinary, for: .lifecycleV2)
         #expect(throws: (any Error).self) { try C.validate(ordinary, for: .lifecycleQualification) }
-        let lifecycle = C.Advertisement(profile: .ordinary, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
+        let lifecycle = C.Advertisement(profile: .ordinary, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
         try C.validate(lifecycle, for: .lifecycleV2)
         #expect(C.Requirement(rawValue: "bootstrap-v1") == nil)
         #expect(C.StorageContract(rawValue: "bootstrap-v1") == nil)
-        let qualification = C.Advertisement(profile: .lifecycleQualification, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery])
+        let qualification = C.Advertisement(profile: .lifecycleQualification, storageContracts: [.lifecycleV2, .lifecycleV2AdoptedServiceChange, .lifecycleV2StableHostIdentity, .lifecycleV2ColdDeadResolution, .lifecycleV2ColdUnenrolledRecovery, .coldObservedRecovery])
         try C.validate(qualification, for: .lifecycleQualification)
         #expect(try C.decode(C.encode(qualification)) == qualification)
         #expect(throws: (any Error).self) { try C.validate(qualification, for: .lifecycleV2) }
@@ -88,7 +88,7 @@ import Testing
 
     @Test func qualificationContractsAreAnUnorderedClosedLifecycleSet() throws {
         let reversed = C.Advertisement(profile: .lifecycleQualification,
-            storageContracts: [.lifecycleV2ColdUnenrolledRecovery, .lifecycleV2ColdDeadResolution, .lifecycleV2StableHostIdentity, .lifecycleV2AdoptedServiceChange, .lifecycleV2])
+            storageContracts: [.coldObservedRecovery, .lifecycleV2ColdUnenrolledRecovery, .lifecycleV2ColdDeadResolution, .lifecycleV2StableHostIdentity, .lifecycleV2AdoptedServiceChange, .lifecycleV2])
         #expect(try C.decode(C.encode(reversed)) == reversed)
         try C.validate(reversed, for: .lifecycleQualification)
     }
@@ -128,7 +128,7 @@ import Testing
             canonical.replacingOccurrences(of: "\"profile\":\"ordinary\",", with: ""),
             canonical.replacingOccurrences(of: "\"schemaVersion\":1,", with: ""),
             canonical.replacingOccurrences(of: "\"securityRevision\":1,", with: ""),
-            canonical.replacingOccurrences(of: ",\"storageContracts\":[\"lifecycle-v2\",\"lifecycle-v2-adopted-service-change-v1\",\"lifecycle-v2-stable-host-identity-v1\",\"lifecycle-v2-cold-dead-resolution-v1\",\"lifecycle-v2-cold-unenrolled-recovery-v1\"]", with: ""),
+            canonical.replacingOccurrences(of: ",\"storageContracts\":[\"lifecycle-v2\",\"lifecycle-v2-adopted-service-change-v1\",\"lifecycle-v2-stable-host-identity-v1\",\"lifecycle-v2-cold-dead-resolution-v1\",\"lifecycle-v2-cold-unenrolled-recovery-v1\",\"lifecycle-v2-cold-observed-recovery-v1\"]", with: ""),
             canonical.replacingOccurrences(of: "\"profile\"", with: "\"unknown\""),
             canonical.replacingOccurrences(of: "{", with: "{\"extra\":true,"),
             canonical.replacingOccurrences(of: "ordinary", with: "unknown"),
@@ -151,7 +151,7 @@ import Testing
         }
         for token in ["true", "null", "1", "{}", "\"lifecycle-v2\""] {
             let text = canonical.replacingOccurrences(
-                of: "[\"lifecycle-v2\",\"lifecycle-v2-adopted-service-change-v1\",\"lifecycle-v2-stable-host-identity-v1\",\"lifecycle-v2-cold-dead-resolution-v1\",\"lifecycle-v2-cold-unenrolled-recovery-v1\"]", with: token)
+                of: "[\"lifecycle-v2\",\"lifecycle-v2-adopted-service-change-v1\",\"lifecycle-v2-stable-host-identity-v1\",\"lifecycle-v2-cold-dead-resolution-v1\",\"lifecycle-v2-cold-unenrolled-recovery-v1\",\"lifecycle-v2-cold-observed-recovery-v1\"]", with: token)
             #expect(throws: (any Error).self) { try C.decode(Data(text.utf8)) }
         }
     }

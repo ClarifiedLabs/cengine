@@ -144,6 +144,7 @@ metadata = {
     "protocolVersion": 1,
     "storageServiceBootVersion": 2,
     "storageLifecycleVersion": 2,
+    "storageColdObservationVersion": 1,
     "workloadStorageBootVersion": 1,
     "containerInitramfsSHA256": hashlib.sha256((output / "container-initramfs.cpio.gz").read_bytes()).hexdigest(),
     "storageInitramfsSHA256": hashlib.sha256((output / "storage-initramfs.cpio.gz").read_bytes()).hexdigest(),

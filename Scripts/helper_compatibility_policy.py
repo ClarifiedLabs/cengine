@@ -73,9 +73,9 @@ def select(environment: dict[str, str], metadata: dict) -> tuple[str, str]:
     qualification, fault, controller, prepare, exact = (environment.get(key, "") for key in KEYS[:-1])
     for key, value, allowed in (
         (KEYS[0], qualification, ("", QUALIFICATION)),
-        (KEYS[1], fault, ("", "before-configure-v1", "after-replacement-before-completion-v1",
+        (KEYS[1], fault, ("", "before-configure-v1", "before-cold-configure-v1", "after-replacement-before-completion-v1",
                           "before-takeover-apply-v1", "after-takeover-apply-v1",
-                          "after-cold-l2-before-a1-v1", "after-first-cold-completion-v1")),
+                          "after-cold-l2-before-a1-v1", "after-first-cold-apply-v1", "after-first-cold-completion-v1")),
         (KEYS[2], controller, ("", PREPARE_PROFILES[-1])),
         (KEYS[3], prepare, ("", *PREPARE_PROFILES)),
         (KEYS[4], exact, ("", "1")),

@@ -52,7 +52,11 @@ compiling a kernel as part of every application release.
 Manual dispatch uploads workflow artifacts without publishing. Pushing the
 configured `kernel-v*` tag creates a dedicated GitHub Release containing
 `cengine-kernel-arm64`, `kernel-input.sha256`, and `SHA256SUMS`; an existing
-kernel release is never overwritten.
+kernel release is never overwritten. The default source build applies both
+host-bind close-to-open and managed-storage patches. Before staging, the kernel
+workflow validates the local build receipt against the actual image and current
+recipe, then checks required image markers. Those checks do not replace native
+storage ABI and compatibility probes.
 
 `release-ci` exercises the full signing and notarization paths and uploads the
 guest assets and signed package as workflow artifacts. It does not create a
@@ -65,7 +69,9 @@ Both `Scripts/build-release.sh` and `Scripts/package-release.sh` validate guest
 assets before building and again after staging, before signing. The schema-1
 `disk-bootstrap.json` includes `ordinaryProvenance`: the complete Guest/build
 recipe pin, actual init-binary hashes and Go versions, paired mke2fs hash, and
-kernel origin/hash/release/input digest. The validator inspects the actual `/init`
+kernel origin/hash/release/input digest. The inner schema-2 kernel receipt also
+requires `managedPatchSHA256`, binding the configured managed-storage patch after
+the host-bind patch in the product series. The validator inspects the actual `/init`
 build information in bounded gzip/newc images without executing guest code or
 extracting archive paths. Compatibility profiles, stripped/relabelled fault
 images, stale pins, ambiguous archives and incomplete manifests are refused.

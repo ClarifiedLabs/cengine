@@ -37,7 +37,7 @@ public enum StorageLifecycleColdProtocol {
                 controllerEpoch: c.decode(UInt64.self, forKey: .controllerEpoch), controllerKey: c.decode(String.self, forKey: .controllerKey),
                 openRevision: c.decode(UInt64.self, forKey: .openRevision), bootstrapKey: c.decode(String.self, forKey: .bootstrapKey))
         }
-        fileprivate var signingJSON: String {
+        var signingJSON: String {
             "{\"current_grant\":\(currentGrant.signingJSON),\"service_epoch\":\"\(serviceEpoch)\",\"controller_epoch\":\(controllerEpoch),\"controller_key\":\"\(controllerKey)\",\"open_revision\":\(openRevision),\"bootstrap_key\":\"\(bootstrapKey)\"}"
         }
     }
@@ -71,7 +71,7 @@ public enum StorageLifecycleColdProtocol {
                 initramfsSHA256: c.decode(String.self, forKey: .initramfsSHA256), ext4UUID: c.decode(String.self, forKey: .ext4UUID),
                 bytes: c.decode(UInt64.self, forKey: .bytes))
         }
-        fileprivate var signingJSON: String {
+        var signingJSON: String {
             "{\"shim_launch_uuid\":\"\(shimLaunchUUID)\",\"spec_sha256\":\"\(specSHA256)\",\"initramfs_sha256\":\"\(initramfsSHA256)\",\"ext4_uuid\":\"\(ext4UUID)\",\"bytes\":\(bytes)}"
         }
     }
@@ -83,10 +83,12 @@ public enum StorageLifecycleColdProtocol {
         public let launch: Launch
         public let nowUnixSeconds: UInt64
         public let lifetimeSeconds: UInt64
+        public let observation: StorageLifecycleColdObservationProtocol.SignedRequest?
         public init(operationID: String, predecessor: Predecessor, takeover: L.SignedGrant, launch: Launch,
-                    nowUnixSeconds: UInt64, lifetimeSeconds: UInt64) throws {
+                    nowUnixSeconds: UInt64, lifetimeSeconds: UInt64,
+                    observation: StorageLifecycleColdObservationProtocol.SignedRequest? = nil) throws {
             self.operationID = operationID; self.predecessor = predecessor; self.takeover = takeover; self.launch = launch
-            self.nowUnixSeconds = nowUnixSeconds; self.lifetimeSeconds = lifetimeSeconds
+            self.nowUnixSeconds = nowUnixSeconds; self.lifetimeSeconds = lifetimeSeconds; self.observation = observation
             try validate()
         }
         public func validate() throws {
@@ -98,21 +100,33 @@ public enum StorageLifecycleColdProtocol {
                   nowUnixSeconds > 0, nowUnixSeconds <= 253_402_300_799,
                   lifetimeSeconds > 0, lifetimeSeconds <= 86_400,
                   lifetimeSeconds <= 253_402_300_799 - nowUnixSeconds else { throw L.ValidationError.invalidValue }
+            if let observation {
+                try observation.validate()
+                let old = try observation.request.subjectOpen().request
+                guard observation.request.observer == launch, g.serial > old.takeover.grant.serial,
+                      g.newKey != old.takeover.grant.newKey, operationID != old.operationID,
+                      operationID != observation.request.observationID else { throw L.ValidationError.invalidValue }
+                let outcome: StorageLifecycleColdObservationProtocol.Observation.Outcome = predecessor == old.predecessor ? .unchanged : .applied
+                try StorageLifecycleColdObservationProtocol.Observation(requestSHA256: observation.request.digest,
+                    outcome: outcome, predecessor: predecessor).validate(for: observation.request)
+            }
         }
         enum CodingKeys: String, CodingKey {
             case operationID = "operation_id", predecessor, takeover, launch
-            case nowUnixSeconds = "now_unix_seconds", lifetimeSeconds = "lifetime_seconds"
+            case nowUnixSeconds = "now_unix_seconds", lifetimeSeconds = "lifetime_seconds", observation
         }
         public init(from decoder: any Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             try self.init(operationID: c.decode(String.self, forKey: .operationID), predecessor: c.decode(Predecessor.self, forKey: .predecessor),
                 takeover: c.decode(L.SignedGrant.self, forKey: .takeover), launch: c.decode(Launch.self, forKey: .launch),
-                nowUnixSeconds: c.decode(UInt64.self, forKey: .nowUnixSeconds), lifetimeSeconds: c.decode(UInt64.self, forKey: .lifetimeSeconds))
+                nowUnixSeconds: c.decode(UInt64.self, forKey: .nowUnixSeconds), lifetimeSeconds: c.decode(UInt64.self, forKey: .lifetimeSeconds),
+                observation: c.decodeIfPresent(StorageLifecycleColdObservationProtocol.SignedRequest.self, forKey: .observation))
         }
         /// Exact Go declaration order, not sorted transport JSON.
         public var signingBytes: Data {
             let signed = "{\"grant\":\(takeover.grant.signingJSON),\"signature\":\"\(takeover.signature.base64EncodedString())\"}"
-            let json = "{\"operation_id\":\"\(operationID)\",\"predecessor\":\(predecessor.signingJSON),\"takeover\":\(signed),\"launch\":\(launch.signingJSON),\"now_unix_seconds\":\(nowUnixSeconds),\"lifetime_seconds\":\(lifetimeSeconds)}"
+            let observed = observation.map { ",\"observation\":\($0.signingJSON)" } ?? ""
+            let json = "{\"operation_id\":\"\(operationID)\",\"predecessor\":\(predecessor.signingJSON),\"takeover\":\(signed),\"launch\":\(launch.signingJSON),\"now_unix_seconds\":\(nowUnixSeconds),\"lifetime_seconds\":\(lifetimeSeconds)\(observed)}"
             return Data(("cengine.storageauthority.lifecycle-cold-open.v1\0" + json).utf8)
         }
         public var digest: String { SHA256.hash(data: signingBytes).map { String(format: "%02x", $0) }.joined() }
@@ -144,6 +158,7 @@ public enum StorageLifecycleColdProtocol {
         public func isValidSignature(using root: StorageIdentity.RootPublicKey) -> Bool {
             guard (try? validate()) != nil, root.fingerprint.rawValue == request.predecessor.bootstrapKey,
                   request.takeover.isValidSignature(using: root),
+                  request.observation == nil || request.observation?.isValidSignature(using: root) == true,
                   let key = try? Curve25519.Signing.PublicKey(rawRepresentation: root.publicData) else { return false }
             return key.isValidSignature(signature, for: request.signingBytes)
         }

@@ -1559,6 +1559,7 @@ private func freshTestMessageAudit(_ message: xpc_object_t, _ token: UnsafeMutab
         if fault != "missing-file" {
             var metadata: [String: Any] = ["schemaVersion": 1, "protocolVersion": 1,
                 "storageServiceBootVersion": 2, "storageLifecycleVersion": 2, "workloadStorageBootVersion": 1,
+                "storageColdObservationVersion": 1,
                 "containerInitramfsSHA256": containerBootTestSHA256, "storageInitramfsSHA256": digest]
             switch fault {
             case "missing-version": metadata.removeValue(forKey: "storageServiceBootVersion")

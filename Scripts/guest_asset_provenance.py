@@ -26,6 +26,8 @@ MAX_ARCHIVE = 256 << 20
 MAX_BINARY = 64 << 20
 MAX_KERNEL = 128 << 20
 RECEIPT = "kernel-origin.json"
+BASE_PATCH = "0001-virtiofs-host-close-to-open.patch"
+MANAGED_PATCH = "0002-fuse-request-credentials-experimental.patch"
 ASSETS = ("vmlinux", "container-initramfs.cpio.gz", "storage-initramfs.cpio.gz", "disk-bootstrap.json")
 REQUIRED_SETTINGS = {"-buildmode": "exe", "-compiler": "gc", "-trimpath": "true",
                      "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64", "GOARM64": "v8.0"}
@@ -110,17 +112,37 @@ def kernel_config(root: Path) -> tuple[str, str]:
     return release, sha(inputs)
 
 
+def managed_patch_sha256(root: Path) -> str:
+    """Close the managed recipe claim, not the actual kernel's runtime ABI."""
+    directory = root / "Configuration/kernel-patches"
+    patches = []
+    for name in read_bytes(directory / "series", 65536).decode().split("\n"):
+        if not name or name.startswith("#"):
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]*", name) is None:
+            raise ValueError(f"invalid kernel patch name: {name}")
+        if name in patches:
+            raise ValueError(f"duplicate kernel patch: {name}")
+        patches.append(name)
+    if BASE_PATCH not in patches or MANAGED_PATCH not in patches or patches.index(BASE_PATCH) > patches.index(MANAGED_PATCH):
+        raise ValueError("managed kernel patch must be listed after base patch")
+    return digest(read_bytes(directory / MANAGED_PATCH, 16 << 20))
+
+
 def kernel_receipt(root: Path, binary: Path, origin: str) -> dict:
     if origin not in ("canonical-release", "custom-release", "local", "unverified"):
         raise ValueError("invalid kernel origin")
     release, inputs = kernel_config(root)
-    return {"schemaVersion": 1, "origin": origin, "sha256": digest(read_bytes(binary, MAX_KERNEL)),
-            "release": release, "inputSHA256": inputs}
+    # Local/unverified kernels retain their origin: recipe hashes do not attest
+    # that arbitrary kernel bytes implement request_cred/managed_close_to_open.
+    return {"schemaVersion": 2, "origin": origin, "sha256": digest(read_bytes(binary, MAX_KERNEL)),
+            "release": release, "inputSHA256": inputs, "managedPatchSHA256": managed_patch_sha256(root)}
 
 
 def check_kernel(root: Path, binary: Path, receipt: Path, origin: str | None = None) -> dict:
     value = load_json(read_bytes(receipt, 4096))
-    exact(value, {"schemaVersion": int, "origin": str, "sha256": str, "release": str, "inputSHA256": str})
+    exact(value, {"schemaVersion": int, "origin": str, "sha256": str, "release": str,
+                  "inputSHA256": str, "managedPatchSHA256": str})
     expected = kernel_receipt(root, binary, origin or value["origin"])
     if value != expected:
         raise ValueError("kernel origin/hash/configuration mismatch")
@@ -263,7 +285,9 @@ def provenance(root: Path, output: Path, go: Path, pin: str) -> dict:
         raise ValueError("ordinary source changed during build")
     try:
         kernel = check_kernel(root, output / "vmlinux", output / RECEIPT)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        # A missing sidecar is allowed for arbitrary local/staged bytes. An existing
+        # old or malformed receipt must never be silently upgraded or repaired.
         kernel = kernel_receipt(root, output / "vmlinux", "unverified")
     binaries = {}
     mke2fs = None
@@ -306,19 +330,22 @@ def validate(root: Path, output: Path, go: Path, *, require_release_kernel: bool
     if any(key in metadata for key in ("storageLifecycleQualification", "storageLifecycleSourcePin")):
         raise ValueError("lifecycle qualification assets are test-only, never ordinary release assets")
     exact(metadata, {"schemaVersion": int, "protocolVersion": int, "storageServiceBootVersion": int,
-                     "workloadStorageBootVersion": int, "storageLifecycleVersion": int, "containerInitramfsSHA256": str,
+                     "workloadStorageBootVersion": int, "storageLifecycleVersion": int,
+                     "storageColdObservationVersion": int, "containerInitramfsSHA256": str,
                      "storageInitramfsSHA256": str, "ordinaryProvenance": dict})
     if any(metadata[key] != 1 for key in ("schemaVersion", "protocolVersion", "workloadStorageBootVersion")):
         raise ValueError("unsupported bootstrap metadata version")
-    if metadata["storageLifecycleVersion"] != 2 or metadata["storageServiceBootVersion"] != 2:
-        raise ValueError("ordinary release assets require storageLifecycleVersion 2 and storageServiceBootVersion 2")
+    if (metadata["storageLifecycleVersion"] != 2 or metadata["storageServiceBootVersion"] != 2
+            or metadata["storageColdObservationVersion"] != 1):
+        raise ValueError("ordinary release assets require storageLifecycleVersion 2, storageServiceBootVersion 2 and storageColdObservationVersion 1")
     value = metadata["ordinaryProvenance"]
     exact(value, {"schemaVersion": int, "policy": str, "sourceSHA256": str, "kernel": dict,
                   "containerBinary": dict, "storageBinary": dict, "mke2fsSHA256": str})
     for name in ("containerBinary", "storageBinary"):
         exact(value[name], {"sha256": str, "goVersion": str})
         sha(value[name]["sha256"])
-    exact(value["kernel"], {"schemaVersion": int, "origin": str, "sha256": str, "release": str, "inputSHA256": str})
+    exact(value["kernel"], {"schemaVersion": int, "origin": str, "sha256": str, "release": str,
+                            "inputSHA256": str, "managedPatchSHA256": str})
     origin = "canonical-release" if require_release_kernel else value["kernel"]["origin"]
     if value["kernel"] != kernel_receipt(root, output / "vmlinux", origin):
         raise ValueError("kernel origin/hash/configuration mismatch")

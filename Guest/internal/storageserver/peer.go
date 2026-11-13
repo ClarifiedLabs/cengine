@@ -33,6 +33,8 @@ type peer struct {
 	queue          [][]byte
 	bytes          int
 	wake           chan struct{}
+
+	rootReplyPending bool // under mu; set with queue publication, cleared by the first completed write
 }
 
 func (p *peer) failure() error { p.mu.Lock(); defer p.mu.Unlock(); return p.err }
@@ -43,6 +45,9 @@ func (p *peer) fail(err error) {
 	p.mu.Lock()
 	first := p.err == nil
 	if first {
+		if p.rootReplyPending {
+			err = wrapHandshakeFailure(handshakeRootReplyWrite, err)
+		}
 		p.err = err
 		p.stopInputLocked()
 		close(p.done)
@@ -116,17 +121,19 @@ func frame(message w.Message) ([]byte, error) {
 	copy(out[4:], payload)
 	return out, nil
 }
-func (p *peer) enqueueMessage(message w.Message) error {
-	b, err := frame(message)
+func (p *peer) enqueueRootReply(root w.Entry) error {
+	b, err := frame(&w.RootReply{Root: root})
 	if err != nil {
 		return err
 	}
-	return p.enqueue(b)
+	return p.enqueueFrame(b, true)
 }
 
 // Immutable frames may be shared between recipients. Accounting conservatively
 // charges the complete frame to each recipient, including the in-flight write.
-func (p *peer) enqueue(b []byte) error {
+func (p *peer) enqueue(b []byte) error { return p.enqueueFrame(b, false) }
+
+func (p *peer) enqueueFrame(b []byte, rootReply bool) error {
 	p.mu.Lock()
 	if p.err != nil {
 		err := p.err
@@ -140,6 +147,12 @@ func (p *peer) enqueue(b []byte) error {
 	}
 	p.queue = append(p.queue, b)
 	p.bytes += len(b)
+	if rootReply {
+		// Publish the queue-to-write phase under the same lock as fail: even
+		// cancellation before writer startup must retire with the marked cause.
+		// Earlier failures and queue refusals never enter the write phase.
+		p.rootReplyPending = true
+	}
 	p.mu.Unlock()
 	select {
 	case p.wake <- struct{}{}:
@@ -200,6 +213,7 @@ func (p *peer) writeLoop() {
 		p.bytes -= len(b)
 		if first {
 			first = false
+			p.rootReplyPending = false
 			close(p.rootWritten)
 		}
 		p.mu.Unlock()

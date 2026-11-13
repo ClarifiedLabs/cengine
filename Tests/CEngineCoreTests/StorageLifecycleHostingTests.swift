@@ -161,7 +161,8 @@ struct StorageLifecycleHostingTests {
         #expect(published == duringBind && bound == duringBind)
     }
 
-    @Test func completedHostPublicationDoesNotTieEnrolledMachineToDaemonEOF() async throws {
+    @Test(arguments: [RawDiskBootTransaction.Policy.journalDriven, .requireInitializedStorage, .resumeReadOnly])
+    func completedHostPublicationDoesNotTieEnrolledMachineToDaemonEOF(policy: RawDiskBootTransaction.Policy) async throws {
         let gate = VMShimBootGate(), machineOwner = VMShimMachineOwner<FakeMachine>()
         let control = StorageLifecycleControlLifetime(), machine = FakeMachine()
         machineOwner.machine = machine
@@ -178,7 +179,9 @@ struct StorageLifecycleHostingTests {
         try control.beginEnrollment(); try control.enroll()
         // EOF only fences control after ROOT enrollment; the startup transaction
         // is already complete and cannot turn it into VM/DATA teardown.
-        #expect(control.detach() && control.preservesOwner)
+        let abort = StorageLifecycleFreshAbort()
+        #expect(abort.terminationDecision(policy: policy, control: control) == .preserveOwner)
+        #expect(control.preservesOwner && abort.task == nil)
         #expect(published && bound && started && !closed && !gate.isStopping)
         #expect(machineOwner.machine === machine)
     }
@@ -310,13 +313,15 @@ struct StorageLifecycleHostingTests {
         #expect(early.terminate(nil) && !early.terminate(nil))
     }
 
-    @Test func initializerExitWaitsForFullStopJoinAndIsOneShot() async throws {
+    @Test(arguments: [RawDiskBootTransaction.Policy.journalDriven, .requireInitializedStorage, .resumeReadOnly])
+    func initializerExitWaitsForFullStopJoinAndIsOneShot(policy: RawDiskBootTransaction.Policy) async throws {
         let owner = VMShimMachineOwner<FakeMachine>()
         owner.machine = FakeMachine()
         let abort = StorageLifecycleFreshAbort(), guestExit = StorageLifecycleGuestExit()
         let control = StorageLifecycleControlLifetime(), exit = VMShimInitializerExit()
         let bootGate = VMShimBootGate()
         guestExit.guestDidStop()
+        #expect(abort.terminationDecision(policy: policy, control: control) == .beginAbort)
         abort.begin(exit: guestExit, close: { _ in }, fallback: { Issue.record("unexpected force") })
         #expect(await abort.task?.value == true)
         var exits: [Int32] = [], stops = 0, joins = 0
