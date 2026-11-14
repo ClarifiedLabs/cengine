@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class DefaultAssetsTests(unittest.TestCase):
-    def run_selection(self, explicit=False, profile=""):
+    def run_selection(self, explicit=False, profile="", *, identity="Developer ID Application: Fixture (ABCDEFGHIJ)", helper_mode=""):
         source = (ROOT / "Scripts/run-compat-tests.sh").read_text()
         prefix = source[:source.index("LOCK=")]
         prepare = source[source.index('if [ "$BUILD_DEFAULT_ASSETS" = 1 ]; then'):source.index('stage "$BUILD_STAGE"')]
@@ -27,7 +27,9 @@ class DefaultAssetsTests(unittest.TestCase):
             kernel.chmod(0o755)
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("CENGINE_", "XCODE", "PREPARE_"))}
-            env.update(CALLS=str(calls), CENGINE_DEVELOPER_ID_APPLICATION="Developer ID Application: Fixture (ABCDEFGHIJ)")
+            env.update(CALLS=str(calls), CENGINE_COMPAT_HELPER_MODE=helper_mode)
+            if identity is not None:
+                env["CENGINE_DEVELOPER_ID_APPLICATION"] = identity
             if explicit:
                 assets = root / "explicit-assets"
                 assets.mkdir()
@@ -46,7 +48,8 @@ make() {
 }
 stage() { :; }
 '''
-            result = subprocess.run(["sh", "-eu", "-c", prefix + stubs + prepare,
+            child_environment = '\npython3 -c \'import os; print(os.environ.get("CENGINE_DEVELOPER_ID_APPLICATION", "missing"))\'\n'
+            result = subprocess.run(["sh", "-eu", "-c", prefix + stubs + prepare + child_environment,
                                      str(root / "Scripts/run-compat-tests.sh")], env=env, text=True, capture_output=True)
             return result, calls.read_text().splitlines() if calls.exists() else []
 
@@ -59,6 +62,24 @@ stage() { :; }
         result, calls = self.run_selection(explicit=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["validate"])
+
+    def test_default_adhoc_signing_selection_reaches_children(self):
+        result, calls = self.run_selection(identity=None, helper_mode="unprivileged")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "-")
+        self.assertEqual(calls, ["build", "kernel-check", "validate"])
+
+    def test_explicit_signing_selection_reaches_children_unchanged(self):
+        for identity in ("-", "Developer ID Application: Fixture (ABCDEFGHIJ)"):
+            with self.subTest(identity=identity):
+                result, _ = self.run_selection(identity=identity, helper_mode="unprivileged")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), identity)
+
+    def test_privileged_mode_cannot_infer_adhoc_identity(self):
+        result, calls = self.run_selection(identity=None, helper_mode="privileged")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
 
     def test_profile_cannot_trigger_ordinary_asset_build(self):
         result, calls = self.run_selection(profile="rtm096-full-nine-v3")

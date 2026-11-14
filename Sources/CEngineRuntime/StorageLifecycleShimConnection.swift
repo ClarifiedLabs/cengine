@@ -123,13 +123,16 @@ final class StorageLifecycleShimConnection: ManagedStorageLifecycleServiceTransp
         do {
             let lease = try channel.lease(), fd = lease.fileDescriptor
             let observed = try Self.observeAdopted(fd: fd, status: status)
+            let policy = authorization.policy
+            let identity = try policy.currentIdentity(role: .engine)
             let authenticate: @Sendable (Int32) throws -> Void = { fd in
                 guard try Self.observeAdopted(fd: fd, status: status) == observed else { throw Wire.Failure.unauthorized }
                 var token = status.shimAudit.withUnsafeBytes { $0.loadUnaligned(as: audit_token_t.self) }
                 var flags: UInt32 = 0
                 guard adoptedShimCodeStatus(Int32(bitPattern: token.val.5), 0, &flags,
                     MemoryLayout<UInt32>.size, &token) == 0,
-                    Self.validAdoptedCodeFlags(flags) else { throw Wire.Failure.unauthorized }
+                    Self.validAdoptedCodeFlags(flags, namespace: policy.namespace,
+                        isQualification: policy.isQualification, team: identity.teamIdentifier) else { throw Wire.Failure.unauthorized }
                 guard try Self.observeAdopted(fd: fd, status: status) == observed else { throw Wire.Failure.unauthorized }
             }
             try authenticate(fd)
@@ -142,10 +145,16 @@ final class StorageLifecycleShimConnection: ManagedStorageLifecycleServiceTransp
         } catch { channel.close(); throw error }
     }
     /// Pure rejection predicate, not an authentication or capability-minting seam.
-    static func validAdoptedCodeFlags(_ flags: UInt32) -> Bool {
-        // XNU cs_blobs.h: CS_VALID | CS_RUNTIME; reject CS_ADHOC | CS_DEBUGGED.
-        let required: UInt32 = 0x0000_0001 | 0x0001_0000
-        let forbidden: UInt32 = 0x0000_0002 | 0x1000_0000
+    static func validAdoptedCodeFlags(_ flags: UInt32, namespace: SignedStorageIdentity.Namespace,
+                                      isQualification: Bool, team: String) -> Bool {
+        // Match ROOT's BootstrapRegisteredShimCodePin only for authenticated
+        // ordinary ad-hoc compatibility. Signed/qualification code stays strict.
+        let allowAdHoc = namespace == .compatibility && !isQualification
+            && team == SignedStorageIdentity.adHocCompatibilityTeam
+        // XNU cs_blobs.h: always require CS_VALID and reject CS_DEBUGGED.
+        // Otherwise also require CS_RUNTIME and reject CS_ADHOC.
+        let required: UInt32 = allowAdHoc ? 0x0000_0001 : (0x0000_0001 | 0x0001_0000)
+        let forbidden: UInt32 = allowAdHoc ? 0x1000_0000 : (0x0000_0002 | 0x1000_0000)
         return flags & required == required && flags & forbidden == 0
     }
     private static func observeAdopted(fd: Int32, status: StorageLifecycleAdoptionRootProtocol.Status) throws -> Data {

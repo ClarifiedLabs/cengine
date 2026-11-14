@@ -57,6 +57,15 @@ mkdir -p "$OUTPUT" \
     "$CONTAINER_ROOT/bin" "$CONTAINER_ROOT/sbin" "$CONTAINER_ROOT/etc" "$CONTAINER_ROOT/dev" "$CONTAINER_ROOT/proc" "$CONTAINER_ROOT/sys" "$CONTAINER_ROOT/run" "$CONTAINER_ROOT/rootfs" \
     "$STORAGE_ROOT/bin" "$STORAGE_ROOT/sbin" "$STORAGE_ROOT/etc" "$STORAGE_ROOT/dev" "$STORAGE_ROOT/proc" "$STORAGE_ROOT/sys" "$STORAGE_ROOT/run" "$STORAGE_ROOT/data"
 
+# The archive preserves staging modes. A private host umask (the compatibility
+# runner uses 077) must not make guest / unsearchable to caller-identity workers.
+# Normalize only guest system directories; keep host output permissions intact.
+for guest_root in "$CONTAINER_ROOT" "$STORAGE_ROOT"; do
+    chmod 0755 "$guest_root" "$guest_root/bin" "$guest_root/sbin" "$guest_root/etc" \
+        "$guest_root/dev" "$guest_root/proc" "$guest_root/sys" "$guest_root/run"
+done
+chmod 0700 "$CONTAINER_ROOT/rootfs" "$STORAGE_ROOT/data"
+
 if [ ! -f "$OUTPUT/vmlinux" ]; then
     echo "cengine kernel is missing at $OUTPUT/vmlinux; run make kernel" >&2
     exit 2

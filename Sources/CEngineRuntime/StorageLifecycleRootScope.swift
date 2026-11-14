@@ -23,26 +23,37 @@ nonisolated extension StorageLifecycleRootClient {
             policy.namespace == .production ? UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : 0)
         let pending = ScopeBindPending()
         xpc_connection_set_event_handler(connection) { event in
-            if xpc_get_type(event) == XPC_TYPE_ERROR { pending.finish(.failure(Failure(.unavailable))) }
+            if xpc_get_type(event) == XPC_TYPE_ERROR {
+                pending.finish(.failure(Failure(.unavailable)), phase: .replyTransport)
+            }
         }
         xpc_connection_activate(connection)
         defer { xpc_connection_cancel(connection) }
         let policy = policy, team = installedTeam
         xpc_connection_send_message_with_reply(connection, message, queue) { response in
-            pending.finish(Result {
+            var phase = StorageLifecycleScopeBindClientDiagnostic.Phase.replyTransport
+            let result = Result<Void, any Error> {
                 guard xpc_get_type(response) == XPC_TYPE_DICTIONARY else { throw Failure(.unavailable) }
+                phase = .authenticate
                 var token = audit_token_t(); scopeRootReplyAudit(response, &token)
                 try Self.authenticate(token: token, team: team, policy: policy)
+                phase = .replyShape
                 var keys = Set<String>()
                 xpc_dictionary_apply(response) { key, _ in keys.insert(String(cString: key)); return true }
                 guard keys == ["ok"], let ok = xpc_dictionary_get_value(response, "ok"),
-                      xpc_get_type(ok) == XPC_TYPE_BOOL, xpc_bool_get_value(ok) else { throw Failure(.unauthorized) }
-            })
+                      xpc_get_type(ok) == XPC_TYPE_BOOL else { throw Failure(.unauthorized) }
+                phase = .rejected
+                guard xpc_bool_get_value(ok) else { throw Failure(.unauthorized) }
+            }
+            pending.finish(result, phase: phase)
         }
         let remaining = deadline - ProcessInfo.processInfo.systemUptime
         guard remaining > 0, pending.ready.wait(timeout: .now() + remaining) == .success,
               ProcessInfo.processInfo.systemUptime < deadline,
-              let result = pending.lock.withLock({ pending.result }) else { throw Failure(.unavailable) }
+              let result = pending.lock.withLock({ pending.result }) else {
+            StorageLifecycleScopeBindClientDiagnostic.emit(.init(phase: .timeout, error: Failure(.unavailable)))
+            throw Failure(.unavailable)
+        }
         try result.get()
     }
 
@@ -77,12 +88,46 @@ nonisolated extension StorageLifecycleRootClient {
     #endif
 }
 
+/// Closed failure-only stderr breadcrumbs, never helper authority or recovery evidence.
+nonisolated struct StorageLifecycleScopeBindClientDiagnostic: Equatable, Sendable {
+    enum Phase: String, CaseIterable, Sendable {
+        case replyTransport = "reply-transport"
+        case authenticate, replyShape = "reply-shape", rejected, timeout
+    }
+    enum Category: String, CaseIterable, Sendable {
+        case invalidRequest, unauthorized, conflict, unknownStore, unknownGrant
+        case blocked, epochExhausted, capacityExceeded, repairRequired, unavailable, other
+    }
+    let phase: Phase
+    let category: Category
+    init(phase: Phase, error: any Error) {
+        self.phase = phase
+        category = (error as? StorageLifecycleRootClient.Failure).flatMap { Category(rawValue: $0.code.rawValue) } ?? .other
+    }
+    var line: String {
+        "cengine.lifecycle.scope-bind.failed phase=\(phase.rawValue) category=\(category.rawValue)\n"
+    }
+    static func emit(_ diagnostic: Self) {
+        // Bounded best-effort stderr write; logging failure does not alter the result.
+        diagnostic.line.utf8CString.withUnsafeBytes { bytes in
+            _ = Darwin.write(STDERR_FILENO, bytes.baseAddress, bytes.count - 1)
+        }
+    }
+}
+
 nonisolated private final class ScopeBindPending: @unchecked Sendable {
     let lock = NSLock()
     let ready = DispatchSemaphore(value: 0)
     var result: Result<Void, any Error>?
-    func finish(_ result: Result<Void, any Error>) {
-        lock.withLock { if self.result == nil { self.result = result; ready.signal() } }
+    func finish(_ result: Result<Void, any Error>, phase: StorageLifecycleScopeBindClientDiagnostic.Phase) {
+        lock.withLock {
+            if self.result == nil {
+                if case .failure(let error) = result {
+                    StorageLifecycleScopeBindClientDiagnostic.emit(.init(phase: phase, error: error))
+                }
+                self.result = result; ready.signal()
+            }
+        }
     }
 }
 #endif

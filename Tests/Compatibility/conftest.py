@@ -543,7 +543,11 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         )
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(session: pytest.Session, items: list[pytest.Item]) -> None:
+    # Validate the complete inventory before pytest applies -m/-k deselection.
+    # The runner's qualification split must not hide ledger gaps or bad IDs.
+    validate_compatibility_collection(session, items)
     seed = os.environ.get("CENGINE_TEST_SEED")
     if seed is not None:
         random.Random(int(seed)).shuffle(items)
@@ -618,10 +622,10 @@ def pytest_report_header() -> list[str]:
     return versions
 
 
-def pytest_collection_finish(session: pytest.Session) -> None:
+def validate_compatibility_collection(session: pytest.Session, items: list[pytest.Item]) -> None:
     ledger = (REPO_ROOT / "docs/docker-compatibility.md").read_text()
     seen: set[str] = set()
-    for item in session.items:
+    for item in items:
         marker = item.get_closest_marker("compat")
         if marker is None or len(marker.args) != 1:
             raise pytest.UsageError(f"{item.nodeid} is missing one @pytest.mark.compat ID")
@@ -633,7 +637,9 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         seen.add(compat_id)
     documented = set(re.findall(r"^\| `([A-Z]+-[0-9]+)` \|", ledger, flags=re.MULTILINE))
     requested = [pathlib.Path(str(value).split("::", 1)[0]).resolve() for value in session.config.args]
-    full_suite = requested == [pathlib.Path(__file__).parent.resolve()] and not session.config.option.markexpr
+    # Marker selection does not narrow the inventory above. Explicit node/module
+    # selections and -k are focused runs, so they need not cover the whole ledger.
+    full_suite = requested == [pathlib.Path(__file__).parent.resolve()] and not session.config.option.keyword
     missing = documented - seen
     if full_suite and missing:
         raise pytest.UsageError(f"compatibility ledger IDs have no tests: {', '.join(sorted(missing))}")

@@ -955,7 +955,7 @@ public final class UserspaceNetworkUplink: @unchecked Sendable {
             if remaining >= 8 {
                 remaining -= 8
             } else if remaining > 0 {
-                let mask = UInt8(0xff << (8 - remaining))
+                let mask = UInt8(truncatingIfNeeded: 0xff << (8 - remaining))
                 bytes[index] &= mask
                 remaining = 0
             } else {

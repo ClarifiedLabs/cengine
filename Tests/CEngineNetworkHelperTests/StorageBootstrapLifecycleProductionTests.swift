@@ -133,6 +133,104 @@ private let noSync: @Sendable (Int32) throws -> Void = { _ in }
         try StorageLifecycleProductionFormat.require(directory.fd, owner: geteuid(), sync: noSync)
     }
 
+    private func addHistory(_ directory: ProductionTempDirectory, count: Int) throws {
+        for index in 0..<count {
+            let name = String(format: "%064x", index)
+            let (fd, fresh) = try StorageLifecycleQualificationFiles.directory(directory.fd, name, owner: geteuid(), create: true)
+            defer { close(fd) }
+            #expect(fresh)
+            try StorageLifecycleQualificationFiles.write(Data("historical authority \(index)\n".utf8),
+                parent: fd, name: "scope", owner: geteuid(), sync: noSync)
+        }
+    }
+
+    private func snapshot(_ directory: ProductionTempDirectory) throws -> [String: Data] {
+        let enumerator = try #require(FileManager.default.enumerator(atPath: directory.url.path))
+        var result: [String: Data] = [:]
+        for case let path as String in enumerator {
+            var isDirectory: ObjCBool = false
+            #expect(FileManager.default.fileExists(atPath: directory.path(path), isDirectory: &isDirectory))
+            result[path] = isDirectory.boolValue ? Data() : try Data(contentsOf: URL(fileURLWithPath: directory.path(path)))
+        }
+        return result
+    }
+
+    @Test(arguments: [129, 512]) func durableHistoryHasNoActiveScopeLimit(count: Int) throws {
+        for namespace in [StorageLifecycleScopeNamespace.production, .compatibility] {
+            let directory = try ProductionTempDirectory(), root = try ProductionTempDirectory()
+            try StorageLifecycleProductionFormat.require(directory.fd, owner: geteuid(), namespace: namespace, sync: noSync)
+            let binding = try StorageLifecycleQualificationBinding.verified(
+                store: "11111111-1111-4111-8111-111111111111", rootFD: root.fd, owner: geteuid())
+            var scope: StorageLifecycleQualificationDirectory? = try .init(
+                baseFD: directory.fd, binding: binding, owner: geteuid(), sync: noSync)
+            let key = try scope!.journal.readRootPublicKey()
+            scope = nil
+            try addHistory(directory, count: count - 1)
+            let before = try snapshot(directory)
+            let marker = namespace == .production ? StorageLifecycleProductionFormat.bytes
+                : Data("cengine.storage.lifecycle.compatibility.v3\n".utf8)
+            #expect(before["format"] == marker)
+            // A new directory stream/descriptor models validation after helper restart.
+            let reopened = openat(directory.fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            defer { close(reopened) }
+            #expect(reopened >= 0)
+            var syncs = 0
+            try StorageLifecycleProductionFormat.require(reopened, owner: geteuid(), namespace: namespace, sync: { _ in syncs += 1 })
+            #expect(syncs == 0)
+            scope = try .init(baseFD: reopened, binding: binding, owner: geteuid(), sync: noSync)
+            #expect(!scope!.wasCreated)
+            #expect(try scope!.journal.readRootPublicKey() == key)
+            #expect(try snapshot(directory) == before)
+        }
+    }
+
+    @Test func invalidEntriesInLargeHistoryRefuseWithoutWrites() throws {
+        for namespace in [StorageLifecycleScopeNamespace.production, .compatibility] {
+            for entry in ["v1", "authority.journal", "unknown", String(repeating: "g", count: 64), String(repeating: "a", count: 63)] {
+                let directory = try ProductionTempDirectory()
+                try StorageLifecycleProductionFormat.require(directory.fd, owner: geteuid(), namespace: namespace, sync: noSync)
+                try addHistory(directory, count: 512)
+                // Add the invalid entry only after more than 128 historical roots.
+                #expect(mkdirat(directory.fd, entry, 0o700) == 0)
+                let before = try snapshot(directory)
+                var syncs = 0
+                #expect(throws: StorageLifecycleUnsupportedFormat(entry: entry)) {
+                    try StorageLifecycleProductionFormat.require(directory.fd, owner: geteuid(), namespace: namespace, sync: { _ in syncs += 1 })
+                }
+                #expect(syncs == 0)
+                #expect(try snapshot(directory) == before)
+            }
+        }
+    }
+
+    @Test func missingMalformedOrForeignMarkersInLargeHistoryRefuseWithoutWrites() throws {
+        for namespace in [StorageLifecycleScopeNamespace.production, .compatibility] {
+            let foreign = namespace == .production ? "cengine.storage.lifecycle.compatibility.v3\n"
+                : "cengine.storage.lifecycle.production.v3\n"
+            for marker in [nil, foreign, "cengine.storage.lifecycle.production.v1\n", "malformed\n"] as [String?] {
+                let directory = try ProductionTempDirectory()
+                try addHistory(directory, count: 512)
+                if let marker {
+                    try StorageLifecycleQualificationFiles.write(Data(marker.utf8), parent: directory.fd,
+                        name: "format", owner: geteuid(), sync: noSync)
+                }
+                let before = try snapshot(directory)
+                var syncs = 0
+                #expect(throws: StorageLifecycleUnsupportedFormat(entry: marker == nil ? String(repeating: "0", count: 64) : "format")) {
+                    try StorageLifecycleProductionFormat.require(directory.fd, owner: geteuid(), namespace: namespace, sync: { _ in syncs += 1 })
+                }
+                #expect(syncs == 0)
+                #expect(try snapshot(directory) == before)
+            }
+        }
+    }
+
+    @Test func durableHistoryDoesNotRaiseActiveLimits() {
+        #expect(StorageLifecycleQualificationRegistry.maximum == 128)
+        #expect(StorageLifecycleQualificationAdmission<Int>.maximumPeers == 128)
+        #expect(StorageLifecycleQualificationAdmission<Int>.maximumInFlight == 16)
+    }
+
     @Test func existingV1OrUnknownProductionAuthorityRefusesAndPreservesBytes() throws {
         let legacy = Data("CEBSJ001 legacy v1 production authority bytes".utf8)
         for (name, isDirectory) in [("authority.journal", false), ("authority.lock", false), ("v1", true), ("unexpected", false)] {
@@ -328,6 +426,26 @@ private func adminRun(_ arguments: [String], directory: ProductionTempDirectory,
         xpc_dictionary_set_fd(message, "store-root", fd)
         if let extra { xpc_dictionary_set_string(message, extra, "x") }
         return message
+    }
+
+    @Test func scopeBindDiagnosticsUseOnlyClosedFields() {
+        typealias D = StorageLifecycleScopeBindDiagnostic
+        struct SecretFailure: LocalizedError {
+            var errorDescription: String? { "/private/store token=secret pid=123 certificate=request" }
+        }
+        for phase in D.Phase.allCases {
+            let diagnostic = D(phase: phase, error: SecretFailure())
+            #expect(diagnostic.category == .other)
+            #expect(diagnostic.line == "storage-lifecycle-scope-bind-rejected phase=\(phase.rawValue) category=other\n")
+        }
+        for code in StorageIdentity.ErrorCode.allCases {
+            let diagnostic = D(phase: .binding, error: BootstrapFailure(code))
+            #expect(diagnostic.category.rawValue == code.rawValue)
+            #expect(diagnostic.line == "storage-lifecycle-scope-bind-rejected phase=binding category=\(code.rawValue)\n")
+        }
+        #expect(D.Category(rawValue: "token=secret\nforged") == nil)
+        #expect(D.Phase.allCases.map(\.rawValue) == ["admission", "owner", "sender", "decode", "rootdescriptor",
+            "binding", "registry", "resolve", "rootvalidation", "senderrecheck", "remember"])
     }
 
     @Test func productionScopeBindIsAdmittedAndDecoded() throws {

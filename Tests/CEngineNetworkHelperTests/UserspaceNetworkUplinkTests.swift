@@ -106,6 +106,86 @@ import Testing
         await uplink.stop()
     }
 
+    @Test func ndpGatewayCanonicalizesHostBitsInPartialByteSubnet() async throws {
+        // NET-022: fd00:ce::1e/124 canonicalizes to fd00:ce::10/124,
+        // whose first address (and uplink gateway) is fd00:ce::11.
+        try await Self.expectNdpGateway(subnet: "fd00:ce::1e/124", gateway: "fd00:ce::11")
+    }
+
+    @Test(arguments: [
+        (0, "::1"),
+        (8, "fd00::1"),
+        (16, "fd12::1"),
+        (24, "fd12:3400::1"),
+        (32, "fd12:3456::1"),
+        (40, "fd12:3456:7800::1"),
+        (48, "fd12:3456:789a::1"),
+        (56, "fd12:3456:789a:bc00::1"),
+        (64, "fd12:3456:789a:bcde::1"),
+        (72, "fd12:3456:789a:bcde:fe00::1"),
+        (80, "fd12:3456:789a:bcde:fedc::1"),
+        (88, "fd12:3456:789a:bcde:fedc:ba00::1"),
+        (96, "fd12:3456:789a:bcde:fedc:ba98::1"),
+        (104, "fd12:3456:789a:bcde:fedc:ba98:7600:1"),
+        (112, "fd12:3456:789a:bcde:fedc:ba98:7654:1"),
+        (120, "fd12:3456:789a:bcde:fedc:ba98:7654:3201"),
+        (121, "fd12:3456:789a:bcde:fedc:ba98:7654:3281"),
+        (122, "fd12:3456:789a:bcde:fedc:ba98:7654:32c1"),
+        (123, "fd12:3456:789a:bcde:fedc:ba98:7654:32e1"),
+        (124, "fd12:3456:789a:bcde:fedc:ba98:7654:32f1"),
+        (125, "fd12:3456:789a:bcde:fedc:ba98:7654:32f9"),
+        (126, "fd12:3456:789a:bcde:fedc:ba98:7654:32fd"),
+        (127, "fd12:3456:789a:bcde:fedc:ba98:7654:32ff"),
+        (128, "fd12:3456:789a:bcde:fedc:ba98:7654:32ff"),
+    ])
+    func ndpGatewayMasksEveryPartialByteAndByteAlignedPrefix(prefix: Int, gateway: String) async throws {
+        try await Self.expectNdpGateway(
+            subnet: "fd12:3456:789a:bcde:fedc:ba98:7654:32fe/\(prefix)",
+            gateway: gateway
+        )
+    }
+
+    private static func expectNdpGateway(subnet: String, gateway: String) async throws {
+        var address = in6_addr()
+        try #require(inet_pton(AF_INET6, gateway, &address) == 1)
+        let gatewayIP6 = withUnsafeBytes(of: address) { Array($0) }
+        let request = PrivilegedVMNetRequest(
+            namespace: "compat",
+            id: "net-ndp-prefix",
+            vlan: vlan,
+            subnet: "",
+            gateway: "",
+            ipv6Subnet: subnet,
+            internalNetwork: false,
+            dhcpEnabled: false,
+            ports: []
+        )
+        let (uplink, clientFD) = try UserspaceNetworkUplink.start(request: request)
+        defer {
+            Darwin.close(clientFD)
+            Task { await uplink.stop() }
+        }
+
+        var payload: [UInt8] = [135, 0, 0, 0, 0, 0, 0, 0] + gatewayIP6
+        payload += [1, 1] + guestMAC
+        var frame: [UInt8] = gatewayMAC + guestMAC + [0x86, 0xdd]
+        frame += [0x60, 0, 0, 0, 0, UInt8(payload.count), 58, 255]
+        frame += guestIP6 + gatewayIP6 + payload
+        try writeUntaggedFrame(clientFD, frame)
+
+        let reply = try await readTaggedFrame(clientFD)
+        try #require(reply.count >= 14 + 40 + 32)
+        #expect(Array(reply[0..<6]) == guestMAC)
+        #expect(Array(reply[6..<12]) == gatewayMAC)
+        #expect(reply[14 + 6] == 58)
+        #expect(Array(reply[(14 + 8)..<(14 + 24)]) == gatewayIP6)
+        #expect(reply[14 + 40] == 136) // Neighbor Advertisement
+        #expect(Array(reply[(14 + 40 + 8)..<(14 + 40 + 24)]) == gatewayIP6)
+        #expect(Array(reply[(14 + 40 + 26)..<(14 + 40 + 32)]) == gatewayMAC)
+
+        await uplink.stop()
+    }
+
     @Test func udpAndDnsForwardingRoundTripToLocalHostServices() async throws {
         // Start a local UDP echo/DNS stub on 127.0.0.1:0.
         let serverFD = socket(AF_INET, SOCK_DGRAM, 0)

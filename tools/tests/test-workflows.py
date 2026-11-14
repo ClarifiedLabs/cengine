@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import json
+import subprocess
+
 from _checks import REPO_ROOT, read, require_absent, require_contains
 
 
@@ -171,6 +174,29 @@ def main() -> None:
         raise AssertionError("compatibility helper lifecycle must use one administrator session")
     if "/usr/bin/osascript" in compat_helper or "with administrator privileges" in compat_helper:
         raise AssertionError("compatibility helper lifecycle must elevate with sudo, not osascript")
+    # Keep VM/signature-heavy compatibility runs optimized, without switching
+    # their isolated namespace or fault/profile gates to the Release build.
+    project = json.loads(subprocess.check_output([
+        'plutil', '-convert', 'json', '-o', '-', str(REPO_ROOT / 'cengine.xcodeproj/project.pbxproj')]))
+    objects = project['objects']
+    configurations = objects[objects[project['rootObject']]['buildConfigurationList']]['buildConfigurations']
+    settings = {objects[key]['name']: objects[key]['buildSettings'] for key in configurations}
+    expected = {
+        'SWIFT_OPTIMIZATION_LEVEL': '-O', 'GCC_OPTIMIZATION_LEVEL': '2',
+        'ENABLE_TESTABILITY': 'YES', 'DEBUG_INFORMATION_FORMAT': 'dwarf',
+        'SWIFT_ACTIVE_COMPILATION_CONDITIONS': 'DEBUG $(inherited)',
+        'ENABLE_CODE_COVERAGE': 'NO', 'CLANG_COVERAGE_MAPPING': 'NO',
+        'CENGINE_NETWORK_HELPER_CLIENT_IDENTIFIER': 'dev.cengine.engine.test-compat',
+        'CENGINE_NETWORK_HELPER_IDENTIFIER': 'dev.cengine.network-helper.test-compat',
+        'CENGINE_NETWORK_HELPER_SERVICE_NAME': 'dev.cengine.network-helper.test-compat',
+    }
+    for key, value in expected.items():
+        if str(settings['test-compat'].get(key)) != value:
+            raise AssertionError(f'test-compat must preserve {key}={value}')
+    if settings['Debug']['SWIFT_OPTIMIZATION_LEVEL'] != '-Onone' or str(settings['Debug']['GCC_OPTIMIZATION_LEVEL']) != '0':
+        raise AssertionError('Debug must remain unoptimized')
+    if settings['Release']['SWIFT_OPTIMIZATION_LEVEL'] != '-O':
+        raise AssertionError('Release must remain optimized')
     for needle in (
         '<Scheme',
         'buildConfiguration = "test-compat"',

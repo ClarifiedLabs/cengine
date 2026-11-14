@@ -27,6 +27,8 @@ trap 'rm -f "$INPUTS"' EXIT HUP INT TERM
         /bin/cat "$1"
         printf '\n'
     }
+    # Build settings affect the helper even when its Swift sources are unchanged.
+    fingerprint_file "$ROOT/cengine.xcodeproj/project.pbxproj"
     fingerprint_file "$ROOT/Configuration/helper-support-sources.txt"
     while IFS= read -r relative; do
         fingerprint_file "$ROOT/$relative"

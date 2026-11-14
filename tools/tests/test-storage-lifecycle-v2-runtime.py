@@ -18,7 +18,7 @@ FUNCTIONS = {
     "committed_cold_edge", "frozen_committed_cold_proof", "recovered_committed_cold_proof", "committed_cold_births",
     "cold_signed_digest", "cold_predecessor", "frozen_cold_proof", "recovered_cold_proof", "observe_cold_births", "observe_cold_controller", "cold_attempt_births",
     "takeover_observation_shape", "takeover_pause_observation", "frozen_takeover_proof", "recovered_takeover_proof",
-    "selected", "prerequisites", "progressed", "produced_while_absent", "native_snapshot",
+    "selected", "adhoc_applicable", "prerequisites", "progressed", "produced_while_absent", "native_snapshot",
     "parse_progress", "disk_identity", "progress_command", "fault_diagnostics",
     "qualify_initialization_fault", "resume_initialization", "lifecycle_owner",
     "replacement_receipts", "lifecycle_replacement_proof",
@@ -111,14 +111,14 @@ class LifecycleRuntimeTests(unittest.TestCase):
                 R.prerequisites(SELECTED)
             run.assert_not_called()
 
-    def test_prerequisites_use_renamed_helper_with_stable_signing_identity(self):
+    def test_prerequisites_use_shared_read_only_signature_and_helper_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             assets = root / "assets"
             assets.mkdir()
             environment = {**SELECTED, "CENGINE_BINARY": str(root / "cengine"),
                            "CENGINE_COMPAT_MANAGED_ASSET_DIR": str(assets),
-                           "CENGINE_DEVELOPER_ID_APPLICATION": "Developer ID Application: Test (TEAM)"}
+                           "CENGINE_DEVELOPER_ID_APPLICATION": "Developer ID Application: Test (ABCDEFGHIJ)"}
             for name in ("cengine", "cengine-helper", "cengine-storage-controller"):
                 executable = root / name
                 executable.write_text("fixture")
@@ -132,36 +132,229 @@ class LifecycleRuntimeTests(unittest.TestCase):
                 R.prerequisites(environment)
                 self.assertEqual(run.call_count, 2)
                 guard = run.call_args.args[0][2]
-                self.assertIn('/cengine-helper" dev.cengine.network-helper.test-compat', guard)
+                self.assertIn('compat_network_helper_validate_managed_signatures "$2" "$(dirname "$2")/cengine-helper"', guard)
+                self.assertIn('compat_network_helper_require "$2" "$fingerprint"', guard)
+                self.assertEqual(run.call_args.kwargs['env'], environment)
+                for forbidden in ('compat_network_helper_provision', 'sudo', 'curl', 'build-storage', 'download'):
+                    self.assertNotIn(forbidden, guard)
                 self.assertNotIn("cengine-network-helper", guard)
-                command = run.call_args.args[0].copy()
-            # Execute the actual shell composition, not just a string assertion.
-            # Stub only installation/signing I/O; use the real policy selector.
-            scripts = root / "Scripts"
-            scripts.mkdir()
-            (scripts / "helper_compatibility_policy.py").write_bytes(
-                (ROOT / "Scripts/helper_compatibility_policy.py").read_bytes())
-            (scripts / "compat-network-helper.sh").write_text(
-                '. "$REAL_CHECKOUT/Scripts/compat-network-helper.sh"\n'
-                'compat_network_helper_require() { compat_network_helper_select_policy; }\n')
-            (scripts / "managed-signing.sh").write_text(
-                'managed_signing_team() { printf TEAM; }\n'
-                'managed_signing_verify() { :; }\n')
-            fingerprint = scripts / "network-helper-fingerprint.sh"
-            fingerprint.write_text('#!/bin/sh\nprintf fingerprint\\n')
-            fingerprint.chmod(0o755)
-            (assets / "disk-bootstrap.json").write_text('{"storageLifecycleVersion": 2}')
-            command[4] = str(root)
-            result = subprocess.run(command, env={
-                "PATH": R.os.environ["PATH"], "REAL_CHECKOUT": str(ROOT), **environment,
-            }, capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), "compatible lifecycle-v2")
+            # Missing renamed local helper fails before any subprocess.
             (root / "cengine-helper").rename(root / "cengine-network-helper")
             with patch.object(R.subprocess, "run") as run:
                 with self.assertRaisesRegex(ValueError, "paired signed compatibility executable"):
                     R.prerequisites(environment)
                 run.assert_not_called()
+
+    def signature_fixture(self, root):
+        """Real shell policy/validator/require; fake only OS signing/install/health I/O."""
+        scripts = root / 'Scripts'
+        scripts.mkdir()
+        assets = root / 'assets'
+        assets.mkdir()
+        (assets / 'disk-bootstrap.json').write_text('{"storageLifecycleVersion": 2}')
+        environment = {
+            'PATH': str(root) + ':' + R.os.environ['PATH'], 'HOME': str(root),
+            'PYTHONDONTWRITEBYTECODE': '1',
+            'CENGINE_BINARY': str(root / 'cengine'),
+            'CENGINE_COMPAT_MANAGED_ASSET_DIR': str(assets),
+            'CENGINE_DEVELOPER_ID_APPLICATION': '-',
+            'CENGINE_COMPAT_HELPER_MODE': 'unprivileged',
+        }
+        for key, name in (('CENGINE_KERNEL', 'vmlinux'),
+                          ('CENGINE_CONTAINER_INITRAMFS', 'container-initramfs.cpio.gz'),
+                          ('CENGINE_STORAGE_INITRAMFS', 'storage-initramfs.cpio.gz')):
+            (assets / name).touch()
+            environment[key] = str(assets / name)
+        paths = [root / name for name in ('cengine', 'cengine-helper', 'cengine-storage-controller')]
+        paths.append(root / 'installed-helper')
+        identifiers = ('engine', 'network-helper', 'storage-control', 'network-helper')
+        status = dict(buildFingerprint='a' * 64, serviceName='dev.cengine.network-helper.test-compat',
+                      ownerUID=R.os.getuid(), protocolVersion=5, capabilities={})
+        for path, identifier in zip(paths, identifiers):
+            path.write_text("#!/bin/sh\nprintf '%s\\n' '" + R.json.dumps(status) + "'\n")
+            path.chmod(0o755)
+            path.with_suffix('.signature').write_text(R.json.dumps(dict(
+                identifier='dev.cengine.' + identifier + '.test-compat',
+                team='not set', signature='adhoc', valid=True, runtime=False)))
+        codesign = root / 'codesign'
+        codesign.write_text('#!' + sys.executable + '\n' + '''import json, sys
+from pathlib import Path
+path = Path(sys.argv[-1])
+value = json.loads(path.with_suffix('.signature').read_text())
+if '--verify' in sys.argv:
+    requirement = sys.argv[sys.argv.index('-R') + 1]
+    assert value['valid']
+    assert 'identifier "' + value['identifier'] + '"' in requirement
+    if 'anchor apple generic' in requirement:
+        assert 'certificate leaf[subject.OU] = "' + value['team'] + '"' in requirement
+else:
+    print('TeamIdentifier=' + value['team'])
+    print('Signature=' + value['signature'])
+    print('Authority=' + value.get('authority', ''))
+    print('flags=' + ('runtime' if value['runtime'] else 'none'))
+    print('CandidateCDHashFull sha256=' + 'b' * 64)
+''')
+        codesign.chmod(0o755)
+        helper = (ROOT / 'Scripts/compat-network-helper.sh').read_text()
+        helper = helper.replace('/usr/bin/codesign', str(codesign))
+        # No real installation, service or protected filesystem is inspected.
+        helper += '\n' + '\n'.join((
+            'compat_network_helper_path="$ROOT/installed-helper"',
+            'compat_network_helper_validate_installation() { [ "${FIXTURE_INSTALLATION_VALID:-1}" = 1 ]; }',
+            'compat_network_helper_matches_local_build() { [ "${FIXTURE_LOCAL_MATCH:-1}" = 1 ]; }',
+            'compat_network_helper_installed_fingerprint() { printf "%s\\n" ' + 'a' * 64 + '; }',
+            'compat_network_helper_install() { echo install >> "$ROOT/actions"; return 99; }',
+            'compat_network_helper_print_install_instruction() { :; }',
+        )) + '\n'
+        (scripts / 'compat-network-helper.sh').write_text(helper)
+        for name in ('helper_compatibility_policy.py', 'managed-signing.sh'):
+            (scripts / name).write_bytes((ROOT / 'Scripts' / name).read_bytes())
+        fingerprint = scripts / 'network-helper-fingerprint.sh'
+        fingerprint.write_text('#!/bin/sh\nprintf "%s\\n" ' + 'a' * 64 + '\n')
+        fingerprint.chmod(0o755)
+        return environment, paths
+
+    def run_signature_prerequisites(self, root, environment):
+        # Capture the real prerequisite composition, bypassing asset provenance
+        # only; execute the actual shared shell policy and signature checks below.
+        with patch.object(R.subprocess, 'run') as run:
+            R.prerequisites(environment)
+            self.assertEqual(run.call_count, 2)
+            command = run.call_args.args[0].copy()
+        command[4] = str(root)
+        command[2] = command[2].replace('/usr/bin/codesign', str(root / 'codesign'))
+        before = {path.relative_to(root): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual({path.relative_to(root): path.read_bytes() for path in root.rglob('*') if path.is_file()}, before)
+        self.assertFalse((root / 'actions').exists(), 'prerequisites must never install/replace a helper')
+        return result
+
+    def test_shared_signature_guard_accepts_ordinary_adhoc_and_developer_id(self):
+        for signed, fault in ((False, ''), (True, ''), (True, R.FAULT)):
+            with self.subTest(signed=signed, fault=fault), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                environment, paths = self.signature_fixture(root)
+                if signed:
+                    environment['CENGINE_DEVELOPER_ID_APPLICATION'] = 'Developer ID Application: Test (ABCDEFGHIJ)'
+                    for path in paths:
+                        signature = R.json.loads(path.with_suffix('.signature').read_text())
+                        signature.update(team='ABCDEFGHIJ', signature='CMS', runtime=True,
+                                         authority='Developer ID Application: Test (ABCDEFGHIJ)')
+                        path.with_suffix('.signature').write_text(R.json.dumps(signature))
+                if fault:
+                    environment[R.FAULT_ENV] = fault
+                result = self.run_signature_prerequisites(root, environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('required contract: lifecycle-v2', result.stderr)
+
+    def test_shared_signature_guard_rejects_each_malformed_or_production_adhoc_component(self):
+        for component in range(4):
+            for field, value in (('identifier', 'dev.cengine.engine'), ('valid', False),
+                                 ('signature', 'CMS'), ('team', 'ABCDEFGHIJ')):
+                with self.subTest(component=component, field=field), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp).resolve()
+                    environment, paths = self.signature_fixture(root)
+                    path = paths[component].with_suffix('.signature')
+                    signature = R.json.loads(path.read_text())
+                    signature[field] = value
+                    path.write_text(R.json.dumps(signature))
+                    result = self.run_signature_prerequisites(root, environment)
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_shared_signature_guard_rejects_malformed_signed_quartet_and_adhoc_mislabel(self):
+        for mutation in ('authority', 'runtime', 'team', 'identifier', 'adhoc-mislabel'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                environment, paths = self.signature_fixture(root)
+                if mutation != 'adhoc-mislabel':
+                    environment['CENGINE_DEVELOPER_ID_APPLICATION'] = 'Developer ID Application: Test (ABCDEFGHIJ)'
+                for index, path in enumerate(paths):
+                    signature = R.json.loads(path.with_suffix('.signature').read_text())
+                    signature.update(team='ABCDEFGHIJ', signature='CMS', runtime=True,
+                                     authority='Developer ID Application: Test (ABCDEFGHIJ)')
+                    if index == 3 and mutation != 'adhoc-mislabel':
+                        signature[mutation] = {'authority': 'Apple Development', 'runtime': False,
+                                               'team': 'ZYXWVUTSRQ', 'identifier': 'dev.cengine.network-helper'}[mutation]
+                    path.with_suffix('.signature').write_text(R.json.dumps(signature))
+                result = self.run_signature_prerequisites(root, environment)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_adhoc_requires_ordinary_unprivileged_applicability_before_subprocess(self):
+        with tempfile.TemporaryDirectory() as temp:
+            environment, _ = self.signature_fixture(Path(temp).resolve())
+            for extra in ({'CENGINE_COMPAT_HELPER_MODE': ''}, {'CENGINE_COMPAT_HELPER_MODE': 'privileged'},
+                          {R.FAULT_ENV: R.FAULT}, {R.FAULT_ENV: R.REPLACEMENT_FAULT},
+                          {'CENGINE_STORAGE_LIFECYCLE_QUALIFICATION': 'lifecycle-v2-native-v1'},
+                          {'PREPARE_COMPATIBILITY_PROFILE': 'anything'},
+                          {'CENGINE_DEVELOPER_ID_APPLICATION': 'Developer ID Application: Test (BAD)'},
+                          {'CENGINE_DEVELOPER_ID_APPLICATION': ''}):
+                with self.subTest(extra=extra), patch.object(R.subprocess, 'run') as run:
+                    with self.assertRaises(ValueError):
+                        R.prerequisites({**environment, **extra})
+                    run.assert_not_called()
+
+    def test_shared_require_never_replaces_stale_or_missing_installed_helper(self):
+        for extra in ({'FIXTURE_LOCAL_MATCH': '0'}, {'FIXTURE_INSTALLATION_VALID': '0'}):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                environment, _ = self.signature_fixture(root)
+                result = self.run_signature_prerequisites(root, {**environment, **extra})
+                self.assertNotEqual(result.returncode, 0)
+                if 'FIXTURE_LOCAL_MATCH' in extra:
+                    self.assertIn('never install/replace', result.stderr)
+
+    def test_adhoc_case_requires_applicability_and_fails_missing_prerequisites_without_skip(self):
+        tree = ast.parse(SOURCE.read_text())
+        fixture = next(n for n in tree.body if getattr(n, 'name', '') == 'image_cache')
+        fixture.decorator_list = []
+        namespace = dict(R.__dict__)
+        namespace.update(prerequisites=Mock(side_effect=ValueError('missing helper/assets')),
+                         pytest=SimpleNamespace(skip=Mock(side_effect=AssertionError('unexpected skip')),
+                                                fail=Mock(side_effect=AssertionError('prerequisites failed'))))
+        exec(compile(ast.Module(body=[fixture], type_ignores=[]), str(SOURCE), 'exec'), namespace)
+        request = SimpleNamespace(node=SimpleNamespace(
+            get_closest_marker=lambda name: SimpleNamespace(args=('RTM-137',))))
+        for environment in ({}, {'CENGINE_DEVELOPER_ID_APPLICATION': '-',
+                                  'CENGINE_COMPAT_HELPER_MODE': 'unprivileged'}):
+            with self.subTest(environment=environment), patch.dict(R.os.environ, environment, clear=True):
+                with self.assertRaisesRegex(AssertionError, 'prerequisites failed'):
+                    namespace['image_cache'](object(), request)
+                namespace['pytest'].skip.assert_not_called()
+
+    def test_adhoc_case_is_inapplicable_only_after_signed_prerequisites_pass(self):
+        tree = ast.parse(SOURCE.read_text())
+        fixture = next(n for n in tree.body if getattr(n, 'name', '') == 'image_cache')
+        fixture.decorator_list = []
+        namespace = dict(R.__dict__)
+        check = Mock()
+        skip = Mock(side_effect=AssertionError('validated signed runner'))
+        namespace.update(prerequisites=check, pytest=SimpleNamespace(
+            skip=skip, fail=Mock(side_effect=AssertionError('unexpected failure'))))
+        exec(compile(ast.Module(body=[fixture], type_ignores=[]), str(SOURCE), 'exec'), namespace)
+        request = SimpleNamespace(node=SimpleNamespace(
+            get_closest_marker=lambda name: SimpleNamespace(args=('RTM-137',))))
+        environment = {'CENGINE_DEVELOPER_ID_APPLICATION': 'Developer ID Application: Test (ABCDEFGHIJ)'}
+        with patch.dict(R.os.environ, environment, clear=True):
+            with self.assertRaisesRegex(AssertionError, 'validated signed runner'):
+                namespace['image_cache'](object(), request)
+        check.assert_called_once()
+        skip.assert_called_once()
+
+    def test_adhoc_case_reuses_strict_live_restart_data_and_native_identity_proof(self):
+        tree = ast.parse(SOURCE.read_text())
+        entries = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        for name in ('test_lifecycle_v2_daemon_restart_preserves_live_data',
+                     'test_lifecycle_v2_adhoc_daemon_restart_preserves_live_data'):
+            self.assertIn('live_daemon_restart(client, daemon, shared)', ast.unparse(entries[name]))
+        self.assertIn('assert adhoc_applicable(os.environ)', ast.unparse(
+            entries['test_lifecycle_v2_adhoc_daemon_restart_preserves_live_data']))
+        code = ast.unparse(entries['live_daemon_restart'])
+        for proof in ('native_snapshot', '== original', 'seed-', 'progressed(absent[name], row)',
+                      'produced_while_absent', 'spool_progress', 'mount_proof', 'exchange',
+                      'RestartCount', 'fresh-attachment-'):
+            self.assertIn(proof, code)
+        self.assertLess(code.index('cp /data/'), code.index('daemon.stop(kill=True)'))
+        self.assertGreater(code.index("'/data/seed-'"), code.index('daemon.start()'))
 
     def test_progress_requires_both_directions_same_fd_and_advance(self):
         before = (10, 11, "2:33", 42)
@@ -1936,7 +2129,7 @@ class LifecycleRuntimeTests(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "compat":
                 ids.append(ast.literal_eval(node.args[0]))
-        self.assertEqual(sorted(ids), ["RTM-117", "RTM-118", "RTM-119", "RTM-120", "RTM-121", "RTM-122", "RTM-123", "RTM-124", "RTM-125", "RTM-127", "RTM-128", "RTM-129", "RTM-130", "RTM-131", "RTM-132", "RTM-133", "RTM-135", "RTM-136"])
+        self.assertEqual(sorted(ids), ["RTM-117", "RTM-118", "RTM-119", "RTM-120", "RTM-121", "RTM-122", "RTM-123", "RTM-124", "RTM-125", "RTM-127", "RTM-128", "RTM-129", "RTM-130", "RTM-131", "RTM-132", "RTM-133", "RTM-135", "RTM-136", "RTM-137"])
         ledger = (ROOT / "docs/docker-compatibility.md").read_text()
         for case in ids:
             self.assertEqual(ledger.count("| `" + case + "` |"), 1)

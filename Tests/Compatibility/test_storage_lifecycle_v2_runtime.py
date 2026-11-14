@@ -69,7 +69,16 @@ def selected(environment, *, fault=False):
     return not expected or bool(profile)
 
 
+def adhoc_applicable(environment):
+    return (environment.get("CENGINE_DEVELOPER_ID_APPLICATION") == "-"
+            and environment.get("CENGINE_COMPAT_HELPER_MODE") == "unprivileged"
+            and not any(environment.get(key) for key in (
+                FAULT_ENV, "CENGINE_STORAGE_LIFECYCLE_QUALIFICATION",
+                "CENGINE_STORAGE_CONTROLLER_PREPARE_COMPATIBILITY", "PREPARE_COMPATIBILITY_PROFILE")))
+
+
 def prerequisites(environment):
+    selected(environment, fault=environment.get(FAULT_ENV) or False)
     paths = {}
     for name in ("CENGINE_BINARY", "CENGINE_COMPAT_MANAGED_ASSET_DIR"):
         raw = environment.get(name, "")
@@ -88,23 +97,29 @@ def prerequisites(environment):
                       ("CENGINE_STORAGE_INITRAMFS", "storage-initramfs.cpio.gz")):
         if not (assets / name).is_file() or Path(environment.get(key, "")).resolve() != assets / name:
             raise ValueError("daemon assets do not match the paired asset directory")
-    if not environment.get("CENGINE_DEVELOPER_ID_APPLICATION", "").startswith("Developer ID Application: "):
-        raise ValueError("signed Developer ID compatibility runner required")
+    identity = environment.get("CENGINE_DEVELOPER_ID_APPLICATION", "")
+    if not adhoc_applicable(environment) and not re.fullmatch(
+            r"Developer ID Application: [^\r\n]+ \([A-Z0-9]{10}\)", identity):
+        raise ValueError("Developer ID runner or ordinary unprivileged ad-hoc runner required")
     # Read-only normal guards, never install, build, download or elevate here.
     subprocess.run(["python3", str(ROOT / "Scripts/check-managed-guest-assets.py"), str(assets)],
                    check=True, capture_output=True, timeout=60)
     subprocess.run([
         "/bin/sh", "-ec",
         'ROOT=$1; . "$ROOT/Scripts/compat-network-helper.sh"; '
-        '. "$1/Scripts/managed-signing.sh"; '
-        'team=$(managed_signing_team "$3"); '
-        'managed_signing_verify "$2" dev.cengine.engine.test-compat "$team"; '
-        'managed_signing_verify "$(dirname "$2")/cengine-storage-controller" dev.cengine.storage-control.test-compat "$team"; '
-        'managed_signing_verify "$(dirname "$2")/cengine-helper" dev.cengine.network-helper.test-compat "$team"; '
-        'fingerprint=$("$1/Scripts/network-helper-fingerprint.sh"); '
+        '. "$ROOT/Scripts/managed-signing.sh"; '
+        'if [ "$3" = - ]; then '
+        '/usr/bin/codesign -dv --verbose=4 "$2" 2>&1 | /usr/bin/grep -qx "TeamIdentifier=not set"; '
+        'else team=$(managed_signing_team "$3"); '
+        'managed_signing_verify "$2" dev.cengine.engine.test-compat "$team"; fi; '
+        'compat_network_helper_validate_managed_signatures "$2" "$(dirname "$2")/cengine-helper"; '
+        # Unlike the shared runner, a prerequisite check must never provision or
+        # replace a helper, even when require finds a stale unprivileged build.
+        'compat_network_helper_install() { echo "lifecycle prerequisites never install/replace a helper" >&2; return 1; }; '
+        'fingerprint=$("$ROOT/Scripts/network-helper-fingerprint.sh"); '
         'compat_network_helper_require "$2" "$fingerprint"',
-        "lifecycle-prerequisites", str(ROOT), str(binary), environment["CENGINE_DEVELOPER_ID_APPLICATION"],
-    ], check=True, capture_output=True, timeout=60)
+        "lifecycle-prerequisites", str(ROOT), str(binary), identity,
+    ], check=True, capture_output=True, timeout=60, env=dict(environment))
 
 
 @pytest.fixture
@@ -124,6 +139,8 @@ def image_cache(image_cache, request):
         prerequisites(os.environ)
     except (OSError, ValueError, subprocess.SubprocessError):
         pytest.fail("lifecycle prerequisites incomplete; use installed paired helper/assets", pytrace=False)
+    if case == ("RTM-137",) and not adhoc_applicable(os.environ):
+        pytest.skip("ad-hoc adoption case is inapplicable to a validated Developer ID runner")
     return image_cache
 
 
@@ -363,6 +380,17 @@ def test_lifecycle_v2_ready_graceful_restarts(client, daemon, shared):
 
 @pytest.mark.compat("RTM-118")
 def test_lifecycle_v2_daemon_restart_preserves_live_data(client, daemon, shared):
+    live_daemon_restart(client, daemon, shared)
+
+
+@pytest.mark.compat("RTM-137")
+def test_lifecycle_v2_adhoc_daemon_restart_preserves_live_data(client, daemon, shared):
+    """Ordinary ad-hoc quartet: live native births and saved/new shared DATA survive."""
+    assert adhoc_applicable(os.environ), "RTM-137 requires an ordinary unprivileged ad-hoc runner"
+    live_daemon_restart(client, daemon, shared)
+
+
+def live_daemon_restart(client, daemon, shared):
     names = ("left", "right")
     peers = [create_peer(client, shared, name, progress_command(name, other))
              for name, other in zip(names, reversed(names))]
@@ -376,6 +404,10 @@ def test_lifecycle_v2_daemon_restart_preserves_live_data(client, daemon, shared)
             lambda: parse_progress(peer.logs(), name),
             lambda row: row is not None and row[1] > 1, timeout=30,
             description="both peers exchanging shared DATA through original FD3")
+    seed = "live-restart-seed-" + uuid.uuid4().hex
+    exchange(*peers, seed)
+    for peer, side in zip(peers, names):
+        _exec(peer, "sh", "-ec", f"cp /data/{side} /data/seed-{side}; sync")
     # Bound the Guest clock at kill from a direct current /proc read, not a
     # possibly buffered log. Host elapsed time overestimates the interval from
     # the actual Guest sample to waitpid. Later Guest timestamps therefore prove
@@ -410,6 +442,8 @@ def test_lifecycle_v2_daemon_restart_preserves_live_data(client, daemon, shared)
         peer.reload()
         assert peer.status == "running" and peer.attrs["RestartCount"] == 0
         mount_proof(daemon, peer)
+        for side in names:
+            assert _exec(peer, "cat", "/data/seed-" + side) == (seed + "-" + side).encode()
         wait_for_value(lambda: parse_progress(peer.logs(), name),
                        lambda row: progressed(absent[name], row), timeout=30,
                        description="original unlinked FD continues after control reattachment")
@@ -417,7 +451,10 @@ def test_lifecycle_v2_daemon_restart_preserves_live_data(client, daemon, shared)
     fresh = create_peer(client, shared, "fresh")
     fresh.start()
     mount_proof(daemon, fresh)
+    for side in names:
+        assert _exec(fresh, "cat", "/data/seed-" + side) == (seed + "-" + side).encode()
     exchange(peers[0], fresh, "fresh-attachment-" + uuid.uuid4().hex)
+    assert native_snapshot(daemon, {peer.id for peer in peers}) == original
 
 
 def disk_identity(root):

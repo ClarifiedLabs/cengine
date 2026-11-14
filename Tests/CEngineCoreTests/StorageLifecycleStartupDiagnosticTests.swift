@@ -53,6 +53,47 @@ import Testing
         #expect(!cancelled.contains("unauthorized"))
     }
 
+    @Test func scopeBindClientDiagnosticIsClosedAndSecretFree() {
+        typealias D = StorageLifecycleScopeBindClientDiagnostic
+        for phase in D.Phase.allCases {
+            let diagnostic = D(phase: phase, error: SensitiveFailure())
+            #expect(diagnostic.category == .other)
+            #expect(diagnostic.line == "cengine.lifecycle.scope-bind.failed phase=\(phase.rawValue) category=other\n")
+        }
+        for code in StorageIdentity.ErrorCode.allCases {
+            let diagnostic = D(phase: .authenticate, error: StorageLifecycleRootClient.Failure(code))
+            #expect(diagnostic.category.rawValue == code.rawValue)
+            #expect(diagnostic.line == "cengine.lifecycle.scope-bind.failed phase=authenticate category=\(code.rawValue)\n")
+        }
+        #expect(D.Category(rawValue: "token=secret\nforged") == nil)
+        #expect(D.Phase.allCases.map(\.rawValue) == ["reply-transport", "authenticate", "reply-shape", "rejected", "timeout"])
+    }
+
+    @Test func scopeBindDiagnosticsDoNotChangeWireOrAuthority() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let client = try String(contentsOf: root.appendingPathComponent("Sources/CEngineRuntime/StorageLifecycleRootScope.swift"), encoding: .utf8)
+        let helper = try String(contentsOf: root.appendingPathComponent("Sources/CEngineNetworkHelper/StorageBootstrapLifecycleQualification.swift"), encoding: .utf8)
+        // Pure formatters must never accept or reflect arbitrary request/error text.
+        for (text, name) in [(client, "StorageLifecycleScopeBindClientDiagnostic"), (helper, "StorageLifecycleScopeBindDiagnostic")] {
+            let diagnostic = try #require(text.components(separatedBy: "struct \(name):").last)
+                .components(separatedBy: "\n}\n")[0]
+            for forbidden in ["localizedDescription", "String(describing:", "String(reflecting:", "store.rawValue", "auditToken", "rootHash"] {
+                #expect(!diagnostic.contains(forbidden))
+            }
+            #expect(diagnostic.contains("let phase: Phase") && diagnostic.contains("let category: Category"))
+            #expect(diagnostic.contains("?? .other"))
+        }
+        #expect(client.contains("guard keys == [\"ok\"]"))
+        #expect(client.contains("xpc_get_type(ok) == XPC_TYPE_BOOL else { throw Failure(.unauthorized) }"))
+        #expect(client.contains("guard xpc_bool_get_value(ok) else { throw Failure(.unauthorized) }"))
+        #expect(client.range(of: "try Self.authenticate(token:")!.lowerBound < client.range(of: "guard keys == [\"ok\"]")!.lowerBound)
+        #expect(client.contains("ProcessInfo.processInfo.systemUptime < deadline"))
+        #expect(helper.contains("guard keys == [\"operation\", \"request\", \"store-root\"]"))
+        #expect(helper.contains("guard try daemon(message) == sender else { throw BootstrapFailure(.unauthorized) }"))
+        #expect(helper.contains("if operation == Self.scopeBindOperation {\n                    StorageLifecycleScopeBindDiagnostic.emit"))
+        #expect(helper.contains("if isScopeBind { StorageLifecycleScopeBindDiagnostic.emit(.init(phase: .admission, error: error)) }"))
+    }
+
     @Test func rejectsUntrustedOperationTextAndEngineMessages() {
         let line = StorageLifecycleStartupDiagnostic.line(phase: .prepareCold,
             operationID: "token=secret\nforged diagnostic", error: EngineError(.forbidden, "secret key"))

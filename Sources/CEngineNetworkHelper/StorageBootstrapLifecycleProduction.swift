@@ -58,38 +58,54 @@ enum StorageLifecycleProductionFormat {
     static func isScope(_ name: String) -> Bool {
         name.utf8.count == 64 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
-    static func entries(_ fd: Int32) throws -> [String] {
+    /// Durable scope history is not the bounded set of active bindings. Visit every
+    /// entry descriptor-relatively without retaining a history-sized collection.
+    static func visitEntries(_ fd: Int32, _ visit: (String) throws -> Void) throws {
         let dup = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard dup >= 0 else { throw BootstrapFailure(.repairRequired) }
         guard let stream = fdopendir(dup) else { close(dup); throw BootstrapFailure(.repairRequired) }
         defer { closedir(stream) }
-        var names: [String] = []
         while true {
             errno = 0
             guard let entry = readdir(stream) else {
                 guard errno == 0 else { throw BootstrapFailure(.repairRequired) }
-                return names.sorted()
+                return
             }
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
             }
-            if name != "." && name != ".." { names.append(name) }
-            guard names.count <= StorageLifecycleQualificationRegistry.maximum + 1 else { throw BootstrapFailure(.capacityExceeded) }
+            if name != "." && name != ".." { try visit(name) }
         }
+    }
+    /// Bounded snapshots for diagnostics/tests only, never authority validation.
+    static func entries(_ fd: Int32) throws -> [String] {
+        var names: [String] = []
+        try visitEntries(fd) { name in
+            guard names.count < StorageLifecycleQualificationRegistry.maximum + 1 else { throw BootstrapFailure(.capacityExceeded) }
+            names.append(name)
+        }
+        return names.sorted()
     }
     static func require(_ base: Int32, owner: uid_t, namespace: StorageLifecycleScopeNamespace = .production, sync: (Int32) throws -> Void) throws {
         let bytes = namespace == .production ? Self.bytes : Data("cengine.storage.lifecycle.compatibility.v3\n".utf8)
         try StorageLifecycleQualificationFiles.validate(base, owner: owner, directory: true)
-        let names = try entries(base)
-        if names.isEmpty {
+        var first: String?
+        var unsupported: String?
+        var hasMarker = false
+        try visitEntries(base) { entry in
+            if first == nil || entry < first! { first = entry }
+            if entry == name { hasMarker = true }
+            else if !isScope(entry), unsupported == nil || entry < unsupported! { unsupported = entry }
+        }
+        guard let first else {
             try StorageLifecycleQualificationFiles.write(bytes, parent: base, name: name, owner: owner, sync: sync)
             return
         }
-        guard names.contains(name) else { throw StorageLifecycleUnsupportedFormat(entry: names[0]) }
+        guard hasMarker else { throw StorageLifecycleUnsupportedFormat(entry: first) }
         guard (try? StorageLifecycleQualificationFiles.read(base, name, owner: owner)) == bytes else {
             throw StorageLifecycleUnsupportedFormat(entry: name)
         }
-        if let other = names.first(where: { $0 != name && !isScope($0) }) { throw StorageLifecycleUnsupportedFormat(entry: other) }
+        if let unsupported { throw StorageLifecycleUnsupportedFormat(entry: unsupported) }
     }
 }
 

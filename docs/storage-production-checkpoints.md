@@ -27,7 +27,12 @@ reset them. A separate authority namespace cannot bypass this check.
   Limits apply to active or unresolved registrations, not cumulative completed use.
 - ROOT permits at most 128 active/unresolved bindings. The per-store checkpoint is
   bounded to 192 KiB with a 16-KiB completion reservation; aggregate publication
-  limits remain independent.
+  limits remain independent. Durable scope-directory history is not the active
+  registry: namespace-format validation streams all entries with constant memory,
+  so more than 128 historical roots cannot prevent a new authenticated bind or
+  reopening an existing scope after helper restart. The exact namespace marker,
+  owner/ACL checks and rejection of unknown/v1 entries remain mandatory; no
+  historical journals are evicted, migrated or deleted to regain capacity.
 - Exact pending/current retries are idempotent only for the independently proven
   original recipient. Superseded epochs/generations are not re-signed from history.
 - Fold completed state only after durable authenticated confirmation. Pending

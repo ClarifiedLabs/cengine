@@ -421,6 +421,44 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             P.load_json('{"schemaVersion":1,"schemaVersion":1}')
 
+    def test_guest_directory_modes_do_not_inherit_host_umask(self):
+        archives = {}
+        for mask in ("077", "027", "022", "000"):
+            with self.subTest(umask=mask), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "output"
+                # Run the actual staging path, stopping at its missing-kernel
+                # preflight. No Go, network, VM, helper or build stubs are used.
+                result = subprocess.run([
+                    "sh", "-c", 'umask "$1"; exec sh "$2"', "guest-staging", mask,
+                    str(ROOT / "Scripts/build-guest-assets.sh")],
+                    env={**os.environ, "CENGINE_GUEST_OUTPUT": str(output)}, capture_output=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"cengine kernel is missing", result.stderr)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o777 & ~int(mask, 8))
+                for kind, private in (("container", "rootfs"), ("storage", "data")):
+                    root = output / (kind + "-root")
+                    expected = {".": 0o755, private: 0o700}
+                    expected.update({name: 0o755 for name in ("bin", "sbin", "etc", "dev", "proc", "sys", "run")})
+                    for name, mode in expected.items():
+                        path = root if name == "." else root / name
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, (mask, kind, name))
+                    raw, offset, observed = ARCHIVE.archive(root, 0), 0, {}
+                    while offset < len(raw):
+                        header = raw[offset:offset + 110]
+                        self.assertEqual(header[:6], b"070701")
+                        fields = [int(header[i:i + 8], 16) for i in range(6, 110, 8)]
+                        name = raw[offset + 110:offset + 110 + fields[11] - 1].decode()
+                        payload = (offset + 110 + fields[11] + 3) & ~3
+                        offset = (payload + fields[6] + 3) & ~3
+                        if name == "TRAILER!!!":
+                            break
+                        self.assertEqual((fields[2], fields[3]), (0, 0))
+                        observed[name] = stat.S_IMODE(fields[1])
+                    self.assertEqual(observed, expected)
+                    if kind in archives:
+                        self.assertEqual(raw, archives[kind])
+                    archives[kind] = raw
+
     def test_failed_build_invalidates_old_metadata_before_mutation(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)

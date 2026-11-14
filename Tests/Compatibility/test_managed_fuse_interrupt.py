@@ -23,6 +23,8 @@ import docker
 from docker.types import Mount
 import pytest
 
+pytestmark = pytest.mark.qualification
+
 import managed_fuse_artifact as artifact
 import managed_storage as smoke
 import storage_backend_proof as backend
@@ -52,11 +54,14 @@ def worker_case(arguments):
 
 
 @pytest.fixture
-def image_cache(tmp_path):
+def image_cache(tmp_path, request):
     from conftest import managed_storage_arguments
     managed_storage_arguments(os.environ)
-    smoke.require(os.environ.get("CENGINE_RTM081_FIXTURE") and os.environ.get("CENGINE_RTM081_FIXTURE_SHA256"),
-                  "native tests require the parent-built pinned fixture before daemon startup")
+    case_id, = request.node.get_closest_marker("compat").args
+    # Validate the exact case-bound bundle before helper restart or root creation.
+    load_inputs(case_id)
+    if case_id == "RTM-085":
+        artifact.load_fsx(os.environ.get("CENGINE_RTM085_FSX"))
     return tmp_path
 
 
@@ -65,9 +70,22 @@ def verify_docker_cli_target():
     pass  # No CLI/cache dependency: no registry or extra network.
 
 
+def fixture_inputs(case_id, environment):
+    artifact.selection(case_id)
+    prefix = "CENGINE_" + case_id.replace("-", "") + "_FIXTURE"
+    # Preserve a single-case caller's legacy pair, but never replace an incomplete
+    # case-specific opt-in with it. load_fixture still checks exact case/source pins.
+    if prefix not in environment and prefix + "_SHA256" not in environment:
+        prefix = "CENGINE_RTM081_FIXTURE"
+    directory, digest = environment.get(prefix), environment.get(prefix + "_SHA256")
+    smoke.require(directory and digest,
+                  "native tests require the parent-built pinned fixture before daemon startup")
+    return directory, digest
+
+
 def load_inputs(case_id="RTM-081"):
-    return artifact.load_fixture(os.environ["CENGINE_RTM081_FIXTURE"],
-                                 os.environ["CENGINE_RTM081_FIXTURE_SHA256"], REPO_ROOT, case_id)
+    directory, digest = fixture_inputs(case_id, os.environ)
+    return artifact.load_fixture(directory, digest, REPO_ROOT, case_id)
 
 
 def image_archive(native, helper, formatter, plan, case_id="RTM-081", *, fsx=None):
@@ -239,7 +257,7 @@ def run_campaign(daemon, started, case_id="RTM-081"):
             before = manifest["sources"]
             record("sources", files=before, inventory_sha256=smoke.digest(direct._encode(before)))
             record("compiler", builder=manifest["builder"], toolchain=manifest["toolchain"], cleanup=manifest["cleanup"],
-                   fixture_manifest_sha256=os.environ["CENGINE_RTM081_FIXTURE_SHA256"])
+                   fixture_manifest_sha256=fixture_inputs(case_id, os.environ)[1])
             native, helper, formatter = (files[name] for name in ("native.test", "setup", "mke2fs"))
             fsx = None
             if case_id == "RTM-085":

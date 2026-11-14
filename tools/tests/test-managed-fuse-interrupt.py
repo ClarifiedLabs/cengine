@@ -43,6 +43,8 @@ def load(path, namespace):
             node.decorator_list = []
             nodes.append(node)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in node.targets):
+                continue  # Collection-only metadata, exercised by qualification routing tests.
             nodes.append(node)
     module = ModuleType(path.stem)
     module.__dict__.update(namespace, __file__=str(path))
@@ -610,11 +612,14 @@ class InterruptGuards(unittest.TestCase):
 
     def test_fixture_requires_source_pins_without_startup_optin(self):
         fake = SimpleNamespace(managed_storage_arguments=lambda env: [])
+        request = SimpleNamespace(node=SimpleNamespace(get_closest_marker=lambda _: SimpleNamespace(args=("RTM-081",))))
         with patch.dict(sys.modules, conftest=fake), patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "parent-built pinned fixture"):
-                case.image_cache("no-cache")
-        with patch.dict(sys.modules, conftest=fake), patch.dict(os.environ, CENGINE_RTM081_FIXTURE="/owned", CENGINE_RTM081_FIXTURE_SHA256="a"*64):
-            self.assertEqual(case.image_cache("no-cache"), "no-cache")
+                case.image_cache("no-cache", request)
+        with patch.dict(sys.modules, conftest=fake), patch.dict(os.environ, CENGINE_RTM081_FIXTURE="/owned", CENGINE_RTM081_FIXTURE_SHA256="a"*64), \
+                patch.object(artifact, "load_fixture") as load:
+            self.assertEqual(case.image_cache("no-cache", request), "no-cache")
+            load.assert_called_once_with("/owned", "a" * 64, ROOT, "RTM-081")
         self.assertIsNone(case.verify_docker_cli_target())
 
     def test_private_failure_logs_bounded_streaming_and_redacted(self):
@@ -812,7 +817,7 @@ class InterruptGuards(unittest.TestCase):
                 with patch.dict(case.__dict__, namespace), patch.dict(sys.modules,
                     conftest=SimpleNamespace(expected_git_commit=lambda binary: "commit"),
                     test_volume_workflows=SimpleNamespace(_campaign=campaign)), \
-                    patch.dict(os.environ, CENGINE_RTM081_FIXTURE_SHA256="a" * 64, CENGINE_RTM085_FSX="/owned/fsx"), \
+                    patch.dict(os.environ, CENGINE_RTM081_FIXTURE="/owned", CENGINE_RTM081_FIXTURE_SHA256="a" * 64, CENGINE_RTM085_FSX="/owned/fsx"), \
                     patch.object(shutil, "disk_usage", return_value=SimpleNamespace(free=4 << 30)), patch.object(time, "sleep"):
                     if failure:
                         with self.assertRaises((ValueError, TimeoutError)) as raised:

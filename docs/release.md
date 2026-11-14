@@ -37,8 +37,12 @@ its test owner automatically; manual root-helper enrollment is not a test step.
 Release qualification must exercise daemon restart, controlled first-start retry,
 installed-system reboot recovery, and signed package upgrades on the candidate.
 Focused component checks do not replace the ordinary compatibility suite or real
-package installation tests. See [Managed storage](storage-adoption.md) for the
-recovery contract.
+package installation tests. `make test-compat` runs ordinary compatibility only;
+release qualification also requires the separately selected native component and
+full PREPARE campaigns through `make test-compat-qualification` (see
+[Compatibility testing](compatibility-testing.md#ordinary-suite-fixtures-and-separate-qualification-campaigns)).
+Missing fixtures, empty native selections and partial PREPARE shards cannot satisfy
+that gate. See [Managed storage](storage-adoption.md) for the recovery contract.
 
 ## Workflows
 

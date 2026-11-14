@@ -51,7 +51,8 @@ class HelperFingerprintTests(unittest.TestCase):
                 text = text.replace(command, "printf 'fixture-toolchain\\n'")
             script.write_text(text)
             (script.parent / 'storage_lifecycle_qualification.py').write_text("print('')\n")
-            inputs = support_sources() + [str(MANIFEST), 'Configuration/network-helper-Info.plist']
+            inputs = support_sources() + [str(MANIFEST), 'Configuration/network-helper-Info.plist',
+                                          'cengine.xcodeproj/project.pbxproj']
             inputs += [str(path.relative_to(ROOT)) for path in
                        sorted((ROOT / 'Sources/CEngineNetworkHelper').glob('*.swift'))]
             for source in inputs:

@@ -7,6 +7,33 @@ import Foundation
 @_silgen_name("xpc_dictionary_get_audit_token")
 private func qualificationAudit(_ message: xpc_object_t, _ token: UnsafeMutablePointer<audit_token_t>)
 
+/// Failure breadcrumbs only: no request values, native identities, or error text.
+struct StorageLifecycleScopeBindDiagnostic: Equatable, Sendable {
+    enum Phase: String, CaseIterable, Sendable {
+        case admission, owner, sender, decode, rootdescriptor, binding, registry
+        case resolve, rootvalidation, senderrecheck, remember
+    }
+    enum Category: String, CaseIterable, Sendable {
+        case invalidRequest, unauthorized, conflict, unknownStore, unknownGrant
+        case blocked, epochExhausted, capacityExceeded, repairRequired, unavailable, other
+    }
+    let phase: Phase
+    let category: Category
+    init(phase: Phase, error: any Error) {
+        self.phase = phase
+        category = (error as? BootstrapFailure).flatMap { Category(rawValue: $0.code.rawValue) } ?? .other
+    }
+    var line: String {
+        "storage-lifecycle-scope-bind-rejected phase=\(phase.rawValue) category=\(category.rawValue)\n"
+    }
+    static func emit(_ diagnostic: Self) {
+        // Same bounded, best-effort stderr pattern as StorageBootstrapBindingDiagnostic.
+        diagnostic.line.utf8CString.withUnsafeBytes { bytes in
+            _ = Darwin.write(STDERR_FILENO, bytes.baseAddress, bytes.count - 1)
+        }
+    }
+}
+
 /// Descriptor-relative storage. The injected base/owner/sync are unprivileged test
 /// seams only; live construction always uses fixedBase(), uid 0 and full durability.
 enum StorageLifecycleQualificationFiles {
@@ -627,6 +654,14 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
     /// Returns true exactly when this adapter owns the one asynchronous reply.
     func dispatch(_ message: xpc_object_t, reply: xpc_object_t, peer: xpc_connection_t) throws -> Bool {
         let receivedAt = DispatchTime.now()
+        // Identify only the fixed operation token, including for rejected admission.
+        let isScopeBind: Bool = {
+            guard xpc_get_type(message) == XPC_TYPE_DICTIONARY,
+                  let op = xpc_dictionary_get_value(message, "operation"), xpc_get_type(op) == XPC_TYPE_STRING,
+                  xpc_string_get_length(op) == Self.scopeBindOperation.utf8.count,
+                  let text = xpc_string_get_string_ptr(op) else { return false }
+            return String(cString: text) == Self.scopeBindOperation
+        }()
         let operation: String
         let record: Peer
         let ticket: StorageLifecycleQualificationAdmission<ObjectIdentifier>.Ticket
@@ -643,6 +678,7 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
                 return (value, ticket)
             }
         } catch {
+            if isScopeBind { StorageLifecycleScopeBindDiagnostic.emit(.init(phase: .admission, error: error)) }
             disconnected(peer); xpc_connection_cancel(peer); throw error
         }
         let deadline = Self.requestDeadline(operation: operation, receivedAt: receivedAt)
@@ -653,23 +689,34 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
                     xpc_connection_send_message(peer, reply)
                 }
             }
+            var bindPhase = StorageLifecycleScopeBindDiagnostic.Phase.admission
             do {
                 guard !lock.withLock({ terminating || record.closed }) else { throw BootstrapFailure(.unavailable) }
                 if operation == Self.scopeBindOperation {
                     // Both namespaces: `policy`/`namespace` fix the journal root
                     // (production: StorageLifecycleNativePolicy.production).
+                    bindPhase = .owner
                     let installedOwnerUID = try owner()
+                    bindPhase = .sender
                     let sender = try daemon(message)
+                    bindPhase = .decode
                     let request = try Self.decodeBind(message)
+                    bindPhase = .rootdescriptor
                     let fd = xpc_dictionary_dup_fd(message, "store-root"); guard fd >= 0 else { throw BootstrapFailure(.invalidRequest) }
                     defer { close(fd) }
+                    bindPhase = .binding
                     let binding = try StorageLifecycleQualificationBinding.verified(store: request.store, rootFD: fd, owner: installedOwnerUID)
+                    bindPhase = .registry
                     try registry.bind(sender, to: binding)
+                    bindPhase = .resolve
                     let scope = try scopes.resolve(binding) {
                         try Scope(binding: binding, rootFD: fd, owner: installedOwnerUID, team: team, policy: policy, namespace: namespace)
                     }
+                    bindPhase = .rootvalidation
                     try scope.validateRoot(receivedFD: fd)
+                    bindPhase = .senderrecheck
                     guard try daemon(message) == sender else { throw BootstrapFailure(.unauthorized) }
+                    bindPhase = .remember
                     try scope.worker.perform { try scope.cold.remember(sender); try scope.resume.remember(sender) }
                     xpc_dictionary_set_bool(reply, "ok", true); finish(.success(())); return
                 }
@@ -906,7 +953,12 @@ final class StorageBootstrapLifecycleRouter: @unchecked Sendable {
                     }
                     if lock.withLock({ terminating || record.closed }) { scope.disconnected(peer); throw BootstrapFailure(.unavailable) }
                 }, completion: finish)
-            } catch { finish(.failure(error)) }
+            } catch {
+                if operation == Self.scopeBindOperation {
+                    StorageLifecycleScopeBindDiagnostic.emit(.init(phase: bindPhase, error: error))
+                }
+                finish(.failure(error))
+            }
         }
         return true
     }

@@ -22,7 +22,7 @@ import Testing
         let b = FileHandle(fileDescriptor: fds[1], closeOnDealloc: true)
         let status = try status()
         _ = await Task.detached {
-            #expect(throws: (any Error).self) {
+            #expect(throws: StorageLifecycleShimProtocol.Failure.unauthorized) {
                 try StorageLifecycleShimConnection(adoptedBorrowedFD: a.fileDescriptor, status: status)
             }
         }.value
@@ -48,18 +48,34 @@ import Testing
             return fd
         }.value
         defer { close(peer) }
-        await #expect(throws: (any Error).self) { try await attempt.value }
+        await #expect(throws: StorageLifecycleShimProtocol.Failure.unauthorized) { try await attempt.value }
         var byte: UInt8 = 0
         #expect(recv(peer, &byte, 1, MSG_DONTWAIT) == 0)
     }
-    @Test(arguments: [UInt32(0), 1, 0x10000, 0x10003, 0x10010001, 0x10010003])
-    func adoptedCodeFlagsRejectInvalidNonRuntimeAdhocAndDebugged(_ flags: UInt32) {
-        #expect(!StorageLifecycleShimConnection.validAdoptedCodeFlags(flags))
-    }
-    @Test func adoptedCodeFlagsRequireValidHardenedRuntime() {
-        #expect(StorageLifecycleShimConnection.validAdoptedCodeFlags(0x10001))
-        // Unrelated flags do not replace either mandatory bit.
-        #expect(StorageLifecycleShimConnection.validAdoptedCodeFlags(0x10001 | 0x200))
+    @Test(arguments: SignedStorageIdentity.Namespace.allCases, [false, true])
+    func adoptedCodeFlagsOnlyRelaxForOrdinaryAdHocCompatibility(
+        namespace: SignedStorageIdentity.Namespace, isQualification: Bool
+    ) {
+        for team in [SignedStorageIdentity.adHocCompatibilityTeam, "M6P3423NZS", "",
+                     "000000000", "00000000000", "0000000000\n"] {
+            let allowsAdHoc = namespace == .compatibility && !isQualification
+                && team == SignedStorageIdentity.adHocCompatibilityTeam
+            // Exhaust all combinations of CS_VALID, CS_ADHOC, CS_RUNTIME and
+            // CS_DEBUGGED, both with and without an unrelated status bit.
+            for combination in 0..<16 {
+                let valid = combination & 1 != 0
+                let adHoc = combination & 2 != 0
+                let runtime = combination & 4 != 0
+                let debugged = combination & 8 != 0
+                let flags: UInt32 = (valid ? 0x1 : 0) | (adHoc ? 0x2 : 0)
+                    | (runtime ? 0x10000 : 0) | (debugged ? 0x10000000 : 0)
+                let expected = valid && !debugged && (allowsAdHoc || (runtime && !adHoc))
+                for unrelated: UInt32 in [0, 0x200] {
+                    #expect(StorageLifecycleShimConnection.validAdoptedCodeFlags(flags | unrelated,
+                        namespace: namespace, isQualification: isQualification, team: team) == expected)
+                }
+            }
+        }
     }
     @Test(arguments: [false, true])
     func initialRouterSeparatesAdoptionBeforeTokenDecoding(adopted: Bool) throws {

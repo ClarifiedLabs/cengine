@@ -30,7 +30,9 @@ part of the GitHub-hosted test workflow.
    compatibility address pools that overlap an active host interface or specific route.
 6. Delete and recreate the Python virtual environment from the pinned requirements.
 7. Let the pytest harness create a unique engine root and Docker configuration for the
-   run, then execute the requested tests.
+   run, then execute ordinary tests (`not qualification`). Native component and
+   parent-owned PREPARE campaigns have a separate explicit entry point below;
+   they are not counted as passes by this target.
 8. On success, failure, or interruption, stop all owned processes, remove temporary
    roots, assert the state is clean, and release the lock. The test helper remains
    installed for later runs.
@@ -39,7 +41,13 @@ Before **each new ordinary pytest daemon fixture root** (including manual first 
 the harness performs one authenticated test-helper process restart. It is never part of
 `Daemon.start()`, daemon restart, or recovery, and collection/skipped fixtures do not
 restart it. This bounds process-local helper registrations without increasing capacity,
-reinstalling the helper, or deleting protected lifecycle journals. The image cache only
+reinstalling the helper, or deleting protected lifecycle journals. Durable namespace
+history is validated separately by a constant-memory scan; it does not consume
+the 128 active/unresolved binding slots. More than 128 historical roots remain
+valid, including after helper restart. Unknown entries and wrong namespace markers
+still refuse without writes. Scope-bind failures emit closed phase/category tokens
+in the test helper's stderr and the daemon log; they never emit paths, identities,
+keys or request payloads, and diagnostics never authorize recovery or cleanup. The image cache only
 caches content; it does not start a daemon.
 
 All three supported launchers (`run-compat-tests.sh`, `run-isolated-cengine.sh`, and
@@ -72,6 +80,23 @@ no new root. Retained roots require explicit investigation, never automatic disp
 These guards cover supported launchers; unsynchronized direct/private launchers are
 unsupported. Historical roots placed in arbitrary nonstandard directories are not
 inventoried automatically.
+
+The `test-compat` configuration uses optimized Swift (`-O`) and C (`-O2`)
+while retaining debug information, `DEBUG`, testability, isolated signing identities,
+and the existing fault/profile gates. Unoptimized engine binaries make repeated
+strict native signature validation expensive enough to exhaust recovery readiness
+budgets. Optimization changes neither authentication checks nor deadlines. The helper
+fingerprint includes the Xcode project so build-setting changes are recorded too.
+Qualification source pins include this project; prior source-pinned campaign results
+must not be reused for a changed build.
+
+Guest staging sets `/` and system directories to `0755`, with private `/rootfs`
+(container) and `/data` (storage) at `0700`, independently of the host umask.
+The host output directory retains its original permissions. In particular, the
+runner's private `077` umask must not become guest `/` mode: nonroot managed
+operations need to traverse `/proc` to use their exact pinned descriptors.
+RTM-080 checks named-user ACL access against the direct-ext4 source, not merely
+that shared-volume ACL bytes survived copy-up.
 
 Compiler intermediates and the pinned kernel build are caches, not runtime state. They
 remain between runs; Xcode dependency tracking rebuilds changed sources, guest assets
@@ -255,6 +280,56 @@ the fixture image with `CENGINE_TEST_IMAGE` and its source mirror with
 Use `CENGINE_BINARY` for a custom daemon and `CENGINE_EXPECTED_GIT_COMMIT` for its
 expected source revision. The harness checks daemon identity and Docker CLI access
 to a sentinel on each isolated socket before running scenarios.
+
+## Ordinary suite fixtures and separate qualification campaigns
+
+`make test-compat-images` explicitly prepares the digest-pinned Python, Alpine and
+BuildKit fixtures for local Compose/Buildx cases. The filesystem corpus also needs
+its separate build-only preparation on an authorized Linux arm64 endpoint:
+
+```sh
+CENGINE_CORPUS_BUILD_HOST=unix:///absolute/authorized/build.sock \
+  python3 Tests/Compatibility/fixtures/volume-corpus/build.py
+```
+
+`make test-compat` and `make test-compat-soak` run the ordinary suite. Twenty
+native component cases and the five parent-campaign registrations carry the
+`qualification` marker and are explicitly deselected, not reported as passing.
+The runner owns marker selection; caller-supplied `-m` overrides are refused.
+Use the separate entry point for qualification:
+
+```sh
+make test-compat-qualification QUALIFICATION=native
+make test-compat-qualification QUALIFICATION=prepare \
+  QUALIFICATION_ARGS='--rtm RTM-096 --assets .build/managed-assets-full9 --evidence .build/managed-prepare-matrix'
+```
+
+Native managed-FUSE cases require parent-built, source-pinned, case-bound bundles,
+not just ordinary guest assets. Supply each case's path/hash pair, for example
+`CENGINE_RTM081_FIXTURE`/`CENGINE_RTM081_FIXTURE_SHA256` and
+`CENGINE_RTM082_FIXTURE`/`CENGINE_RTM082_FIXTURE_SHA256`. The legacy RTM081 pair
+still supports a single-case invocation; it cannot relabel a bundle for another
+case. `QUALIFICATION_ARGS` accepts native pytest selections such as
+`'-k test_native_managed_fuse_interrupt'`. All selected bundles, and RTM-085's fsx
+input, are verified before helper restart or daemon-root creation. Missing,
+stale or mismatched inputs fail; they do not skip or download implicitly. The
+compiler's approved builder identity and all native no-skip assertions remain.
+
+PREPARE dispatch delegates to the existing `tools/managed-prepare-matrix.sh`
+parent, which owns signed assets, supervision and full aggregation. Run RTM-096,
+097, 098, 099 and 100 separately with their complete selections. The five pytest
+registrations still refuse acceptance: only actual full campaign aggregation can
+qualify them, never a partial shard, a placeholder invocation or an empty selection.
+A successful ordinary suite is not qualification of these campaigns.
+
+On 2026-11-13, the full default run exposed an ordinary ad-hoc live-adoption
+rejection in addition to those prerequisites. The fix preserves strict production,
+Developer ID and qualification flags while accepting authenticated ordinary
+ad-hoc compatibility code. The runner now exports its normalized signing choice,
+and ordinary lifecycle prerequisites use the shared read-only signature/helper
+guards. Focused BLD-002 restart and RTM-137 shared-DATA live-restore checks passed
+with the published `kernel-v6.18.63-1` through the default unprivileged/ad-hoc path
+and clean teardown. This is not a full-suite pass or native campaign qualification.
 
 ## Focused and repeated runs
 

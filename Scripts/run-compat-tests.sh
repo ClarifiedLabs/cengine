@@ -2,10 +2,36 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-# shellcheck source=Scripts/compat-network-helper.sh
-. "$ROOT/Scripts/compat-network-helper.sh"
 MODE=${1:-suite}
 shift || true
+# Validate selection before signing checks, claims, builds or runtime work.
+case "$MODE" in
+    helper-install) BUILD_STAGE="build and provision compatibility runtime" ;;
+    suite|soak|oracle|qualification) BUILD_STAGE="build and validate compatibility runtime" ;;
+    *) echo "unknown compatibility test mode: $MODE" >&2; exit 2 ;;
+esac
+for argument in "$@"; do
+    case "$argument" in
+        -m|-m?*|--markexpr|--markexpr=*)
+            echo 'compatibility modes own the pytest marker selection; do not pass -m/--markexpr' >&2
+            exit 2 ;;
+    esac
+    if [ "$MODE" = qualification ]; then
+        case "$argument" in
+            *test_oracle.py*)
+                echo 'Docker oracle selections are not qualification campaigns' >&2
+                exit 2 ;;
+        esac
+    fi
+done
+# Keep options-only/default collection rooted in Compatibility after adding -m.
+[ "$#" -ne 0 ] || set -- "$ROOT/Tests/Compatibility"
+case "$MODE" in
+    suite|soak) set -- -m 'not qualification' "$@" ;;
+    qualification) set -- -m qualification "$@" ;;
+esac
+# shellcheck source=Scripts/compat-network-helper.sh
+. "$ROOT/Scripts/compat-network-helper.sh"
 . "$ROOT/Scripts/managed-signing.sh"
 # Build-only lifecycle fault. Validate before normalizing any ambient profile fields.
 CENGINE_COMPAT_LIFECYCLE_FAULT=$(python3 "$ROOT/Scripts/compat_lifecycle_fault.py" selection)
@@ -62,6 +88,9 @@ if [ "${CENGINE_COMPAT_HELPER_MODE:-}" = "unprivileged" ] && \
    [ "${CENGINE_DEVELOPER_ID_APPLICATION:-}" = "" ]; then
     CENGINE_DEVELOPER_ID_APPLICATION=-
 fi
+# Child prerequisite checks must see the same normalized signing selection used
+# for the build; a shell-local ad-hoc default is otherwise lost before pytest.
+export CENGINE_DEVELOPER_ID_APPLICATION
 if [ "${CENGINE_COMPAT_HELPER_MODE:-}" = "unprivileged" ] && \
    [ -z "$CENGINE_STORAGE_LIFECYCLE_QUALIFICATION" ] && \
    [ -z "$CENGINE_COMPAT_LIFECYCLE_FAULT" ] && \
@@ -187,19 +216,6 @@ CENGINE_COMPAT_IPV6_FIXTURE_PREFIX=${CENGINE_COMPAT_IPV6_FIXTURE_PREFIX:-fdcd::/
 export CENGINE_COMPAT_IPV4_AUTO_POOL CENGINE_COMPAT_IPV6_AUTO_PREFIX
 export CENGINE_COMPAT_IPV4_FIXTURE_POOL CENGINE_COMPAT_IPV6_FIXTURE_PREFIX
 
-case "$MODE" in
-    helper-install)
-        BUILD_STAGE="build and provision compatibility runtime"
-        ;;
-    suite|soak|oracle)
-        BUILD_STAGE="build and validate compatibility runtime"
-        ;;
-    *)
-        echo "unknown compatibility test mode: $MODE" >&2
-        exit 2
-        ;;
-esac
-
 stage "preflight reset"
 $RESET
 
@@ -290,8 +306,9 @@ run_pytest() {
 }
 
 case "$MODE" in
-    suite)
-        stage "run compatibility suite"
+    suite|qualification)
+        stage "run compatibility $MODE"
+        # Preserve pytest's nonzero status for empty selections (exit 5).
         run_pytest "$@"
         ;;
     soak)

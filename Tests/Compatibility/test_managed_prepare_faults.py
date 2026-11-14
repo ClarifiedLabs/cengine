@@ -23,6 +23,8 @@ import pytest
 import managed_prepare_faults as proof
 from managed_storage_recovery import exact_exit, unchanged_processes, read_public
 
+pytestmark = pytest.mark.qualification
+
 
 # Authenticated PREPARE/channel failures map to conflict; externally killed shims
 # lose the host transport and map to internal error. This is not an either/or oracle.

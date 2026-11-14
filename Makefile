@@ -42,7 +42,7 @@ CENGINE_COMPAT_RESET = python3 Scripts/reset-compat-runtime.py --binary "$(XCODE
 
 export CENGINE_GIT_COMMIT CENGINE_BUILD_TIME CENGINE_HOST_OS
 
-.PHONY: all build guest-assets guest-initramfs kernel kernel-build test test-guest test-compat test-compat-images test-compat-soak test-compat-oracle test-compat-reset test-compat-reset-system test-compat-doctor test-compat-helper-install test-compat-helper-uninstall dist-cli package release release-list test-release clean help
+.PHONY: all build guest-assets guest-initramfs kernel kernel-build test test-guest test-compat test-compat-images test-compat-soak test-compat-qualification test-compat-oracle test-compat-reset test-compat-reset-system test-compat-doctor test-compat-helper-install test-compat-helper-uninstall dist-cli package release release-list test-release clean help
 
 all: dist-cli
 
@@ -56,9 +56,11 @@ help:
 		'make kernel-build  Build the pinned cengine Linux kernel from source' \
 		'make test          Run the Xcode test suite' \
 		'make test-guest    Run Linux guest service unit tests' \
-		'make test-compat  Reset, rebuild, run Docker compatibility tests, and reset again' \
+		'make test-compat  Reset, rebuild, run ordinary Docker compatibility tests, and reset again' \
 		'make test-compat-images  Explicitly download pinned local build image fixtures' \
-		'make test-compat-soak  Run the compatibility suite three times with shuffled ordering' \
+		'make test-compat-soak  Run ordinary compatibility tests three times with shuffled ordering' \
+		'make test-compat-qualification QUALIFICATION=native|prepare  Run an explicit campaign' \
+		'  QUALIFICATION_ARGS="..."  Native pytest options or PREPARE matrix CLI args (e.g. --rtm RTM-096)' \
 		'make test-compat-oracle  Compare deterministic contracts with DOCKER_REFERENCE_HOST' \
 		'make test-compat-reset  Stop this worktree’s orphaned compatibility VMs and remove temporary roots' \
 		'make test-compat-reset-system  Also restart vmnet system state after a helper crash' \
@@ -119,6 +121,8 @@ test:
 	@python3 tools/tests/test-managed-original-lifecycle-peer.py
 	@python3 tools/tests/test-rtm103-failure-diagnostic.py
 	@python3 tools/tests/test-compat-harness.py
+	@python3 tools/tests/test-compat-qualification.py
+	@python3 tools/tests/test-native-fixture-routing.py
 	@python3 tools/tests/test-compat-fixture-outcomes.py
 	@python3 tools/tests/test-helper-fixture-lifetime.py
 	@python3 tools/tests/test-tool-canonical-claims.py
@@ -169,6 +173,9 @@ test-compat:
 
 test-compat-soak:
 	@$(CENGINE_COMPAT_ENV) Scripts/run-compat-tests.sh soak $(COMPAT_ARGS)
+
+test-compat-qualification:
+	@${CENGINE_COMPAT_ENV} Scripts/run-compat-qualification.sh "$(QUALIFICATION)" $(QUALIFICATION_ARGS)
 
 test-compat-oracle:
 	@DOCKER_REFERENCE_HOST="$(DOCKER_REFERENCE_HOST)" $(CENGINE_COMPAT_ENV) Scripts/run-compat-tests.sh oracle $(COMPAT_ARGS)
