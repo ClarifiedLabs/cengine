@@ -46,9 +46,9 @@ that gate. See [Managed storage](storage-adoption.md) for the recovery contract.
 
 ## Workflows
 
-`test.yml` runs for `main`, `release-ci`, pull requests, and manual dispatch.
-`release.yml` runs for `release-ci`, `v*.*.*` tags, and manual dispatch. It waits
-for a successful test run for the same commit before packaging. Normal guest
+`test.yml` runs for `main`, `v*.*.*` tags, pull requests, and manual dispatch.
+On main and release tags, its packaging job requires the guest and macOS tests
+and guest asset build to succeed in the same run. Normal guest
 asset builds fetch the dedicated, checksum-verified kernel release rather than
 compiling a kernel as part of every application release.
 
@@ -62,7 +62,7 @@ workflow validates the local build receipt against the actual image and current
 recipe, then checks required image markers. Those checks do not replace native
 storage ABI and compatibility probes.
 
-`release-ci` exercises the full signing and notarization paths and uploads the
+Pushes to `main` exercise the full signing and notarization paths and upload the
 guest assets and signed package as workflow artifacts. It does not create a
 GitHub Release or update Homebrew. Tag runs publish the package and update the
 Homebrew Cask to use it.
@@ -122,9 +122,7 @@ The Homebrew GitHub App must have Contents read/write access to
 
 ## Test a Release
 
-```bash
-git push origin HEAD:release-ci
-```
+Push to `main`, or manually dispatch `test.yml` on `main`, to exercise the release build without publishing.
 
 The resulting `cengine-<version>.pkg` must pass nested signature inspection,
 stapler validation, and Gatekeeper assessment.

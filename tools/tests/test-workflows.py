@@ -7,12 +7,12 @@ from _checks import REPO_ROOT, read, require_absent, require_contains
 
 def main() -> None:
     test = read(REPO_ROOT / ".github/workflows/test.yml")
-    release = read(REPO_ROOT / ".github/workflows/release.yml")
+    release = test
     kernel_release = read(REPO_ROOT / ".github/workflows/kernel-release.yml")
     makefile = read(REPO_ROOT / "Makefile")
     engine_entitlements = read(REPO_ROOT / "Configuration/cengine.entitlements")
     for needle in (
-        "- main", "- release-ci", "pull_request:", "workflow_dispatch:", "runs-on: xcode-27", "make test",
+        "- main", "v*.*.*", "pull_request:", "workflow_dispatch:", "runs-on: xcode-27", "make test",
         "python3 tools/tests/test-homebrew-formula.py",
         "python3 tools/tests/test-package.py", "python3 tools/tests/test-installer.py",
     ):
@@ -46,11 +46,11 @@ def main() -> None:
     require_contains(test, "-parallel-testing-enabled NO", "test.yml")
     require_contains(test, '-resultBundlePath $XCODE_RESULT_BUNDLE_PATH', "test.yml")
     for needle in (
-        "- release-ci", "v*.*.*", "require-tests:", "guest-assets:",
+        "v*.*.*", "guest-assets:",
         "runs-on: ubuntu-24.04-arm", "DOCKER_CONTEXT: default", "CENGINE_KERNEL_MODE: release",
         "docker --context default buildx version",
         ".build/guest/disk-bootstrap.json",
-        "needs: [require-tests, guest-assets]",
+        "needs: [guest, test, guest-assets]",
         "CENGINE_SIGN_RELEASE=1", "CENGINE_NOTARIZE=1", "./Scripts/package-release.sh",
         "gh release create", "homebrew-publish:", "ClarifiedLabs/homebrew-tap",
         "Upload release artifacts", ".pkg", "PKG_SHA256",
@@ -58,7 +58,7 @@ def main() -> None:
         "--check-notarization", "com.apple.security.virtualization",
     ):
         require_contains(release, needle, "release.yml")
-    for forbidden in ("draft: true", "--draft", "TestFlight"):
+    for forbidden in ("draft: true", "--draft", "TestFlight", "release-ci", "require-tests:", "workflow_runs"):
         require_absent(release, forbidden, "release.yml")
     require_absent(release, "make kernel-build", "release.yml")
     require_contains(release, 'sudo env "PATH=$PATH" "TMPDIR=$RUNNER_TEMP" ./Scripts/test-guest.sh', "release.yml")
@@ -94,8 +94,14 @@ def main() -> None:
     require_contains(prepare, "set -euo pipefail", "kernel-release.yml preparation")
     for gate in kernel_gates[1:6]:
         require_contains(prepare, gate, "kernel-release.yml preparation")
-    guest_release = release.split("  guest-assets:\n", 1)[1].split("\n  require-tests:", 1)[0]
+    guest_release = release.split("  guest-assets:\n", 1)[1].split("\n  build:", 1)[0]
+    require_contains(guest_release, "if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))", "guest assets trigger")
     require_contains(guest_release, "CENGINE_KERNEL_MODE: release", "release.yml guest assets")
+    build = release.split("  build:\n", 1)[1].split("\n  homebrew-publish:", 1)[0]
+    publish = build.split("      - name: Create GitHub release\n", 1)[1].split("      - name:", 1)[0]
+    require_contains(publish, "if: startsWith(github.ref, 'refs/tags/v')", "GitHub release gate")
+    homebrew = release.split("  homebrew-publish:\n", 1)[1]
+    require_contains(homebrew, "if: startsWith(github.ref, 'refs/tags/v')", "Homebrew release gate")
     require_contains(guest_release, "make guest-assets", "release.yml guest assets")
     for forbidden in ("CENGINE_KERNEL_RELEASE_BASE_URL", "CENGINE_LOCAL_KERNEL", "make kernel-build"):
         require_absent(guest_release, forbidden, "release.yml canonical kernel fetch")
